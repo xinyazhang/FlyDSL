@@ -177,6 +177,13 @@ See `/gemm-optimization` §1 for the full derivation and the worked 5120×5120×
 
 ## 2. LDS Double-Buffering (Ping-Pong)
 
+> **Terminology.** "Ping-pong" here means LDS double-buffering, *not* the
+> inter-warpgroup alternation the term denotes in FlashAttention-3 and in the
+> gfx950 `DUALWAVE_SWP` kernels. See
+> [`kernels/attention/gfx1201_fmha.md`](../kernels/attention/gfx1201_fmha.md#terminology)
+> for a glossary disambiguating LDS ping-pong, dual-wave SWP, binding vs
+> non-binding prefetch, and warp specialization.
+
 With `lds_stage=2`, allocate **two** LDS buffers for the A tile. While one buffer
 feeds the MFMAs, the next K-tile's A is loaded into the other, hiding the
 global→LDS latency:
