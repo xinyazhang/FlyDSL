@@ -39,9 +39,10 @@ cd kernels/attention && python3 -m pytest test_flash_attn_func_gfx1201.py -v
 | builder | file | staging |
 |---|---|---|
 | `build_flash_attn_func_module` | `flash_attn_func_gfx1201.py` | baseline: V prefetched in registers, K loaded at distance 0 |
-| `build_flash_attn_func_bp_module` | `flash_attn_func_gfx1201_bp.py` | binding prefetch: K *and* V in registers at distance 1 |
+| `build_flash_attn_func_bp_module` | `flash_attn_func_gfx1201_bp.py` | binding prefetch: K *and* V in registers at distance 1; V staged transposed in LDS |
+| `build_flash_attn_func_m32_module` | `flash_attn_func_gfx1201_m32.py` | **head_dim 64 only:** two Q row-tiles per wave (BLOCK_M=256), so one K/V operand feeds two WMMAs. **+14% at N=4096** |
 
-Select with `flydsl_flash_attn_func_gfx1201(..., use_binding_prefetch=True)`.
+Select with `use_binding_prefetch=True` or `variant="m32"`.
 The two are currently bit-identical in output and within noise on throughput;
 the variant exists to be tuned. See the file's docstring for the schedule and
 the open scheduling issue (a conservative `s_wait_loadcnt_dscnt 0x0` before the
@@ -154,6 +155,23 @@ So the 22% is mostly *inherent* to getting V into WMMA-operand form, not to how
 the reads are spelled. Reducing it further likely needs higher arithmetic
 intensity — each of the 8 waves reads the whole K and V tile every iteration
 because it owns only 16 of 128 Q rows.
+
+### Register budget curve
+
+Price any change that adds live state against this before building it. Measured
+by holding N extra `v8f32` accumulators live across the KV loop (head_dim 128):
+
+| extra VGPRs | total | waves/SIMD | TFLOPS | cost |
+|---|---|---|---|---|
+| +0 | 150 | 9 | 92.1 | — |
+| +64 | 222 | 6 | 89.8 | -2.5% |
+| +96 | 247 | 5 | 76.0 | -17% |
+| +112 | 256 (spills) | 5 | 67.3 | -27% |
+
+So roughly **+64 VGPRs is affordable**; the cliff is between 6 and 5 waves/SIMD,
+and spilling is catastrophic. Doubling a wave's Q row-tiles costs
+`o_accs + q_b_packs + s_accs`, which scales with head_dim: +64 at head_dim 64
+(fits, and `m32` takes it) but +112 at head_dim 128 (does not).
 
 ### Measuring this kernel
 
