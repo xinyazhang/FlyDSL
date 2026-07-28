@@ -113,6 +113,29 @@ tile has this problem; kernels migrated from `SmemAllocator` to
 `SharedAllocator` are worth auditing. The upstream fix is an alignment override
 on the op.
 
+## Roofline
+
+Dense WMMA peak on this part is **~205 TFLOPS** (f16 and bf16 alike), measured
+with [`kernels/microbench/wmma_peak.py`](../microbench/wmma_peak.py) and
+consistent with AMD's published 191 TFLOPS. The FMHA kernel runs at ~90 TFLOPS,
+i.e. **~44% of the matrix-pipeline ceiling** — express kernel results against
+that measured number, not against a spec sheet.
+
+The gap is instruction mix rather than stall. Per KV loop iteration the kernel
+issues ~452 instructions of which only **32 are `v_wmma`**; 128 of the rest are
+scalar 16-bit `ds_load_u16*` for the GEMM2 V reads, which move the same bytes
+per lane as the 16 vectorized `ds_load_2addr_b64` used for K in GEMM1. At the
+~10 waves/SIMD this kernel reaches, issue bandwidth caps throughput and per-wave
+stall is covered by other waves — which is why latency-oriented scheduling
+changes (a `sched_barrier` to stop the prefetch being hoisted, and
+software-pipelining GEMM1's LDS reads) both measured as noise. Note the run-to-run
+spread is 3-8%, so single-shot comparisons are not meaningful here.
+
+Vectorizing the GEMM2 V reads is the open lead. The docstring note above about a
+V pre-transpose regressing 8.8% predates the LDS alignment fix and was measured
+when the whole kernel ran at 39 TFLOPS, so it should be re-tested rather than
+treated as settled.
+
 ## Terminology
 
 Four distinct concepts get conflated in attention-kernel discussions, and
