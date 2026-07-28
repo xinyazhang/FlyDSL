@@ -26,6 +26,27 @@ exist in a pip-only ROCm install. Without it the JIT fails with a bare
 
 One CSV per configuration is written to the cwd.
 
+Correctness tests live in `test_flash_attn_func_gfx1201.py` and check both
+scheduling variants against PyTorch SDPA. They are intentionally **not** wired
+into `scripts/run_tests.sh`; run them the same way:
+
+```bash
+cd kernels/attention && python3 -m pytest test_flash_attn_func_gfx1201.py -v
+```
+
+## Scheduling variants
+
+| builder | file | staging |
+|---|---|---|
+| `build_flash_attn_func_module` | `flash_attn_func_gfx1201.py` | baseline: V prefetched in registers, K loaded at distance 0 |
+| `build_flash_attn_func_bp_module` | `flash_attn_func_gfx1201_bp.py` | binding prefetch: K *and* V in registers at distance 1 |
+
+Select with `flydsl_flash_attn_func_gfx1201(..., use_binding_prefetch=True)`.
+The two are currently bit-identical in output and within noise on throughput;
+the variant exists to be tuned. See the file's docstring for the schedule and
+the open scheduling issue (a conservative `s_wait_loadcnt_dscnt 0x0` before the
+barrier drains the prefetch a few instructions after it is issued).
+
 ## Why these four files break directory conventions
 
 They import each other by **bare module name** and depend on nothing but

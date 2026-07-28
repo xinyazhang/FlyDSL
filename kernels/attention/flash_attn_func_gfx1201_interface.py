@@ -35,6 +35,7 @@ import torch
 import torch.nn.functional as F
 
 from flash_attn_func_gfx1201 import build_flash_attn_func_module
+from flash_attn_func_gfx1201_bp import build_flash_attn_func_bp_module
 
 __all__ = ["flydsl_flash_attn_func_gfx1201"]
 
@@ -67,8 +68,10 @@ def _get_kernel(
     dtype_str: str,
     waves_per_eu: int,
     daz: bool,
+    use_binding_prefetch: bool,
 ):
-    return build_flash_attn_func_module(
+    builder = build_flash_attn_func_bp_module if use_binding_prefetch else build_flash_attn_func_module
+    return builder(
         num_heads=num_heads,
         head_dim=head_dim,
         causal=causal,
@@ -86,6 +89,7 @@ def flydsl_flash_attn_func_gfx1201(
     waves_per_eu: int = 2,
     daz: bool = True,
     stream: torch.cuda.Stream | None = None,
+    use_binding_prefetch: bool = False,
 ) -> torch.Tensor:
     """Run FlyDSL Flash Attention on RDNA4 (gfx1201).
 
@@ -98,6 +102,11 @@ def flydsl_flash_attn_func_gfx1201(
         daz: enable denormals-are-zero on the kernel.
         stream: optional CUDA/HIP stream to launch on. Defaults to the current
             stream for ``q.device``.
+        use_binding_prefetch: select the binding-prefetch scheduling variant
+            (``flash_attn_func_gfx1201_bp``), which carries both K and V tiles
+            in registers at prefetch distance 1 instead of loading K at
+            distance 0. Stage 1: correctness-oriented and not yet tuned, and it
+            only accepts head_dim 64/128. Defaults to the baseline kernel.
 
     Returns:
         Output tensor with the same shape and dtype as ``q``.
@@ -179,6 +188,7 @@ def flydsl_flash_attn_func_gfx1201(
             dtype_str=dtype_str,
             waves_per_eu=waves_per_eu,
             daz=daz,
+            use_binding_prefetch=use_binding_prefetch,
         )
         exe(
             q_p.reshape(-1),
