@@ -31,6 +31,7 @@ import torch
 import torch.nn.functional as F
 
 from flash_attn_func_gfx1201_bp import build_flash_attn_func_bp_module
+from flash_attn_func_gfx1201_m32 import build_flash_attn_func_m32_module
 from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
 
 # Relative-error tolerance against an fp32 reference. The kernel accumulates in
@@ -176,6 +177,41 @@ def test_binding_prefetch_rejects_unsupported_config(kwargs, match):
     """Stage 1 of the binding-prefetch variant guards its supported config set."""
     with pytest.raises(ValueError, match=match):
         build_flash_attn_func_bp_module(causal=False, dtype_str="f16", **kwargs)
+
+
+# The m32 variant gives each wave two Q row-tiles (BLOCK_M=256) so one K/V
+# operand feeds two WMMAs. head_dim 64 only -- at 128 the doubled per-wave state
+# exceeds the 256-VGPR cap and spills.
+_M32_SHAPES = [
+    (1, 512, False, torch.float16),
+    (2, 1024, False, torch.float16),
+    (1, 512, True, torch.float16),
+    (2, 768, True, torch.bfloat16),
+    (1, 300, True, torch.float16),  # seq_len not a multiple of BLOCK_M=256
+]
+
+
+@pytest.mark.parametrize(
+    "shape",
+    _M32_SHAPES,
+    ids=[f"b{b}_s{s}_{'causal' if c else 'full'}_{str(d).split('.')[-1]}" for b, s, c, d in _M32_SHAPES],
+)
+def test_m32_matches_sdpa(shape):
+    _require_env()
+    batch, seq, causal, dtype = shape
+    q, k, v = _qkv(batch, seq, _NUM_HEADS, 64, dtype)
+    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, variant="m32")
+    torch.cuda.synchronize()
+    assert out.shape == q.shape and out.dtype == q.dtype
+    rel, cos = _compare(out, _reference(q, k, v, causal))
+    assert rel < _REL_TOL[dtype], f"max rel err {rel:.3e}"
+    assert cos > _COS_TOL, f"cosine similarity {cos:.6f}"
+
+
+def test_m32_rejects_head_dim_128():
+    """head_dim 128 would spill; the builder must refuse rather than regress."""
+    with pytest.raises(ValueError, match="head_dim 64"):
+        build_flash_attn_func_m32_module(num_heads=_NUM_HEADS, head_dim=128, causal=False, dtype_str="f16")
 
 
 def test_shape_and_dtype_validation():
