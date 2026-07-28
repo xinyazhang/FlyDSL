@@ -45,6 +45,94 @@ FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 PYTHONPATH=./ <CMD>
 
 ---
 
+## Prerequisites — check these first
+
+Each of these has silently cost a failed capture. Verify before running.
+
+**1. `pyyaml` must be installed to use `-i input.yaml`.** rocprofv3 shells out to
+Python to parse the config and dies with
+`[rocprofv3] Fatal error: No module named 'yaml'`. Install it, or write the same
+schema as JSON (`-i input.json`), or use the CLI flags.
+
+```bash
+python3 -c "import yaml" || pip install pyyaml
+```
+
+**2. For ATT, prefer the all-CLI form over `-i <config>`.** With rocprofv3 1.3.2
+on gfx1201, `-i config.{yaml,json}` reliably collects the raw `.att` files and
+then **wedges in the decode stage** — no `ui_output_agent_*` is ever produced,
+the first attempt reported `Error loading decoder: 37`, and the process ignores
+SIGTERM (so `timeout` will not reclaim it; use SIGKILL). This reproduced with the
+library path supplied every way available: the `att_library_path` config key,
+`ROCPROF_ATT_LIBRARY_PATH`, and `--att-library-path` — including all three at
+once. The equivalent all-CLI invocation decodes reliably; verified back-to-back,
+CLI succeeding immediately before `-i` wedged on the same machine.
+
+Point at the decoder explicitly anyway. On a pip-installed ROCm it ships in the
+SDK wheel (no download needed):
+
+```bash
+R=$(rocm-sdk path --root)      # or /opt/rocm for a system install
+ls $R/lib/librocprof-trace-decoder.so
+export ROCPROF_ATT_LIBRARY_PATH=$R/lib
+```
+
+`-i <config>` remains fine for **PMC** jobs; this only affects ATT.
+
+**3. Never let the FlyDSL JIT compile inside the profiled process.** Compiling
+under rocprofv3 has been observed to fail with
+`LLVM ERROR: Cannot select: intrinsic %llvm.amdgcn.wmma.f32.16x16x16.f16`
+(gfx1201, rocprofv3 1.3.2) — the arch the JIT selects under the profiler's
+interposition differs from a normal run. `FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1` is
+*not* the cause; it compiles fine outside the profiler. Pre-warm the disk cache
+in a separate run using the **identical** environment (the debug-info flag is
+part of the cache key), and pin `ARCH`:
+
+```bash
+export FLYDSL_RUNTIME_CACHE_DIR=/tmp/att_jitcache ARCH=<gfx target>
+ARCH=$ARCH FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 python3 <script>   # warm, no profiler
+# ...then profile with the same env; the JIT now hits the cache
+```
+
+This is worth doing regardless: otherwise the trace includes the compiler.
+
+**4. A wedged ATT run poisons later captures.** After SIGKILLing a stuck
+rocprofv3, subsequent captures — *including a previously working one* — can
+produce no output at all. Before concluding that a recipe is broken, kill every
+`rocprofv3`/target process, confirm a plain non-profiled GPU run still works,
+and re-validate with a trivial kernel. Several confusing "failures" during this
+investigation were only contamination from an earlier killed run.
+
+**5. `--att-simd-select` means different things on CDNA and RDNA.**
+
+| target | meaning | pass |
+|---|---|---|
+| **CDNA** (e.g. gfx90a, gfx942, gfx950) | **bitmask** of SIMDs to enable | `0xf` = all four SIMDs |
+| **RDNA** (e.g. gfx10xx, gfx11xx, gfx120x) | **SIMD selection** — a single SIMD index | `0` (or the SIMD you want) |
+
+So the `0xf` in the examples below is a CDNA mask meaning "all SIMDs"; carried
+onto an RDNA target it is read as *SIMD index 15* and will not do what you want.
+
+The split is **CDNA vs RDNA**, by architecture family. `rocprofv3 --help`
+phrases it as *"Bitmask of SIMDs to enable (gfx9) or SIMD ID (gfx10+)"*, but do
+not treat the numeric prefix as the rule — the gfx number does not always track
+the architecture family. If you are unsure for a given target, confirm the
+family rather than inferring it from the gfx digits.
+
+A known-good local invocation (gfx1201, rocprofv3 1.3.2), avoiding the config
+file entirely:
+
+```bash
+R=$(rocm-sdk path --root)
+export ROCM_PATH=$R ROCPROF_ATT_LIBRARY_PATH=$R/lib
+ARCH=gfx1201 FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 FLYDSL_RUNTIME_CACHE_DIR=/tmp/att_jitcache PYTHONPATH=. \
+rocprofv3 --att --att-library-path $R/lib --att-target-cu 1 --att-simd-select 0 \
+  --att-shader-engine-mask 0x1 --att-buffer-size 0x6000000 \
+  --kernel-include-regex '<kernel>_0' -d /tmp/att_out -o out -- python3 <script>.py
+```
+
+---
+
 ## Workflow
 
 ```
@@ -114,7 +202,7 @@ jobs:
        advanced_thread_trace: true
        att_target_cu: 1
        att_shader_engine_mask: "0xf"
-       att_simd_select: "0xf"
+       att_simd_select: "0xf"     # CDNA mask ONLY; RDNA wants a SIMD index -- see below
        att_buffer_size: "0x6000000"
 ```
 
@@ -123,6 +211,14 @@ Key configuration:
 - `kernel_iteration_range`: `"[1, [2-4]]"` skips warmup (iteration 0), traces iterations 2-4
 - `att_target_cu: 1`: Single CU for manageable output
 - `att_buffer_size: "0x6000000"`: 96MB per SE (increase to `0xC000000` if truncated)
+- `att_simd_select`: **`"0xf"` is a CDNA bitmask meaning "all SIMDs". On RDNA
+  this field is a SIMD *selection*, so pass `0`** (see Prerequisites #5).
+- Requires `pyyaml`; use JSON with the same schema if it is unavailable.
+
+> **On gfx10+/rocprofv3 1.3.2 this config-file route has not been made to decode
+> at all** — it collects `.att` files then wedges (Prerequisites #2). Use the
+> all-CLI invocation shown there instead; the config file is still the right way
+> to drive PMC jobs.
 
 ---
 
@@ -145,7 +241,14 @@ FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 PYTHONPATH=./ \
 in the trace output. This enables DWARF debug info in the compiled HSACO, so `code.json`
 will contain source file:line annotations for each ISA instruction.
 
-Timeout: allow 3-5 minutes for JIT compilation + trace collection.
+**Pre-warm the JIT cache first** (Prerequisites #3) — compiling inside the
+profiled process can fail outright, and otherwise just pollutes the trace with
+the compiler. Use the same env, including the debug-info flag, since it is part
+of the cache key.
+
+Timeout: allow 3-5 minutes for JIT compilation + trace collection. If the run
+appears to hang *after* the `.att` files stop growing, it is the decode stage —
+it is the decode stage wedging (Prerequisites #2) — SIGKILL and use the all-CLI form rather than waiting.
 
 ---
 
@@ -293,7 +396,12 @@ Run /kernel-trace-analysis to analyze bottlenecks.
 
 | Error | Fix |
 |-------|-----|
-| `rocprof-trace-decoder library path not found` | Install decoder: see kernel-trace-analysis skill Step 3 |
+| `[rocprofv3] Fatal error: No module named 'yaml'` | `pip install pyyaml`, or pass the same schema as JSON via `-i input.json` |
+| `Error loading decoder: 37`, and/or `.att` files written but no `ui_output_agent_*`, process ignores SIGTERM | The `-i <config>` ATT path wedges in decode (rocprofv3 1.3.2 / gfx1201). SIGKILL it and re-run with the all-CLI form (Prerequisites #2) |
+| A previously working capture suddenly produces nothing | Leftover state from an earlier killed ATT run. Kill all `rocprofv3`/target processes, verify a plain GPU run works, re-validate on a trivial kernel (Prerequisites #4) |
+| `LLVM ERROR: Cannot select: intrinsic %llvm.amdgcn.wmma.*` | The JIT compiled inside the profiled process and picked the wrong arch. Pre-warm `FLYDSL_RUNTIME_CACHE_DIR` outside rocprofv3 with identical env, and pin `ARCH` (Prerequisites #3) |
+| Trace decodes but the wrong/no SIMD appears on RDNA | `att_simd_select` is a **bitmask on CDNA** but a **SIMD selection on RDNA** — pass `0`, not the CDNA `0xf` mask |
+| `rocprof-trace-decoder library path not found` | On pip ROCm the decoder is already in `$(rocm-sdk path --root)/lib`; just point at it. Otherwise see kernel-trace-analysis skill Step 3 |
 | `INVALID_SHADER_DATA` | aqlprofile/decoder version mismatch, update both |
 | Empty ui_output_agent_* | kernel_include_regex didn't match -- re-check kernel name from Step 2 |
 | No source mapping in code.json | Ensure `FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1` is set |

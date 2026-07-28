@@ -102,7 +102,8 @@ jobs:
        advanced_thread_trace: true
        att_target_cu: 1
        att_shader_engine_mask: "0xf"
-       att_simd_select: "0xf"
+       att_simd_select: "0xf"   # CDNA bitmask = all SIMDs;
+                                # on RDNA this is a SIMD selection -- pass 0
        att_buffer_size: "0x6000000"
 ```
 
@@ -118,7 +119,24 @@ FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 rocprofv3 -i /tmp/trace_input.yaml -- <CMD> 2>&
 find . -type d -name "ui_output_agent_*" -newer /tmp/trace_ts 2>/dev/null
 ```
 
-If `rocprof-trace-decoder` library is missing:
+If `rocprof-trace-decoder` library is missing, **check whether it is already
+installed before downloading anything** — recent ROCm ships it, including the
+pip `rocm-sdk` wheels, and the download below needs network access that a
+container may not have:
+
+```bash
+R=$(rocm-sdk path --root 2>/dev/null || echo /opt/rocm)
+ls $R/lib/librocprof-trace-decoder.so && export ROCPROF_ATT_LIBRARY_PATH=$R/lib
+```
+
+Point rocprofv3 at it with `--att-library-path $R/lib` **and**
+`ROCPROF_ATT_LIBRARY_PATH`, and drive ATT from **CLI flags rather than
+`-i <config>`**: on rocprofv3 1.3.2 / gfx1201 the config-file route collects the
+raw `.att` files and then wedges in decode, producing no `ui_output_agent_*`
+(`Error loading decoder: 37`), regardless of how the library path is supplied.
+See the `/capture-kernel-trace` skill for the known-good invocation.
+
+Only if it is genuinely absent:
 ```bash
 wget -q https://github.com/ROCm/rocprof-trace-decoder/releases/download/0.1.6/rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh
 chmod +x rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh
@@ -445,7 +463,9 @@ See /prefetch-data-load skill.
 
 | Error | Fix |
 |-------|-----|
-| `rocprof-trace-decoder library path not found` | Install decoder .so (see Step 3) |
+| `rocprof-trace-decoder library path not found` | Check `$(rocm-sdk path --root)/lib` first — usually already present (see Step 3) |
+| `Error loading decoder: 37`, or `.att` files but no `ui_output_agent_*` | ATT via `-i <config>` wedges in decode; SIGKILL and re-run with all-CLI `--att ...` flags |
+| Large stall total on an instruction with a tiny `Hitcount` | Prologue cost amortized over the whole kernel, not a hot loop. Rank by `Stall`, but always read `Hitcount` alongside it |
 | Trace output empty | Check `kernel_include_regex` matches exactly |
 | Trace truncated | Increase `att_buffer_size` to `"0xC000000"` |
 | `kernel_iteration_range` mismatch | Adjust range; try `"[0, [1-2]]"` |
