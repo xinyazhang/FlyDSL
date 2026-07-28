@@ -33,9 +33,15 @@ GEMM1's K reads in iteration i-1 from the K writes in iteration i, and the
 barrier after ``store V[i]`` separates GEMM2's V reads in iteration i-1 from the
 V writes in iteration i.
 
-Status: stage 1, correctness-oriented. Scheduling is not yet tuned; the
-prefetch distance is fixed at 1 and no attempt is made to control where the
-``s_waitcnt`` lands. Profile with ``rocprofv3 --att`` before tuning.
+V is staged **transposed** in LDS (``V^T[d][kv]``) and filled with
+``global_load_tr_b128``, whose hardware 16x16 transpose delivers each lane the
+8 kv-elements it needs contiguously. GEMM2 therefore reads one vector per
+operand instead of 8 strided scalar loads, and the LDS store stays contiguous
+rather than becoming a 16-way scatter. Worth +2.7% at N>=4096.
+
+Status: correctness-oriented; see ``gfx1201_fmha.md`` for measured component
+costs and for two approaches that were tried and rejected (bypassing LDS for V,
+double-buffering K).
 
 Supported configs (enforced): head_dim 64 or 128, BLOCK_M=128, BLOCK_N=32,
 f16/bf16, causal and non-causal.
@@ -169,7 +175,23 @@ def build_flash_attn_func_bp_module_primary(
     NUM_S_ACCS = N_SUB_TILES * 2
     NUM_S_VALS = NUM_S_ACCS * 8
 
+    # Stage 1 of the binding-prefetch variant targets correctness on a
+    # deliberately narrow config set; widen only with matching tests.
+    if head_dim not in (64, 128):
+        raise ValueError(f"binding-prefetch variant supports head_dim 64 or 128, got {head_dim}")
+    if (BLOCK_M, BLOCK_N) != (128, 32):
+        raise ValueError(
+            f"binding-prefetch variant supports BLOCK_M=128, BLOCK_N=32 only, got {(BLOCK_M, BLOCK_N)}"
+        )
+    if causal and NUM_S_VALS != 16:
+        # The causal mask below is unrolled into 16 explicitly named scalars.
+        raise ValueError(f"causal masking assumes NUM_S_VALS == 16, got {NUM_S_VALS}")
+
     NUM_WAVES = BLOCK_M // ROWS_PER_WAVE
+    _V_TR_TILES = (head_dim // WMMA_N) * (BLOCK_N // WMMA_K)
+    if _V_TR_TILES % NUM_WAVES:
+        raise ValueError(f"V transpose tiles ({_V_TR_TILES}) must divide across {NUM_WAVES} waves")
+    V_TR_LOADS = _V_TR_TILES // NUM_WAVES
     if flat_work_group_size is None:
         flat_work_group_size = NUM_WAVES * WARP_SIZE
     BLOCK_SIZE = flat_work_group_size
@@ -178,6 +200,11 @@ def build_flash_attn_func_bp_module_primary(
 
     NUM_PREFETCH_K = 1
     NUM_PREFETCH_V = 1
+
+    # global_load_tr_b128 transposes an 8x8 tile of 16-bit elements across each
+    # group of 8 lanes, so one wave-wide TR load produces a 16(d) x 16(kv) block
+    # already in WMMA-operand layout. Split those blocks over the waves.
+    V_TR_D_BLOCKS = head_dim // WMMA_N
 
     K_STEP_QK = WMMA_K
     K_STEPS_QK = head_dim // K_STEP_QK
@@ -194,18 +221,6 @@ def build_flash_attn_func_bp_module_primary(
     assert head_dim >= 64
     assert dtype_str in ("f16", "bf16")
 
-    # Stage 1 of the binding-prefetch variant targets correctness on a
-    # deliberately narrow config set; widen only with matching tests.
-    if head_dim not in (64, 128):
-        raise ValueError(f"binding-prefetch variant supports head_dim 64 or 128, got {head_dim}")
-    if (BLOCK_M, BLOCK_N) != (128, 32):
-        raise ValueError(
-            f"binding-prefetch variant supports BLOCK_M=128, BLOCK_N=32 only, got {(BLOCK_M, BLOCK_N)}"
-        )
-    if causal and NUM_S_VALS != 16:
-        # The causal mask below is unrolled into 16 explicitly named scalars.
-        raise ValueError(f"causal masking assumes NUM_S_VALS == 16, got {NUM_S_VALS}")
-
     if sm_scale is None:
         sm_scale = 1.0 / host_math.sqrt(head_dim)
 
@@ -216,7 +231,11 @@ def build_flash_attn_func_bp_module_primary(
 
     # LDS layout -- K uses padding instead of XOR swizzle; V row-major with padding
     K_STRIDE = HEAD_DIM + 4  # padding to reduce bank conflicts (no swizzle)
-    V_STRIDE = HEAD_DIM + 4  # padding to reduce bank conflicts
+    # V is staged TRANSPOSED: V^T[d][kv], so GEMM2 reads 8 consecutive kv for a
+    # fixed d as one contiguous vector instead of 8 strided scalar loads.
+    # +4 makes the row stride 36 elems = 72 B: 18 dwords, so lane16*18 mod 32
+    # hits 16 distinct banks (conflict-free) while staying 8-byte aligned.
+    VT_STRIDE = BLOCK_N + 4
 
     ENABLE_LDS_VEC16 = os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
     VEC_WIDTH = 16 if ENABLE_LDS_VEC16 else 8
@@ -231,7 +250,7 @@ def build_flash_attn_func_bp_module_primary(
         KV_NEEDS_GUARD = False
 
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
-    LDS_V_TILE_SIZE = BLOCK_N * V_STRIDE
+    LDS_V_TILE_SIZE = HEAD_DIM * VT_STRIDE
     LDS_K_TOTAL_SIZE = NUM_PREFETCH_K * LDS_K_TILE_SIZE
     LDS_V_BASE = LDS_K_TOTAL_SIZE
     LDS_V_TOTAL_SIZE = NUM_PREFETCH_V * LDS_V_TILE_SIZE
@@ -257,9 +276,26 @@ def build_flash_attn_func_bp_module_primary(
     ):
         elem_type = elem_numeric_cls.ir_type
         elem_dtype = elem_numeric_cls
+
+        def _to_global_ptr_i64(ptr):
+            return arith.index_cast(T.i64, fx.ptrtoint(ptr))
+
+        def _global_load_tr_v8(base_i64, elem_idx):
+            """One global_load_tr_b128: an 8x8 16-bit transpose per lane-group.
+
+            Lane g_i supplies an address; the 8 contiguous elements there become
+            column i of the group's output, so lane g_j receives
+            [M_0[j] .. M_7[j]]. Verified empirically on gfx1201.
+            """
+            byte_off = arith.index_cast(T.i64, _raw(fx.Index(elem_idx) * 2))
+            addr = arith.addi(base_i64, byte_off)
+            p = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), addr).result
+            return rocdl.global_load_tr_b128(v8f16_type, p)
+
         q_ptr = _pointer_to_llvm_ptr(Q)
         k_ptr = _pointer_to_llvm_ptr(K)
         v_ptr = _pointer_to_llvm_ptr(V)
+        v_ptr_i64 = _to_global_ptr_i64(V)
         o_ptr = _pointer_to_llvm_ptr(O)
         fm_fast = arith.FastMathFlags.fast
 
@@ -423,31 +459,42 @@ def build_flash_attn_func_bp_module_primary(
                     lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                     _lds_store_vx(vecs[batch], lds_idx)
 
-        def _v_store_row_major(v_base, lds_row, vec):
-            lds_idx = v_base + lds_row * V_STRIDE + load_col_base
-            _lds_store_vx(vec, lds_idx)
+        def _v_store_transposed(v_base, l, vec):
+            """Lane holds V[kv0+klane*8 .. +7][d]; contiguous in V^T[d][kv]."""
+            tile = wave_id + fx.Index(l * NUM_WAVES)
+            d = (tile % V_TR_D_BLOCKS) * WMMA_N + lane16
+            kv = (tile // V_TR_D_BLOCKS) * WMMA_K + klane * WMMA_LANE_K
+            lds_idx = v_base + d * VT_STRIDE + kv
+            v = Vec(vec)
+            for h in range_constexpr(2):  # 2x v4f16: honest 8-byte alignment
+                part = v.shuffle(v, [h * 4, h * 4 + 1, h * 4 + 2, h * 4 + 3])
+                fx.ptr_store(part, lds_kv + fx.Int32(lds_idx + h * 4))
+
+        # Address each lane must supply so the hardware transpose lands the
+        # right 16(d) x 16(kv) block in WMMA-operand order (see the derivation
+        # in _global_load_tr_v8): within a group of 8 lanes the lane index picks
+        # the kv row, and the group index picks the 8-wide d half.
+        _tr_kv_off = (lane // 16) * WMMA_LANE_K + (lane % 8)
+        _tr_d_off = ((lane // 8) % 2) * WMMA_LANE_K
 
         def coop_load_v_global(tile_start):
             vecs = []
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                row_idx = tile_start + load_row_in_batch + row_offset
-                g_idx = kv_global_idx(row_idx, load_col_base)
-                vecs.append(load_global_f16xN(v_ptr, g_idx))
+            for l in range_constexpr(V_TR_LOADS):
+                tile = wave_id + fx.Index(l * NUM_WAVES)
+                d_base = (tile % V_TR_D_BLOCKS) * WMMA_N
+                kv_base = (tile // V_TR_D_BLOCKS) * WMMA_K
+                row = tile_start + kv_base + _tr_kv_off
+                col = d_base + _tr_d_off
+                vecs.append(_global_load_tr_v8(v_ptr_i64, kv_global_idx(row, col)))
             return vecs
 
         def coop_store_v_lds(vecs, buf_id=0):
+            # The TR tiling covers the V tile exactly (V_TR_LOADS blocks per wave over
+            # NUM_WAVES waves), so unlike the K path there is no partial row to
+            # guard against.
             v_base = v_buf_base(buf_id)
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
-                    if row_valid:
-                        lds_row = load_row_in_batch + row_offset
-                        _v_store_row_major(v_base, lds_row, vecs[batch])
-                else:
-                    lds_row = load_row_in_batch + row_offset
-                    _v_store_row_major(v_base, lds_row, vecs[batch])
+            for l in range_constexpr(V_TR_LOADS):
+                _v_store_transposed(v_base, l, vecs[l])
 
         # ---- Q preload ----
         q_row = q_start + wave_q_offset + lane16
@@ -496,7 +543,7 @@ def build_flash_attn_func_bp_module_primary(
         # Both K and V tiles ride the loop in registers (prefetch distance 1).
         for batch in range_constexpr(NUM_BATCHES_KV):
             init_args.append(_k_vecs_init[batch])
-        for batch in range_constexpr(NUM_BATCHES_KV):
+        for batch in range_constexpr(V_TR_LOADS):
             init_args.append(_v_vecs_init[batch])
 
         loop_results = init_args
@@ -512,7 +559,7 @@ def build_flash_attn_func_bp_module_primary(
             ]
             _v_vecs_cur = [
                 inner_iter_args[2 + D_CHUNKS + NUM_BATCHES_KV + b]
-                for b in range_constexpr(NUM_BATCHES_KV)
+                for b in range_constexpr(V_TR_LOADS)
             ]
 
             next_kv_start = kv_block_start + fx.Index(BLOCK_N_OUT)
@@ -705,17 +752,11 @@ def build_flash_attn_func_bp_module_primary(
             v_base = v_buf_base(0)
 
             def _load_v_rowmajor(st_kv_base_val, pks_val, dc_val):
+                # V^T[d][kv]: the 8 kv values this lane needs are contiguous, so
+                # this is one vector read instead of 8 strided scalar loads.
                 d_pos = fx.Index(dc_val * D_CHUNK) + lane16
-                v_elems = []
-                for k_sub in range_constexpr(8):
-                    kv_row = (
-                        fx.Index(st_kv_base_val + pks_val * PV_K_STEP)
-                        + klane * WMMA_LANE_K
-                        + fx.Index(k_sub)
-                    )
-                    v_lds_idx = v_base + kv_row * V_STRIDE + d_pos
-                    v_elems.append(fx.ptr_load(lds_kv + fx.Int32(v_lds_idx)))
-                return Vec.from_elements(v_elems, elem_dtype).ir_value()
+                kv0 = fx.Index(st_kv_base_val + pks_val * PV_K_STEP) + klane * WMMA_LANE_K
+                return _lds_load_v8(v_base + d_pos * VT_STRIDE + kv0)
 
             # Software pipeline: preload first V pack
             cur_v_packs = []
@@ -753,7 +794,7 @@ def build_flash_attn_func_bp_module_primary(
             _yield_args = [m_running, l_running] + o_accs
             for batch in range_constexpr(NUM_BATCHES_KV):
                 _yield_args.append(_k_vecs_next[batch])
-            for batch in range_constexpr(NUM_BATCHES_KV):
+            for batch in range_constexpr(V_TR_LOADS):
                 _yield_args.append(_v_vecs_next[batch])
             loop_results = yield _yield_args
 
