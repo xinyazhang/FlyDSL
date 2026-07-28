@@ -113,28 +113,63 @@ tile has this problem; kernels migrated from `SmemAllocator` to
 `SharedAllocator` are worth auditing. The upstream fix is an alignment override
 on the op.
 
-## Roofline
+## Roofline and measured bottlenecks
 
-Dense WMMA peak on this part is **~205 TFLOPS** (f16 and bf16 alike), measured
-with [`kernels/microbench/wmma_peak.py`](../microbench/wmma_peak.py) and
-consistent with AMD's published 191 TFLOPS. The FMHA kernel runs at ~90 TFLOPS,
-i.e. **~44% of the matrix-pipeline ceiling** — express kernel results against
-that measured number, not against a spec sheet.
+Dense WMMA peak is **~205 TFLOPS** measured on this (overclocked) board with
+[`kernels/microbench/wmma_peak.py`](../microbench/wmma_peak.py); AMD's published
+figure is **191 TFLOPS** at reference clock. Use 191 as the denominator for
+"% of theoretical" so numbers stay comparable off this machine. The kernel runs
+at ~92 TFLOPS, i.e. **~48% of spec**.
 
-The gap is instruction mix rather than stall. Per KV loop iteration the kernel
-issues ~452 instructions of which only **32 are `v_wmma`**; 128 of the rest are
-scalar 16-bit `ds_load_u16*` for the GEMM2 V reads, which move the same bytes
-per lane as the 16 vectorized `ds_load_2addr_b64` used for K in GEMM1. At the
-~10 waves/SIMD this kernel reaches, issue bandwidth caps throughput and per-wave
-stall is covered by other waves — which is why latency-oriented scheduling
-changes (a `sched_barrier` to stop the prefetch being hoisted, and
-software-pipelining GEMM1's LDS reads) both measured as noise. Note the run-to-run
-spread is 3-8%, so single-shot comparisons are not meaningful here.
+**WMMA is a VALU instruction on RDNA4** — VOP3P encoded, documented in section
+7.12 of the ISA doc's *Vector ALU Operations* chapter. There is no separate
+matrix unit as on CDNA, so softmax VALU work contends directly with WMMA issue.
+Do not reason about this kernel as if MFMA-style co-issue exists.
 
-Vectorizing the GEMM2 V reads is the open lead. The docstring note above about a
-V pre-transpose regressing 8.8% predates the LDS alignment fix and was measured
-when the whole kernel ran at 39 TFLOPS, so it should be re-tested rather than
-treated as settled.
+Component costs, from ablations measured **device-side** at N=4096 (each removes
+one thing and is deliberately numerically incorrect):
+
+| ablation | vs baseline |
+|---|---|
+| GEMM2 V-operand reads replaced by a constant | **-22%** (largest single item) |
+| all barriers removed | -7.5% |
+| O-rescale removed (64 `v_mul`) | -1.5% |
+| global KV streaming removed (all cache hits) | +1.5% — **not DRAM bound** |
+| all compute dead | -83% — the kernel is compute-dominated |
+
+What has been tried against the V-operand cost:
+
+- **V staged transposed in LDS** (`V^T[d][kv]`, filled via `global_load_tr_b128`
+  so the store stays contiguous): **+2.7%**, landed. Turns 128 scalar
+  `ds_load_u16` into 16 `ds_load_2addr_b64`.
+- **V bypassing LDS entirely**, WMMA operand fetched per-wave straight from
+  global with `global_load_tr_b128`: **-15%, rejected.** All 8 waves need the
+  same V tile, so removing the LDS staging makes each wave re-fetch it — the
+  redundancy and longer global latency cost more than the LDS reads saved.
+  LDS staging is earning its keep as a sharing mechanism.
+- **Double-buffered K** to drop a barrier: no gain (V still needs its own
+  publish/protect pair, so the barrier count does not actually fall).
+
+So the 22% is mostly *inherent* to getting V into WMMA-operand form, not to how
+the reads are spelled. Reducing it further likely needs higher arithmetic
+intensity — each of the 8 waves reads the whole K and V tile every iteration
+because it owns only 16 of 128 Q rows.
+
+### Measuring this kernel
+
+Two traps, both of which produced confidently wrong conclusions:
+
+1. **Never `sys.path.insert` a directory containing same-named modules.** A
+   benchmark that inserted the repo's `kernels/attention` (to pick up
+   `bench_shim`) silently imported the *repo* kernel instead of the variant
+   under test, so six different ablations all benchmarked the same binary and
+   agreed to within 1%. Copy the harness into the variant's directory instead.
+2. **Cross-check against device time.** `rocprofv3 --stats --kernel-trace` gives
+   per-kernel duration from the `top_kernels` table; it agrees with CUDA-event
+   timing to ~4% when the harness is correct, and diverges wildly when it is not.
+
+Run-to-run spread is a few percent, so use medians over repeats and treat
+non-overlapping min/max ranges as the bar for believing a small win.
 
 ## Terminology
 
