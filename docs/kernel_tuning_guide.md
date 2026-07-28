@@ -487,14 +487,45 @@ analyze with the `/kernel-trace-analysis` skill, which bundles the
 helpers under `.claude/skills/kernel-trace-analysis/scripts/`:
 
 ```bash
+# 0. pre-warm the JIT cache with the SAME env (see caveats below)
+ARCH=<gfx target> FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 FLYDSL_RUNTIME_CACHE_DIR=/tmp/att_jitcache <CMD>
 # 1. discover the hot kernel
 rocprofv3 --stats --kernel-trace -f csv -- <CMD>
-# 2. collect ATT for that kernel (input.yaml: advanced_thread_trace, att_target_cu:1)
-FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 rocprofv3 -i /tmp/trace_input.yaml -- <CMD>
+# 2. collect ATT for that kernel -- drive it from CLI flags, not -i (see caveats)
+R=$(rocm-sdk path --root); export ROCPROF_ATT_LIBRARY_PATH=$R/lib
+FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 FLYDSL_RUNTIME_CACHE_DIR=/tmp/att_jitcache ARCH=<gfx target> \
+  rocprofv3 --att --att-library-path $R/lib --att-target-cu 1 --att-simd-select 0 \
+    --att-shader-engine-mask 0x1 --att-buffer-size 0x6000000 \
+    --kernel-include-regex '<kernel>_0' -d /tmp/att_out -o out -- <CMD>
 # 3. hotspots mapped to source
 python .claude/skills/kernel-trace-analysis/scripts/hotspot_analyzer.py \
     <ui_output_agent_*_dispatch_*> --topk 15 --mode both
 ```
+
+Four setup caveats, each of which silently breaks a capture. The
+`/capture-kernel-trace` skill documents them in full:
+
+- **`pyyaml` is required** for `-i *.yaml`; without it rocprofv3 aborts with
+  `No module named 'yaml'`. JSON with the same schema works as a fallback.
+- **`att_simd_select` is a bitmask on CDNA but a SIMD selection on RDNA.** On
+  CDNA, `0xf` enables all four SIMDs; on RDNA the field is a single SIMD index,
+  so `0xf` would select SIMD 15 — pass `0`. The split follows the architecture
+  family, not the gfx number.
+- **Drive ATT from CLI flags, not `-i <config>`.** On rocprofv3 1.3.2 / gfx1201
+  the config-file route collects the raw `.att` files then wedges in decode and
+  never emits `ui_output_agent_*`, however the decoder path is supplied; the
+  wedged process also ignores SIGTERM. `-i` is still correct for PMC jobs. If a
+  capture that previously worked suddenly yields nothing, suspect leftover state
+  from an earlier killed run before suspecting the recipe.
+- **Pre-warm the JIT cache outside rocprofv3** (step 0 above) and pin `ARCH`.
+  Compiling inside the profiled process has been seen to fail with
+  `LLVM ERROR: Cannot select: intrinsic %llvm.amdgcn.wmma.*`, and even when it
+  succeeds it puts the compiler in the trace. The debug-info flag is part of the
+  cache key, so the warm-up run must set it too.
+
+When reading the per-instruction CSV, weight `Stall` by `Hitcount`: a large
+stall total on an instruction executed twice is prologue cost amortized across
+the kernel, not a hot loop.
 
 Map the dominant stall type to a fix:
 
