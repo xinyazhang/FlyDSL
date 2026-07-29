@@ -155,6 +155,15 @@ def build_flash_attn_func_module_primary(
 
     BLOCK_N_OUT = BLOCK_N
 
+    # LLVM's amdgpu-sched-strategy function attribute; "" leaves the default
+    # GCN scheduler in place. See the passthrough block in the launch wrapper
+    # for what this buys. Measured at BATCH=2 H=12 N=4096 d=128 f16:
+    # causal 69.8 -> 79.2 TFLOPS, but non-causal 89.4 -> 88.6, so only the
+    # causal schedule wants it.
+    SCHED_STRATEGY = os.environ.get(
+        "FMHA_SCHED_STRATEGY", "max-memory-clause" if causal else ""
+    )
+
     NUM_PREFETCH_K = 1
     NUM_PREFETCH_V = 1
 
@@ -746,6 +755,20 @@ def build_flash_attn_func_module_primary(
                         op.attributes["rocdl.flat_work_group_size"] = flat_wg_attr
 
         passthrough_entries = []
+        # The default GCN scheduler sinks every LDS load next to its consuming
+        # WMMA and funnels them all through one VGPR quad, so SIInsertWaitcnts
+        # emits `s_wait_dscnt 0x0` between each load and use and the GEMMs run
+        # with no LDS latency hiding. max-memory-clause trades VGPRs for
+        # keeping several loads in flight.
+        if const_expr(SCHED_STRATEGY):
+            passthrough_entries.append(
+                ir.ArrayAttr.get(
+                    [
+                        ir.StringAttr.get("amdgpu-sched-strategy"),
+                        ir.StringAttr.get(SCHED_STRATEGY),
+                    ]
+                )
+            )
         if const_expr(daz):
             passthrough_entries.append(
                 ir.ArrayAttr.get(

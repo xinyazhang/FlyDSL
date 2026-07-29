@@ -254,6 +254,71 @@ but no plots (matplotlib is not a FlyDSL dependency).
 iteration counts, it returns the median rather than the mean, and it does not
 flush caches between runs.
 
+`bench_one.py` measures exactly one `(variant, causal)` config per process.
+Prefer it over a multi-config sweep when A/B-ing a change, for the reason in
+the next section.
+
+### This board drifts ~5% between runs; always interleave A/B
+
+Two arms of an A/B run back to back can differ by 5% from clock/thermal state
+alone. A sweep that measures "before" as one whole script run and "after" as
+another will attribute that drift to the change. A `max-memory-clause` A/B was
+first measured this way at +4.8%; interleaving the arms and repeating three
+times put the true effect at +0.4%, and re-running the original sweep
+reproduced 96.3 then 91.2 TFLOPS for the *same binary*.
+
+Interleave the arms (`for rep; for arm`) and repeat at least three times. Real
+effects come out flat to ±0.1 TFLOPS across reps; anything that moves more than
+that between reps of the same arm is drift, not signal.
+
+## The GCN scheduler serializes LDS loads by default
+
+At head_dim 128 the loop body was spending its time stalled on LDS, not on
+VALU. The default scheduler sinks each `ds_load` next to the `v_wmma` that
+consumes it and lets the register allocator funnel every one of them through a
+single VGPR quad. That creates a WAR dependency on the preceding WMMA, so
+`SIInsertWaitcnts` has to emit a full `s_wait_dscnt 0x0` between every load and
+its use:
+
+```
+ds_load_2addr_b64 v[139:142], v121 offset0:16 offset1:17
+s_wait_dscnt 0x0                                    <- full drain
+v_wmma_f32_16x16x16_f16 v[105:112], v[139:142], ...
+ds_load_2addr_b64 v[139:142], v128 offset1:1        <- same quad, must wait
+s_wait_dscnt 0x0
+```
+
+33 of 35 waits in the loop were full drains. Setting LLVM's
+`amdgpu-sched-strategy` function attribute (via the existing `passthrough`
+block) to `max-memory-clause` spreads the loads across distinct quads and drops
+full drains to 14, with the rest becoming `0x1`-`0x3`; VGPRs go 147 -> 157 with
+no spills.
+
+It is **not** a universal win -- measured at BATCH=2 H=12 N=4096 d=128 f16:
+
+| variant | causal | default | max-memory-clause |
+|---|---|---|---|
+| baseline | no | 89.4 | 88.6 |
+| baseline | yes | 69.8 | **79.2** |
+| bp | no | 91.4 | 91.9 |
+| bp | yes | 85.6 | **88.5** |
+| m32 (d=64) | no | **95.5** | 90.6 |
+| m32 (d=64) | yes | 84.2 | 83.9 |
+
+So it is enabled unconditionally in `_bp`, only for `causal` in the baseline,
+and not at all in `m32`. `max-ilp` was also tried and is a consistent loss
+(-4.5%). Override with `FMHA_SCHED_STRATEGY=` (empty for the stock scheduler).
+
+Two consequences worth remembering. Restructuring the *source* to batch the
+loads does nothing -- the backend rescheduled a hand-batched GEMM1 to a
+byte-identical schedule, so this is only reachable through the attribute. And
+because the loop is latency-bound rather than VALU-bound, cutting VALU work
+does not help: replacing the 16 `v_cvt_f16_f32` (`WriteFloatCvt`, 4 cycles
+each) + 8 `v_pack_b32_f16` P-conversion with 8 `v_cvt_pk_rtz_f16_f32` removed a
+verified 64 VALU cycles per iteration and changed throughput by 0.4%. That
+saving is still available to bank if the kernel ever becomes VALU-bound; it was
+reverted here because it buys nothing today and changes rounding to RTZ.
+
 ## Graduation
 
 When the terminology settles, move the [Terminology](#terminology) section into
