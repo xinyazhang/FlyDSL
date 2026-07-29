@@ -46,11 +46,24 @@ __all__ = ["flydsl_flash_attn_func_gfx1201"]
 # BLOCK_M is head_dim-dependent; see default_block_m() in the kernel module.
 _KERNEL_BLOCK_M = 128
 
-# A wave's output accumulator is head_dim/2 VGPRs, so head_dim 512 alone needs
-# the whole 256-VGPR file before anything else; its K+V LDS tile also exceeds
-# the 64 KB workgroup limit (66048 B). Both need the V/output width to be split
-# from the QK width -- see "head_dim above 256" in gfx1201_fmha.md.
-_MAX_HEAD_DIM = 256
+# A wave's output accumulator is head_dim/2 VGPRs, so an unsliced head_dim 512
+# would need the whole 256-VGPR file before anything else, and its K+V LDS tile
+# would exceed the 64 KB workgroup limit (66048 B). Both are avoided by slicing
+# the V/output width -- see "head_dim above 256" in gfx1201_fmha.md.
+_MAX_HEAD_DIM = 512
+
+# Above this QK width the V/output side is computed in column slices of this
+# size, so that o_accs (head_dim_v/2 VGPRs) and the V LDS tile stay in budget.
+_V_SLICE_ABOVE = 256
+_V_SLICE_WIDTH = 128
+
+
+def _v_slice_width(head_dim: int) -> int:
+    """Column-slice width for V/O; head_dim itself means no slicing."""
+    if head_dim <= _V_SLICE_ABOVE:
+        return head_dim
+    assert head_dim % _V_SLICE_WIDTH == 0, head_dim
+    return _V_SLICE_WIDTH
 
 # Maximum tolerated ratio of padded tokens for non-causal attention.
 # 0.5% is the bf16 mantissa precision floor (~0.4%) plus 1 bit of margin.
@@ -78,6 +91,8 @@ def _get_kernel(
     daz: bool,
     use_binding_prefetch: bool,
     variant: str = "",
+    head_dim_v: int | None = None,
+    d_offset: int = 0,
 ):
     if variant == "m32":
         builder = build_flash_attn_func_m32_module
@@ -85,6 +100,11 @@ def _get_kernel(
         builder = build_flash_attn_func_bp_module
     else:
         builder = build_flash_attn_func_module
+    kwargs = {}
+    if head_dim_v is not None:
+        # Only the baseline builder splits the V/output width; bp and m32 do not
+        # take these, and are gated to head_dim <= 128 anyway.
+        kwargs = {"head_dim_v": head_dim_v, "d_offset": d_offset}
     return builder(
         num_heads=num_heads,
         head_dim=head_dim,
@@ -92,6 +112,7 @@ def _get_kernel(
         dtype_str=dtype_str,
         waves_per_eu=waves_per_eu,
         daz=daz,
+        **kwargs,
     )
 
 
@@ -111,7 +132,9 @@ def flydsl_flash_attn_func_gfx1201(
     Args:
         q, k, v: tensors with shape ``[batch, seq_len, num_heads, head_dim]``
             (BSHD). All three must share dtype, batch, num_heads, head_dim,
-            and seq_len. Must reside on a CUDA/HIP device.
+            and seq_len. Must reside on a CUDA/HIP device. ``head_dim`` must be
+            a multiple of 16 and at most 512; above 256 it is computed in
+            128-wide V column slices and so must be a multiple of 128.
         causal: apply causal masking when ``True``.
         waves_per_eu: kernel occupancy hint passed to the FlyDSL builder.
         daz: enable denormals-are-zero on the kernel.
@@ -159,6 +182,11 @@ def flydsl_flash_attn_func_gfx1201(
             f"kernel requires 16 <= head_dim <= {_MAX_HEAD_DIM} and head_dim % 16 == 0, "
             f"got {head_dim}"
         )
+    if head_dim > _V_SLICE_ABOVE and head_dim % _V_SLICE_WIDTH != 0:
+        raise ValueError(
+            f"head_dim above {_V_SLICE_ABOVE} is computed in V column slices of "
+            f"{_V_SLICE_WIDTH}, so it must be a multiple of {_V_SLICE_WIDTH}; got {head_dim}"
+        )
 
     dtype_str = _torch_dtype_to_str(q.dtype)
 
@@ -201,25 +229,35 @@ def flydsl_flash_attn_func_gfx1201(
         launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
         if launch_stream.device != q.device:
             raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
-        exe = _get_kernel(
-            num_heads=num_heads,
-            head_dim=head_dim,
-            causal=causal,
-            dtype_str=dtype_str,
-            waves_per_eu=waves_per_eu,
-            daz=daz,
-            use_binding_prefetch=use_binding_prefetch,
-            variant=variant,
-        )
-        exe(
-            q_p.reshape(-1),
-            k_p.reshape(-1),
-            v_p.reshape(-1),
-            o_p.reshape(-1),
-            batch,
-            seq_len_pad,
-            stream=launch_stream,
-        )
+        # A wave's output accumulator is head_dim_v/2 VGPRs and the V LDS tile
+        # scales with head_dim_v, so wide heads are computed one column slice at
+        # a time. Sound because attention is column-separable in V:
+        # O[:, s] = P @ V[:, s], and P does not depend on V. GEMM1 and the K
+        # traffic repeat per slice, which is what makes this a fallback rather
+        # than the default.
+        slice_w = _v_slice_width(head_dim)
+        for d_off in range(0, head_dim, slice_w):
+            exe = _get_kernel(
+                num_heads=num_heads,
+                head_dim=head_dim,
+                causal=causal,
+                dtype_str=dtype_str,
+                waves_per_eu=waves_per_eu,
+                daz=daz,
+                use_binding_prefetch=use_binding_prefetch,
+                variant=variant,
+                head_dim_v=None if slice_w == head_dim else slice_w,
+                d_offset=0 if slice_w == head_dim else d_off,
+            )
+            exe(
+                q_p.reshape(-1),
+                k_p.reshape(-1),
+                v_p.reshape(-1),
+                o_p.reshape(-1),
+                batch,
+                seq_len_pad,
+                stream=launch_stream,
+            )
 
     if seq_len_pad != seq_len_real:
         return o_p[:, :seq_len_real, :, :].contiguous()

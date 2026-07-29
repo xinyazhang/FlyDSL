@@ -231,7 +231,7 @@ def test_shape_and_dtype_validation():
 # regression cases for the cooperative-load batch-count bug: ROWS_PER_BATCH_LOAD
 # came to 25/21/18, and BLOCK_N // that == 1, so only 25/21/18 of the 32 KV rows
 # were written to LDS and the output came back NaN.
-_HEAD_DIMS = [16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256]
+_HEAD_DIMS = [16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 384, 512]
 
 
 @pytest.mark.parametrize("head_dim", _HEAD_DIMS)
@@ -248,7 +248,7 @@ def test_head_dim_ladder(head_dim, causal):
     assert cos > 0.9999, f"head_dim={head_dim} causal={causal} cos={cos:.6f}"
 
 
-@pytest.mark.parametrize("head_dim", [8, 24, 100, 272, 512])
+@pytest.mark.parametrize("head_dim", [8, 24, 100, 272, 640])
 def test_head_dim_validation(head_dim):
     """head_dim must be a multiple of WMMA_K=16 and within the register budget."""
     _require_env()
