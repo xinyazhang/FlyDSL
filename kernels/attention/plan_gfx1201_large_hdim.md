@@ -329,3 +329,51 @@ confirmed against ISA or a profile before being quoted as speedups.
 2. Add 512 to `_BP_HEAD_DIMS` and re-measure.
 3. Re-verify the full head_dim ladder for regressions -- especially 64/128,
    which must stay byte-identical or better.
+
+## Rotate swizzle: IMPLEMENTED, MEASURED, REVERTED (2026-07-29)
+
+The bank-conflict analysis above is correct, and the implementation worked --
+LDS came out at exactly the predicted 16384 / 32768 / 49152 / 65536 B for
+head_dim 128 / 256 / 384 / 512, all unpadded, with correct results at every
+head_dim in both masking modes. **But it is a net loss and has been reverted.**
+
+Paired A/B, B=1 H=8 N=4096 f16 non-causal, bp kernel:
+
+| head_dim | padded | rotate-swizzled | delta | spills |
+|---|---|---|---|---|
+| 128 | 97.6 | 87.5 | **-10%** | 0 -> 0 |
+| 256 | 75.3 | 73.9 | -2% | 0 -> 0 |
+| 384 | 45.1 | 26.4 | **-41%** | 0 -> **32** |
+| 512 | 22.4 | 24.1 | +7.6% | 50 -> 50 |
+
+**What the bank model missed: the cost of computing the swizzled address.**
+Padding gives every access a `base + immediate` form, because the row stride is
+a compile-time constant and the column steps are constexpr. A swizzle makes the
+block index a *runtime* function of the row, so each access needs its own live
+address register -- and these kernels already sit at the 256-VGPR ceiling. At
+head_dim 384 that pushed a spill-free kernel to 32 spills and cost 41%.
+
+Three variants were tried, in this order:
+
+1. `(blk + row) mod nb` with a true remainder -- 58 spills at 512. A runtime
+   remainder by a non-power-of-two lowers to a magic-multiply sequence.
+2. Conditional subtract instead (`r = row & (R-1)` with R a power of two, so
+   `blk + r < 2*nb` and one compare/cndmask suffices) -- 58 -> 39 spills.
+3. XOR where the block count allows it -- **worse** (232 VGPR at 128 against
+   the rotate's 186): XOR blocks base+immediate folding more than an add does.
+4. 8-element blocks for K (one address per GEMM1 read instead of two) with
+   4-element blocks for V -- best of the four, 32/50 spills, and the numbers
+   above.
+
+Even at its best the swizzle only helps head_dim 512, and 24.1 is still below
+the baseline's 31.6, so it does not unlock that width either.
+
+**Conclusion: padding stays.** head_dim 512 remains on the baseline's
+launch-level V slicing, and `_BP_HEAD_DIMS` stays {256, 384}. Reopening this
+needs a way to make head_dim 512 fit 64 KiB *without* per-access address
+arithmetic -- the constraint is not bank conflicts alone but bank conflicts at
+zero register cost.
+
+Worth noting for anyone re-reading the analysis above: the bank tables are not
+wrong, they are incomplete. Conflict count is only one term, and on a kernel
+pinned at the register ceiling it is not the dominant one.
