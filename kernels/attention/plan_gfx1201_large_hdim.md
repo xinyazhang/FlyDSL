@@ -101,23 +101,41 @@ Per wave, per KV tile:
 Totals: **147 VGPR**, **128 WMMA per 16 output rows per KV tile** (32 per wave
 x 4 waves, none duplicated), against today's 243 and 320.
 
-### LDS
+### LDS: V stays in LDS, swizzle replaces padding
 
-K stays in LDS at full width: `32 * 516 * 2` = **33024 B**. V does **not** go
-through LDS -- each wave consumes a private 128-wide slice, so it is loaded
-straight to registers in WMMA-operand layout via `global_load_tr_b128`, the
-mechanism `flash_attn_func_gfx1201_bp.py` already uses to stage V transposed.
-Since the four waves touch disjoint slices of both K and V, each is still read
-exactly once collectively -- no amplification.
+**Corrected.** An earlier draft said V would be taken register-direct via
+`global_load_tr_b128`, "the mechanism bp already uses". Only half of that is
+true. bp does use TR loads, but it stages V *through* LDS:
 
-Keeping V in LDS instead would need `32 * 516 * 2 * 2` = 66048 B, over the
-64 KiB limit. WGP mode does not help: `getLocalMemorySize()` doubles in WGP
-mode (`AMDGPUBaseInfo.cpp:1179`) but feeds only occupancy
+```
+coop_load_v_global  ->  TR loads from global into registers
+coop_store_v_lds    ->  _v_store_transposed writes them to LDS
+_load_v_rowmajor    ->  _lds_load_v8 reads V back for GEMM2
+```
+
+The TR load's purpose there is to land V in LDS already in WMMA-operand layout,
+because gfx1201 has no `ds_load_tr_b64` for an LDS-side transpose. Register-
+direct V is **not** an existing mechanism, and "LDS bypass for V" was previously
+measured at **-15%** at head_dim 128. With the gate margin at 1.76x rather than
+the 2.5x the WMMA count suggested, that is not a risk worth stacking on.
+
+So V stays in LDS, and the 64 KiB budget is met by replacing the `+4` element
+padding with an XOR swizzle, which costs no extra LDS:
+
+| | padded | swizzled |
+|---|---|---|
+| K: `BLOCK_N x (head_dim+pad)` | 32 x 516 x 2 = 33024 | 32 x 512 x 2 = **32768** |
+| V transposed: `head_dim x (BLOCK_N+pad)` | 512 x 36 x 2 = 36864 | 512 x 32 x 2 = **32768** |
+| total | 69888 (over) | **65536** (exactly at the cap) |
+
+Zero margin, so any future addition to LDS forces a rethink. Register-direct V
+stays on the shelf as a separate experiment if the swizzle proves awkward.
+
+WGP mode does not help: `getLocalMemorySize()` doubles in WGP mode
+(`AMDGPUBaseInfo.cpp:1179`) but feeds only occupancy
 (`AMDGPUSubtarget.cpp:49,59`), while the check that rejects an oversized kernel
-is `getAddressableLocalMemorySize()` = 65536
-(`AMDGPUAsmPrinter.cpp:1380`), which never doubles. HIP reports
-`shared_memory_per_block = 65536`. The 128 KiB buys two 64 KiB workgroups per
-WGP, i.e. occupancy, already ours since gfx1201 carries no `FeatureCuMode`.
+is `getAddressableLocalMemorySize()` = 65536 (`AMDGPUAsmPrinter.cpp:1380`),
+which never doubles. HIP reports `shared_memory_per_block = 65536`.
 
 ## Step 1 RESULT: gate PASSES with explicit partials; atomics REJECTED
 
@@ -195,14 +213,34 @@ variant lands near or above that, the design does not pay and we stop.
 Deliverable: `kernels/microbench/lds_reduce.py`, reporting ns and estimated
 cycles per reduction for A/B/C plus a no-reduction baseline.
 
-## Step 2 -- implement, only if Step 1 clears
+## Step 2 -- fuse into the perf kernel (gate cleared)
 
-- wave index split into `(q_tile, shard)`;
-- `q_b_packs` preload restricted to the wave's own head-dim slice;
-- S reduction (variant from Step 1) + barrier;
-- V via `global_load_tr_b128`, no V LDS;
-- GEMM2 restricted to the wave's V/O slice; output store likewise;
-- drop the launch-level V slicing for `head_dim > 256`.
+Implement inside **`flash_attn_func_gfx1201_bp.py`**, the 91.9 TFLOPS kernel at
+head_dim 128 -- not as a new file. `QK_SHARDS` becomes a parameter and
+**`QK_SHARDS == 1` is today's kernel exactly**: no reduction, no extra barrier,
+no duplicated softmax, no V/O sharding. Every sharded construct sits behind
+`const_expr(QK_SHARDS > 1)` so the unsharded path traces to identical IR.
+
+`QK_SHARDS = max(1, head_dim // SHARD_WIDTH)` with `SHARD_WIDTH = 128`, so
+head_dim <= 128 keeps the current single-wave-per-Q-tile structure and only
+head_dim 256/384/512 shard.
+
+**Step 2a -- restructure, `QK_SHARDS = 1` only.** Split the wave index into
+`(q_tile, shard)` and thread it through, with `QK_SHARDS` pinned to 1. Success
+criterion: **bit-identical output and no measurable perf change at head_dim
+64/128**. This isolates the refactor from the new behaviour.
+
+**Step 2b -- add the sharded path.** Behind `const_expr(QK_SHARDS > 1)`:
+- Q preload restricted to the wave's own head-dim slice (`q_b_packs` 128 -> 32);
+- partial GEMM1 over that slice;
+- explicit-partial S reduction through LDS + barrier (variant from Step 1;
+  atomics rejected);
+- softmax on the reduced S, duplicated across the shard-waves;
+- GEMM2 and the output store restricted to the wave's V/O slice.
+
+**Step 2c -- lift bp's head_dim guard.** It currently accepts only 64/128;
+extend to 256/384/512 and route those away from the baseline kernel's
+launch-level V slicing.
 
 ## Step 3 -- measure
 
