@@ -225,3 +225,33 @@ def test_shape_and_dtype_validation():
         flydsl_flash_attn_func_gfx1201(q, k.to(torch.bfloat16), v, causal=True)
     with pytest.raises(ValueError, match="rank"):
         flydsl_flash_attn_func_gfx1201(q[0], k[0], v[0], causal=True)
+
+
+# The full head_dim ladder the kernel is expected to cover. 160/192/224 are the
+# regression cases for the cooperative-load batch-count bug: ROWS_PER_BATCH_LOAD
+# came to 25/21/18, and BLOCK_N // that == 1, so only 25/21/18 of the 32 KV rows
+# were written to LDS and the output came back NaN.
+_HEAD_DIMS = [16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256]
+
+
+@pytest.mark.parametrize("head_dim", _HEAD_DIMS)
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_head_dim_ladder(head_dim, causal):
+    """Every supported head_dim matches SDPA, for both masking modes."""
+    _require_env()
+    q, k, v = _qkv(1, 256, 2, head_dim, torch.float16)
+    got = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal)
+    assert got.shape == q.shape
+    assert torch.isfinite(got).all(), f"head_dim={head_dim} causal={causal} produced non-finite output"
+    rel, cos = _compare(got, _reference(q, k, v, causal))
+    assert rel < 5e-3, f"head_dim={head_dim} causal={causal} rel={rel:.3e}"
+    assert cos > 0.9999, f"head_dim={head_dim} causal={causal} cos={cos:.6f}"
+
+
+@pytest.mark.parametrize("head_dim", [8, 24, 100, 272, 512])
+def test_head_dim_validation(head_dim):
+    """head_dim must be a multiple of WMMA_K=16 and within the register budget."""
+    _require_env()
+    q, k, v = _qkv(1, 256, 2, head_dim, torch.float16)
+    with pytest.raises(ValueError, match="head_dim"):
+        flydsl_flash_attn_func_gfx1201(q, k, v, causal=False)

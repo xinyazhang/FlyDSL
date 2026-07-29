@@ -271,6 +271,60 @@ Interleave the arms (`for rep; for arm`) and repeat at least three times. Real
 effects come out flat to ±0.1 TFLOPS across reps; anything that moves more than
 that between reps of the same arm is drift, not signal.
 
+## head_dim coverage
+
+The baseline kernel handles any `head_dim` that is a multiple of `WMMA_K = 16`,
+from 16 to 256. There is one kernel, not one per head_dim; tile sizes come from
+`default_block_m()` in `flash_attn_func_gfx1201.py`.
+
+Measured at B=1 H=8 N=4096 f16 non-causal, with per-wave VGPR use and spills:
+
+| head_dim | VGPR | spills | TFLOPS |
+|---|---|---|---|
+| 64 | 97 | 0 | 85.0 |
+| 128 | 148 | 0 | 93.0 |
+| 160 | 237 | 0 | 80.8 |
+| 192 | 256 | 24 | 67.2 |
+| 224 | 256 | 64 (BM=64) | 50.9 |
+| 256 | 256 | 36 | 67.2 |
+
+Throughput falls off above 160 because the kernel starts spilling. Two per-wave
+terms scale with head_dim and **neither depends on BLOCK_M or BLOCK_N**:
+
+- `o_accs` = `head_dim/2` VGPRs -- a wave owns `WMMA_M`=16 Q rows x head_dim
+  outputs, which is 16*head_dim/32 floats per lane.
+- `q_b_packs` = `head_dim/4` VGPRs.
+
+So tile size is a weak lever on spilling. It is not a null one, because it
+changes the cooperative-load geometry -- head_dim 224 spills 101 registers at
+BLOCK_M=128 (33.5 TFLOPS) versus 64 at BLOCK_M=64 (50.9), which is why 224 is
+the one entry in `_BLOCK_M_BY_HEAD_DIM`. Everywhere else BLOCK_M=128 wins.
+
+### head_dim above 256
+
+`head_dim` 512 is rejected. Both limits are structural, and **smaller blocks
+cannot fix either**:
+
+- `o_accs` alone is 256 VGPRs, the entire register file, before Q packs,
+  S accumulators or addressing.
+- The K+V LDS tile is `32 * (516 + 516) * 2` = 66048 B, over the 64 KB
+  workgroup limit. `BLOCK_N` is already at its floor of 32, because
+  `BLOCK_N % K_SUB_N == 0` and `K_SUB_N` is 32.
+
+The fix is to give the kernel a V/output width separate from its QK width.
+Attention is column-separable in V -- `O[:, dslice] = P @ V[:, dslice]`, and P
+does not depend on V at all -- so a `head_dim_v < head_dim` shrinks `o_accs`,
+the V LDS tile and the output write, while GEMM1 keeps the full reduction.
+head_dim 512 at a 128-wide V slice gives `o_accs` 64, LDS 41472 B, both
+comfortable.
+
+The cost is that GEMM1 and the K LDS traffic repeat once per slice: at 512 with
+four slices that is 4x64 + 64 = 320 WMMA against an ideal 128, so ~2.5x the
+matmul work. Avoiding the recompute means staging S in LDS and having each wave
+consume a slice of it, which is a larger restructure. The same `head_dim_v`
+generalisation is what MLA-style shapes (d_qk != d_v) need, so it is worth doing
+properly rather than as a 512 special case.
+
 ## P precision: f32 P through GEMM2 is not possible on gfx1201
 
 RDNA4 WMMA has no F32xF32 form (ISA manual Table 41) -- A/B operands are

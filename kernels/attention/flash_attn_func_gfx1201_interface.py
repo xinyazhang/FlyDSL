@@ -34,7 +34,7 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
-from flash_attn_func_gfx1201 import build_flash_attn_func_module
+from flash_attn_func_gfx1201 import build_flash_attn_func_module, default_block_m
 from flash_attn_func_gfx1201_bp import build_flash_attn_func_bp_module
 from flash_attn_func_gfx1201_m32 import build_flash_attn_func_m32_module
 
@@ -43,7 +43,14 @@ __all__ = ["flydsl_flash_attn_func_gfx1201"]
 
 # Tile size baked into the gfx1201 kernel (BLOCK_M). Seq_len must be a
 # multiple of this; padding is invisible to callers.
+# BLOCK_M is head_dim-dependent; see default_block_m() in the kernel module.
 _KERNEL_BLOCK_M = 128
+
+# A wave's output accumulator is head_dim/2 VGPRs, so head_dim 512 alone needs
+# the whole 256-VGPR file before anything else; its K+V LDS tile also exceeds
+# the 64 KB workgroup limit (66048 B). Both need the V/output width to be split
+# from the QK width -- see "head_dim above 256" in gfx1201_fmha.md.
+_MAX_HEAD_DIM = 256
 
 # Maximum tolerated ratio of padded tokens for non-causal attention.
 # 0.5% is the bf16 mantissa precision floor (~0.4%) plus 1 bit of margin.
@@ -147,8 +154,11 @@ def flydsl_flash_attn_func_gfx1201(
         raise ValueError(f"expected 4D BSHD tensor, got rank {q.dim()} ({tuple(q.shape)})")
 
     batch, seq_len_real, num_heads, head_dim = q.shape
-    if head_dim < 64 or head_dim % 32 != 0:
-        raise ValueError(f"kernel requires head_dim >= 64 and head_dim % 32 == 0, got {head_dim}")
+    if head_dim < 16 or head_dim % 16 != 0 or head_dim > _MAX_HEAD_DIM:
+        raise ValueError(
+            f"kernel requires 16 <= head_dim <= {_MAX_HEAD_DIM} and head_dim % 16 == 0, "
+            f"got {head_dim}"
+        )
 
     dtype_str = _torch_dtype_to_str(q.dtype)
 
@@ -158,7 +168,8 @@ def flydsl_flash_attn_func_gfx1201(
     # but exp(0) = 1 still contributes to the softmax denominator and would
     # scale the output. Padded queries produce garbage rows that we slice
     # off before returning.
-    block_m = 256 if variant == "m32" else _KERNEL_BLOCK_M
+    # Must match the kernel's own choice: it sets the seq_len padding below.
+    block_m = 256 if variant == "m32" else default_block_m(head_dim)
     seq_len_pad = ((seq_len_real + block_m - 1) // block_m) * block_m
     n_pad = seq_len_pad - seq_len_real
     if not causal and n_pad > 0 and n_pad / seq_len_pad > _MAX_NONCAUSAL_PAD_RATIO:
