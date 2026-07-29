@@ -136,6 +136,8 @@ def default_block_m(head_dim):
 def build_flash_attn_func_module_primary(
     num_heads,
     head_dim,
+    head_dim_v=None,
+    d_offset=0,
     causal=True,
     dtype_str="bf16",
     sm_scale=None,
@@ -177,6 +179,15 @@ def build_flash_attn_func_module_primary(
         flat_work_group_size = NUM_WAVES * WARP_SIZE
     BLOCK_SIZE = flat_work_group_size
 
+    # Attention is column-separable in V: O[:, s] = P @ V[:, s], and P does not
+    # depend on V. So the V/output width can be a slice of the QK width, which
+    # is what keeps o_accs (head_dim_v/2 VGPRs) and the V LDS tile inside their
+    # budgets at large head_dim. D_OFFSET is that slice's column origin.
+    V_HEAD_DIM = head_dim if head_dim_v is None else head_dim_v
+    D_OFFSET = d_offset
+    assert V_HEAD_DIM % 16 == 0 and 0 < V_HEAD_DIM <= head_dim
+    assert D_OFFSET % 16 == 0 and D_OFFSET + V_HEAD_DIM <= head_dim
+
     BLOCK_N_OUT = BLOCK_N
 
     # LLVM's amdgpu-sched-strategy function attribute; "" leaves the default
@@ -196,7 +207,7 @@ def build_flash_attn_func_module_primary(
     WMMA_LANE_K = 8
 
     D_CHUNK = WMMA_N
-    D_CHUNKS = head_dim // D_CHUNK
+    D_CHUNKS = V_HEAD_DIM // D_CHUNK
 
     PV_K_STEP = WMMA_K
     PV_K_STEPS = K_SUB_N // PV_K_STEP
@@ -216,10 +227,17 @@ def build_flash_attn_func_module_primary(
 
     # LDS layout -- K uses padding instead of XOR swizzle; V row-major with padding
     K_STRIDE = HEAD_DIM + 4  # padding to reduce bank conflicts (no swizzle)
-    V_STRIDE = HEAD_DIM + 4  # padding to reduce bank conflicts
+    V_STRIDE = V_HEAD_DIM + 4  # padding to reduce bank conflicts
 
     ENABLE_LDS_VEC16 = os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
     VEC_WIDTH = 16 if ENABLE_LDS_VEC16 else 8
+    def _load_geom(width):
+        """Cooperative-load geometry for a row of `width` elements."""
+        tpr = width // VEC_WIDTH
+        rpb = BLOCK_SIZE // tpr
+        nb = (BLOCK_N + rpb - 1) // rpb
+        return tpr, rpb, nb, nb * rpb != BLOCK_N
+
     THREADS_PER_ROW_LOAD = HEAD_DIM // VEC_WIDTH
     ROWS_PER_BATCH_LOAD = BLOCK_SIZE // THREADS_PER_ROW_LOAD
 
@@ -230,6 +248,10 @@ def build_flash_attn_func_module_primary(
     # written to LDS. The rest was stale LDS, which surfaced as NaN output.
     NUM_BATCHES_KV = (BLOCK_N + ROWS_PER_BATCH_LOAD - 1) // ROWS_PER_BATCH_LOAD
     KV_NEEDS_GUARD = NUM_BATCHES_KV * ROWS_PER_BATCH_LOAD != BLOCK_N
+
+    # V and O are only V_HEAD_DIM wide when the output head_dim is split, so
+    # they need their own load geometry. Identical to K's when unsplit.
+    V_TPR_LOAD, V_ROWS_PER_BATCH, NUM_BATCHES_V, V_NEEDS_GUARD = _load_geom(V_HEAD_DIM)
 
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
     LDS_V_TILE_SIZE = BLOCK_N * V_STRIDE
@@ -340,11 +362,21 @@ def build_flash_attn_func_module_primary(
         load_lane_in_row = tid % THREADS_PER_ROW_LOAD
         load_col_base = load_lane_in_row * VEC_WIDTH
 
+        v_row_in_batch = tid // V_TPR_LOAD
+        v_col_base = (tid % V_TPR_LOAD) * VEC_WIDTH
+
         def global_idx(token_idx, col):
             token = batch_idx * seq_len_v + token_idx
             return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
         seq_last = seq_len_v - fx.Index(1)
+
+        def vo_global_idx(token_idx, col):
+            """global_idx into the V/O slice: col is relative to D_OFFSET."""
+            token = batch_idx * seq_len_v + token_idx
+            return (
+                token * STRIDE_TOKEN + head_idx * HEAD_DIM + fx.Index(D_OFFSET) + col
+            )
 
         def kv_global_idx(token_idx, col):
             """global_idx with the row clamped into the tensor.
@@ -450,31 +482,37 @@ def build_flash_attn_func_module_primary(
                     _lds_store_vx(vec, lds_idx)
 
         def _v_store_row_major(v_base, lds_row, vec):
-            lds_idx = v_base + lds_row * V_STRIDE + load_col_base
+            lds_idx = v_base + lds_row * V_STRIDE + v_col_base
             _lds_store_vx(vec, lds_idx)
+
+        def v_global_row_idx(token_idx):
+            """Clamp a V row into the sequence; see kv_global_idx."""
+            return fx.Index(
+                ArithValue(token_idx < seq_len_v).select(token_idx, seq_last)
+            )
 
         def coop_load_v_global(tile_start):
             vecs = []
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                row_idx = tile_start + load_row_in_batch + row_offset
-                g_idx = kv_global_idx(row_idx, load_col_base)
+            for batch in range_constexpr(NUM_BATCHES_V):
+                row_offset = batch * V_ROWS_PER_BATCH
+                row_idx = tile_start + v_row_in_batch + row_offset
+                g_idx = vo_global_idx(v_global_row_idx(row_idx), v_col_base)
                 vecs.append(load_global_f16xN(v_ptr, g_idx))
             return vecs
 
         def coop_store_v_lds(vecs, buf_id=0):
             v_base = v_buf_base(buf_id)
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                if const_expr(KV_NEEDS_GUARD):
+            for batch in range_constexpr(NUM_BATCHES_V):
+                row_offset = batch * V_ROWS_PER_BATCH
+                if const_expr(V_NEEDS_GUARD):
                     row_valid = (
-                        load_row_in_batch + fx.Index(row_offset) < fx.Index(BLOCK_N)
+                        v_row_in_batch + fx.Index(row_offset) < fx.Index(BLOCK_N)
                     )
                     if row_valid:
-                        lds_row = load_row_in_batch + row_offset
+                        lds_row = v_row_in_batch + row_offset
                         _v_store_row_major(v_base, lds_row, vecs[batch])
                 else:
-                    lds_row = load_row_in_batch + row_offset
+                    lds_row = v_row_in_batch + row_offset
                     _v_store_row_major(v_base, lds_row, vecs[batch])
 
         # ---- Q preload ----
@@ -521,7 +559,7 @@ def build_flash_attn_func_module_primary(
         for _ in range_constexpr(D_CHUNKS):
             init_args.append(_raw(c_zero_v8f32))
         # Carry V prefetch vecs as loop-carried values
-        for batch in range_constexpr(NUM_BATCHES_KV):
+        for batch in range_constexpr(NUM_BATCHES_V):
             init_args.append(_v_vecs_init[batch])
 
         loop_results = init_args
@@ -533,7 +571,7 @@ def build_flash_attn_func_module_primary(
             o_accs = [inner_iter_args[2 + i] for i in range_constexpr(D_CHUNKS)]
             _v_vecs_prefetch = [
                 inner_iter_args[2 + D_CHUNKS + b]
-                for b in range_constexpr(NUM_BATCHES_KV)
+                for b in range_constexpr(NUM_BATCHES_V)
             ]
 
             coop_load_k(kv_block_start, 0)
@@ -767,7 +805,7 @@ def build_flash_attn_func_module_primary(
             _v_vecs_next = coop_load_v_global(next_kv_start)
 
             _yield_args = [m_running, l_running] + o_accs
-            for batch in range_constexpr(NUM_BATCHES_KV):
+            for batch in range_constexpr(NUM_BATCHES_V):
                 _yield_args.append(_v_vecs_next[batch])
             loop_results = yield _yield_args
 
@@ -783,7 +821,7 @@ def build_flash_attn_func_module_primary(
                 o_norm_vec = _fmul(o_finals[dc], inv_l_vec)
                 o_trunc = Vec(o_norm_vec).to(elem_dtype).ir_value()
                 d_col = fx.Index(dc * D_CHUNK) + klane * 8
-                o_global = global_idx(q_row, d_col)
+                o_global = vo_global_idx(q_row, d_col)
                 _store_global_half(o_ptr, o_global, o_trunc)
 
     @flyc.jit

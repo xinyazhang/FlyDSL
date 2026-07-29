@@ -274,7 +274,7 @@ that between reps of the same arm is drift, not signal.
 ## head_dim coverage
 
 The baseline kernel handles any `head_dim` that is a multiple of `WMMA_K = 16`,
-from 16 to 256. There is one kernel, not one per head_dim; tile sizes come from
+from 16 to 512 (above 256, in multiples of 128 -- see V column slicing below). There is one kernel, not one per head_dim; tile sizes come from
 `default_block_m()` in `flash_attn_func_gfx1201.py`.
 
 Measured at B=1 H=8 N=4096 f16 non-causal, with per-wave VGPR use and spills:
@@ -300,10 +300,10 @@ changes the cooperative-load geometry -- head_dim 224 spills 101 registers at
 BLOCK_M=128 (33.5 TFLOPS) versus 64 at BLOCK_M=64 (50.9), which is why 224 is
 the one entry in `_BLOCK_M_BY_HEAD_DIM`. Everywhere else BLOCK_M=128 wins.
 
-### head_dim above 256
+### head_dim above 256: V column slicing
 
-`head_dim` 512 is rejected. Both limits are structural, and **smaller blocks
-cannot fix either**:
+Run unsliced, head_dim 512 hits two walls at once, and **smaller blocks fix
+neither**:
 
 - `o_accs` alone is 256 VGPRs, the entire register file, before Q packs,
   S accumulators or addressing.
@@ -311,19 +311,32 @@ cannot fix either**:
   workgroup limit. `BLOCK_N` is already at its floor of 32, because
   `BLOCK_N % K_SUB_N == 0` and `K_SUB_N` is 32.
 
-The fix is to give the kernel a V/output width separate from its QK width.
-Attention is column-separable in V -- `O[:, dslice] = P @ V[:, dslice]`, and P
-does not depend on V at all -- so a `head_dim_v < head_dim` shrinks `o_accs`,
-the V LDS tile and the output write, while GEMM1 keeps the full reduction.
-head_dim 512 at a 128-wide V slice gives `o_accs` 64, LDS 41472 B, both
-comfortable.
+Both are solved by giving the kernel a V/output width separate from its QK
+width. Attention is **column-separable in V** -- `O[:, s] = P @ V[:, s]`, and P
+does not depend on V at all -- so the builder takes `head_dim_v` and `d_offset`,
+sizing `o_accs`, the V LDS tile, the V load geometry and the output write to the
+slice while GEMM1 keeps the full head_dim reduction. Above `_V_SLICE_ABOVE`
+(256) the interface loops over 128-wide slices, one launch each.
 
-The cost is that GEMM1 and the K LDS traffic repeat once per slice: at 512 with
-four slices that is 4x64 + 64 = 320 WMMA against an ideal 128, so ~2.5x the
-matmul work. Avoiding the recompute means staging S in LDS and having each wave
-consume a slice of it, which is a larger restructure. The same `head_dim_v`
-generalisation is what MLA-style shapes (d_qk != d_v) need, so it is worth doing
-properly rather than as a 512 special case.
+head_dim 512 then uses 243 VGPRs with **no spills** and 41472 B of LDS.
+
+The cost is that GEMM1 and the K LDS traffic repeat once per slice -- at 512
+that is `4*64 + 64` = 320 WMMA against an ideal 128:
+
+| head_dim | slices | VGPR | spills | TFLOPS |
+|---|---|---|---|---|
+| 256 | 1 | 256 | 36 | 67.5 |
+| 384 | 3 | 243 | 0 | 36.9 |
+| 512 | 4 | 243 | 0 | 31.6 |
+
+Avoiding the recompute means staging S in LDS and having each wave consume a
+slice of it, which is a larger restructure. Note the same `head_dim_v`
+generalisation is what MLA-style shapes (`d_qk != d_v`) need, so it is worth
+keeping general rather than special-casing wide heads.
+
+Slicing is also a lever below 256 whenever spilling costs more than the
+recompute -- head_dim 224 spills 101 registers at BLOCK_M=128, and is a
+candidate for a 112-wide slice. Not yet measured.
 
 ## P precision: f32 P through GEMM2 is not possible on gfx1201
 
