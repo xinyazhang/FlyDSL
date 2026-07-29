@@ -35,7 +35,7 @@ import torch
 import torch.nn.functional as F
 
 from flash_attn_func_gfx1201 import build_flash_attn_func_module, default_block_m
-from flash_attn_func_gfx1201_bp import build_flash_attn_func_bp_module
+from flash_attn_func_gfx1201_bp import build_flash_attn_func_bp_module, bp_block_m
 from flash_attn_func_gfx1201_m32 import build_flash_attn_func_m32_module
 
 __all__ = ["flydsl_flash_attn_func_gfx1201"]
@@ -56,6 +56,19 @@ _MAX_HEAD_DIM = 512
 # size, so that o_accs (head_dim_v/2 VGPRs) and the V LDS tile stay in budget.
 _V_SLICE_ABOVE = 256
 _V_SLICE_WIDTH = 128
+
+
+# head_dims routed to the binding-prefetch kernel by default. Its head-dim
+# sharding beats the baseline's launch-level V slicing here, measured at
+# B=1 H=8 N=4096 f16 non-causal: 256 67.5 -> 75.5, 384 36.9 -> 45.1. head_dim
+# 512 is NOT in this set -- it is the one width where LDS padding has to be
+# dropped to fit 64 KiB, and the resulting bank conflicts cost more than the
+# sharding gains (31.6 -> 22.4). Add it once the XOR swizzle lands.
+_BP_HEAD_DIMS = frozenset({256, 384})
+
+
+def _use_bp(head_dim: int, use_binding_prefetch: bool, variant: str) -> bool:
+    return variant != "m32" and (use_binding_prefetch or head_dim in _BP_HEAD_DIMS)
 
 
 def _v_slice_width(head_dim: int) -> int:
@@ -89,14 +102,14 @@ def _get_kernel(
     dtype_str: str,
     waves_per_eu: int,
     daz: bool,
-    use_binding_prefetch: bool,
+    use_bp: bool,
     variant: str = "",
     head_dim_v: int | None = None,
     d_offset: int = 0,
 ):
     if variant == "m32":
         builder = build_flash_attn_func_m32_module
-    elif use_binding_prefetch:
+    elif use_bp:
         builder = build_flash_attn_func_bp_module
     else:
         builder = build_flash_attn_func_module
@@ -197,7 +210,13 @@ def flydsl_flash_attn_func_gfx1201(
     # scale the output. Padded queries produce garbage rows that we slice
     # off before returning.
     # Must match the kernel's own choice: it sets the seq_len padding below.
-    block_m = 256 if variant == "m32" else default_block_m(head_dim)
+    use_bp = _use_bp(head_dim, use_binding_prefetch, variant)
+    if variant == "m32":
+        block_m = 256
+    elif use_bp:
+        block_m = bp_block_m(head_dim)
+    else:
+        block_m = default_block_m(head_dim)
     seq_len_pad = ((seq_len_real + block_m - 1) // block_m) * block_m
     n_pad = seq_len_pad - seq_len_real
     if not causal and n_pad > 0 and n_pad / seq_len_pad > _MAX_NONCAUSAL_PAD_RATIO:
@@ -235,7 +254,7 @@ def flydsl_flash_attn_func_gfx1201(
         # O[:, s] = P @ V[:, s], and P does not depend on V. GEMM1 and the K
         # traffic repeat per slice, which is what makes this a fallback rather
         # than the default.
-        slice_w = _v_slice_width(head_dim)
+        slice_w = head_dim if use_bp else _v_slice_width(head_dim)
         for d_off in range(0, head_dim, slice_w):
             exe = _get_kernel(
                 num_heads=num_heads,
@@ -244,7 +263,7 @@ def flydsl_flash_attn_func_gfx1201(
                 dtype_str=dtype_str,
                 waves_per_eu=waves_per_eu,
                 daz=daz,
-                use_binding_prefetch=use_binding_prefetch,
+                use_bp=use_bp,
                 variant=variant,
                 head_dim_v=None if slice_w == head_dim else slice_w,
                 d_offset=0 if slice_w == head_dim else d_off,
