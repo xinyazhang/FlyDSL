@@ -1,7 +1,7 @@
 # Plan: wide head dimensions on gfx1201 FMHA
 
-Status: **revision 3, in progress.** Step 1 (measurement gate) is the current
-work; steps 2-3 are not started.
+Status: **revision 3, in progress.** Step 1 (measurement gate) is **done and
+passed**; Step 2 (implementation) is next.
 
 Goal: at `head_dim` 512, cut per-wave registers from 243 to ~147 and issued
 WMMA from 320 to 128 per 16 output rows, by sharding the head dimension across
@@ -119,7 +119,46 @@ is `getAddressableLocalMemorySize()` = 65536
 `shared_memory_per_block = 65536`. The 128 KiB buys two 64 KiB workgroups per
 WGP, i.e. occupancy, already ours since gfx1201 carries no `FeatureCuMode`.
 
-## Step 1 -- measure the cross-wave S reduction. DECISION GATE.
+## Step 1 RESULT: gate PASSES with explicit partials; atomics REJECTED
+
+Measured with `kernels/microbench/lds_reduce.py` (grid 512, iters 2000, best of
+5), normalised per Q-tile per KV tile. The WMMA yardstick is linear over
+64/128/256 WMMA per unit, giving 0.0390 ns per WMMA:
+
+| variant | ns | WMMA-equivalents |
+|---|---|---|
+| baseline (no reduction) | 0.39 | - |
+| **explicit partials** | 2.49 | **54** |
+| `ds_add_f32` atomic | 41.55 | **1055** |
+
+**`ds_add_f32` is 20x worse than an explicit write/read reduction and is
+rejected.** The ISA confirms `ds_add_f32` was genuinely selected (16 of them, no
+compare-exchange loop), so this is real hardware behaviour, not a lowering
+artefact: three waves atomically accumulating onto the *same* 512 addresses
+serialises at the bank, and the read-modify-write cost compounds it. The traffic
+model that predicted atomics would halve the cost was wrong -- it counted bytes
+moved and ignored contention.
+
+With explicit partials, per Q-tile per KV tile at head_dim 512:
+
+| | WMMA-equivalents |
+|---|---|
+| today | 320 |
+| sharded (128) + reduction (54) | **182** |
+
+**1.76x**, extrapolating 31.6 -> ~56 TFLOPS. Lower than the ~65 estimated from
+WMMA count alone, because the reduction eats 54 of the 192 saved, but still a
+clear win. Gate passes.
+
+Caveats to carry into Step 3: the microbench's LDS has no competing traffic,
+whereas in the real kernel the reduction contends with K tile reads; softmax
+stays 4x duplicated; and the extra barriers phase-lock all 8 waves.
+
+Variant C (single-wave softmax, republish P) is not worth pursuing while
+atomics are rejected -- its whole point was to build on cheap atomic
+accumulation.
+
+## Step 1 method (superseded by the result above)
 
 The whole design rests on a reduction that runs once per Q-tile per KV tile, in
 the LDS-latency regime that already dominates this kernel (see "The GCN
