@@ -346,7 +346,32 @@ def build_flash_attn_func_module_primary(
             return (hi_i32 & mask) | lo_i32.shrui(shift)
 
         def bf16_trunc_pack_v8(f32_vals):
-            """Pack 8 f32 values into v8bf16 via bitwise truncation (upper 16 bits)."""
+            """Pack 8 f32 values into v8bf16 via bitwise truncation (upper 16 bits).
+
+            On P precision, before anyone tries to raise it here:
+
+            **There is no way to keep P in f32 through GEMM2 on gfx1201.** RDNA4
+            WMMA has no F32xF32 form (ISA manual Table 41); A/B operands are
+            f16/bf16/iu8/iu4/fp8 only. LLVM does define
+            `v_wmma_f32_16x16x4_f32`, but it is real-ized under
+            `VOP3P_Real_WMMA_gfx1250` -- gfx1250 only, not gfx12/gfx1201. The
+            AOTriton idiom `acc += tl.dot(p, v.to(p.type.element_ty))` works on
+            CDNA because that has `v_mfma_f32_16x16x4f32`; it has no gfx1201
+            equivalent. Doing PV in f32 here would mean dropping to VALU FMA and
+            giving up the matrix cores for GEMM2.
+
+            Note also that V is *not* downcast: it reaches GEMM2 at the input
+            tensor's native 16-bit width, so only P loses precision.
+
+            Truncation is round-toward-zero. Measured against an fp64 reference
+            (`accuracy_probe.py`, B=1 H=4 N=1024 d=128): no output bias (O sums
+            P*V and V is zero-mean, so the one-sided P error cancels), but the
+            RMS error is 1.6x torch SDPA's at bf16 (4.43e-3 vs 2.78e-3). f16 is
+            already at exact parity. Switching to round-to-nearest-even --
+            `x += 0x7FFF + ((x >> 16) & 1)` before the shift -- closes that gap
+            exactly (2.79e-3) but costs 2-3% on bp and 2.7-5.4% on m32, so it is
+            deliberately not done. Kept as truncation by decision, not oversight.
+            """
             _c16 = fx.Int32(16)
             _cmask = fx.Int32(0xFFFF0000)
             pairs = []

@@ -271,6 +271,41 @@ Interleave the arms (`for rep; for arm`) and repeat at least three times. Real
 effects come out flat to ±0.1 TFLOPS across reps; anything that moves more than
 that between reps of the same arm is drift, not signal.
 
+## P precision: f32 P through GEMM2 is not possible on gfx1201
+
+RDNA4 WMMA has no F32xF32 form (ISA manual Table 41) -- A/B operands are
+f16/bf16/iu8/iu4/fp8 only, with an f32 *accumulator*. LLVM does define
+`v_wmma_f32_16x16x4_f32`, but only under `VOP3P_Real_WMMA_gfx1250`; it is a
+gfx1250 instruction and does not exist on gfx1201. The AOTriton idiom
+`acc += tl.dot(p, v.to(p.type.element_ty))`, which keeps P in f32 and upcasts V
+to match, relies on CDNA's `v_mfma_f32_16x16x4f32` and has no gfx1201
+equivalent. Doing PV in f32 here means abandoning the matrix cores for GEMM2.
+
+This is another case where gfx1250 and gfx1201 diverge despite adjacent arch
+numbers -- check which target a WMMA form is real-ized for before assuming it.
+
+Two facts worth knowing about the current numerics, measured against an fp64
+reference by `accuracy_probe.py` (B=1 H=4 N=1024 d=128):
+
+- **V is never downcast.** It reaches GEMM2 at the input tensor's native 16-bit
+  width via LDS. Only P loses precision.
+- **There is no output bias**, for either dtype. P's rounding error is one-sided
+  for bf16 (truncation is round-toward-zero, and P > 0 always), but O sums P*V
+  with zero-mean V, so it cancels and shows up as variance instead. Note the
+  numerator and denominator do disagree by construction -- `l` sums exact f32 P
+  while O accumulates rounded P -- so the error does not cancel in O/l.
+
+| dtype | flydsl RMS | torch SDPA RMS | ratio |
+|---|---|---|---|
+| f16 | 3.51e-4 | 3.50e-4 | 1.00 |
+| bf16 | 4.43e-3 | 2.78e-3 | 1.59 |
+
+f16 is at exact parity. bf16 sits at 1.6x because `bf16_trunc_pack_v8` truncates
+(RMS 0.577 ulp) rather than rounding to nearest-even (0.289 ulp). RTNE --
+`x += 0x7FFF + ((x >> 16) & 1)` before the shift -- closes the gap exactly
+(measured 2.79e-3) but costs 2-3% on bp and 2.7-5.4% on m32. **Kept as
+truncation by decision, not oversight.**
+
 ## The GCN scheduler serializes LDS loads by default
 
 At head_dim 128 the loop body was spending its time stalled on LDS, not on
