@@ -146,6 +146,7 @@ def build_flash_attn_func_bp_module_primary(
     flat_work_group_size=None,
     block_m=None,
     block_n=None,
+    qk_shards=None,
     unsafe_fp_math=True,
     fast_fp_math=True,
     daz=True,
@@ -192,11 +193,16 @@ def build_flash_attn_func_bp_module_primary(
     # V/O column slice in GEMM2. QK_SHARDS == 1 is the unsharded kernel: every
     # sharded construct below is behind `const_expr(QK_SHARDS > 1)`, so this
     # path must trace to identical IR. See plan_gfx1201_large_hdim.md.
-    QK_SHARDS = 1
-    QK_SLICE = head_dim // QK_SHARDS
+    QK_SHARDS = qk_shards if qk_shards is not None else 1
+    QK_SLICE = head_dim // QK_SHARDS          # head-dim columns per wave in GEMM1
+    VO_SLICE = head_dim // QK_SHARDS          # V/O columns owned per wave in GEMM2
     assert head_dim % QK_SHARDS == 0
 
-    Q_TILES_PER_BLOCK = BLOCK_M // ROWS_PER_WAVE
+    # Keep the workgroup at TARGET_WAVES by trading Q row-tiles for shards, so
+    # BLOCK_M shrinks as QK_SHARDS grows. QK_SHARDS=1 gives BLOCK_M=128 as before.
+    TARGET_WAVES = 8
+    Q_TILES_PER_BLOCK = max(1, TARGET_WAVES // QK_SHARDS)
+    BLOCK_M = ROWS_PER_WAVE * Q_TILES_PER_BLOCK
     NUM_WAVES = Q_TILES_PER_BLOCK * QK_SHARDS
     _V_TR_TILES = (head_dim // WMMA_N) * (BLOCK_N // WMMA_K)
     if _V_TR_TILES % NUM_WAVES:
@@ -223,11 +229,11 @@ def build_flash_attn_func_bp_module_primary(
     V_TR_D_BLOCKS = head_dim // WMMA_N
 
     K_STEP_QK = WMMA_K
-    K_STEPS_QK = head_dim // K_STEP_QK
+    K_STEPS_QK = QK_SLICE // K_STEP_QK        # GEMM1 K-steps for this wave's slice
     WMMA_LANE_K = 8
 
     D_CHUNK = WMMA_N
-    D_CHUNKS = head_dim // D_CHUNK
+    D_CHUNKS = VO_SLICE // D_CHUNK            # o_accs count for this wave's slice
 
     PV_K_STEP = WMMA_K
     PV_K_STEPS = K_SUB_N // PV_K_STEP
@@ -383,6 +389,10 @@ def build_flash_attn_func_bp_module_primary(
         q_tile_in_block = wave_id // QK_SHARDS
         shard_id = wave_id % QK_SHARDS
         wave_q_offset = q_tile_in_block * ROWS_PER_WAVE
+
+        # Column origins of this wave's slices. Both are 0 at QK_SHARDS == 1.
+        shard_qk_off = shard_id * fx.Index(QK_SLICE)   # into Q/K head_dim
+        shard_vo_off = shard_id * fx.Index(VO_SLICE)   # into V/O head_dim
 
         head_idx = block_id % NUM_HEADS
         batch_q_tile_id = block_id // NUM_HEADS
@@ -553,7 +563,7 @@ def build_flash_attn_func_bp_module_primary(
         c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
         q_b_packs = []
         for ks in range_constexpr(K_STEPS_QK):
-            q_col = fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
+            q_col = shard_qk_off + fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
             g_idx = global_idx(q_row_safe, q_col)
             raw = load_global_v8f16(q_ptr, g_idx)
             q_b_packs.append(ArithValue(q_in_bounds).select(raw, c_zero_v8f16))
@@ -622,7 +632,7 @@ def build_flash_attn_func_bp_module_primary(
             s_accs = [_raw(c_zero_v8f32) for _ in range(NUM_S_ACCS)]
 
             for ks in range_constexpr(K_STEPS_QK):
-                k_col = fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
+                k_col = shard_qk_off + fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
 
                 for st_idx in range_constexpr(N_SUB_TILES):
                     st_base_row = st_idx * K_SUB_N
@@ -799,7 +809,7 @@ def build_flash_attn_func_bp_module_primary(
             def _load_v_rowmajor(st_kv_base_val, pks_val, dc_val):
                 # V^T[d][kv]: the 8 kv values this lane needs are contiguous, so
                 # this is one vector read instead of 8 strided scalar loads.
-                d_pos = fx.Index(dc_val * D_CHUNK) + lane16
+                d_pos = shard_vo_off + fx.Index(dc_val * D_CHUNK) + lane16
                 kv0 = fx.Index(st_kv_base_val + pks_val * PV_K_STEP) + klane * WMMA_LANE_K
                 return _lds_load_v8(v_base + d_pos * VT_STRIDE + kv0)
 
@@ -854,7 +864,7 @@ def build_flash_attn_func_bp_module_primary(
             for dc in range_constexpr(D_CHUNKS):
                 o_norm_vec = _fmul(o_finals[dc], inv_l_vec)
                 o_trunc = Vec(o_norm_vec).to(elem_dtype).ir_value()
-                d_col = fx.Index(dc * D_CHUNK) + klane * 8
+                d_col = shard_vo_off + fx.Index(dc * D_CHUNK) + klane * 8
                 o_global = global_idx(q_row, d_col)
                 _store_global_half(o_ptr, o_global, o_trunc)
 
