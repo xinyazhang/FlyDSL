@@ -168,13 +168,16 @@ def test_noncausal_padding_ratio_rejected():
 @pytest.mark.parametrize(
     "kwargs, match",
     [
-        (dict(num_heads=_NUM_HEADS, head_dim=96), "head_dim"),
+        (dict(num_heads=_NUM_HEADS, head_dim=100), "head_dim"),
         (dict(num_heads=_NUM_HEADS, head_dim=128, block_n=64), "BLOCK_N"),
     ],
-    ids=["head_dim_96", "block_n_64"],
+    ids=["head_dim_100", "block_n_64"],
 )
 def test_binding_prefetch_rejects_unsupported_config(kwargs, match):
-    """Stage 1 of the binding-prefetch variant guards its supported config set."""
+    """The binding-prefetch variant guards its supported config set.
+
+    head_dim must be a multiple of 16 within 16..512; BLOCK_N must be 32.
+    """
     with pytest.raises(ValueError, match=match):
         build_flash_attn_func_bp_module(causal=False, dtype_str="f16", **kwargs)
 

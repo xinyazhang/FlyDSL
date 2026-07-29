@@ -178,12 +178,10 @@ def build_flash_attn_func_bp_module_primary(
 
     # Stage 1 of the binding-prefetch variant targets correctness on a
     # deliberately narrow config set; widen only with matching tests.
-    if head_dim not in (64, 128):
-        raise ValueError(f"binding-prefetch variant supports head_dim 64 or 128, got {head_dim}")
-    if (BLOCK_M, BLOCK_N) != (128, 32):
-        raise ValueError(
-            f"binding-prefetch variant supports BLOCK_M=128, BLOCK_N=32 only, got {(BLOCK_M, BLOCK_N)}"
-        )
+    if head_dim % 16 or not (16 <= head_dim <= 512):
+        raise ValueError(f"binding-prefetch variant needs 16 <= head_dim <= 512, %16==0, got {head_dim}")
+    if BLOCK_N != 32:
+        raise ValueError(f"binding-prefetch variant supports BLOCK_N=32 only, got {BLOCK_N}")
     if causal and NUM_S_VALS != 16:
         # The causal mask below is unrolled into 16 explicitly named scalars.
         raise ValueError(f"causal masking assumes NUM_S_VALS == 16, got {NUM_S_VALS}")
@@ -193,7 +191,7 @@ def build_flash_attn_func_bp_module_primary(
     # V/O column slice in GEMM2. QK_SHARDS == 1 is the unsharded kernel: every
     # sharded construct below is behind `const_expr(QK_SHARDS > 1)`, so this
     # path must trace to identical IR. See plan_gfx1201_large_hdim.md.
-    QK_SHARDS = qk_shards if qk_shards is not None else 1
+    QK_SHARDS = qk_shards if qk_shards is not None else max(1, head_dim // 128)
     QK_SLICE = head_dim // QK_SHARDS          # head-dim columns per wave in GEMM1
     VO_SLICE = head_dim // QK_SHARDS          # V/O columns owned per wave in GEMM2
     assert head_dim % QK_SHARDS == 0
@@ -238,7 +236,10 @@ def build_flash_attn_func_bp_module_primary(
     PV_K_STEP = WMMA_K
     PV_K_STEPS = K_SUB_N // PV_K_STEP
 
-    assert BLOCK_M % NUM_WAVES == 0
+    # BLOCK_M is ROWS_PER_WAVE * Q_TILES_PER_BLOCK by construction; with
+    # QK_SHARDS > 1 NUM_WAVES exceeds the Q-tile count, so the old
+    # `BLOCK_M % NUM_WAVES` invariant no longer applies.
+    assert BLOCK_M % ROWS_PER_WAVE == 0
     assert head_dim % 32 == 0
     assert head_dim >= 64
     assert dtype_str in ("f16", "bf16")
@@ -252,12 +253,17 @@ def build_flash_attn_func_bp_module_primary(
     STRIDE_TOKEN = NUM_HEADS * HEAD_DIM
 
     # LDS layout -- K uses padding instead of XOR swizzle; V row-major with padding
-    K_STRIDE = HEAD_DIM + 4  # padding to reduce bank conflicts (no swizzle)
+    # Padding costs BLOCK_N*4*2 B on K and head_dim*4*2 B on V, which at
+    # head_dim 512 pushes K+V to 69888 B, over the 64 KiB workgroup cap. Drop it
+    # there: 32768 + 32768 = 65536 lands exactly at the limit. Bank conflicts
+    # return; an XOR swizzle would avoid both, and is the follow-up.
+    _LDS_PAD = 4 if (BLOCK_N * (HEAD_DIM + 4) + HEAD_DIM * (BLOCK_N + 4)) * 2 <= 65536 else 0
+    K_STRIDE = HEAD_DIM + _LDS_PAD  # padding to reduce bank conflicts (no swizzle)
     # V is staged TRANSPOSED: V^T[d][kv], so GEMM2 reads 8 consecutive kv for a
     # fixed d as one contiguous vector instead of 8 strided scalar loads.
     # +4 makes the row stride 36 elems = 72 B: 18 dwords, so lane16*18 mod 32
     # hits 16 distinct banks (conflict-free) while staying 8-byte aligned.
-    VT_STRIDE = BLOCK_N + 4
+    VT_STRIDE = BLOCK_N + _LDS_PAD
 
     ENABLE_LDS_VEC16 = os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
     VEC_WIDTH = 16 if ENABLE_LDS_VEC16 else 8
@@ -277,6 +283,18 @@ def build_flash_attn_func_bp_module_primary(
     LDS_V_BASE = LDS_K_TOTAL_SIZE
     LDS_V_TOTAL_SIZE = NUM_PREFETCH_V * LDS_V_TILE_SIZE
     LDS_KV_TOTAL_SIZE = LDS_K_TOTAL_SIZE + LDS_V_TOTAL_SIZE
+
+    # The cross-shard S reduction aliases the V region rather than allocating
+    # its own: V is written to LDS only *after* softmax, so between the
+    # post-K-store barrier and that write the V tile holds the previous
+    # iteration's data, already consumed by the previous GEMM2.
+    RED_F32_PER_WAVE = NUM_S_VALS * WARP_SIZE
+    RED_F32_TOTAL = NUM_WAVES * RED_F32_PER_WAVE
+    if QK_SHARDS > 1 and RED_F32_TOTAL * 4 > LDS_V_TOTAL_SIZE * 2:
+        raise ValueError(
+            f"S reduction needs {RED_F32_TOTAL * 4} B but the V region is only "
+            f"{LDS_V_TOTAL_SIZE * 2} B"
+        )
 
     # FlyDSL's `dtype_to_elem_type` returns a Numeric class, which is what the
     # Vector API (`Vec.make_type`, `.to(...)`) and `fx.Array` require. aiter's
@@ -375,6 +393,23 @@ def build_flash_attn_func_bp_module_primary(
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_kv = lds.kv.ptr
+
+        # f32 view of the V LDS region, for the cross-shard S reduction. The
+        # kv array is elem_dtype (16-bit), so go through an addrspace(3) LLVM
+        # pointer: ptrtoint on a shared pointer yields the 32-bit LDS offset.
+        _lds_byte_base = _raw(fx.ptrtoint(lds_kv))
+        _RED_BYTE0 = LDS_V_BASE * 2
+
+        def _red_addr(i_f32):
+            off = fx.Int32(_RED_BYTE0) + fx.Int32(i_f32) * fx.Int32(4)
+            addr = arith.addi(_lds_byte_base, _raw(off))
+            return _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<3>"), addr).result
+
+        def _red_store(i_f32, val):
+            _llvm.StoreOp(_raw(val), _red_addr(i_f32))
+
+        def _red_load(i_f32):
+            return _llvm.LoadOp(ir.F32Type.get(), _red_addr(i_f32)).result
 
         block_id = fx.Index(gpu.block_idx.x)
         tid = fx.Index(gpu.thread_idx.x)
@@ -653,6 +688,43 @@ def build_flash_attn_func_bp_module_primary(
                     s_accs[acc_idx_b] = wmma_acc(
                         k_pack_b, q_b_packs[ks], s_accs[acc_idx_b]
                     )
+
+            # ==== Cross-shard S reduction ====
+            # Each shard-wave holds a partial sum over its own head_dim slice;
+            # the full S is their sum. Explicit partials, not ds_add_f32:
+            # measured 54 vs 1055 WMMA-equivalents, see
+            # kernels/microbench/lds_reduce.py.
+            if const_expr(QK_SHARDS > 1):
+                s_flat = []
+                for st in range_constexpr(NUM_S_ACCS):
+                    for r in range_constexpr(8):
+                        s_flat.append(_raw(Vec(s_accs[st])[r]))
+
+                own = wave_id * fx.Index(RED_F32_PER_WAVE)
+                for e in range_constexpr(NUM_S_VALS):
+                    _red_store(own + fx.Index(e * WARP_SIZE) + lane, s_flat[e])
+                gpu.barrier()
+
+                base_group = q_tile_in_block * fx.Index(QK_SHARDS * RED_F32_PER_WAVE)
+                for e in range_constexpr(NUM_S_VALS):
+                    acc = s_flat[e]
+                    for k in range_constexpr(QK_SHARDS - 1):
+                        peer = base_group + (
+                            (shard_id + fx.Index(k + 1)) % fx.Index(QK_SHARDS)
+                        ) * fx.Index(RED_F32_PER_WAVE)
+                        acc = _fadd(
+                            acc, _red_load(peer + fx.Index(e * WARP_SIZE) + lane)
+                        )
+                    s_flat[e] = acc
+                gpu.barrier()
+
+                s_accs = [
+                    Vec.from_elements(
+                        [fx.Float32(s_flat[st * 8 + r]) for r in range_constexpr(8)],
+                        fx.Float32,
+                    ).ir_value()
+                    for st in range_constexpr(NUM_S_ACCS)
+                ]
 
             # ==== Online softmax ====
             s_raw = []
