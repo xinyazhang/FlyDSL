@@ -272,3 +272,60 @@ allocated `hdim_qk` wide -- so they are not `hdim_vo` and must not be exposed
 under that name. A true `hdim_vo` needs a second token stride, `Out` allocated
 at `hdim_vo`, `o_accs` sized from it, and matching interface validation.
 Rename them to `VO_SLICE` / `vo_slice_offset` to keep the name free.
+
+## LDS swizzle: verification results (2026-07-29)
+
+Padding exists for **bank conflicts, not alignment** -- and head_dim being a
+power of two is what causes them. LDS is 32 banks x 4 B; a 512-element row is
+256 dwords and `256 mod 32 == 0`, so all 16 lanes reading 16 different rows
+start in the same bank (16-way). `+4` elements = +2 dwords makes the stride
+`== 2 (mod 32)`, spreading lane *r* onto banks {2r, 2r+1} -- all 32, once.
+It is not monotonic: `+8` gives `== 4` and falls back to 2-way. The condition
+is `stride_dwords == 2*odd (mod 32)`.
+
+**Rotate beats XOR as a padding-free replacement.** `swz_block = (block + row)
+mod NB` over 4-element (8-byte) blocks is a permutation for *any* `NB`, whereas
+XOR needs its mask to divide `NB`, which only holds when `head_dim % 64 == 0`.
+For the GEMM1 K read (16 lanes, 16 rows, fixed column):
+
+| head_dim | no pad | XOR no pad | rotate no pad | +4 pad |
+|---|---|---|---|---|
+| 64..512 (incl. 80/96/160/224) | 4-16 way | 1-way only if hd%64==0 | **1-way** | 1-way |
+| 16 / 32 / 48 | 4/8/4-way | 4/2/4-way | 4/2/2-way | 1-way |
+
+16/32/48 have `NB = 4/8/12 < 16` blocks per row, so 16 lanes cannot reach 32
+banks under *any* permutation -- a floor, not a scheme failure. Rotate already
+attains it.
+
+Extending to the other two access patterns, **rotate matches `+4` padding
+exactly** on all of them at head_dim 64/128/256/384/512:
+
+| pattern | +4 pad | rotate, no pad |
+|---|---|---|
+| K read (GEMM1) | 32/32 banks | 32/32 |
+| K store (coop) | 32/32 | 32/32 |
+| V^T store + GEMM2 read | 32/32 | 32/32 |
+
+So rotate is a safe drop-in for padding and frees its storage: at head_dim 512
+K 32768 + V 32768 = **65536**, exactly at the cap and conflict-free, removing
+the 16-way K / 8-way V conflicts that currently cost that width -29%.
+
+Cost is amortised to the prologue: in the GEMM1 read `row` is `lane16`
+(loop-invariant) and `block` is constexpr per unrolled step, so
+`(block + lane16) mod NB` precomputes outside the KV loop -- the conditional
+subtract (`t = blk + r; if t >= NB: t -= NB`, valid since `blk + r < 2*NB`)
+never enters it.
+
+**Caveat on the metric.** The tables count banks covered and worst lanes-per-
+bank. With 32 lanes x 2 dwords = 64 accesses over 32 banks, 2 per bank is the
+floor, so "4-way" on a 32/32 row is not necessarily pathological. The
+comparison between schemes is sound; the absolute conflict factors should be
+confirmed against ISA or a profile before being quoted as speedups.
+
+### Next
+
+1. Implement rotate uniformly at the four sites (K store, GEMM1 K read, V^T
+   store, GEMM2 V read), dropping `_LDS_PAD` entirely.
+2. Add 512 to `_BP_HEAD_DIMS` and re-measure.
+3. Re-verify the full head_dim ladder for regressions -- especially 64/128,
+   which must stay byte-identical or better.
