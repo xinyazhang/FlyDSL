@@ -1,189 +1,145 @@
 # Plan: wide head dimensions on gfx1201 FMHA
 
-Status: **draft for review, not started.**
+Status: **draft for review, not started.** Revision 2.
 
-Goal: make large head dimensions fast on `flash_attn_func_gfx1201.py`, and put
-`hdim_qk != hdim_vo` on a correct footing rather than the slicing hack that is
-in the tree today.
+Goal: make `head_dim` 384/512 faster on `flash_attn_func_gfx1201.py` by cutting
+per-wave register pressure, so that the existing V column slicing can use
+fewer, wider slices and stop paying for so many redundant GEMM1 passes.
 
-## Terminology
+## Revision 2: what changed
 
-Four distinct quantities that earlier notes (and the current code) conflate.
-Use these names from here on.
+- **`hdim_qk != hdim_vo` (MLA) is deferred.** Not needed for `head_dim > 256`,
+  and dropping it removes the whole second-token-stride / `Out`-width /
+  interface-validation workstream. Self-attention has `hdim_qk == hdim_vo`, and
+  that is the only case in scope.
+- **Only the Q·K^T (GEMM1) head dimension is sharded across waves.** Revision 1
+  sharded both GEMM1 and the V/O output within a workgroup; this shards GEMM1
+  only and keeps the existing per-launch V column slicing untouched.
 
-| name | meaning |
-|---|---|
-| `hdim_qk` | Head dimension of the **Q and K** tensors. The GEMM1 reduction length. |
-| `hdim_vo` | Head dimension of the **V and Out** tensors. The GEMM2 output width. |
-| `QK_SHARD` | Sub-division of `hdim_qk` that one wave reduces over in GEMM1. |
-| `VO_SHARD` | Sub-division of `hdim_vo` that one wave accumulates in GEMM2. |
+Terminology kept from revision 1: `QK_SHARD` is the sub-division of the head
+dimension that one wave reduces over in GEMM1. `VO_SLICE` is the existing
+column slice of V/Out that one *launch* computes.
 
-`hdim_qk` and `hdim_vo` are **tensor** properties: `V` and `Out` both have
-last dimension `hdim_vo`, and the accumulator's shape is implied by `Out`, so
-`o_accs` is sized from `hdim_vo` (or from `VO_SHARD` once sharded), never from
-`hdim_qk`. `QK_SHARD` and `VO_SHARD` are **kernel tiling** choices and are
-independent of each other and of the tensor shapes.
+## What sharding GEMM1 does and does not buy
 
-MLA-style shapes have `hdim_qk != hdim_vo` (e.g. 576 / 512). Self-attention has
-them equal. Both must work.
+`S[i,j] = sum_d Q[i,d] * K[j,d]`, so the reduction can be split: wave *s*
+computes a partial sum over its own `QK_SHARD`, and the partials are reduced
+through LDS. Each wave then only needs its own slice of Q in registers, so
+`q_b_packs` drops from `head_dim/4` to `head_dim/(4 * QK_SHARDS)`.
 
-### What is in the tree today is *not* `hdim_vo`
+**It reduces registers, not total GEMM1 work.** Splitting the reduction across
+four waves distributes the same 64 WMMA; it does not remove any. The redundancy
+that costs 320 WMMA per Q-tile at head_dim 512 comes from having **four
+separate launches**, each recomputing the whole of GEMM1 because every V slice
+needs the full P.
 
-The builder currently takes `head_dim_v` + `d_offset`. Those are a **column
-slice of a V tensor that is `hdim_qk` wide** -- V's row stride is still
-`num_heads * head_dim`, and `Out` is still allocated `hdim_qk` wide. That is
-correct for the job it does (splitting a wide self-attention head across
-launches) but it is *not* `hdim_vo`, and exposing it publicly under that name
-would silently misread a real MLA V tensor, whose stride is
-`num_heads * hdim_vo`.
+So the work saving is **indirect**: freed registers are spent on a wider
+`VO_SLICE`, which means fewer launches, which means fewer redundant GEMM1
+passes.
 
-Action: rename `head_dim_v` -> `VO_SLICE` and `d_offset` -> `vo_slice_offset`
-to free the name, before introducing a true `hdim_vo`.
+## Budgets (head_dim 512, BLOCK_N 32)
 
-## Correction: WGP mode does not raise the per-workgroup LDS ceiling
+Overhead calibrated against the measured d=512 point (243 VGPR, 0 spills, at
+`q_b_packs`=128 and `o_accs`=64), giving 51 VGPR of non-scaling
+`s_accs`/`p_vals`/addressing.
 
-A WGP is 2 CUs with 128 KiB of LDS, and LLVM models that:
+| QK_SHARDS | VO_SLICE | launches | q_b | o_acc | VGPR | GEMM1 | GEMM2 | WMMA | LDS | |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 128 | 4 | 128 | 64 | 243 | 256 | 64 | 320 | 41472 | today |
+| 4 | 128 | 4 | 32 | 64 | 147 | 256 | 64 | 320 | 41472 | registers freed, no work saved |
+| **4** | **256** | **2** | **32** | **128** | **211** | **128** | **64** | **192** | **49664** | **target** |
+| 2 | 256 | 2 | 64 | 128 | 243 | 128 | 64 | 192 | 49664 | no register headroom |
+| 4 | 512 | 1 | 32 | 256 | 339 | 64 | 64 | 128 | 66048 | VGPR + LDS |
+| 8 | 512 | 1 | 16 | 256 | 323 | 64 | 64 | 128 | 66048 | VGPR + LDS |
 
-```cpp
-// getLocalMemorySize(), AMDGPUBaseInfo.cpp:1179
-if (isGFX10Plus(STI) && !STI.getFeatureBits().test(FeatureCuMode))
-    BytesPerCU *= 2;                       // 128 KiB in WGP mode
-```
+**Target: `QK_SHARDS=4`, `VO_SLICE=256`, 2 launches.** 211 VGPR (32 below
+today's 243, which already spills nothing) and **192 WMMA against 320, a 40%
+cut**. LDS 49664 B, comfortably inside the 64 KiB per-workgroup limit.
 
-But that doubled value is read **only** at `AMDGPUSubtarget.cpp:49` and `:59`,
-both occupancy calculations. The limit that rejects an oversized kernel is a
-different one, and it never doubles:
+Note the last two rows: `o_accs` alone is 256 VGPRs at `VO_SLICE=512`, so the
+ideal 128 WMMA is **unreachable by QK sharding at any shard count**. Getting
+there requires splitting V/O *within* a workgroup, which is revision 1's
+design. This plan deliberately stops at 192.
 
-```cpp
-// AMDGPUAsmPrinter.cpp:1380
-if (MFI->getLDSSize() > STM.getAddressableLocalMemorySize()) {   // 65536
-```
+### Wave organisation
 
-HIP agrees: `shared_memory_per_block = 65536` on this device. Nabu confirms a
-hard per-workgroup cap rooted in the DS instruction's 16-bit offset field,
-though it could not cite an ISA section and was asked a leading question, so
-weight it below the other two.
+`NUM_WAVES = Q_TILES * QK_SHARDS`. With 8 waves and `QK_SHARDS=4` that is 2
+Q-tiles, so `BLOCK_M = 32`. All four shard-waves of a Q-tile cover the same 16
+Q rows and differ only in which head-dimension slice they reduce.
 
-So WGP's 128 KiB buys **two 64 KiB workgroups resident per WGP** -- occupancy,
-not a bigger single workgroup. gfx1201 already runs in WGP mode (no
-`FeatureCuMode` in the gfx12 feature list), so that benefit is already ours.
+After the reduction every shard-wave holds the full S for those rows. They then
+run softmax and GEMM2 **redundantly** — same P, same `VO_SLICE`, same output.
+That is 4x wasted work on those stages, and is the price of not sharding V/O.
+It costs throughput, not latency, because the waves sit on different SIMDs; it
+does mean only one of them should perform the output store.
 
-**This does not block the design.** K+V at full 512 width is 66048 B, over by
-exactly 512 -- which is precisely the `+4` element padding. See LDS below.
+*Open question below: whether that redundancy is bad enough to justify going
+straight to revision 1.*
 
-## Current state
+## LDS
 
-`hdim_qk == hdim_vo`, 16..512, all verified against SDPA. Above 256 the
-interface loops over 128-wide V column slices, one launch each, because
-attention is column-separable in V (`O[:, s] = P @ V[:, s]`, and P does not
-depend on V).
+Unchanged from today apart from the wider V slice: K at full head_dim (33024 B)
+plus a 256-wide V slice (16640 B) = 49664 B. No swizzle or TR-load change
+needed at this slice width, so the `global_load_tr_b128` question from revision
+1 is deferred with it.
 
-| hdim | slices | VGPR | spills | TFLOPS |
-|---|---|---|---|---|
-| 256 | 1 | 256 | 36 | 67.5 |
-| 384 | 3 | 243 | 0 | 36.9 |
-| 512 | 4 | 243 | 0 | 31.6 |
-
-The problem: each launch redoes the **whole** GEMM1, because every slice needs
-the full P.
-
-| per Q-tile per KV-tile, hdim 512 | GEMM1 | GEMM2 | total WMMA |
-|---|---|---|---|
-| today (4 launches) | 4 x 64 = 256 | 64 | **320** |
-| ideal | 64 | 64 | **128** |
-
-## Proposed design: shard both dimensions across waves
-
-Waves are indexed `(q_tile, shard)`. With `NUM_WAVES = 8` and 4 shards, that is
-2 Q-tiles x 4 shards, so `BLOCK_M = 32`.
-
-**GEMM1 shards along the reduction.** `S[i,j] = sum_d Q[i,d] * K[j,d]`, so wave
-*s* computes a partial sum over its own `QK_SHARD` and the shards are reduced
-through LDS. Each wave ends up holding the full S and runs softmax on it.
-
-**GEMM2 shards along the output.** Wave *s* accumulates
-`O[:, VO_SHARD_s] += P @ V[:, VO_SHARD_s]`.
-
-The two shard widths are independent, which is what makes `hdim_qk != hdim_vo`
-fall out of the same mechanism instead of needing a special case.
-
-### Budgets (hdim_qk = hdim_vo = 512, BLOCK_N = 32, 4 shards)
-
-| per wave | today | sharded |
-|---|---|---|
-| `q_b_packs` | 128 | **32** (own `QK_SHARD` only) |
-| `o_accs` | 64 | 64 (`VO_SHARD`/2) |
-| `s_accs` + `p_vals` + misc | ~51 | ~56 |
-| **total VGPR** | 243 | **~152** |
-
-| WMMA per Q-tile per KV-tile | GEMM1 | GEMM2 | total |
-|---|---|---|---|
-| today | 256 | 64 | 320 |
-| sharded | 64 | 64 | **128** |
-
-### LDS
-
-Each wave touches a **disjoint** slice of both K and V, so collectively each is
-read exactly once -- no amplification from sharding. Two ways to fit 64 KiB:
-
-- **(a) V straight from global via `global_load_tr_b128`, K in LDS** ->
-  **33024 B**. Large headroom; the TR machinery already exists in the bp
-  kernel, which stages V transposed that way. **Preferred.**
-- (b) Both in LDS, XOR swizzle replacing the `+4` padding -> 32768 x 2 =
-  65536 exactly. Fits with zero margin.
+For reference, the earlier premise that WGP mode would provide 128 KiB does not
+hold: `getLocalMemorySize()` does double in WGP mode
+(`AMDGPUBaseInfo.cpp:1179`) but feeds only occupancy
+(`AMDGPUSubtarget.cpp:49,59`); the check that rejects an oversized kernel is
+`getAddressableLocalMemorySize()` = 65536 (`AMDGPUAsmPrinter.cpp:1380`), which
+never doubles, and HIP reports `shared_memory_per_block = 65536`. WGP's 128 KiB
+means two 64 KiB workgroups per WGP — occupancy, already ours since gfx1201
+carries no `FeatureCuMode`.
 
 ## Steps
 
-**Step 0 -- rename, then introduce a true `hdim_vo`.** *Not independent of the
-rest, contrary to an earlier note.* `V` and `Out` carry `hdim_vo` as their real
-last dimension, so this touches:
+**Step 1 — measure the cross-wave S reduction in isolation. DECISION GATE.**
+Unchanged from revision 1, and still the thing that decides whether any of this
+is worth building. Four partial S tiles must be summed across waves through
+LDS: lower bound ~16 KB per Q-tile per KV-tile (each wave contributes 2 KB and
+receives 2 KB), ~32 KB for a naive all-to-all. At 128 B/clk/CU that is 128–256
+cycles, against 128 WMMA saved per Q-tile. This lands squarely in the
+LDS-latency regime that already dominates this kernel (see "The GCN scheduler
+serializes LDS loads" in `gfx1201_fmha.md`), so it needs a measurement, not an
+estimate.
 
-- a second token stride: `STRIDE_TOKEN_VO = num_heads * hdim_vo`, distinct from
-  `STRIDE_TOKEN_QK`, used for every V and Out address;
-- `Out` allocation in the interface at `hdim_vo`, not `hdim_qk`;
-- `o_accs` sized from `hdim_vo` (implied by `Out`), not from `hdim_qk`;
-- interface validation: `q.shape[-1] == k.shape[-1] == hdim_qk`,
-  `v.shape[-1] == hdim_vo`, output last dim `hdim_vo`;
-- the existing `VO_SLICE`/`vo_slice_offset` become a sub-division *of
-  `hdim_vo`*, which is the correct relationship.
+**Step 2 — implement**, only if Step 1 clears:
+- wave index split into `(q_tile, shard)`;
+- `q_b_packs` preload restricted to the wave's own `QK_SHARD`;
+- partial-S reduce through LDS + barrier;
+- store guarded to one shard-wave;
+- `VO_SLICE` default raised to 256 for `head_dim > 256`.
 
-Worth landing on its own -- it makes MLA shapes correct and single-launch --
-but it is a real change, not a rename.
-
-**Step 1 -- measure the cross-wave S reduction in isolation. DECISION GATE.**
-Lower bound is ~16 KB per Q-tile per KV-tile (each wave contributes 2 KB and
-receives 2 KB); a naive all-to-all is ~32 KB. At 128 B/clk/CU that is 128-256
-cycles against ~192 WMMA saved. **This could consume the entire gain**, and it
-lands squarely in the LDS-latency regime that already dominates this kernel
-(see "The GCN scheduler serializes LDS loads" in `gfx1201_fmha.md`). Measure
-before building.
-
-**Step 2 -- implement**, only if Step 1 clears: wave indexing, partial-S reduce,
-V via TR loads, shard-aware epilogue.
-
-**Step 3 -- measure** against 31.6 TFLOPS at hdim 512, keeping the slice-per-
-launch path as correctness reference and fallback.
+**Step 3 — measure** against 31.6 TFLOPS at head_dim 512 and 36.9 at 384, with
+interleaved A/B and 3 reps. Keep the current path as correctness reference and
+fallback.
 
 ## Risks
 
-1. **S-reduction cost** -- the main one; Step 1 gates it.
-2. **`BLOCK_M` drops to 32**, so a workgroup covers 32 Q rows. More workgroups,
-   more K re-reads across them. Partly offset by better occupancy (152 VGPR
-   against 243).
-3. **Softmax goes 4x redundant** -- each wave softmaxes the same reduced S.
-   Costs throughput, not latency, since the waves sit on different SIMDs.
-4. **Two extra barriers per KV iteration** (reduce, broadcast). Barriers
-   phase-lock all 8 waves, and a previous one-barrier restructure measured
-   -2.7% for exactly this reason.
-5. Everything here is measured with **interleaved A/B, 3 reps** -- this board
-   drifts ~5% between runs and a naive before/after already produced one wrong
-   conclusion (+4.8% that was really +0.4%).
+1. **S-reduction cost** — the main one; Step 1 gates it.
+2. **Softmax and GEMM2 go 4x redundant.** Throughput, not latency, but it is
+   pure waste and it is what revision 1 avoided. If Step 1 shows the reduction
+   is cheap, revision 1 becomes more attractive than this plan.
+3. **`BLOCK_M` drops to 32**, so a workgroup covers 32 Q rows: more workgroups
+   and more K re-reads across them. Partly offset by 211 VGPR against 243.
+4. **One extra barrier per KV iteration** (the reduce). Barriers phase-lock all
+   8 waves, and a previous one-barrier restructure measured -2.7% for that
+   reason.
+5. Measurement discipline: this board drifts ~5% between runs and a naive
+   before/after already produced one wrong conclusion (+4.8% that was really
+   +0.4%). Interleave arms, 3 reps.
 
 ## Open questions for review
 
-- Approve the **Step 1 gate**, or go straight to implementation?
-- **(a) V-via-TR** or **(b) swizzle** for the LDS budget?
-- Should Step 0 (`hdim_vo`) land before Step 1, given it is a prerequisite for
-  MLA shapes but not for the sharding measurement?
-- Is `BLOCK_M = 32` acceptable, or should `NUM_WAVES` rise to 16 (4 Q-tiles x 4
-  shards, `BLOCK_M = 64`) to keep the Q tile wider?
+- **Is 192 WMMA the right stopping point?** This plan reaches it with a
+  contained change but pays 4x redundant softmax + GEMM2. Revision 1 reaches
+  128 WMMA with no redundancy, for a bigger change. Both need the same S
+  reduction, so Step 1 gates both — worth deciding after that measurement
+  rather than before.
+- Approve the Step 1 gate, or go straight to implementation?
+- `QK_SHARDS=4` with `BLOCK_M=32`, or `NUM_WAVES=16` (4 Q-tiles x 4 shards,
+  `BLOCK_M=64`) to keep the Q tile wider?
+- Confirm MLA / `hdim_qk != hdim_vo` is deferred, and that the misleading
+  `head_dim_v` / `d_offset` builder parameters should be renamed to
+  `VO_SLICE` / `vo_slice_offset` in the meantime, so the name stays free.
