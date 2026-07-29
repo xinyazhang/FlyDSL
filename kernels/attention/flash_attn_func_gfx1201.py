@@ -109,6 +109,30 @@ def _pointer_store(value: ir.Value, ptr: ir.Value):
     return _llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
 
 
+# Per-wave register use is dominated by two head_dim-proportional terms:
+# o_accs = head_dim/2 VGPRs (a wave owns WMMA_M=16 Q rows x head_dim outputs)
+# and q_b_packs = head_dim/4. Neither depends on BLOCK_M or BLOCK_N, so tile
+# size is a weak lever on spilling -- but it is not a null one, because it
+# changes the cooperative-load geometry. Measured spills / TFLOPS at
+# B=1 H=8 N=4096 f16 non-causal:
+#
+#   head_dim  BM=128        BM=64        BM=32
+#   160       0sp / 80.8    - / 74.4     - / 48.7
+#   192      24sp / 67.2    - / 59.0     - / 37.9
+#   224     101sp / 33.5   64sp / 50.9   38sp / compile-fail
+#   256      36sp / 67.2   20sp / 46.9   53sp / 19.9
+#
+# BLOCK_M=128 wins everywhere except head_dim=224, whose awkward
+# THREADS_PER_ROW_LOAD=14 spills 101 registers and loses ~40%.
+_DEFAULT_BLOCK_M = 128
+_BLOCK_M_BY_HEAD_DIM = {224: 64}
+
+
+def default_block_m(head_dim):
+    """BLOCK_M for a head_dim, from measured throughput (see table above)."""
+    return _BLOCK_M_BY_HEAD_DIM.get(head_dim, _DEFAULT_BLOCK_M)
+
+
 def build_flash_attn_func_module_primary(
     num_heads,
     head_dim,
@@ -134,7 +158,7 @@ def build_flash_attn_func_module_primary(
     K_SUB_N = 32
     ROWS_PER_WAVE = WMMA_M
 
-    BLOCK_M = block_m if block_m is not None else 128
+    BLOCK_M = block_m if block_m is not None else default_block_m(head_dim)
     BLOCK_N = block_n if block_n is not None else 32
 
     assert (
@@ -178,8 +202,8 @@ def build_flash_attn_func_module_primary(
     PV_K_STEPS = K_SUB_N // PV_K_STEP
 
     assert BLOCK_M % NUM_WAVES == 0
-    assert head_dim % 32 == 0
-    assert head_dim >= 64
+    assert head_dim % 16 == 0
+    assert head_dim >= 16
     assert dtype_str in ("f16", "bf16")
 
     if sm_scale is None:
@@ -199,12 +223,13 @@ def build_flash_attn_func_module_primary(
     THREADS_PER_ROW_LOAD = HEAD_DIM // VEC_WIDTH
     ROWS_PER_BATCH_LOAD = BLOCK_SIZE // THREADS_PER_ROW_LOAD
 
-    if ROWS_PER_BATCH_LOAD >= BLOCK_N:
-        NUM_BATCHES_KV = 1
-        KV_NEEDS_GUARD = ROWS_PER_BATCH_LOAD > BLOCK_N
-    else:
-        NUM_BATCHES_KV = BLOCK_N // ROWS_PER_BATCH_LOAD
-        KV_NEEDS_GUARD = False
+    # Cover BLOCK_N rows with ceil() batches, not floor(). Flooring silently
+    # dropped rows whenever ROWS_PER_BATCH_LOAD neither reached BLOCK_N nor
+    # divided it -- head_dim 160/192/224 gave ROWS_PER_BATCH_LOAD 25/21/18, so
+    # BLOCK_N // that == 1 and only 25/21/18 of the 32 KV rows were ever
+    # written to LDS. The rest was stale LDS, which surfaced as NaN output.
+    NUM_BATCHES_KV = (BLOCK_N + ROWS_PER_BATCH_LOAD - 1) // ROWS_PER_BATCH_LOAD
+    KV_NEEDS_GUARD = NUM_BATCHES_KV * ROWS_PER_BATCH_LOAD != BLOCK_N
 
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
     LDS_V_TILE_SIZE = BLOCK_N * V_STRIDE
@@ -319,6 +344,19 @@ def build_flash_attn_func_module_primary(
             token = batch_idx * seq_len_v + token_idx
             return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
+        seq_last = seq_len_v - fx.Index(1)
+
+        def kv_global_idx(token_idx, col):
+            """global_idx with the row clamped into the tensor.
+
+            Cooperative KV loads can address rows past the tile (and past the
+            sequence on the final tile) when ROWS_PER_BATCH_LOAD does not divide
+            BLOCK_N. Those lanes are discarded by the store guard, so any
+            in-bounds address will do -- but the load itself still issues.
+            """
+            row = fx.Index(ArithValue(token_idx < seq_len_v).select(token_idx, seq_last))
+            return global_idx(row, col)
+
         def _load_global_half_vec(ptr, base_idx, vec_type):
             gep = buffer_ops.get_element_ptr(
                 ptr, fx.Int64(base_idx), elem_type=elem_type
@@ -395,9 +433,11 @@ def build_flash_attn_func_module_primary(
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 row_idx = tile_start + load_row_in_batch + row_offset
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
+                    row_valid = (
+                        load_row_in_batch + fx.Index(row_offset) < fx.Index(BLOCK_N)
+                    )
                     if row_valid:
-                        g_idx = global_idx(row_idx, load_col_base)
+                        g_idx = kv_global_idx(row_idx, load_col_base)
                         lds_row = load_row_in_batch + row_offset
                         lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                         vec = load_global_f16xN(k_ptr, g_idx)
@@ -418,7 +458,7 @@ def build_flash_attn_func_module_primary(
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 row_idx = tile_start + load_row_in_batch + row_offset
-                g_idx = global_idx(row_idx, load_col_base)
+                g_idx = kv_global_idx(row_idx, load_col_base)
                 vecs.append(load_global_f16xN(v_ptr, g_idx))
             return vecs
 
@@ -427,7 +467,9 @@ def build_flash_attn_func_module_primary(
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
+                    row_valid = (
+                        load_row_in_batch + fx.Index(row_offset) < fx.Index(BLOCK_N)
+                    )
                     if row_valid:
                         lds_row = load_row_in_batch + row_offset
                         _v_store_row_major(v_base, lds_row, vecs[batch])
