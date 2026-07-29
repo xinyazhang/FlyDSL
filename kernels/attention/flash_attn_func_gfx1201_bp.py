@@ -136,6 +136,23 @@ def _pointer_store(value: ir.Value, ptr: ir.Value):
     return _llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
 
 
+# Head-dimension sharding policy, exported so the interface can agree on
+# BLOCK_M (which it needs for seq_len padding) without building the kernel.
+# One shard per 128 head-dim columns; head_dim <= 128 stays unsharded.
+_BP_TARGET_WAVES = 8
+_BP_ROWS_PER_WAVE = 16
+
+
+def bp_qk_shards(head_dim):
+    """Waves cooperating on one Q row-tile at this head_dim."""
+    return max(1, head_dim // 128)
+
+
+def bp_block_m(head_dim):
+    """BLOCK_M for this head_dim: Q row-tiles are traded for shards."""
+    return _BP_ROWS_PER_WAVE * max(1, _BP_TARGET_WAVES // bp_qk_shards(head_dim))
+
+
 def build_flash_attn_func_bp_module_primary(
     num_heads,
     head_dim,
@@ -191,15 +208,14 @@ def build_flash_attn_func_bp_module_primary(
     # V/O column slice in GEMM2. QK_SHARDS == 1 is the unsharded kernel: every
     # sharded construct below is behind `const_expr(QK_SHARDS > 1)`, so this
     # path must trace to identical IR. See plan_gfx1201_large_hdim.md.
-    QK_SHARDS = qk_shards if qk_shards is not None else max(1, head_dim // 128)
+    QK_SHARDS = qk_shards if qk_shards is not None else bp_qk_shards(head_dim)
     QK_SLICE = head_dim // QK_SHARDS          # head-dim columns per wave in GEMM1
     VO_SLICE = head_dim // QK_SHARDS          # V/O columns owned per wave in GEMM2
     assert head_dim % QK_SHARDS == 0
 
     # Keep the workgroup at TARGET_WAVES by trading Q row-tiles for shards, so
     # BLOCK_M shrinks as QK_SHARDS grows. QK_SHARDS=1 gives BLOCK_M=128 as before.
-    TARGET_WAVES = 8
-    Q_TILES_PER_BLOCK = max(1, TARGET_WAVES // QK_SHARDS)
+    Q_TILES_PER_BLOCK = max(1, _BP_TARGET_WAVES // QK_SHARDS)
     BLOCK_M = ROWS_PER_WAVE * Q_TILES_PER_BLOCK
     NUM_WAVES = Q_TILES_PER_BLOCK * QK_SHARDS
     _V_TR_TILES = (head_dim // WMMA_N) * (BLOCK_N // WMMA_K)
