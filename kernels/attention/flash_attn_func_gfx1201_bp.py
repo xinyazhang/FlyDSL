@@ -187,7 +187,17 @@ def build_flash_attn_func_bp_module_primary(
         # The causal mask below is unrolled into 16 explicitly named scalars.
         raise ValueError(f"causal masking assumes NUM_S_VALS == 16, got {NUM_S_VALS}")
 
-    NUM_WAVES = BLOCK_M // ROWS_PER_WAVE
+    # Head-dimension sharding. QK_SHARDS waves cooperate on one Q row-tile,
+    # each reducing over its own head_dim slice in GEMM1 and owning the matching
+    # V/O column slice in GEMM2. QK_SHARDS == 1 is the unsharded kernel: every
+    # sharded construct below is behind `const_expr(QK_SHARDS > 1)`, so this
+    # path must trace to identical IR. See plan_gfx1201_large_hdim.md.
+    QK_SHARDS = 1
+    QK_SLICE = head_dim // QK_SHARDS
+    assert head_dim % QK_SHARDS == 0
+
+    Q_TILES_PER_BLOCK = BLOCK_M // ROWS_PER_WAVE
+    NUM_WAVES = Q_TILES_PER_BLOCK * QK_SHARDS
     _V_TR_TILES = (head_dim // WMMA_N) * (BLOCK_N // WMMA_K)
     if _V_TR_TILES % NUM_WAVES:
         raise ValueError(f"V transpose tiles ({_V_TR_TILES}) must divide across {NUM_WAVES} waves")
@@ -368,7 +378,11 @@ def build_flash_attn_func_bp_module_primary(
         lane16 = lane % 16
         klane = lane // 16
 
-        wave_q_offset = wave_id * ROWS_PER_WAVE
+        # (q_tile, shard) decomposition of the wave index. At QK_SHARDS == 1
+        # this is q_tile == wave_id and shard == 0, i.e. the original mapping.
+        q_tile_in_block = wave_id // QK_SHARDS
+        shard_id = wave_id % QK_SHARDS
+        wave_q_offset = q_tile_in_block * ROWS_PER_WAVE
 
         head_idx = block_id % NUM_HEADS
         batch_q_tile_id = block_id // NUM_HEADS
