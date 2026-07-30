@@ -168,9 +168,24 @@ def bp_qk_shards(head_dim):
     return max(1, head_dim // 128)
 
 
+def bp_q_tiles(head_dim, block_n=32, shards=None):
+    """Q row-tiles per workgroup.
+
+    Starts from TARGET_WAVES/shards and halves until the V transpose tiling
+    divides evenly across the waves -- head_dim 160 and 224 give 20 and 28 TR
+    tiles, which 8 waves do not divide but 4 do.
+    """
+    shards = bp_qk_shards(head_dim) if shards is None else shards
+    tr = (head_dim // 16) * (block_n // 16)
+    qt = max(1, _BP_TARGET_WAVES // shards)
+    while qt > 1 and tr % (qt * shards):
+        qt //= 2
+    return qt
+
+
 def bp_block_m(head_dim):
     """BLOCK_M for this head_dim: Q row-tiles are traded for shards."""
-    return _BP_ROWS_PER_WAVE * max(1, _BP_TARGET_WAVES // bp_qk_shards(head_dim))
+    return _BP_ROWS_PER_WAVE * bp_q_tiles(head_dim)
 
 
 def build_flash_attn_func_bp_module_primary(
@@ -238,11 +253,22 @@ def build_flash_attn_func_bp_module_primary(
     VO_CHUNKS = vo_chunks(head_dim, BLOCK_N, QK_SHARDS)
     VO_CHUNK_COLS = head_dim // VO_CHUNKS     # V columns resident per pass
     VO_SLICE = VO_CHUNK_COLS // QK_SHARDS     # V/O columns per wave per pass
-    assert head_dim % QK_SHARDS == 0
+    if head_dim % QK_SHARDS or QK_SLICE % WMMA_K:
+        # K_STEPS_QK = QK_SLICE // WMMA_K truncates otherwise, silently dropping
+        # part of the reduction: head_dim 224 with 4 shards gives a 56-wide
+        # slice, of which only 48 would be reduced (measured rel err 0.97).
+        raise ValueError(
+            f"head_dim {head_dim} with {QK_SHARDS} shards gives a {QK_SLICE}-wide "
+            f"slice, which must be a multiple of WMMA_K={WMMA_K}"
+        )
+    if VO_SLICE % WMMA_N:
+        raise ValueError(
+            f"V/O slice {VO_SLICE} must be a multiple of WMMA_N={WMMA_N}"
+        )
 
     # Keep the workgroup at TARGET_WAVES by trading Q row-tiles for shards, so
     # BLOCK_M shrinks as QK_SHARDS grows. QK_SHARDS=1 gives BLOCK_M=128 as before.
-    Q_TILES_PER_BLOCK = max(1, _BP_TARGET_WAVES // QK_SHARDS)
+    Q_TILES_PER_BLOCK = bp_q_tiles(head_dim, BLOCK_N, QK_SHARDS)
     BLOCK_M = ROWS_PER_WAVE * Q_TILES_PER_BLOCK
     NUM_WAVES = Q_TILES_PER_BLOCK * QK_SHARDS
     _V_TR_TILES = (VO_CHUNK_COLS // WMMA_N) * (BLOCK_N // WMMA_K)
@@ -314,12 +340,14 @@ def build_flash_attn_func_bp_module_primary(
     THREADS_PER_ROW_LOAD = HEAD_DIM // VEC_WIDTH
     ROWS_PER_BATCH_LOAD = BLOCK_SIZE // THREADS_PER_ROW_LOAD
 
-    if ROWS_PER_BATCH_LOAD >= BLOCK_N:
-        NUM_BATCHES_KV = 1
-        KV_NEEDS_GUARD = ROWS_PER_BATCH_LOAD > BLOCK_N
-    else:
-        NUM_BATCHES_KV = BLOCK_N // ROWS_PER_BATCH_LOAD
-        KV_NEEDS_GUARD = False
+    # Cover BLOCK_N rows with ceil() batches, not floor(). Flooring silently
+    # dropped rows whenever ROWS_PER_BATCH_LOAD neither reached BLOCK_N nor
+    # divided it: head_dim 160/192/224 give 25/21/18, so BLOCK_N // that == 1
+    # and only 25/21/18 of the 32 KV rows reached LDS. The rest was stale LDS,
+    # which surfaced as NaN. Same defect as the baseline kernel's; it was
+    # unreachable here while bp was gated to head_dim 64/128.
+    NUM_BATCHES_KV = (BLOCK_N + ROWS_PER_BATCH_LOAD - 1) // ROWS_PER_BATCH_LOAD
+    KV_NEEDS_GUARD = NUM_BATCHES_KV * ROWS_PER_BATCH_LOAD != BLOCK_N
 
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
     LDS_V_TILE_SIZE = VO_CHUNK_COLS * VT_STRIDE
@@ -334,11 +362,12 @@ def build_flash_attn_func_bp_module_primary(
     # iteration's data, already consumed by the previous GEMM2.
     RED_F32_PER_WAVE = NUM_S_VALS * WARP_SIZE
     RED_F32_TOTAL = NUM_WAVES * RED_F32_PER_WAVE
-    if QK_SHARDS > 1 and RED_F32_TOTAL * 4 > LDS_V_TOTAL_SIZE * 2:
-        raise ValueError(
-            f"S reduction needs {RED_F32_TOTAL * 4} B but the V region is only "
-            f"{LDS_V_TOTAL_SIZE * 2} B"
-        )
+    # Alias the V region when it is large enough (free); otherwise append a
+    # dedicated buffer. The V window shrinks with VO_CHUNKS, and at small
+    # head_dim it is simply narrow, so the alias is not always available.
+    RED_ALIASES_V = QK_SHARDS == 1 or RED_F32_TOTAL * 4 <= LDS_V_TOTAL_SIZE * 2
+    if not RED_ALIASES_V:
+        LDS_KV_TOTAL_SIZE += (RED_F32_TOTAL * 4 + 1) // 2  # in elem_dtype units
 
     # FlyDSL's `dtype_to_elem_type` returns a Numeric class, which is what the
     # Vector API (`Vec.make_type`, `.to(...)`) and `fx.Array` require. aiter's
@@ -442,7 +471,8 @@ def build_flash_attn_func_bp_module_primary(
         # kv array is elem_dtype (16-bit), so go through an addrspace(3) LLVM
         # pointer: ptrtoint on a shared pointer yields the 32-bit LDS offset.
         _lds_byte_base = _raw(fx.ptrtoint(lds_kv))
-        _RED_BYTE0 = LDS_V_BASE * 2
+        _RED_BYTE0 = (LDS_V_BASE if RED_ALIASES_V else LDS_KV_TOTAL_SIZE
+                      - (RED_F32_TOTAL * 4 + 1) // 2) * 2
 
         def _red_addr(i_f32):
             off = fx.Int32(_RED_BYTE0) + fx.Int32(i_f32) * fx.Int32(4)
@@ -583,7 +613,9 @@ def build_flash_attn_func_bp_module_primary(
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
+                    row_valid = (
+                        load_row_in_batch + fx.Index(row_offset) < fx.Index(BLOCK_N)
+                    )
                     if row_valid:
                         lds_row = load_row_in_batch + row_offset
                         lds_idx = k_base + lds_row * K_STRIDE + load_col_base
