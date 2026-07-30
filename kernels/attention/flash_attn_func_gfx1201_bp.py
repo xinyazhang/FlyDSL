@@ -136,6 +136,26 @@ def _pointer_store(value: ir.Value, ptr: ir.Value):
     return _llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
 
 
+def vo_chunks(head_dim, block_n, qk_shards, pad=4):
+    """V staging passes needed to keep the *padded* K+V tile inside 64 KiB.
+
+    Sharding V/O across waves means every wave's slice is live at once, so the
+    full head_dim of V^T would have to be resident -- 69888 B at head_dim 512,
+    over the cap. Staging V in `nc` passes makes only head_dim/nc columns
+    resident, which restores the padding and with it conflict-free LDS. Costs
+    one extra barrier pair per extra pass. Returns 1 whenever one pass fits.
+    """
+    for nc in (1, 2, 4, 8):
+        if head_dim % nc:
+            continue
+        cols = head_dim // nc
+        if cols % (qk_shards * 16):        # each wave needs whole 16-col chunks
+            continue
+        if block_n * (head_dim + pad) * 2 + cols * (block_n + pad) * 2 <= 65536:
+            return nc
+    return 1
+
+
 # Head-dimension sharding policy, exported so the interface can agree on
 # BLOCK_M (which it needs for seq_len padding) without building the kernel.
 # One shard per 128 head-dim columns; head_dim <= 128 stays unsharded.
@@ -210,7 +230,14 @@ def build_flash_attn_func_bp_module_primary(
     # path must trace to identical IR. See plan_gfx1201_large_hdim.md.
     QK_SHARDS = qk_shards if qk_shards is not None else bp_qk_shards(head_dim)
     QK_SLICE = head_dim // QK_SHARDS          # head-dim columns per wave in GEMM1
-    VO_SLICE = head_dim // QK_SHARDS          # V/O columns owned per wave in GEMM2
+
+    # V/O columns are staged in VO_CHUNKS passes. Within a pass the resident
+    # window is VO_CHUNK_COLS wide and contiguous, and wave s owns VO_SLICE of
+    # it -- partition (B): re-partitioning per pass keeps the LDS window
+    # contiguous, so no global->local d remap is needed.
+    VO_CHUNKS = vo_chunks(head_dim, BLOCK_N, QK_SHARDS)
+    VO_CHUNK_COLS = head_dim // VO_CHUNKS     # V columns resident per pass
+    VO_SLICE = VO_CHUNK_COLS // QK_SHARDS     # V/O columns per wave per pass
     assert head_dim % QK_SHARDS == 0
 
     # Keep the workgroup at TARGET_WAVES by trading Q row-tiles for shards, so
@@ -218,7 +245,7 @@ def build_flash_attn_func_bp_module_primary(
     Q_TILES_PER_BLOCK = max(1, _BP_TARGET_WAVES // QK_SHARDS)
     BLOCK_M = ROWS_PER_WAVE * Q_TILES_PER_BLOCK
     NUM_WAVES = Q_TILES_PER_BLOCK * QK_SHARDS
-    _V_TR_TILES = (head_dim // WMMA_N) * (BLOCK_N // WMMA_K)
+    _V_TR_TILES = (VO_CHUNK_COLS // WMMA_N) * (BLOCK_N // WMMA_K)
     if _V_TR_TILES % NUM_WAVES:
         raise ValueError(f"V transpose tiles ({_V_TR_TILES}) must divide across {NUM_WAVES} waves")
     V_TR_LOADS = _V_TR_TILES // NUM_WAVES
@@ -240,14 +267,15 @@ def build_flash_attn_func_bp_module_primary(
     # global_load_tr_b128 transposes an 8x8 tile of 16-bit elements across each
     # group of 8 lanes, so one wave-wide TR load produces a 16(d) x 16(kv) block
     # already in WMMA-operand layout. Split those blocks over the waves.
-    V_TR_D_BLOCKS = head_dim // WMMA_N
+    V_TR_D_BLOCKS = VO_CHUNK_COLS // WMMA_N
 
     K_STEP_QK = WMMA_K
     K_STEPS_QK = QK_SLICE // K_STEP_QK        # GEMM1 K-steps for this wave's slice
     WMMA_LANE_K = 8
 
     D_CHUNK = WMMA_N
-    D_CHUNKS = VO_SLICE // D_CHUNK            # o_accs count for this wave's slice
+    D_CHUNKS = VO_SLICE // D_CHUNK            # accs per wave per chunk
+    O_ACCS = VO_CHUNKS * D_CHUNKS             # accs live across the KV loop
 
     PV_K_STEP = WMMA_K
     PV_K_STEPS = K_SUB_N // PV_K_STEP
@@ -273,7 +301,7 @@ def build_flash_attn_func_bp_module_primary(
     # head_dim 512 pushes K+V to 69888 B, over the 64 KiB workgroup cap. Drop it
     # there: 32768 + 32768 = 65536 lands exactly at the limit. Bank conflicts
     # return; an XOR swizzle would avoid both, and is the follow-up.
-    _LDS_PAD = 4 if (BLOCK_N * (HEAD_DIM + 4) + HEAD_DIM * (BLOCK_N + 4)) * 2 <= 65536 else 0
+    _LDS_PAD = 4  # chunking bounds the V window, so padding always fits
     K_STRIDE = HEAD_DIM + _LDS_PAD  # padding to reduce bank conflicts (no swizzle)
     # V is staged TRANSPOSED: V^T[d][kv], so GEMM2 reads 8 consecutive kv for a
     # fixed d as one contiguous vector instead of 8 strided scalar loads.
@@ -294,7 +322,7 @@ def build_flash_attn_func_bp_module_primary(
         KV_NEEDS_GUARD = False
 
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
-    LDS_V_TILE_SIZE = HEAD_DIM * VT_STRIDE
+    LDS_V_TILE_SIZE = VO_CHUNK_COLS * VT_STRIDE
     LDS_K_TOTAL_SIZE = NUM_PREFETCH_K * LDS_K_TILE_SIZE
     LDS_V_BASE = LDS_K_TOTAL_SIZE
     LDS_V_TOTAL_SIZE = NUM_PREFETCH_V * LDS_V_TILE_SIZE
@@ -583,7 +611,8 @@ def build_flash_attn_func_bp_module_primary(
         _tr_kv_off = (lane // 16) * WMMA_LANE_K + (lane % 8)
         _tr_d_off = ((lane // 8) % 2) * WMMA_LANE_K
 
-        def coop_load_v_global(tile_start):
+        def coop_load_v_global(tile_start, chunk=0):
+            """V columns [chunk*VO_CHUNK_COLS, +VO_CHUNK_COLS) for this KV tile."""
             vecs = []
             for l in range_constexpr(V_TR_LOADS):
                 tile = wave_id + fx.Index(l * NUM_WAVES)
@@ -591,6 +620,8 @@ def build_flash_attn_func_bp_module_primary(
                 kv_base = (tile // V_TR_D_BLOCKS) * WMMA_K
                 row = tile_start + kv_base + _tr_kv_off
                 col = d_base + _tr_d_off
+                if const_expr(chunk):
+                    col = fx.Index(chunk * VO_CHUNK_COLS) + col
                 vecs.append(_global_load_tr_v8(v_ptr_i64, kv_global_idx(row, col)))
             return vecs
 
@@ -644,7 +675,7 @@ def build_flash_attn_func_bp_module_primary(
         _v_vecs_init = coop_load_v_global(fx.Index(0))
 
         init_args = [_raw(c_neg_inf), _raw(c_zero_f)]
-        for _ in range_constexpr(D_CHUNKS):
+        for _ in range_constexpr(O_ACCS):
             init_args.append(_raw(c_zero_v8f32))
         # Both K and V tiles ride the loop in registers (prefetch distance 1).
         for batch in range_constexpr(NUM_BATCHES_KV):
@@ -658,13 +689,13 @@ def build_flash_attn_func_bp_module_primary(
         ):
             m_running = inner_iter_args[0]
             l_running = inner_iter_args[1]
-            o_accs = [inner_iter_args[2 + i] for i in range_constexpr(D_CHUNKS)]
+            o_accs = [inner_iter_args[2 + i] for i in range_constexpr(O_ACCS)]
             _k_vecs_cur = [
-                inner_iter_args[2 + D_CHUNKS + b]
+                inner_iter_args[2 + O_ACCS + b]
                 for b in range_constexpr(NUM_BATCHES_KV)
             ]
             _v_vecs_cur = [
-                inner_iter_args[2 + D_CHUNKS + NUM_BATCHES_KV + b]
+                inner_iter_args[2 + O_ACCS + NUM_BATCHES_KV + b]
                 for b in range_constexpr(V_TR_LOADS)
             ]
 
@@ -861,14 +892,14 @@ def build_flash_attn_func_bp_module_primary(
             l_new = _fadd(l_corr, tile_sum)
 
             corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(8).ir_value()
-            for dc in range_constexpr(D_CHUNKS):
+            for dc in range_constexpr(O_ACCS):
                 o_accs[dc] = _fmul(o_accs[dc], corr_vec)
 
-            # Same for V: publish the registers held since last iteration,
-            # then issue the next tile's V load to fly across GEMM2.
-            coop_store_v_lds(_v_vecs_cur, 0)
-            gpu.barrier()
-            _v_vecs_next = coop_load_v_global(next_kv_start)
+            # V staging is chunked when VO_CHUNKS > 1: only VO_CHUNK_COLS
+            # columns are resident at a time, which is what lets the LDS tile
+            # keep its padding. The prefetch runs one step ahead of the
+            # flattened (iteration, chunk) sequence, so exactly one chunk of V
+            # rides the loop in registers.
 
             # ==== Build P packs ====
             p_packs_all = []
@@ -890,46 +921,76 @@ def build_flash_attn_func_bp_module_primary(
                         )
                 p_packs_all.append(p_packs_st)
 
-            # ==== GEMM2: O += V^T @ P (software pipelined, row-major V) ====
-            # Opt3: Prefetch next V pack while current WMMA executes
-            v_base = v_buf_base(0)
+            def _gemm2_chunk(_vc):
+                """GEMM2 over the V window currently resident in LDS."""
+                # ==== GEMM2: O += V^T @ P (software pipelined, row-major V) ====
+                # Opt3: Prefetch next V pack while current WMMA executes
+                v_base = v_buf_base(0)
 
-            def _load_v_rowmajor(st_kv_base_val, pks_val, dc_val):
-                # V^T[d][kv]: the 8 kv values this lane needs are contiguous, so
-                # this is one vector read instead of 8 strided scalar loads.
-                d_pos = shard_vo_off + fx.Index(dc_val * D_CHUNK) + lane16
-                kv0 = fx.Index(st_kv_base_val + pks_val * PV_K_STEP) + klane * WMMA_LANE_K
-                return _lds_load_v8(v_base + d_pos * VT_STRIDE + kv0)
+                def _load_v_rowmajor(st_kv_base_val, pks_val, dc_val):
+                    # V^T[d][kv]: the 8 kv values this lane needs are contiguous, so
+                    # this is one vector read instead of 8 strided scalar loads.
+                    d_pos = shard_vo_off + fx.Index(dc_val * D_CHUNK) + lane16
+                    kv0 = fx.Index(st_kv_base_val + pks_val * PV_K_STEP) + klane * WMMA_LANE_K
+                    return _lds_load_v8(v_base + d_pos * VT_STRIDE + kv0)
 
-            # Software pipeline: preload first V pack
-            cur_v_packs = []
-            for st_idx in range_constexpr(N_SUB_TILES):
-                cur_v_packs.append(_load_v_rowmajor(st_idx * K_SUB_N, 0, 0))
+                # Software pipeline: preload first V pack
+                cur_v_packs = []
+                for st_idx in range_constexpr(N_SUB_TILES):
+                    cur_v_packs.append(_load_v_rowmajor(st_idx * K_SUB_N, 0, 0))
 
-            for pks in range_constexpr(PV_K_STEPS):
-                for dc in range_constexpr(D_CHUNKS):
-                    next_dc = dc + 1
-                    next_pks = pks
-                    if const_expr(next_dc >= D_CHUNKS):
-                        next_dc = 0
-                        next_pks = pks + 1
-                    has_next = const_expr(next_pks < PV_K_STEPS)
+                for pks in range_constexpr(PV_K_STEPS):
+                    for dc in range_constexpr(D_CHUNKS):
+                        next_dc = dc + 1
+                        next_pks = pks
+                        if const_expr(next_dc >= D_CHUNKS):
+                            next_dc = 0
+                            next_pks = pks + 1
+                        has_next = const_expr(next_pks < PV_K_STEPS)
 
-                    # Prefetch next V while current WMMA runs
-                    next_v_packs = []
-                    if const_expr(has_next):
+                        # Prefetch next V while current WMMA runs
+                        next_v_packs = []
+                        if const_expr(has_next):
+                            for st_idx in range_constexpr(N_SUB_TILES):
+                                next_v_packs.append(
+                                    _load_v_rowmajor(st_idx * K_SUB_N, next_pks, next_dc)
+                                )
+
                         for st_idx in range_constexpr(N_SUB_TILES):
-                            next_v_packs.append(
-                                _load_v_rowmajor(st_idx * K_SUB_N, next_pks, next_dc)
+                            o_accs[_vc * D_CHUNKS + dc] = wmma_acc(
+                                cur_v_packs[st_idx],
+                                p_packs_all[st_idx][pks],
+                                o_accs[_vc * D_CHUNKS + dc],
                             )
 
-                    for st_idx in range_constexpr(N_SUB_TILES):
-                        o_accs[dc] = wmma_acc(
-                            cur_v_packs[st_idx], p_packs_all[st_idx][pks], o_accs[dc]
-                        )
+                        if const_expr(has_next):
+                            cur_v_packs = next_v_packs
 
-                    if const_expr(has_next):
-                        cur_v_packs = next_v_packs
+
+
+            if const_expr(VO_CHUNKS == 1):
+                # Unchunked: keep the original shape exactly. Wrapping this in a
+                # 1-trip chunk loop cost 4 VGPRs (190 -> 194), which crosses an
+                # allocation-granularity boundary and drops occupancy 8 -> 7
+                # waves/SIMD, measured at -4% on head_dim 128.
+                coop_store_v_lds(_v_vecs_cur, 0)
+                gpu.barrier()
+                _v_vecs_next = coop_load_v_global(next_kv_start, 0)
+                _gemm2_chunk(0)
+            else:
+                _v_hold = _v_vecs_cur
+                for vchunk in range_constexpr(VO_CHUNKS):
+                    coop_store_v_lds(_v_hold, 0)
+                    gpu.barrier()
+                    if const_expr(vchunk + 1 < VO_CHUNKS):
+                        _v_hold = coop_load_v_global(kv_block_start, vchunk + 1)
+                    else:
+                        _v_vecs_next = coop_load_v_global(next_kv_start, 0)
+                    _gemm2_chunk(vchunk)
+                    if const_expr(vchunk + 1 < VO_CHUNKS):
+                        # all waves must finish reading this window before the
+                        # next chunk overwrites it
+                        gpu.barrier()
 
             m_running = m_new_raw
             l_running = l_new
@@ -943,16 +1004,19 @@ def build_flash_attn_func_bp_module_primary(
 
         # ---- Normalize and store O ----
         l_final = loop_results[1]
-        o_finals = [loop_results[2 + dc] for dc in range_constexpr(D_CHUNKS)]
+        o_finals = [loop_results[2 + dc] for dc in range_constexpr(O_ACCS)]
 
         inv_l = arith.divf(_raw(c_one_f), _raw(l_final), fastmath=fm_fast)
         inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(8).ir_value()
 
         if q_in_bounds:
-            for dc in range_constexpr(D_CHUNKS):
-                o_norm_vec = _fmul(o_finals[dc], inv_l_vec)
+            for _oi in range_constexpr(O_ACCS):
+                vc, dc = _oi // D_CHUNKS, _oi % D_CHUNKS
+                o_norm_vec = _fmul(o_finals[_oi], inv_l_vec)
                 o_trunc = Vec(o_norm_vec).to(elem_dtype).ir_value()
                 d_col = shard_vo_off + fx.Index(dc * D_CHUNK) + klane * 8
+                if const_expr(vc):
+                    d_col = fx.Index(vc * VO_CHUNK_COLS) + d_col
                 o_global = global_idx(q_row, d_col)
                 _store_global_half(o_ptr, o_global, o_trunc)
 

@@ -377,3 +377,43 @@ zero register cost.
 Worth noting for anyone re-reading the analysis above: the bank tables are not
 wrong, they are incomplete. Conflict count is only one term, and on a kernel
 pinned at the register ceiling it is not the dominant one.
+
+## Chunked V staging: head_dim 512 now 41.3 TFLOPS (2026-07-29)
+
+The swizzle attempt above assumed the LDS pressure was irreducible -- that
+sharding V/O across waves *forces* the full head_dim of V^T resident, so the
+only way to fit 64 KiB was to drop padding. That was wrong. Staging V in
+`VO_CHUNKS` passes decouples "how many waves work concurrently" from "how much
+V is resident", and restores the padding without any swizzle.
+
+Partition **(B)**: chunk *c* covers a contiguous window of `VO_CHUNK_COLS`
+output columns, and within it wave *s* owns `VO_CHUNK_COLS / QK_SHARDS`. The
+LDS window is contiguous, so no global->local `d` remap is needed; only the
+output store takes a per-chunk column offset. Each wave still owns
+`head_dim / QK_SHARDS` columns in total, split across chunks, so `o_accs` is
+unchanged at 64 VGPRs.
+
+`vo_chunks()` picks the fewest passes that let the *padded* tile fit, so only
+head_dim 512 chunks (2 passes); 64-384 stay at one pass and are untouched.
+
+| head_dim | chunks | LDS | padded | VGPR | spills | TFLOPS |
+|---|---|---|---|---|---|---|
+| 128 | 1 | 17664 | yes | 194 | 0 | - |
+| 256 | 1 | 35072 | yes | 246 | 0 | 75.2 |
+| 384 | 1 | 52480 | yes | 256 | 10 | 45.0 |
+| **512** | **2** | **51456** | **yes** | 256 | 16 | **41.3** |
+
+head_dim 512: **22.4 -> 41.4 (+85%)**, and past the baseline's 31.6 by 31%, so
+it joins `_BP_HEAD_DIMS`. Spills fell 28 -> 16 because only one chunk of V is
+prefetched at a time. Cost is one extra barrier pair per KV tile.
+
+The prefetch runs one step ahead of the flattened (iteration, chunk) sequence,
+so exactly one chunk of V rides the loop in registers.
+
+**Known follow-up:** the restructure costs 4 VGPRs at head_dim 128 on the bp
+path (190 -> 194), which crosses the 8-waves/SIMD boundary (1536/192) and
+measures -4% there. The instruction mix is byte-for-byte identical -- same
+WMMA, LDS, barrier and wait counts, no spills -- so it is purely allocation.
+Wrapping GEMM2 in a function was ruled out as the cause (that alone still gives
+190). Not chased further because head_dim 128 routes to the baseline by
+default, so only explicit `use_binding_prefetch=True` sees it.
