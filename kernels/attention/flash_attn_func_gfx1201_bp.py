@@ -397,21 +397,22 @@ def build_flash_attn_func_bp_module_primary(
         def _to_global_ptr_i64(ptr):
             return arith.index_cast(T.i64, fx.ptrtoint(ptr))
 
-        def _global_load_tr_v8(base_i64, elem_idx):
+        def _global_load_tr_v8(base_i64, base64, off32):
             """One global_load_tr_b128: an 8x8 16-bit transpose per lane-group.
 
             Lane g_i supplies an address; the 8 contiguous elements there become
             column i of the group's output, so lane g_j receives
             [M_0[j] .. M_7[j]]. Verified empirically on gfx1201.
             """
-            # Compute the byte offset in i32 and zero-extend, rather than
-            # forming it directly in i64. LLVM's SelectGlobalSAddr only splits
-            # an address into SGPR base + VGPR offset when it sees
-            # `uniform_i64 + zext(i32 divergent)`; an opaque i64 add forces the
-            # whole 64-bit address into a VGPR pair, doubling addressing VGPRs.
-            byte_off32 = arith.index_cast(T.i32, _raw(fx.Index(elem_idx) * 2))
-            byte_off = arith.extui(T.i64, byte_off32)
-            addr = arith.addi(base_i64, byte_off)
+            # Split as elsewhere: the (batch, head, tile) origin in 64 bits,
+            # the intra-tile part in 32. Feeding LLVM `uniform_i64 +
+            # zext(i32 divergent)` is what lets SelectGlobalSAddr keep the base
+            # in SGPRs instead of forcing a 64-bit VGPR address pair.
+            base_bytes = arith.index_cast(T.i64, _raw(fx.Index(base64) * 2))
+            off_bytes = arith.extui(
+                T.i64, arith.index_cast(T.i32, _raw(fx.Index(off32) * 2))
+            )
+            addr = arith.addi(arith.addi(base_i64, base_bytes), off_bytes)
             p = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), addr).result
             return rocdl.global_load_tr_b128(v8f16_type, p)
 
@@ -534,29 +535,64 @@ def build_flash_attn_func_bp_module_primary(
         # reads stay in bounds; the values are never consumed.
         seq_last = seq_len_v - fx.Index(1)
 
-        def kv_global_idx(token_idx, col):
-            row = fx.Index(ArithValue(token_idx < seq_len_v).select(token_idx, seq_last))
-            return global_idx(row, col)
+        # ---- Address split: 64-bit uniform base + 32-bit divergent offset ----
+        #
+        # The full linear element index is
+        #     ((batch * seq_len) + token) * nheads * head_dim + head * head_dim + d
+        # i.e. it spans all of B, S, H and D, and overflows i32 at 2G elements
+        # (2 GB at f16, which real shapes reach). Only the *intra-tile* part is
+        # safely 32-bit: it is bounded by
+        #     max(BLOCK_M, BLOCK_N) * nheads * head_dim + head_dim
+        # because the row index is relative to the tile.
+        #
+        # So the batch/head/tile origin stays in 64 bits, and it is uniform
+        # across the wave -- which is also exactly the shape LLVM's
+        # SelectGlobalSAddr folds into an SGPR base plus a 32-bit VGPR offset.
+        _bh_base = batch_idx * seq_len_v * STRIDE_TOKEN + head_idx * HEAD_DIM
 
-        def _load_global_half_vec(ptr, base_idx, vec_type):
-            # i32 index, not i64: see the SelectGlobalSAddr note in
-            # _global_load_tr_v8.
-            gep = buffer_ops.get_element_ptr(
-                ptr, fx.Int32(base_idx), elem_type=elem_type
+        def tile_base(tile_start):
+            """Uniform 64-bit element base for (batch, head, tile_start)."""
+            return _bh_base + tile_start * STRIDE_TOKEN
+
+        def tile_off(row_in_tile, col):
+            """Divergent 32-bit element offset inside the tile."""
+            return row_in_tile * STRIDE_TOKEN + col
+
+        def kv_addr(tile_start, row_in_tile, col):
+            """(uniform base, divergent offset) for a KV row, clamped in bounds.
+
+            tile_start is clamped first because the distance-1 prefetch can
+            address a tile past the end; the in-tile row is then clamped, and
+            since that can only fire when tile_start is within BLOCK_N of the
+            end, the clamped row stays below BLOCK_N.
+            """
+            ts = fx.Index(
+                ArithValue(tile_start < seq_len_v).select(tile_start, seq_last)
             )
-            return _pointer_load(vec_type, gep)
+            in_range = (ts + row_in_tile) < seq_len_v
+            row = fx.Index(ArithValue(in_range).select(row_in_tile, seq_last - ts))
+            return tile_base(ts), tile_off(row, col)
 
-        def _store_global_half(ptr, base_idx, val):
-            gep = buffer_ops.get_element_ptr(
-                ptr, fx.Int32(base_idx), elem_type=elem_type
+        def _split_ptr(ptr, base64, off32):
+            """ptr + base64 (uniform, 64-bit) + off32 (divergent, 32-bit)."""
+            p = buffer_ops.get_element_ptr(
+                ptr, fx.Int64(base64), elem_type=elem_type
             )
-            _pointer_store(val, gep)
+            return buffer_ops.get_element_ptr(
+                p, fx.Int32(off32), elem_type=elem_type
+            )
 
-        def load_global_f16xN(base_ptr, base_idx):
-            return _load_global_half_vec(base_ptr, base_idx, vxf16_type)
+        def _load_global_half_vec(ptr, base64, off32, vec_type):
+            return _pointer_load(vec_type, _split_ptr(ptr, base64, off32))
 
-        def load_global_v8f16(base_ptr, base_idx):
-            return _load_global_half_vec(base_ptr, base_idx, v8f16_type)
+        def _store_global_half(ptr, base64, off32, val):
+            _pointer_store(val, _split_ptr(ptr, base64, off32))
+
+        def load_global_f16xN(base_ptr, base64, off32):
+            return _load_global_half_vec(base_ptr, base64, off32, vxf16_type)
+
+        def load_global_v8f16(base_ptr, base64, off32):
+            return _load_global_half_vec(base_ptr, base64, off32, v8f16_type)
 
         def _bitcast_i32(value):
             return fx.Int32(ArithValue(value).bitcast(fx.Int32.ir_type))
@@ -615,9 +651,10 @@ def build_flash_attn_func_bp_module_primary(
             vecs = []
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
-                row_idx = tile_start + load_row_in_batch + row_offset
-                g_idx = kv_global_idx(row_idx, load_col_base)
-                vecs.append(load_global_f16xN(k_ptr, g_idx))
+                b64, o32 = kv_addr(
+                    tile_start, load_row_in_batch + row_offset, load_col_base
+                )
+                vecs.append(load_global_f16xN(k_ptr, b64, o32))
             return vecs
 
         def coop_store_k_lds(vecs, buf_id=0):
@@ -662,11 +699,11 @@ def build_flash_attn_func_bp_module_primary(
                 tile = wave_id + fx.Index(l * NUM_WAVES)
                 d_base = (tile % V_TR_D_BLOCKS) * WMMA_N
                 kv_base = (tile // V_TR_D_BLOCKS) * WMMA_K
-                row = tile_start + kv_base + _tr_kv_off
                 col = d_base + _tr_d_off
                 if const_expr(chunk):
                     col = fx.Index(chunk * VO_CHUNK_COLS) + col
-                vecs.append(_global_load_tr_v8(v_ptr_i64, kv_global_idx(row, col)))
+                b64, o32 = kv_addr(tile_start, kv_base + _tr_kv_off, col)
+                vecs.append(_global_load_tr_v8(v_ptr_i64, b64, o32))
             return vecs
 
         def coop_store_v_lds(vecs, buf_id=0):
@@ -691,13 +728,20 @@ def build_flash_attn_func_bp_module_primary(
         # to `v_cmp_gt_u64_e64` and cause an ISA hash drift even though both
         # variants are semantically equivalent for non-negative offsets.
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_v))
-        q_row_safe = fx.Index(ArithValue(q_in_bounds).select(q_row, fx.Index(0)))
+        # Intra-tile Q row, clamped to 0 when the padded tile runs past the
+        # sequence. Bounded by BLOCK_M, so the 32-bit offset stays small.
+        q_row_in_tile = wave_q_offset + lane16
+        q_row_in_tile_safe = fx.Index(
+            ArithValue(q_in_bounds).select(q_row_in_tile, fx.Index(0))
+        )
+        q_tile_base = tile_base(q_start)
         c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
         q_b_packs = []
         for ks in range_constexpr(K_STEPS_QK):
             q_col = shard_qk_off + fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
-            g_idx = global_idx(q_row_safe, q_col)
-            raw = load_global_v8f16(q_ptr, g_idx)
+            raw = load_global_v8f16(
+                q_ptr, q_tile_base, tile_off(q_row_in_tile_safe, q_col)
+            )
             q_b_packs.append(ArithValue(q_in_bounds).select(raw, c_zero_v8f16))
 
         # ---- Constants ----
@@ -1067,8 +1111,9 @@ def build_flash_attn_func_bp_module_primary(
                 d_col = shard_vo_off + fx.Index(dc * D_CHUNK) + klane * 8
                 if const_expr(vc):
                     d_col = fx.Index(vc * VO_CHUNK_COLS) + d_col
-                o_global = global_idx(q_row, d_col)
-                _store_global_half(o_ptr, o_global, o_trunc)
+                _store_global_half(
+                    o_ptr, q_tile_base, tile_off(q_row_in_tile, d_col), o_trunc
+                )
 
     @flyc.jit
     def launch_flash_attn_bp(
