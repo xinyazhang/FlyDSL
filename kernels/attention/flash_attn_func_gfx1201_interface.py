@@ -58,13 +58,15 @@ _V_SLICE_ABOVE = 256
 _V_SLICE_WIDTH = 128
 
 
-# head_dims routed to the binding-prefetch kernel by default. Its head-dim
-# sharding beats the baseline's launch-level V slicing here, measured at
-# B=1 H=8 N=4096 f16 non-causal: 256 67.5 -> 75.5, 384 36.9 -> 45.1. head_dim
+# head_dims routed to the binding-prefetch kernel by default, measured at
+# B=1 H=8 N=4096 f16 non-causal: 192 66.8 -> 97.2, 224 51.1 -> 69.5,
+# 256 67.5 -> 75.2, 384 36.9 -> 45.0, 512 31.6 -> 41.3. 192 and 224 need no
+# sharding at all -- the baseline was simply spilling (24 and 64 registers).
+# head_dim 160 is NOT here: bp measures 70.0 against the baseline's 80.8. head_dim
 # 512 joined once V staging was chunked (vo_chunks): staging half the V
 # columns at a time keeps the padded K+V tile inside 64 KiB, which restores
 # conflict-free LDS and took it 22.4 -> 41.4.
-_BP_HEAD_DIMS = frozenset({256, 384, 512})
+_BP_HEAD_DIMS = frozenset({192, 224, 256, 384, 512})
 
 
 def _use_bp(head_dim: int, use_binding_prefetch: bool, variant: str) -> bool:
