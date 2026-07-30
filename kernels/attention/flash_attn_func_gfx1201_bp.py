@@ -314,8 +314,8 @@ def build_flash_attn_func_bp_module_primary(
     # QK_SHARDS > 1 NUM_WAVES exceeds the Q-tile count, so the old
     # `BLOCK_M % NUM_WAVES` invariant no longer applies.
     assert BLOCK_M % ROWS_PER_WAVE == 0
-    assert head_dim % 32 == 0
-    assert head_dim >= 64
+    assert head_dim % WMMA_K == 0  # WMMA_K, not 32: see the head_dim guard above
+    assert head_dim >= WMMA_K
     assert dtype_str in ("f16", "bf16")
 
     if sm_scale is None:
@@ -404,7 +404,13 @@ def build_flash_attn_func_bp_module_primary(
             column i of the group's output, so lane g_j receives
             [M_0[j] .. M_7[j]]. Verified empirically on gfx1201.
             """
-            byte_off = arith.index_cast(T.i64, _raw(fx.Index(elem_idx) * 2))
+            # Compute the byte offset in i32 and zero-extend, rather than
+            # forming it directly in i64. LLVM's SelectGlobalSAddr only splits
+            # an address into SGPR base + VGPR offset when it sees
+            # `uniform_i64 + zext(i32 divergent)`; an opaque i64 add forces the
+            # whole 64-bit address into a VGPR pair, doubling addressing VGPRs.
+            byte_off32 = arith.index_cast(T.i32, _raw(fx.Index(elem_idx) * 2))
+            byte_off = arith.extui(T.i64, byte_off32)
             addr = arith.addi(base_i64, byte_off)
             p = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), addr).result
             return rocdl.global_load_tr_b128(v8f16_type, p)
@@ -533,14 +539,16 @@ def build_flash_attn_func_bp_module_primary(
             return global_idx(row, col)
 
         def _load_global_half_vec(ptr, base_idx, vec_type):
+            # i32 index, not i64: see the SelectGlobalSAddr note in
+            # _global_load_tr_v8.
             gep = buffer_ops.get_element_ptr(
-                ptr, fx.Int64(base_idx), elem_type=elem_type
+                ptr, fx.Int32(base_idx), elem_type=elem_type
             )
             return _pointer_load(vec_type, gep)
 
         def _store_global_half(ptr, base_idx, val):
             gep = buffer_ops.get_element_ptr(
-                ptr, fx.Int64(base_idx), elem_type=elem_type
+                ptr, fx.Int32(base_idx), elem_type=elem_type
             )
             _pointer_store(val, gep)
 
