@@ -61,10 +61,10 @@ _V_SLICE_WIDTH = 128
 # head_dims routed to the binding-prefetch kernel by default. Its head-dim
 # sharding beats the baseline's launch-level V slicing here, measured at
 # B=1 H=8 N=4096 f16 non-causal: 256 67.5 -> 75.5, 384 36.9 -> 45.1. head_dim
-# 512 is NOT in this set -- it is the one width where LDS padding has to be
-# dropped to fit 64 KiB, and the resulting bank conflicts cost more than the
-# sharding gains (31.6 -> 22.4). Add it once the XOR swizzle lands.
-_BP_HEAD_DIMS = frozenset({256, 384})
+# 512 joined once V staging was chunked (vo_chunks): staging half the V
+# columns at a time keeps the padded K+V tile inside 64 KiB, which restores
+# conflict-free LDS and took it 22.4 -> 41.4.
+_BP_HEAD_DIMS = frozenset({256, 384, 512})
 
 
 def _use_bp(head_dim: int, use_binding_prefetch: bool, variant: str) -> bool:
