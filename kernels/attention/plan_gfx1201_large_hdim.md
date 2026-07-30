@@ -417,3 +417,43 @@ WMMA, LDS, barrier and wait counts, no spills -- so it is purely allocation.
 Wrapping GEMM2 in a function was ruled out as the cause (that alone still gives
 190). Not chased further because head_dim 128 routes to the baseline by
 default, so only explicit `use_binding_prefetch=True` sees it.
+
+## o_accs-to-LDS offload: IMPLEMENTED, MEASURED, REVERTED (2026-07-29)
+
+Idea: park some of the output accumulators in LDS instead of registers. Each is
+8 VGPRs per lane, so every one moved frees 8 registers from the loop-carried
+set -- the term that decides spilling -- at a cost of
+`NUM_WAVES * 8 * WARP_SIZE` f32 of LDS and one read/write per KV iteration.
+
+Implemented behind an `o_accs_in_lds` builder parameter and measured at head_dim
+512, the only config with LDS headroom and spills left. **It does not pay.**
+
+| o_accs in LDS | VGPR | spills | scratch | ds ops | LDS | TFLOPS |
+|---|---|---|---|---|---|---|
+| 0 | 256 | 3 | 6 | 85 | 51456 | 53.5 |
+| 1 | 256 | 4 | 8 | 105 | 59648 | 51.1 |
+
+Two reasons, and the second is the decisive one.
+
+**It did not shorten the live range.** Reading the accumulator at the top of the
+loop body and writing it at the bottom leaves it live across the whole body --
+exactly like a loop-carried value -- so nothing is freed. Narrowing it would
+mean folding the softmax rescale into the load and moving the read/write into
+GEMM2, and even then the `for pks: for dc:` order touches each accumulator at
+both `pks` values, spanning the whole of GEMM2. It would need the loop order
+swapped to `for dc: for pks:`, which perturbs the V prefetch pipeline.
+
+**There is almost nothing left to reclaim.** When this idea was parked, head_dim
+512 spilled 16 registers. The 64/32 address split took it to 9 and the wave-count
+tuning to 3. Across the whole ladder:
+
+| hdim | 96 | 128 | 160 | 192 | 224 | 256 | 384 | 512 |
+|---|---|---|---|---|---|---|---|---|
+| spills | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 |
+
+Six scratch ops per iteration against the 20 LDS ops needed to replace them is a
+losing trade regardless of how the live range is arranged.
+
+**Before reopening this, re-measure the spill table.** The idea is only worth
+anything if some config is spilling meaningfully again -- a new head_dim
+defaulting into an untuned `(shards, q_tiles)` would be the likely candidate.
