@@ -168,19 +168,21 @@ def bp_qk_shards(head_dim):
     return max(1, head_dim // 128)
 
 
-def bp_q_tiles(head_dim, block_n=32, shards=None):
-    """Q row-tiles per workgroup.
+# Q row-tiles per workgroup, where the default of TARGET_WAVES/shards is not
+# the fastest. head_dim 224 has THREADS_PER_ROW_LOAD=14, whose cooperative-load
+# geometry at BLOCK_M=128 spills 76 registers (53.4 TFLOPS) against 11 at
+# BLOCK_M=64 (69.5). Same awkward width that spills 101 on the baseline there.
+_BP_Q_TILES_BY_HEAD_DIM = {224: 4}
 
-    Starts from TARGET_WAVES/shards and halves until the V transpose tiling
-    divides evenly across the waves -- head_dim 160 and 224 give 20 and 28 TR
-    tiles, which 8 waves do not divide but 4 do.
+
+def bp_q_tiles(head_dim, block_n=32, shards=None):
+    """Q row-tiles per workgroup: TARGET_WAVES traded against the shard count.
+
+    The V transpose tiling no longer has to divide evenly across the waves --
+    tail tiles are guarded at the LDS store -- so this is otherwise free.
     """
     shards = bp_qk_shards(head_dim) if shards is None else shards
-    tr = (head_dim // 16) * (block_n // 16)
-    qt = max(1, _BP_TARGET_WAVES // shards)
-    while qt > 1 and tr % (qt * shards):
-        qt //= 2
-    return qt
+    return _BP_Q_TILES_BY_HEAD_DIM.get(head_dim, max(1, _BP_TARGET_WAVES // shards))
 
 
 def bp_block_m(head_dim):
@@ -271,10 +273,12 @@ def build_flash_attn_func_bp_module_primary(
     Q_TILES_PER_BLOCK = bp_q_tiles(head_dim, BLOCK_N, QK_SHARDS)
     BLOCK_M = ROWS_PER_WAVE * Q_TILES_PER_BLOCK
     NUM_WAVES = Q_TILES_PER_BLOCK * QK_SHARDS
+    # The V TR tiling need not divide evenly across the waves: tail tiles are
+    # guarded at the LDS store. Requiring divisibility used to force head_dim
+    # 160 down to 4 waves, which cost it 89.1 -> 70.0 TFLOPS.
     _V_TR_TILES = (VO_CHUNK_COLS // WMMA_N) * (BLOCK_N // WMMA_K)
-    if _V_TR_TILES % NUM_WAVES:
-        raise ValueError(f"V transpose tiles ({_V_TR_TILES}) must divide across {NUM_WAVES} waves")
-    V_TR_LOADS = _V_TR_TILES // NUM_WAVES
+    V_TR_LOADS = (_V_TR_TILES + NUM_WAVES - 1) // NUM_WAVES
+    V_TR_NEEDS_GUARD = V_TR_LOADS * NUM_WAVES != _V_TR_TILES
     if flat_work_group_size is None:
         flat_work_group_size = NUM_WAVES * WARP_SIZE
     BLOCK_SIZE = flat_work_group_size
@@ -658,12 +662,18 @@ def build_flash_attn_func_bp_module_primary(
             return vecs
 
         def coop_store_v_lds(vecs, buf_id=0):
-            # The TR tiling covers the V tile exactly (V_TR_LOADS blocks per wave over
-            # NUM_WAVES waves), so unlike the K path there is no partial row to
-            # guard against.
+            # When V_TR_LOADS * NUM_WAVES overshoots the tile count the last
+            # step has tail waves with no tile. Their global load still ran --
+            # kv_global_idx clamped the row, so it read in bounds -- and is
+            # simply not published here.
             v_base = v_buf_base(buf_id)
             for l in range_constexpr(V_TR_LOADS):
-                _v_store_transposed(v_base, l, vecs[l])
+                if const_expr(V_TR_NEEDS_GUARD and (l + 1) * NUM_WAVES > _V_TR_TILES):
+                    tile_ok = wave_id + fx.Index(l * NUM_WAVES) < fx.Index(_V_TR_TILES)
+                    if tile_ok:
+                        _v_store_transposed(v_base, l, vecs[l])
+                else:
+                    _v_store_transposed(v_base, l, vecs[l])
 
         # ---- Q preload ----
         q_row = q_start + wave_q_offset + lane16

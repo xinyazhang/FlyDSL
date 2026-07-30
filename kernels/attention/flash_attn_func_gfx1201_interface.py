@@ -62,11 +62,12 @@ _V_SLICE_WIDTH = 128
 # B=1 H=8 N=4096 f16 non-causal: 192 66.8 -> 97.2, 224 51.1 -> 69.5,
 # 256 67.5 -> 75.2, 384 36.9 -> 45.0, 512 31.6 -> 41.3. 192 and 224 need no
 # sharding at all -- the baseline was simply spilling (24 and 64 registers).
-# head_dim 160 is NOT here: bp measures 70.0 against the baseline's 80.8. head_dim
+# 160 joined once the V TR tiling was allowed a remainder, which let it use
+# 8 waves instead of 4: 70.0 -> 88.9 against the baseline's 80.8. head_dim
 # 512 joined once V staging was chunked (vo_chunks): staging half the V
 # columns at a time keeps the padded K+V tile inside 64 KiB, which restores
 # conflict-free LDS and took it 22.4 -> 41.4.
-_BP_HEAD_DIMS = frozenset({192, 224, 256, 384, 512})
+_BP_HEAD_DIMS = frozenset({160, 192, 224, 256, 384, 512})
 
 
 def _use_bp(head_dim: int, use_binding_prefetch: bool, variant: str) -> bool:
