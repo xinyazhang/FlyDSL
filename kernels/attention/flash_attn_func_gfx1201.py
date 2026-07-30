@@ -133,6 +133,30 @@ def default_block_m(head_dim):
     return _BLOCK_M_BY_HEAD_DIM.get(head_dim, _DEFAULT_BLOCK_M)
 
 
+# Small head_dim is softmax-bound, not saturation-bound: the per-(row, KV tile)
+# softmax cost does not scale with head_dim, so at head_dim 16 a wave does only
+# 4 WMMA against 17 v_exp_f32 plus 2 barriers. A wider KV tile amortises the
+# per-tile part of that -- the correction exp, the m/l update, the O rescale and
+# the barriers -- across more KV columns. Measured B=1 H=8 N=4096 f16
+# non-causal:
+#
+#   head_dim   BN=32   BN=64   BN=128
+#   16          37.4    44.6    48.2
+#   32          61.4    72.5    70.7
+#
+# Causal is excluded: its mask is unrolled into 16 explicitly named scalars, so
+# it requires NUM_S_VALS == 16, i.e. BLOCK_N == 32. Widening it would mean
+# rewriting that unroll.
+_BLOCK_N_BY_HEAD_DIM_NONCAUSAL = {16: 128, 32: 64}
+
+
+def default_block_n(head_dim, causal):
+    """BLOCK_N for a head_dim, from measured throughput (see table above)."""
+    if causal:
+        return 32
+    return _BLOCK_N_BY_HEAD_DIM_NONCAUSAL.get(head_dim, 32)
+
+
 def build_flash_attn_func_module_primary(
     num_heads,
     head_dim,
@@ -161,7 +185,7 @@ def build_flash_attn_func_module_primary(
     ROWS_PER_WAVE = WMMA_M
 
     BLOCK_M = block_m if block_m is not None else default_block_m(head_dim)
-    BLOCK_N = block_n if block_n is not None else 32
+    BLOCK_N = block_n if block_n is not None else default_block_n(head_dim, causal)
 
     assert (
         BLOCK_N % K_SUB_N == 0
@@ -173,6 +197,15 @@ def build_flash_attn_func_module_primary(
     N_SUB_TILES = BLOCK_N // K_SUB_N
     NUM_S_ACCS = N_SUB_TILES * 2
     NUM_S_VALS = NUM_S_ACCS * 8
+
+    if causal and NUM_S_VALS != 16:
+        # The causal mask below is unrolled into 16 explicitly named scalars and
+        # rebinds s_raw to a 16-element list; a wider BLOCK_N would overrun it
+        # with an IndexError at trace time. Fail clearly instead.
+        raise ValueError(
+            f"causal masking requires BLOCK_N == {K_SUB_N} (NUM_S_VALS == 16), "
+            f"got BLOCK_N={BLOCK_N} (NUM_S_VALS={NUM_S_VALS})"
+        )
 
     NUM_WAVES = BLOCK_M // ROWS_PER_WAVE
     if flat_work_group_size is None:
