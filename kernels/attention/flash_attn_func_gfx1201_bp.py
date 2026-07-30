@@ -165,14 +165,32 @@ _BP_ROWS_PER_WAVE = 16
 
 def bp_qk_shards(head_dim):
     """Waves cooperating on one Q row-tile at this head_dim."""
-    return max(1, head_dim // 128)
+    return _BP_SHARDS_BY_HEAD_DIM.get(head_dim, max(1, head_dim // 128))
 
 
-# Q row-tiles per workgroup, where the default of TARGET_WAVES/shards is not
-# the fastest. head_dim 224 has THREADS_PER_ROW_LOAD=14, whose cooperative-load
-# geometry at BLOCK_M=128 spills 76 registers (53.4 TFLOPS) against 11 at
-# BLOCK_M=64 (69.5). Same awkward width that spills 101 on the baseline there.
-_BP_Q_TILES_BY_HEAD_DIM = {224: 4}
+# Measured (shards, q_tiles) per head_dim. There is no clean formula: more
+# waves helps while registers and LDS allow, and hurts the moment it pushes
+# either over. Both effects are only visible after compiling, so these come
+# from a sweep (B=1 H=8 N=4096 f16 non-causal, TFLOPS at 8 vs 16 waves):
+#
+#   hdim   8 waves  16 waves           chosen         why not more
+#    48      79.5     76.3             8 waves
+#    64      84.3     90.1            16 waves
+#    80      91.4     95.7            16 waves
+#    96      98.4    100.3            16 waves
+#   128      97.5    102.0            16 waves
+#   160      92.9     94.2            16 waves
+#   192      99.5     90.6             8 waves        16 spills 8 registers
+#   224      62.2     79.7 (2 shards) 16 waves        1 shard spills at any count
+#   256      81.9      rej             8 waves        reduction buffer over LDS
+#   384      53.9     63.8 (12 waves) 12 waves        16 waves rejected
+#   512      53.3      rej             8 waves        reduction buffer over LDS
+#
+# The 16-wave rejections are LDS: the cross-shard reduction buffer scales with
+# NUM_WAVES, and past 8 waves it no longer fits inside the V window it aliases.
+_BP_SHARDS_BY_HEAD_DIM = {224: 2}
+_BP_Q_TILES_BY_HEAD_DIM = {48: 8, 64: 16, 80: 16, 96: 16, 128: 16, 160: 16,
+                           192: 8, 224: 8, 256: 4, 384: 4, 512: 2}
 
 
 def bp_q_tiles(head_dim, block_n=32, shards=None):
