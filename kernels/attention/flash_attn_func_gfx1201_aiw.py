@@ -336,6 +336,7 @@ def build_flash_attn_func_aiw_module_primary(
     v_prefetch_dist=1,
     v_lds_layout=None,
     strides_constexpr=False,
+    safe_softmax=True,
     q_row_tiles=1,
     shards=None,
     unsafe_fp_math=True,
@@ -551,6 +552,27 @@ def build_flash_attn_func_aiw_module_primary(
     # contiguous by contract, so it is never passed.
     #
     STRIDES_CONSTEXPR = strides_constexpr
+
+    # Two softmax corrections, both from AOTriton's hard-won list. Kept behind
+    # one knob so the pre-unification kernels remain usable as bitwise oracles
+    # (they have neither fix), and so the cost can be measured.
+    #
+    # (a) `m_i` initialises to -3.40282e+38, not -inf. If a tile is entirely
+    #     masked its row max is -inf, and with an -inf init the rescale becomes
+    #     exp2(-inf - -inf) = exp2(NaN) = NaN. A finite floor makes it
+    #     exp2(0) = 1 and the masked probabilities exp2(-inf - m) = 0, which is
+    #     the right answer. The *mask* fill stays -inf; only the init changes.
+    #
+    # (b) The QK scale is applied to the scores **before** the row max, and
+    #     `m_i` is therefore kept in the scaled domain. The kernel previously
+    #     kept `m_i` unscaled and folded the scale into the exponent as
+    #     `exp2(fma(s, qk_scale, -qk_scale * m))`, which is exactly the FMA
+    #     pattern AOTriton flags in ROCm/aotriton#54 as producing numerical
+    #     errors on large inputs. Costs NUM_S_VALS multiplies per tile and
+    #     saves the FMA; on a loop this LDS-latency-bound that is close to free.
+    #     It is also the convention LSE needs, since logsumexp is
+    #     m + log2(l) in the scaled domain.
+    SAFE_SOFTMAX = safe_softmax
 
     # ---- LDS layout ----
     # K is padded rather than XOR-swizzled (a swizzle was implemented and
@@ -1125,7 +1147,10 @@ def build_flash_attn_func_aiw_module_primary(
             q_b_packs_all.append(_packs)
 
         # ---- Constants ----
+        # Mask fill: genuinely -inf, so exp2(-inf - m) is exactly 0.
         c_neg_inf = fx.Float32(float("-inf"))
+        # m_i floor: finite, so an all-masked tile cannot produce -inf - -inf.
+        c_m_init = fx.Float32(-3.40282e38 if SAFE_SOFTMAX else float("-inf"))
         c_zero_f = fx.Float32(0.0)
         c_one_f = fx.Float32(1.0)
         c_sm_scale_log2e = sm_log2e
@@ -1161,7 +1186,7 @@ def build_flash_attn_func_aiw_module_primary(
 
         init_args = []
         for _ in range_constexpr(Q_ROW_TILES):
-            init_args.append(_raw(c_neg_inf))
+            init_args.append(_raw(c_m_init))
             init_args.append(_raw(c_zero_f))
         for _ in range_constexpr(Q_ROW_TILES * O_ACCS):
             init_args.append(_raw(c_zero_v8f32))
@@ -1298,6 +1323,10 @@ def build_flash_attn_func_aiw_module_primary(
                 for st in range_constexpr(NUM_S_ACCS):
                     for r in range_constexpr(8):
                         s_raw.append(Vec(s_accs[st])[r])
+                if const_expr(SAFE_SOFTMAX):
+                    # Scale here, before the row max, so m_i lives in the
+                    # scaled domain and the exponent is a plain subtract.
+                    s_raw = [_fmul(v, c_sm_scale_log2e) for v in s_raw]
 
                 if const_expr(CAUSAL):
                     kv_start_i32 = fx.Int32(kv_block_start)
@@ -1390,17 +1419,29 @@ def build_flash_attn_func_aiw_module_primary(
                 row_max = _fmax(local_max, peer_max)
                 m_new_raw = _fmax(m_running, row_max)
 
-                diff_m_raw = _fsub(m_running, m_new_raw)
-                diff_m_scaled = _fmul(diff_m_raw, c_sm_scale_log2e)
-                corr = rocdl.exp2(ir.F32Type.get(), _raw(diff_m_scaled))
-
-                scaled_max = _fmul(c_sm_scale_log2e, m_new_raw)
-                neg_scaled_max = _fsub(c_zero_f, scaled_max)
+                if const_expr(SAFE_SOFTMAX):
+                    # m is already scaled, so no scale appears in either
+                    # exponent -- this is the whole point of the change.
+                    corr = rocdl.exp2(
+                        ir.F32Type.get(), _raw(_fsub(m_running, m_new_raw))
+                    )
+                    neg_m = _fsub(c_zero_f, m_new_raw)
+                else:
+                    diff_m_raw = _fsub(m_running, m_new_raw)
+                    diff_m_scaled = _fmul(diff_m_raw, c_sm_scale_log2e)
+                    corr = rocdl.exp2(ir.F32Type.get(), _raw(diff_m_scaled))
+                    scaled_max = _fmul(c_sm_scale_log2e, m_new_raw)
+                    neg_m = _fsub(c_zero_f, scaled_max)
 
                 p_vals = []
                 local_sum = _raw(c_zero_f)
                 for r in range_constexpr(NUM_S_VALS):
-                    diff = fmath.fma(s_raw[r], _raw(c_sm_scale_log2e), neg_scaled_max)
+                    if const_expr(SAFE_SOFTMAX):
+                        diff = _fadd(s_raw[r], neg_m)
+                    else:
+                        diff = fmath.fma(
+                            s_raw[r], _raw(c_sm_scale_log2e), neg_m
+                        )
                     p = rocdl.exp2(ir.F32Type.get(), _raw(diff))
                     p_vals.append(p)
                     local_sum = _fadd(local_sum, p)

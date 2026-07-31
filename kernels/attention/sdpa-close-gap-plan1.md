@@ -599,6 +599,55 @@ only the binding site differs. Promote `sm_scale` and the strides
 (`stride_q0/q1/q2`, per your numeric-naming instruction). Output is the price
 of AOT, not a go/no-go.
 
+**P1 status.** Numerics done (`safe_softmax`, default on). Remaining: MQA/GQA
++ 3D grid, `BLOCK_DMODEL`/`Hdim_qk`/`Hdim_vo`/`PADDED_HEAD`, LSE, buffer loads,
+`ENABLE_LDS_VEC16`.
+
+*Numerics result.* Both corrections landed behind one knob so the pre-unification
+oracles stay usable:
+
+- `m_i` initialises to `-3.40282e+38`; the mask fill stays `-inf`. This is
+  **preventative** — with the current causal implementation the first KV tile is
+  never fully masked (tile 0 always contains `kv = 0 <= q_row`), so `-inf - -inf`
+  is unreachable today. It becomes load-bearing in P2 (`seqlen_q > seqlen_k`
+  leaves whole rows masked) and P6 (a window can exclude an entire tile). Not
+  tested yet because it cannot be reached; add the test with the feature.
+- The QK scale moves *before* the row max, replacing
+  `exp2(fma(s, qk_scale, -qk_scale*m))`. **Demonstrated**, not just conformed
+  to: with `causal=True` the first query row attends to exactly one key, so its
+  softmax is 1.0 and its output is `V[0]` exactly. The corrected form gives
+  `exp2(0) == 1` exactly; the old form computed the rounding error of
+  `qk_scale*m` instead of zero, an error of ~1 ulp of `qk_scale*m` that **grows
+  with input magnitude**. Measured max relative error against an fp64 reference,
+  head_dim 128 causal:
+
+  | input magnitude | old form | corrected |
+  |---|---|---|
+  | 30 | 3.0e-4 | 2.5e-4 |
+  | 100 | 6.2e-4 | 1.5e-4 |
+  | 300 | 4.1e-4 | **0.0** |
+  | 1000 | 4.9e-4 | **0.0** |
+  | 3000 | 6.6e-4 | **0.0** |
+
+  Below magnitude ~100 the difference is under f16 output precision and
+  invisible, which is why the first probe found nothing. Non-causal shows no
+  difference at any magnitude — the max-element error is diluted across 256
+  terms.
+
+*Cost.* A correct form needs `2N` ops per tile where the FMA form needed `N`
+(scale-then-subtract or subtract-then-scale, both `2N`; there is no `N` form
+that is exact). Measured median **0.989** over the ladder, but with two real
+outliers: **head_dim 32 non-causal 0.895** and **head_dim 16 non-causal 0.963**
+(7-rep medians, spread 0.887-0.903 — not noise). Both are the wide-`BLOCK_N`,
+softmax-bound configs the tuning table already flags. It is *not* register
+pressure: at head_dim 32 the corrected form uses **fewer** VGPRs (93 vs 98) and
+gets *higher* occupancy (16 vs 14 waves/SIMD). It is straightforward VALU in a
+loop where softmax already dominates.
+
+Accepted: correctness over 1%. **Follow-up:** `_DIST0_BLOCK_N_BY_HEAD_DIM_NONCAUSAL`
+was measured under the cheap softmax and should be re-swept for head_dim 16/32
+— this is the first concrete instance of the table-revision work N3 flagged.
+
 **P1 — layout generality, MQA/GQA, LSE, numerics.** Simplified by N3:
 - **One constexpr tile width.** Rename the `head_dim` build parameter to
   `BLOCK_DMODEL` to match AOTriton, add runtime `Hdim_qk` / `Hdim_vo` and

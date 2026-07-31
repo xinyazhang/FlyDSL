@@ -106,8 +106,14 @@ def _parity(head_dim, causal, dtype, batch, seq, oracle, aiw_kwargs):
         causal=causal,
         dtype_str="f16" if dtype == torch.float16 else "bf16",
     )
+    # safe_softmax=False: the oracles predate both corrections, so bitwise
+    # parity is only meaningful against the same arithmetic. The corrected
+    # path is covered by test_safe_softmax_* below.
     got = _run(
-        build_flash_attn_func_aiw_module(**common, **aiw_kwargs), q, k, v, batch, seq
+        build_flash_attn_func_aiw_module(
+            **common, **aiw_kwargs, safe_softmax=False
+        ),
+        q, k, v, batch, seq,
     )
     want = _run(oracle(**common), q, k, v, batch, seq, legacy=True)
     assert torch.isfinite(got).all(), "aiw produced non-finite output"
@@ -282,6 +288,57 @@ def test_rejects_non_rank4_and_ragged_last_dim():
     bad = q.transpose(2, 3)
     with pytest.raises(ValueError, match="contiguous last dimension"):
         exe(bad, k, v, torch.empty_like(q), 1, 256)
+
+
+@pytest.mark.parametrize("mag", [300.0, 1000.0], ids=lambda m: f"mag{int(m)}")
+def test_safe_softmax_is_exact_for_large_inputs(mag):
+    """The corrected softmax is exact where the FMA form is not.
+
+    With `causal=True` the first query row attends to exactly one key, so its
+    softmax is 1.0 and its output is V[0] exactly. The corrected form scales the
+    scores *before* the row max, so `s - m` is exactly 0 for the max element and
+    `exp2(0) == 1` exactly.
+
+    The old form scaled the max separately (`fma(s, scale, -scale*m)`), so for
+    the max element it computed the rounding error of `scale*m` rather than
+    zero, giving `exp2(eps) = 1 + eps'`. That error is ~1 ulp of `scale*m` and
+    therefore **grows with input magnitude** -- which is exactly what AOTriton
+    warns about in ROCm/aotriton#54.
+
+    Below magnitude ~100 the difference is under the f16 output precision and
+    invisible; this test is at 300 and 1000, where it is not.
+    """
+    _require_env()
+    head_dim, seq = 128, 256
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v = (
+        torch.randn(
+            1, seq, _NUM_HEADS, head_dim,
+            dtype=torch.float16, device="cuda", generator=gen,
+        ) * mag
+        for _ in range(3)
+    )
+    assert torch.isfinite(q).all(), "inputs overflowed f16; pick a smaller mag"
+
+    common = dict(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16"
+    )
+    got_safe = _run(build_flash_attn_func_aiw_module(**common), q, k, v, 1, seq)
+    got_old = _run(
+        build_flash_attn_func_aiw_module(**common, safe_softmax=False),
+        q, k, v, 1, seq,
+    )
+
+    qb, kb, vb = (x.transpose(1, 2).double() for x in (q, k, v))
+    ref = F.scaled_dot_product_attention(qb, kb, vb, is_causal=True).transpose(1, 2)
+    scale = ref.abs().max().item()
+    err_safe = (got_safe.double() - ref).abs().max().item() / scale
+    err_old = (got_old.double() - ref).abs().max().item() / scale
+
+    assert err_safe < err_old / 10.0, (
+        f"corrected softmax should be markedly more accurate at mag={mag}: "
+        f"safe={err_safe:.3e} old={err_old:.3e}"
+    )
 
 
 def test_shard_resolution_respects_narrow_window():
