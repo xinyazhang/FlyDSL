@@ -3,8 +3,8 @@
 
 """High-level FlyDSL Flash Attention API for gfx1201 / RDNA4.
 
-Wraps ``flash_attn_func_gfx1201.build_flash_attn_func_module`` behind a single
-function, ``flydsl_flash_attn_func_gfx1201(q, k, v, ...)``:
+Wraps ``flash_attn_func_gfx1201_aiw.build_flash_attn_func_aiw_module`` behind a
+single function, ``flydsl_flash_attn_func_gfx1201(q, k, v, ...)``:
 
 - Build cache keyed by (num_heads, head_dim, causal, dtype, waves_per_eu, daz)
   so repeated calls with the same static config compile only once per process.
@@ -35,10 +35,22 @@ import torch
 import torch.nn.functional as F
 
 from flash_attn_func_gfx1201 import build_flash_attn_func_module, default_block_m
+from flash_attn_func_gfx1201_aiw import (
+    build_flash_attn_func_aiw_module,
+    default_block_m as aiw_block_m,
+    default_prefetch_dist as aiw_prefetch_dist,
+)
 from flash_attn_func_gfx1201_bp import build_flash_attn_func_bp_module, bp_block_m
 from flash_attn_func_gfx1201_m32 import build_flash_attn_func_m32_module
 
 __all__ = ["flydsl_flash_attn_func_gfx1201"]
+
+# The unified kernel (``flash_attn_func_gfx1201_aiw``) is the production path.
+# The three originals it replaced are still importable and reachable through
+# ``variant="legacy"`` / ``"legacy_bp"`` / ``"legacy_m32"``, where they serve as
+# correctness oracles: for every knob setting that reproduces one of them, aiw
+# matches bitwise. They are not otherwise used.
+_LEGACY_VARIANTS = ("legacy", "legacy_bp", "legacy_m32")
 
 
 # Tile size baked into the gfx1201 kernel (BLOCK_M). Seq_len must be a
@@ -69,6 +81,31 @@ def _use_bp(head_dim: int, use_binding_prefetch: bool, variant: str) -> bool:
     return variant != "m32" and (
         use_binding_prefetch or head_dim >= _BP_MIN_HEAD_DIM
     )
+
+
+def _aiw_knobs(head_dim: int, use_binding_prefetch: bool, variant: str) -> dict:
+    """Map the public options onto aiw's knob space.
+
+    ``use_binding_prefetch`` forces prefetch distance 1 below the threshold
+    where the policy would pick 0; ``variant="m32"`` selects two Q row-tiles
+    per wave. Everything else follows the tuning policy in the kernel module.
+    """
+    dist = 1 if use_binding_prefetch else aiw_prefetch_dist(head_dim)
+    knobs = {
+        "k_prefetch_dist": dist,
+        "v_lds_layout": "transposed" if dist else "row",
+        "q_row_tiles": 2 if variant == "m32" else 1,
+    }
+    if variant == "m32":
+        # Two row-tiles doubles o_accs + q_b_packs + s_accs; above head_dim 64
+        # that crosses the 256-VGPR cap and spills (-27% measured at 128).
+        if head_dim != 64:
+            raise ValueError(
+                f"variant='m32' (q_row_tiles=2) is head_dim 64 only, got {head_dim}"
+            )
+        knobs["k_prefetch_dist"] = 1
+        knobs["v_lds_layout"] = "transposed"
+    return knobs
 
 
 def _v_slice_width(head_dim: int) -> int:
@@ -107,17 +144,21 @@ def _get_kernel(
     head_dim_v: int | None = None,
     d_offset: int = 0,
 ):
-    if variant == "m32":
+    if variant == "legacy_m32":
         builder = build_flash_attn_func_m32_module
-    elif use_bp:
+    elif variant == "legacy_bp":
         builder = build_flash_attn_func_bp_module
-    else:
+    elif variant == "legacy":
         builder = build_flash_attn_func_module
+    else:
+        builder = build_flash_attn_func_aiw_module
     kwargs = {}
     if head_dim_v is not None:
-        # Only the baseline builder splits the V/output width; bp and m32 do not
-        # take these, and are gated to head_dim <= 128 anyway.
+        # The V/output column window. aiw and the legacy baseline take these;
+        # the legacy bp/m32 builders do not.
         kwargs = {"head_dim_v": head_dim_v, "d_offset": d_offset}
+    if builder is build_flash_attn_func_aiw_module:
+        kwargs.update(_aiw_knobs(head_dim, use_bp, variant))
     return builder(
         num_heads=num_heads,
         head_dim=head_dim,
@@ -153,11 +194,16 @@ def flydsl_flash_attn_func_gfx1201(
         daz: enable denormals-are-zero on the kernel.
         stream: optional CUDA/HIP stream to launch on. Defaults to the current
             stream for ``q.device``.
-        use_binding_prefetch: select the binding-prefetch scheduling variant
-            (``flash_attn_func_gfx1201_bp``), which carries both K and V tiles
-            in registers at prefetch distance 1 instead of loading K at
-            distance 0. Stage 1: correctness-oriented and not yet tuned, and it
-            only accepts head_dim 64/128. Defaults to the baseline kernel.
+        use_binding_prefetch: force K prefetch distance 1 below the head_dim
+            where the tuning policy would pick 0 (48). K and V prefetch
+            distances are independent -- V is always staged one tile ahead --
+            so this only moves K. Above the threshold it is already the default
+            and the flag is a no-op.
+        variant: ``""`` selects the unified kernel (default). ``"m32"`` gives
+            each wave two Q row-tiles, so one K/V operand feeds two WMMAs;
+            head_dim 64 only. ``"legacy"`` / ``"legacy_bp"`` / ``"legacy_m32"``
+            reach the three pre-unification kernels, kept as correctness
+            oracles -- see ``test_flash_attn_func_gfx1201_aiw.py``.
 
     Returns:
         Output tensor with the same shape and dtype as ``q``.
@@ -188,6 +234,11 @@ def flydsl_flash_attn_func_gfx1201(
         raise ValueError(f"q/k/v dtype must match: {q.dtype}/{k.dtype}/{v.dtype}")
     if q.dim() != 4:
         raise ValueError(f"expected 4D BSHD tensor, got rank {q.dim()} ({tuple(q.shape)})")
+    if variant not in ("", "m32") + _LEGACY_VARIANTS:
+        raise ValueError(
+            f"unknown variant {variant!r}; expected '' (unified kernel), 'm32', "
+            f"or one of {_LEGACY_VARIANTS} for the pre-unification oracles"
+        )
 
     batch, seq_len_real, num_heads, head_dim = q.shape
     if head_dim < 16 or head_dim % 16 != 0 or head_dim > _MAX_HEAD_DIM:
@@ -211,12 +262,17 @@ def flydsl_flash_attn_func_gfx1201(
     # off before returning.
     # Must match the kernel's own choice: it sets the seq_len padding below.
     use_bp = _use_bp(head_dim, use_binding_prefetch, variant)
-    if variant == "m32":
+    if variant == "legacy_m32":
         block_m = 256
-    elif use_bp:
+    elif variant == "legacy_bp":
         block_m = bp_block_m(head_dim)
-    else:
+    elif variant == "legacy":
         block_m = default_block_m(head_dim)
+    else:
+        # aiw. BLOCK_M is invariant to q_row_tiles by construction (see the
+        # Q_TILES_PER_BLOCK comment in the kernel), so only the prefetch
+        # distance matters here.
+        block_m = aiw_block_m(head_dim, 1 if use_bp else aiw_prefetch_dist(head_dim))
     seq_len_pad = ((seq_len_real + block_m - 1) // block_m) * block_m
     n_pad = seq_len_pad - seq_len_real
     if not causal and n_pad > 0 and n_pad / seq_len_pad > _MAX_NONCAUSAL_PAD_RATIO:
@@ -249,12 +305,17 @@ def flydsl_flash_attn_func_gfx1201(
         if launch_stream.device != q.device:
             raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
         # A wave's output accumulator is head_dim_v/2 VGPRs and the V LDS tile
-        # scales with head_dim_v, so wide heads are computed one column slice at
-        # a time. Sound because attention is column-separable in V:
+        # scales with head_dim_v, so wide heads can be computed one column slice
+        # at a time. Sound because attention is column-separable in V:
         # O[:, s] = P @ V[:, s], and P does not depend on V. GEMM1 and the K
-        # traffic repeat per slice, which is what makes this a fallback rather
-        # than the default.
-        slice_w = head_dim if use_bp else _v_slice_width(head_dim)
+        # traffic repeat per slice, which is what makes this a fallback.
+        #
+        # aiw does not need it: head-dim sharding plus chunked V staging keep
+        # o_accs and the LDS tile in budget to head_dim 512 in a single pass.
+        # Only the legacy baseline builder relies on slicing. The capability is
+        # kept and tested in aiw (head_dim_v / d_offset) because the AOTriton
+        # gap work needs an independent Hdim_vo anyway.
+        slice_w = _v_slice_width(head_dim) if variant == "legacy" else head_dim
         for d_off in range(0, head_dim, slice_w):
             exe = _get_kernel(
                 num_heads=num_heads,
