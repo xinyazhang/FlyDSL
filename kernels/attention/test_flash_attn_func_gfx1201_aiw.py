@@ -73,9 +73,17 @@ def _qkv(batch, seq, head_dim, dtype, seed=0):
     )
 
 
-def _run(exe, q, k, v, batch, seq, out=None):
+def _run(exe, q, k, v, batch, seq, out=None, legacy=False):
+    """Launch a builder's executable.
+
+    aiw takes the rank-4 tensors whole and reads their strides; the legacy
+    builders take flat pointers and derive the layout from num_heads/head_dim.
+    """
     o = torch.empty_like(q) if out is None else out
-    exe(q.reshape(-1), k.reshape(-1), v.reshape(-1), o.reshape(-1), batch, seq)
+    if legacy:
+        exe(q.reshape(-1), k.reshape(-1), v.reshape(-1), o.reshape(-1), batch, seq)
+    else:
+        exe(q, k, v, o, batch, seq)
     torch.cuda.synchronize()
     return o
 
@@ -101,7 +109,7 @@ def _parity(head_dim, causal, dtype, batch, seq, oracle, aiw_kwargs):
     got = _run(
         build_flash_attn_func_aiw_module(**common, **aiw_kwargs), q, k, v, batch, seq
     )
-    want = _run(oracle(**common), q, k, v, batch, seq)
+    want = _run(oracle(**common), q, k, v, batch, seq, legacy=True)
     assert torch.isfinite(got).all(), "aiw produced non-finite output"
     assert torch.equal(got, want), (
         f"max |aiw - oracle| = {(got.float() - want.float()).abs().max().item():.3e}"
@@ -211,6 +219,69 @@ def test_v_column_window(head_dim, head_dim_v, causal):
     assert torch.isfinite(o).all()
     rel = _rel(o, _reference(q, k, v, causal))
     assert rel < 5e-3, f"hd={head_dim} hdv={head_dim_v} rel={rel:.3e}"
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_storage_flip_matches_contiguous(head_dim, causal):
+    """BSHD *shape* over BHSD *memory* must give the same answer.
+
+    This is AOTriton's `storage_flip`: allocate with axes 1 and 2 swapped, then
+    transpose back, so the logical shape is unchanged while the strides are
+    not. It is precisely the case a shape-derived layout cannot survive, and
+    the reason the kernel reads `stride_?0/1/2` instead of computing
+    `num_heads * head_dim`.
+
+    Without this test the whole stride mechanism is exercised only by
+    contiguous tensors, where a derived layout happens to agree.
+    """
+    _require_env()
+    seq = 256
+
+    def _flipped(seed):
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        # (B, H, S, D) allocation viewed as (B, S, H, D)
+        return torch.randn(
+            1, _NUM_HEADS, seq, head_dim,
+            dtype=torch.float16, device="cuda", generator=gen,
+        ).transpose(1, 2)
+
+    q, k, v = (_flipped(s) for s in range(3))
+    assert not q.is_contiguous(), "test would be vacuous on a contiguous tensor"
+    o = torch.empty(
+        1, _NUM_HEADS, seq, head_dim, dtype=torch.float16, device="cuda"
+    ).transpose(1, 2)
+
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16"
+    )
+    _run(exe, q, k, v, 1, seq, out=o)
+
+    # Same values in a contiguous tensor: the answer must not depend on layout.
+    got_c = _run(exe, q.contiguous(), k.contiguous(), v.contiguous(), 1, seq)
+
+    assert torch.isfinite(o).all(), "flipped-storage run produced non-finite output"
+    assert torch.equal(o, got_c), (
+        "layout changed the result: max |flipped - contiguous| = "
+        f"{(o.float() - got_c.float()).abs().max().item():.3e}"
+    )
+    rel = _rel(o, _reference(q, k, v, causal))
+    assert rel < 5e-3, f"hd={head_dim} causal={causal} rel={rel:.3e}"
+
+
+def test_rejects_non_rank4_and_ragged_last_dim():
+    """Strides can only be read from a rank-4, D-contiguous tensor."""
+    _require_env()
+    q, k, v = _qkv(1, 256, 64, torch.float16)
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16"
+    )
+    with pytest.raises(ValueError, match="rank 4"):
+        exe(q.reshape(-1), k, v, torch.empty_like(q), 1, 256)
+    # D non-contiguous: transpose the last two axes.
+    bad = q.transpose(2, 3)
+    with pytest.raises(ValueError, match="contiguous last dimension"):
+        exe(bad, k, v, torch.empty_like(q), 1, 256)
 
 
 def test_shard_resolution_respects_narrow_window():

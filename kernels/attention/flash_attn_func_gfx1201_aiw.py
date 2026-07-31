@@ -1587,6 +1587,19 @@ def build_flash_attn_func_aiw_module_primary(
         O: fx.Pointer,  # noqa: E741
         batch_size: fx.Int32,
         seq_len: fx.Int32,
+        stride_q0: fx.Int64,
+        stride_q1: fx.Int64,
+        stride_q2: fx.Int64,
+        stride_k0: fx.Int64,
+        stride_k1: fx.Int64,
+        stride_k2: fx.Int64,
+        stride_v0: fx.Int64,
+        stride_v1: fx.Int64,
+        stride_v2: fx.Int64,
+        stride_o0: fx.Int64,
+        stride_o1: fx.Int64,
+        stride_o2: fx.Int64,
+        sm_scale_v: fx.Float32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -1596,25 +1609,19 @@ def build_flash_attn_func_aiw_module_primary(
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
         grid_x = bs_idx * num_q_tiles * NUM_HEADS
 
-        # BSHD strides, numbered by axis: 0 = batch, 1 = seq, 2 = head.
-        # Axis 3 is D, contiguous by contract, so it is not passed.
-        # Always supplied: with STRIDES_CONSTEXPR the kernel simply does not
-        # read them, which is what makes the two arms directly comparable.
-        # All four tensors are BSHD with identical strides in this wrapper.
-        # They are passed separately anyway because the kernel must not assume
-        # it -- K/V come straight from the caller in `mha_fwd_aot`, and under
-        # MQA/GQA they carry Num_head_k rather than Num_head_q.
-        _s0 = fx.Int64(sl_idx * STRIDE_TOKEN)
-        _s1 = fx.Int64(STRIDE_TOKEN)
-        _s2 = fx.Int64(HEAD_DIM)
-
+        # Strides come from the caller, read off the real tensors -- never
+        # derived here from num_heads/head_dim. The shape does not determine
+        # the layout (plan1 section 0), and K/V need not share Q's layout at
+        # all. Axis 3 is D, contiguous by contract, so it is not passed.
+        # Always forwarded: with STRIDES_CONSTEXPR the kernel simply does not
+        # read them, which is what keeps the two arms directly comparable.
         launcher = flash_attn_func_aiw_kernel(
             Q, K, V, O, seq_len,
-            _s0, _s1, _s2,
-            _s0, _s1, _s2,
-            _s0, _s1, _s2,
-            _s0, _s1, _s2,
-            fx.Float32(sm_scale),
+            stride_q0, stride_q1, stride_q2,
+            stride_k0, stride_k1, stride_k2,
+            stride_v0, stride_v1, stride_v2,
+            stride_o0, stride_o1, stride_o2,
+            sm_scale_v,
         )
 
         if const_expr(waves_per_eu is not None):
@@ -1691,31 +1698,62 @@ def build_flash_attn_func_aiw_module_primary(
             return flyc.from_c_void_p(fx.Uint8, ptr)
         return t
 
-    def _wrap_qkvo(args, kwargs):
-        args = list(args)
-        for idx in range(min(4, len(args))):
-            args[idx] = _ptr_arg(args[idx])
-        for name in ("Q", "K", "V", "O"):
-            if name in kwargs:
-                kwargs[name] = _ptr_arg(kwargs[name])
-        return tuple(args), kwargs
+    def _strides_of(t, name):
+        """The three leading strides of a rank-4 tensor, in elements.
+
+        Read from the tensor, never derived from its shape: the shape says
+        BHSD/BSHD but the memory can be any `xxxD` permutation, and the two are
+        not related (see sdpa-close-gap-plan1.md section 0).
+        """
+        if not hasattr(t, "stride"):
+            raise TypeError(
+                f"{name} must be a rank-4 tensor so its strides can be read, "
+                f"got {type(t).__name__}"
+            )
+        if t.dim() != 4:
+            raise ValueError(f"{name} must be rank 4, got shape {tuple(t.shape)}")
+        if t.stride(3) != 1:
+            raise ValueError(
+                f"{name} must have a contiguous last dimension, got "
+                f"stride(3)={t.stride(3)}"
+            )
+        return t.stride(0), t.stride(1), t.stride(2)
+
+    def _prep(Q, K, V, O):  # noqa: E741
+        """Pointers plus the twelve strides, in launch order.
+
+        Deliberately does **not** flatten: `t.reshape(-1)` materialises a copy
+        for any non-contiguous tensor, which would silently defeat the whole
+        point of reading strides. `data_ptr()` is the tensor's base either way.
+        """
+        st = []
+        for t, name in ((Q, "Q"), (K, "K"), (V, "V"), (O, "O")):
+            st.extend(_strides_of(t, name))
+        return [_ptr_arg(t) for t in (Q, K, V, O)], st
 
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
-    def _launch(*args, **kwargs):
-        args, kwargs = _wrap_qkvo(args, kwargs)
-        stream = kwargs.pop("stream", fx.Stream(None))
-        _run_compiled(launch_flash_attn_aiw, *args, stream)
-
-    def _compile(Q, K, V, O, batch_size, seq_len, stream=None):  # noqa: E741
-        return flyc.compile(
+    def _launch(Q, K, V, O, batch_size, seq_len, scale=None, stream=None):  # noqa: E741
+        ptrs, st = _prep(Q, K, V, O)
+        _run_compiled(
             launch_flash_attn_aiw,
-            _ptr_arg(Q),
-            _ptr_arg(K),
-            _ptr_arg(V),
-            _ptr_arg(O),
+            *ptrs,
             batch_size,
             seq_len,
+            *st,
+            float(sm_scale if scale is None else scale),
+            stream if stream is not None else fx.Stream(None),
+        )
+
+    def _compile(Q, K, V, O, batch_size, seq_len, scale=None, stream=None):  # noqa: E741
+        ptrs, st = _prep(Q, K, V, O)
+        return flyc.compile(
+            launch_flash_attn_aiw,
+            *ptrs,
+            batch_size,
+            seq_len,
+            *st,
+            float(sm_scale if scale is None else scale),
             fx.Stream(stream),
         )
 

@@ -329,15 +329,26 @@ def flydsl_flash_attn_func_gfx1201(
                 head_dim_v=None if slice_w == head_dim else slice_w,
                 d_offset=0 if slice_w == head_dim else d_off,
             )
-            exe(
-                q_p.reshape(-1),
-                k_p.reshape(-1),
-                v_p.reshape(-1),
-                o_p.reshape(-1),
-                batch,
-                seq_len_pad,
-                stream=launch_stream,
-            )
+            if variant in _LEGACY_VARIANTS:
+                # The pre-unification builders take flat pointers and derive
+                # the layout from num_heads/head_dim.
+                exe(
+                    q_p.reshape(-1),
+                    k_p.reshape(-1),
+                    v_p.reshape(-1),
+                    o_p.reshape(-1),
+                    batch,
+                    seq_len_pad,
+                    stream=launch_stream,
+                )
+            else:
+                # aiw reads the strides off the tensors, so pass them whole.
+                # Flattening here would call `.reshape(-1)`, which materialises
+                # a copy for any non-contiguous input and would silently defeat
+                # the point of reading strides at all.
+                exe(
+                    q_p, k_p, v_p, o_p, batch, seq_len_pad, stream=launch_stream
+                )
 
     if seq_len_pad != seq_len_real:
         return o_p[:, :seq_len_real, :, :].contiguous()
