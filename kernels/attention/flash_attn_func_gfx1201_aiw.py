@@ -335,6 +335,7 @@ def build_flash_attn_func_aiw_module_primary(
     k_prefetch_dist=None,
     v_prefetch_dist=1,
     v_lds_layout=None,
+    strides_constexpr=False,
     q_row_tiles=1,
     shards=None,
     unsafe_fp_math=True,
@@ -520,6 +521,37 @@ def build_flash_attn_func_aiw_module_primary(
     CAUSAL = causal
     STRIDE_TOKEN = NUM_HEADS * HEAD_DIM
 
+    # Strides and sm_scale are runtime arguments, not folded constants: an AOT
+    # kernel cannot bake them in, since a fixed set of binaries has to cover
+    # every shape.
+    #
+    # Measured price (B=1 H=8 N=4096 f16, interleaved 3-rep A/B over the full
+    # head_dim ladder x causal): **median ratio 0.996**, worst 0.967 (head_dim
+    # 16 causal), best 1.041 (head_dim 192 causal). Several configs come out
+    # *faster* and the spread is symmetric about 1.0, so this is the board's
+    # noise floor rather than a measurable cost. Registers: +0 to +4 VGPRs,
+    # +22 SGPRs, no new spills at any head_dim. Output is bitwise identical to
+    # the folded form, sm_scale included.
+    #
+    # Each tensor carries its own triple, and they are not interchangeable: K
+    # and V reach the kernel exactly as the caller allocated them (`mha_fwd_aot`
+    # passes them through untouched), and under MQA/GQA they carry Num_head_k
+    # rather than Num_head_q. Going from one shared triple to four cost +18
+    # SGPRs and zero VGPRs -- strides are uniform scalars, so they only change
+    # which value an address multiplies.
+    #
+    # `strides_constexpr=True` keeps them folded. It is retained only as an A/B
+    # arm for future phases -- if addressing ever becomes expensive we want to
+    # be able to measure against the folded form -- and is not a shipping
+    # configuration.
+    #
+    # Naming is numeric (`stride_q0/q1/q2`), not by axis letter. The suffixed forms
+    # inherited from the maths (`stride_qz/qh/qm`) read badly and have caused
+    # real mix-ups during AOTriton's kernel development. Axis 3 is `D`, which is
+    # contiguous by contract, so it is never passed.
+    #
+    STRIDES_CONSTEXPR = strides_constexpr
+
     # ---- LDS layout ----
     # K is padded rather than XOR-swizzled (a swizzle was implemented and
     # measured a net loss; see sdpa_lore_gfx1201.md). Chunking bounds the V
@@ -599,6 +631,19 @@ def build_flash_attn_func_aiw_module_primary(
         V: fx.Pointer,
         O: fx.Pointer,  # noqa: E741
         seq_len: fx.Int32,
+        stride_q0: fx.Int64,
+        stride_q1: fx.Int64,
+        stride_q2: fx.Int64,
+        stride_k0: fx.Int64,
+        stride_k1: fx.Int64,
+        stride_k2: fx.Int64,
+        stride_v0: fx.Int64,
+        stride_v1: fx.Int64,
+        stride_v2: fx.Int64,
+        stride_o0: fx.Int64,
+        stride_o1: fx.Int64,
+        stride_o2: fx.Int64,
+        sm_scale_arg: fx.Float32,
     ):
         elem_type = elem_numeric_cls.ir_type
         elem_dtype = elem_numeric_cls
@@ -751,17 +796,51 @@ def build_flash_attn_func_aiw_module_primary(
         # So the batch/head/tile origin stays in 64 bits, and it is uniform
         # across the wave -- which is also exactly the shape LLVM's
         # SelectGlobalSAddr folds into an SGPR base plus a 32-bit VGPR offset.
-        _bh_base = batch_idx * seq_len_v * STRIDE_TOKEN + head_idx * HEAD_DIM
+        # Strides, either folded or taken from arguments. The *body* below is
+        # identical either way -- FlyDSL's arithmetic accepts a Python int and
+        # an fx value interchangeably -- so only this binding differs. That is
+        # the whole reason a single kernel source can serve both the JIT and AOT
+        # paths (see D2 in sdpa-close-gap-plan1.md).
+        if const_expr(STRIDES_CONSTEXPR):
+            # Axis 0 (batch) still depends on the runtime seq_len, so it is
+            # never a compile-time constant even here; only 1 and 2 fold.
+            _st = (seq_len_v * STRIDE_TOKEN, STRIDE_TOKEN, HEAD_DIM)
+            q_st = k_st = v_st = o_st = _st
+            sm_log2e = fx.Float32(sm_scale * _LOG2E)
+        else:
+            q_st = (fx.Index(stride_q0), fx.Index(stride_q1), fx.Index(stride_q2))
+            k_st = (fx.Index(stride_k0), fx.Index(stride_k1), fx.Index(stride_k2))
+            v_st = (fx.Index(stride_v0), fx.Index(stride_v1), fx.Index(stride_v2))
+            o_st = (fx.Index(stride_o0), fx.Index(stride_o1), fx.Index(stride_o2))
+            sm_log2e = _fmul(sm_scale_arg, fx.Float32(_LOG2E))
 
-        def tile_base(tile_start):
-            """Uniform 64-bit element base for (batch, head, tile_start)."""
-            return _bh_base + tile_start * STRIDE_TOKEN
+        # Q/K/V/O each get their own address pair. They genuinely differ: K and
+        # V are whatever the caller allocated (`mha_fwd_aot` passes them through
+        # untouched), and under MQA/GQA they carry Num_head_k rather than
+        # Num_head_q, so their head stride differs from Q's by construction.
+        # Assuming one shared layout is not a simplification, it is wrong.
+        def _addr_pair(st, head):
+            s_batch, s_seq, s_head = st
+            bh = batch_idx * s_batch + head * s_head
 
-        def tile_off(row_in_tile, col):
-            """Divergent 32-bit element offset inside the tile."""
-            return row_in_tile * STRIDE_TOKEN + col
+            def tbase(tile_start):
+                """Uniform 64-bit element base for (batch, head, tile_start)."""
+                return bh + tile_start * s_seq
 
-        def kv_addr(tile_start, row_in_tile, col):
+            def toff(row_in_tile, col):
+                """Divergent 32-bit element offset inside the tile."""
+                return row_in_tile * s_seq + col
+
+            return tbase, toff
+
+        # head_idx is used for all four today; P1 splits it into off_h_q for
+        # Q/O and off_h_k for K/V when MQA/GQA lands.
+        q_tbase, q_toff = _addr_pair(q_st, head_idx)
+        k_tbase, k_toff = _addr_pair(k_st, head_idx)
+        v_tbase, v_toff = _addr_pair(v_st, head_idx)
+        o_tbase, o_toff = _addr_pair(o_st, head_idx)
+
+        def _kv_addr(tbase, toff, tile_start, row_in_tile, col):
             """(uniform base, divergent offset) for a KV row, clamped in bounds.
 
             At K_PREFETCH_DIST == 1 the loop runs one tile ahead, so the final
@@ -781,13 +860,19 @@ def build_flash_attn_func_aiw_module_primary(
                 and V_PREFETCH_DIST == 0
                 and not KV_NEEDS_GUARD
             ):
-                return tile_base(tile_start), tile_off(row_in_tile, col)
+                return tbase(tile_start), toff(row_in_tile, col)
             ts = fx.Index(
                 ArithValue(tile_start < seq_len_v).select(tile_start, seq_last)
             )
             in_range = (ts + row_in_tile) < seq_len_v
             row = fx.Index(ArithValue(in_range).select(row_in_tile, seq_last - ts))
-            return tile_base(ts), tile_off(row, col)
+            return tbase(ts), toff(row, col)
+
+        def k_addr(tile_start, row_in_tile, col):
+            return _kv_addr(k_tbase, k_toff, tile_start, row_in_tile, col)
+
+        def v_addr(tile_start, row_in_tile, col):
+            return _kv_addr(v_tbase, v_toff, tile_start, row_in_tile, col)
 
         def _split_ptr(ptr, base64, off32):
             """ptr + base64 (uniform, 64-bit) + off32 (divergent, 32-bit)."""
@@ -866,7 +951,7 @@ def build_flash_attn_func_aiw_module_primary(
             vecs = []
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
-                b64, o32 = kv_addr(
+                b64, o32 = k_addr(
                     tile_start, load_row_in_batch + row_offset, load_col_base
                 )
                 vecs.append(load_global_f16xN(k_ptr, b64, o32))
@@ -907,13 +992,13 @@ def build_flash_attn_func_aiw_module_primary(
                 if const_expr(KV_NEEDS_GUARD):
                     row_valid = lds_row < fx.Index(BLOCK_N)
                     if row_valid:
-                        b64, o32 = kv_addr(tile_start, lds_row, load_col_base)
+                        b64, o32 = k_addr(tile_start, lds_row, load_col_base)
                         _lds_store_vx(
                             load_global_f16xN(k_ptr, b64, o32),
                             k_base + lds_row * K_STRIDE + load_col_base,
                         )
                 else:
-                    b64, o32 = kv_addr(tile_start, lds_row, load_col_base)
+                    b64, o32 = k_addr(tile_start, lds_row, load_col_base)
                     _lds_store_vx(
                         load_global_f16xN(k_ptr, b64, o32),
                         k_base + lds_row * K_STRIDE + load_col_base,
@@ -963,7 +1048,7 @@ def build_flash_attn_func_aiw_module_primary(
                         col = fx.Index(chunk * VO_CHUNK_COLS) + col
                     if const_expr(D_OFFSET):
                         col = fx.Index(D_OFFSET) + col
-                    b64, o32 = kv_addr(tile_start, kv_base + _tr_kv_off, col)
+                    b64, o32 = v_addr(tile_start, kv_base + _tr_kv_off, col)
                     vecs.append(_global_load_tr_v8(v_ptr_i64, b64, o32))
             else:
                 for batch in range_constexpr(NUM_BATCHES_V):
@@ -971,7 +1056,7 @@ def build_flash_attn_func_aiw_module_primary(
                     col = v_col_base
                     if const_expr(D_OFFSET):
                         col = fx.Index(D_OFFSET) + col
-                    b64, o32 = kv_addr(tile_start, v_row_in_batch + row_offset, col)
+                    b64, o32 = v_addr(tile_start, v_row_in_batch + row_offset, col)
                     vecs.append(load_global_f16xN(v_ptr, b64, o32))
             return vecs
 
@@ -1017,7 +1102,7 @@ def build_flash_attn_func_aiw_module_primary(
             wave_q_offset + fx.Index(qt * WMMA_M) + lane16
             for qt in range_constexpr(Q_ROW_TILES)
         ]
-        q_tile_base = tile_base(q_start)
+        q_tile_base = q_tbase(q_start)
         c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
 
         q_in_bounds_all = []
@@ -1034,7 +1119,7 @@ def build_flash_attn_func_aiw_module_primary(
             _packs = []
             for ks in range_constexpr(K_STEPS_QK):
                 q_col = shard_qk_off + fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
-                raw = load_global_v8f16(q_ptr, q_tile_base, tile_off(_safe, q_col))
+                raw = load_global_v8f16(q_ptr, q_tile_base, q_toff(_safe, q_col))
                 _packs.append(ArithValue(_in).select(raw, c_zero_v8f16))
             q_in_bounds_all.append(_in)
             q_b_packs_all.append(_packs)
@@ -1043,7 +1128,7 @@ def build_flash_attn_func_aiw_module_primary(
         c_neg_inf = fx.Float32(float("-inf"))
         c_zero_f = fx.Float32(0.0)
         c_one_f = fx.Float32(1.0)
-        c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
+        c_sm_scale_log2e = sm_log2e
         c_zero_v8f32 = Vec.filled(8, 0.0, fx.Float32)
         width_i32 = fx.Int32(WARP_SIZE)
         shuf_16_i32 = fx.Int32(16)
@@ -1489,8 +1574,8 @@ def build_flash_attn_func_aiw_module_primary(
                         d_col = fx.Index(D_OFFSET) + d_col
                     _store_global_half(
                         o_ptr,
-                        q_tile_base,
-                        tile_off(q_rows_in_tile[qt], d_col),
+                        o_tbase(q_start),
+                        o_toff(q_rows_in_tile[qt], d_col),
                         o_trunc,
                     )
 
@@ -1511,7 +1596,26 @@ def build_flash_attn_func_aiw_module_primary(
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
         grid_x = bs_idx * num_q_tiles * NUM_HEADS
 
-        launcher = flash_attn_func_aiw_kernel(Q, K, V, O, seq_len)
+        # BSHD strides, numbered by axis: 0 = batch, 1 = seq, 2 = head.
+        # Axis 3 is D, contiguous by contract, so it is not passed.
+        # Always supplied: with STRIDES_CONSTEXPR the kernel simply does not
+        # read them, which is what makes the two arms directly comparable.
+        # All four tensors are BSHD with identical strides in this wrapper.
+        # They are passed separately anyway because the kernel must not assume
+        # it -- K/V come straight from the caller in `mha_fwd_aot`, and under
+        # MQA/GQA they carry Num_head_k rather than Num_head_q.
+        _s0 = fx.Int64(sl_idx * STRIDE_TOKEN)
+        _s1 = fx.Int64(STRIDE_TOKEN)
+        _s2 = fx.Int64(HEAD_DIM)
+
+        launcher = flash_attn_func_aiw_kernel(
+            Q, K, V, O, seq_len,
+            _s0, _s1, _s2,
+            _s0, _s1, _s2,
+            _s0, _s1, _s2,
+            _s0, _s1, _s2,
+            fx.Float32(sm_scale),
+        )
 
         if const_expr(waves_per_eu is not None):
             _wpe = int(waves_per_eu)

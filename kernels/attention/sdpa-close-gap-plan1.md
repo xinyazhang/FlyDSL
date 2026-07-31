@@ -1,0 +1,747 @@
+# Plan 1: Closing the Feature Gap with AOTriton `attn_fwd`
+
+Supersedes `sdpa-close-gap-plan0.md`. Written after building the unified
+kernel, which resolved **D1** and changed several assumptions the first draft
+rested on. All decisions are now resolved; §1 is done and measured, §2 is what
+building it taught us that the first plan got wrong.
+
+---
+
+## 0. Where this kernel is going
+
+**This is not a standalone kernel.** It will be wired into the AOTriton API as
+a gfx1201 backend, and once functional parity is reached it **fully replaces
+the Triton `attn_fwd` kernel on gfx1201**, on performance grounds. That target
+fixes several things that would otherwise look like free choices:
+
+- **The ABI is `aotriton::v3::flash::attn_fwd_params`**, not something of our
+  own design. Argument names, semantics and derivations must match
+  `modules/flash/csrc/attn_fwd.cc`, which is the layer that turns PyTorch's
+  tensors into kernel arguments (`BLOCK_DMODEL` rounding, `PADDED_HEAD`,
+  `Num_seqlens` sign convention, `Batch`, `Num_CU`). Read it as the spec.
+- **The caller is `mha_fwd_aot` / `mha_varlen_fwd_aot`** in PyTorch
+  (`~/mha_all_aot.hip`), at the end of a chain of pure *view* changes:
+
+      any last-dim-contiguous tensor
+        -> BSHD shape          (shim layer, shared by CUDA and ROCm)
+        -> BSHD shape          (flash API, shared by CUDA and ROCm)
+        -> q.permute({0,2,1,3})  (mha_fwd_aot, here)
+        -> BHSD shape          (AOTriton API)
+
+  Not one of those steps copies, so:
+
+  - **The shape is BHSD. The memory layout is any `xxxD` permutation** — `D`
+    contiguous and innermost, with `B`, `H`, `S` in any order above it. A
+    natively-BHSD tensor comes out the far end as BHSD shape over BHSD memory
+    (the two transposes cancel); a BSHD one as BHSD shape over BSHD memory; and
+    nothing stops a caller handing us something as exotic as SHBD, where batch
+    is not even the outermost axis. None of it is detectable from the shape.
+  - Therefore **strides must be read, never derived from the shape.** Our
+    `STRIDE_TOKEN = num_heads * head_dim` is not merely inflexible — it silently
+    assumes one of the layouts and is wrong for the others.
+  - **Correctness and performance have different scopes.** The kernel must be
+    *correct* for any layout the strides can express, SHBD included. It only
+    needs to be *fast* on **BHSD and BSHD**, which are the de-facto standards
+    and the only ones the tuning tables and cooperative-load geometry target.
+    An exotic layout should produce the right answer slowly, not the wrong
+    answer quickly.
+  - varlen arrives as `q.unsqueeze(0).transpose(1, 2)`, i.e. `(1, H, total, D)`.
+- **Selection is per-functional**, via `context.lookup_optimal(gpu)` with a
+  `force_backend_index` override. So partial coverage is deployable: a
+  functional we do not yet support falls back to Triton rather than failing,
+  which makes the P1..P6 order a shipping order and not just a build order.
+
+---
+
+## 1. Status: D1 is done
+
+`flash_attn_func_gfx1201_aiw.py` (1622 L) unifies the three kernels. The
+originals are untouched on disk and now serve as correctness oracles, reachable
+through `variant="legacy" | "legacy_bp" | "legacy_m32"`.
+
+**Correctness.** 124 tests pass (61 pre-existing, unchanged, now running
+through aiw; 63 new in `test_flash_attn_func_gfx1201_aiw.py`).
+
+| oracle | aiw knobs | result |
+|---|---|---|
+| baseline | `k_dist=0, v_dist=1, v_layout=row` | **bitwise**, head_dim 16/32/64/128 × causal |
+| bp | `k_dist=1, v_dist=1, v_layout=transposed` | **bitwise**, head_dim 64/128 × causal × f16/bf16 |
+| m32 | `+ q_row_tiles=2` | **bitwise**, head_dim 64 × causal |
+| sharded / chunked | policy defaults | tolerance vs fp32 SDPA, full ladder 16…512 |
+| V column window | `head_dim_v` / `d_offset` | tolerance, (512,128) (384,128) (256,128) (256,64) |
+
+**Performance** (B=1 H=8 N=4096 f16, interleaved 3-rep A/B, `bench_aiw_ab.py`):
+
+Worst case **0.984** (head_dim 32 non-causal); head_dim 16 non-causal 0.985;
+**every other config in the 13-point ladder × causal is within ±0.5%**.
+
+**Registers**: identical to legacy at every head_dim on the ladder (one config
+one VGPR better). Zero new spills; head_dim 512 still spills 3, as before.
+
+This lands inside the "minor regressions accepted" policy. The residual ~1.5%
+at head_dim 16/32 is the 64/32-bit address split — which is the deliberate
+upgrade, and which the legacy baseline never had.
+
+---
+
+## 2. What building it changed
+
+### 2.1 The knob space has 7 axes, not 5 — and the missing one cost 9.6%
+
+Plan 0's table was wrong. **K and V prefetch distances are independent.**
+
+    kernel      K dist   V dist
+    baseline      0        1      <-- asymmetric
+    bp            1        1
+    m32           1        1
+
+The baseline kernel's "Opt4: pre-issue first V global load before loop" carries
+V in registers exactly as bp does; only *K* is staged at distance 0. Folding
+the two into one `K_PREFETCH_DIST` knob produced a **(K=0, V=0) schedule that
+exists in none of the three originals**, and it cost 9.6% at head_dim 32
+non-causal.
+
+Worth stating plainly because the same reasoning applies to the feature work: a
+knob that looks like one axis because two variants happen to move it together
+may be two.
+
+### 2.2 Bitwise parity has two blind spots
+
+This is the most important methodology finding, and it changes §5 of plan 0.
+Bitwise output equality against an oracle is a strong check, but it is blind
+to:
+
+1. **Tiling geometry.** Each Q row's arithmetic is identical however rows are
+   grouped into blocks. aiw's `q_row_tiles=2` config was building BLOCK_M=512
+   with 16 waves where m32 uses 256 with 8 — doubling per-wave register
+   pressure on top of the knob's own cost — and passed the bitwise test.
+   Caught only by reading the geometry.
+2. **Prefetch distance.** Dropping a prefetch never changes the output. §2.1
+   passed every correctness test.
+
+Both are *performance* properties invisible to *correctness* tests, on a kernel
+where the benchmark noise floor (~5%) is comparable to the effects. Neither
+would have been caught by ISA diffing either, since ISA divergence is expected.
+
+**Consequence for P1-P6:** every phase needs an explicit structural assertion
+alongside its correctness test — BLOCK_M and wave count, prefetch distances,
+barrier count per iteration. `test_block_m_is_invariant_to_q_row_tiles` is the
+pattern.
+
+### 2.3 A tuning table needs one key, and `BLOCK_DMODEL` is it
+
+`qk_shards()` keys off `head_dim` alone. Introduce a V/O window narrower than
+head_dim and it immediately produces invalid geometry: head_dim 384 prefers 3
+shards, which splits a 128-column window into 42-column slices — not a multiple
+of `WMMA_N`. Fixed with `resolve_shards()`, which walks down from the policy
+preference to the first count satisfying both constraints.
+
+Plan 0 read this as a warning that every table would have to become 2-D over
+`(Hdim_qk, Hdim_vo)`. **That was wrong, and AOTriton's build rules say so
+directly** (`modules/flash/aot/attn_fwd.py`):
+
+```python
+@ati.scalar('BLOCK_DMODEL', options=block_dmodel_values())   # constexpr axis
+@ati.scalar(['Hdim_qk', 'Hdim_vo'], 'i32')                   # runtime scalars
+@ati.scalar('PADDED_HEAD', options=[False, True])
+@ati.derives('Hdim_qk', to='BLOCK_DMODEL', when=ati.eq('PADDED_HEAD', False))
+@ati.derives('Hdim_vo', to='BLOCK_DMODEL', when=ati.eq('PADDED_HEAD', False))
+```
+
+with `block_dmodel_values()` (`aot/_common.py`) defaulting to
+`16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 512` — **exactly our
+existing head_dim ladder**.
+
+So there is a *single* constexpr tile width. The host picks the smallest ladder
+value covering both real head dims; `Hdim_qk` / `Hdim_vo` are runtime arguments
+that only control masking and zero-fill, and when `PADDED_HEAD` is False they
+are both equal to `BLOCK_DMODEL`. Tuning keys on that one scalar.
+
+Our tables are therefore **already correctly keyed** — `head_dim` is
+`BLOCK_DMODEL` under a different name. No 2-D sweep, no register-budget model,
+no fallback policy. See **[N3 — RESOLVED]**.
+
+### 2.4 V column slicing was dead code in production
+
+`_use_bp()` returns True for every `head_dim >= 48`, and the interface computed
+`slice_w = head_dim if use_bp else _v_slice_width(head_dim)` — so the slicing
+loop never ran with more than one iteration on the default path. The baseline's
+V-window machinery has been unreachable in production since bp took over.
+
+It is now alive and tested in aiw, deliberately: P1 needs an independent
+`Hdim_vo` regardless, so the capability had to be preserved rather than
+retired. But it means the code path had no production coverage before this
+work, and its measured cost is unknown.
+
+### 2.5 The merge added a fourth copy of the scaffolding
+
+Plan 0 step 5 (extract the ~440 lines of shared preamble/tail into a common
+module) did **not** happen, because you asked to keep the originals. aiw
+therefore carries its own copy of `dtype_to_elem_type`, `_run_compiled`, the
+`_llvm_*` / `_pointer_*` glue, `_ptr_arg`, `_wrap_qkvo`, `_launch`, `_compile`
+and the whole launch wrapper. There are now **four** copies, not one.
+
+That is the correct trade for now — the oracles are worth more than the
+duplication — but it is a debt with a due date. See **[DECISION N1]**.
+
+---
+
+## 3. Decisions
+
+### [N1 — RESOLVED] Scaffolding moves to a common module *after* the oracles retire
+
+Ordering as recommended, so the oracles stay byte-identical to the production
+kernels they were. Additional scope: the common module is expected to be shared
+with the **backward** kernels too, so design it for that rather than as a
+forward-only dedup. (Speculative — the backward kernels do not exist here yet;
+do not over-fit the interface to forward's needs in the meantime.)
+
+### [N2 — RESOLVED] Oracles retire at the end of P2, with their numbers recorded
+
+Accepted. **Record the legacy performance numbers before deleting them** —
+once the files are gone the A/B in `bench_aiw_ab.py` has no comparison arm, and
+the pre-unification ladder becomes unreproducible. Capture the full
+head_dim × causal ladder with VGPR/spill counts into `sdpa_lore_gfx1201.md` as
+a frozen reference table at the point of retirement.
+
+### [N3 — RESOLVED] Key on `BLOCK_DMODEL`; seqlen binning later; asymmetric hdim is not a goal
+
+Per §2.3, the tables already key correctly — `head_dim` is `BLOCK_DMODEL`.
+Three consequences:
+
+1. **One constexpr tile width, two runtime head dims.** Drop plan 0 §2.5's
+   `BLOCK_DMODEL_QK` / `BLOCK_DMODEL_VO` split — it does not match the AOT
+   model and buys nothing. The host picks the smallest ladder value covering
+   `max(Hdim_qk, Hdim_vo)`; the kernel masks and zero-fills down to the real
+   dims. `(Hdim_qk, Hdim_vo)` cannot be a tuning key in an AOT kernel because
+   they are *arguments*, not build axes.
+2. **Optimising asymmetric head dims is explicitly not a goal.** A
+   `(7, 511)` call runs a 512-wide QK GEMM and wastes most of it. Correct, and
+   accepted. This also retires the last remnant of the dynamic-VGPR idea
+   (plan 0 §2.5.1), whose only motivation was asymmetric hdim.
+3. **Tuning should eventually key on `(seqlen_q, seqlen_k)`.** AOTriton bins on
+   exactly that — `@ati.tune.binning(Max_seqlen_q=le, Max_seqlen_k=le)`. Out of
+   scope now: keep the current fixed `seqlen_q == seqlen_k` tables and revisit
+   once P2 makes `seqlen_q != seqlen_k` legal. Noted so the tables are not
+   mistaken for final.
+
+### [D2 — ANSWERED by P0] Keep only the general path; AOT costs ~0.2%
+
+**P0 is done.** Strides (`stride_0/1/2`, numeric naming) and `sm_scale` are
+runtime arguments in `flash_attn_func_gfx1201_aiw.py`, with
+`strides_constexpr=True` retained purely as an A/B arm.
+
+Measured with **all four independent stride triples** (`stride_q*`, `stride_k*`,
+`stride_v*`, `stride_o*`), i.e. the real AOT argument set, not a proxy:
+
+| measurement | 1 shared triple | **4 per-tensor triples** |
+|---|---|---|
+| perf, median over ladder × causal | 0.998 | **0.996** |
+| worst | 0.970 (hd 16 causal) | 0.967 (hd 16 causal) |
+| best | 1.045 (hd 192 causal) | 1.041 (hd 192 causal) |
+| VGPRs | +0 to +4 | **+0 to +4** (unchanged) |
+| SGPRs | +4 | +22 |
+| spills | none new | **none new** |
+| output | bitwise identical | bitwise identical |
+
+The spread is symmetric about 1.0 and several configs come out faster, so this
+is the board's noise floor, not a cost. Well under the ~3% threshold this
+decision was gated on, so: **ship the general path only.** The folded arm stays
+in the source as a diagnostic for later phases — if addressing ever becomes
+expensive we want to A/B against it — but is not a shipping configuration.
+
+Three things worth carrying forward:
+
+- **The kernel body needed no branch at all.** Only the binding site differs;
+  FlyDSL's arithmetic accepts a Python `int` and an `fx` value interchangeably.
+  That is what makes one source serve both paths, and it is the pattern every
+  later runtime-value promotion should follow.
+- **Per-tensor strides are SGPR-only.** Going from one triple to four cost +18
+  SGPRs and *zero* additional VGPRs, because the strides are uniform scalars
+  that only change which value each address multiplies. SGPRs are not the
+  occupancy constraint on RDNA4; VGPRs are.
+- **One shared triple was not just imprecise, it was wrong.** `mha_fwd_aot`
+  passes K and V through untouched, so their layout is whatever the caller
+  allocated and is independent of Q's; under MQA/GQA they carry `Num_head_k`
+  and differ by construction. Doing this in P0 rather than P1 also structurally
+  separates Q/O from K/V addressing, which is the prerequisite MQA/GQA needs
+  anyway — `head_idx` is now a parameter of the address builder, ready to split
+  into `off_h_q` / `off_h_k`.
+
+### [D2 — background] FlyDSL does support Triton-style specialization
+
+Confirmed in the source. `Constexpr` (`python/flydsl/expr/typing.py:450`) is a
+real parameter annotation on `@flyc.jit`:
+
+- constexpr-annotated params are **excluded from the runtime argument slots**
+  (`compiler/jit_function.py:1121`), and
+- their values are folded into the **JIT cache key** via
+  `Constexpr.value_signature` (`jit_function.py:1321`).
+
+So your assumption holds: one kernel source, specialised at compile time. For
+our builders it is simpler still — a stride is either a Python `int` from the
+builder closure or an `fx.Int32` kernel argument, and FlyDSL's arithmetic
+overloads accept both, so the *body* needs no branch at all. Only the binding
+site does.
+
+The maintenance half of D2 therefore dissolves: keeping both paths is one
+`const_expr` at the binding site, not two code paths. **P0 still measures the
+delta**, but now only to know the price of AOT, not to decide whether we can
+afford two paths.
+
+### [D3 — RESOLVED] `seq_info_q` / `seq_info_k`, and `varlen_mode`
+
+`seq_info_q/k` — "bounds" wrongly implies interval endpoints when the packed
+case holds cumulative lengths. `varlen_mode` as proposed.
+
+### [D4 — RESOLVED] ALIBI out of scope
+
+Confirmed independently by the build rules: `@ati.scalar('USE_ALIBI',
+options=[False])` — alibi is not in the shipped AOT set at all. Same for
+`INT8` / `INT8_KV` / `USE_P_SCALE` and `RETURN_ENCODED_SOFTMAX`.
+
+### [LSE — RESOLVED] Rank-2, fp32, one unified offset formula
+
+`@ati.tensor('L', '*fp32:16', rank=2)` — always rank 2, always fp32. The layout
+is a function of `varlen_mode`, and `(B*H, S)` vs `(B, H, S)` is cosmetic (same
+buffer, same offsets). The two real layouts are:
+
+| mode | layout | `_lse_offset(b, h, s, H, S)` inputs |
+|---|---|---|
+| non-varlen | `(B*H, Max_seqlen_q)` | `b=batch_index, s=0, S=Max_seqlen_q` |
+| varlen | `(H, TotalS)` | `b=0, s=cu_seqlens_q_start, S=total` |
+
+**Write it as one code path, not an `if varlen_mode` branch.** AOTriton already
+does: `_lse_offset` is `((b*H + h) * S) + s` with no branching — the mode
+selects the *inputs* (`batch_index`, `cu_seqlens_q_start`, `lse_stride`), which
+are computed once in the prologue. Adopt that shape; it is the same trick that
+makes the rest of the varlen path branch-free.
+
+### [Output dtype — RESOLVED] Same as Q, by construction
+
+`@ati.type_var('T_io', dtype=MAIN_DTYPES, signature_name='Q')` and Q, K, V,
+`Out`, B, A all declared as `'T_io'` — a single type variable. Out cannot
+differ from Q in the shipped kernels. Our existing constraint is correct; keep
+it and state it as an invariant rather than an incidental restriction.
+
+### [D5 — RESOLVED] `F.pad` and the pad-ratio guard go away, once masking works
+
+Both are host-side workarounds for the kernel's inability to handle a
+`seq_len` that is not a multiple of `BLOCK_M`. `F.pad`
+(`torch.nn.functional.pad`) allocates padded copies of Q/K/V and the guard
+rejects the non-causal cases where the resulting zero K/V rows would perturb
+the softmax denominator. In-kernel `Max_seqlen_q/k` masking makes both
+obsolete, and keeping the guard would then be actively wrong — it would reject
+calls the kernel can answer correctly.
+
+Sequencing: delete them **in the same commit as the masking**, behind the
+ragged-shape tests below, never ahead of them. The guard currently converts a
+silent wrong answer into a loud failure; removing it early would reverse that.
+Deleting `F.pad` also removes a three-tensor copy on every unaligned call
+(~25 MB at B=1 H=8 N=4096 d=128 f16), so it is a speedup as well as a
+correctness fix.
+
+### Terminology: three things called "hdim"
+
+Earlier drafts of this plan conflated these and drew wrong conclusions twice.
+Use the specific term, never the bare word:
+
+| term | meaning | value | who sets it |
+|---|---|---|---|
+| **`Hdim_qk` / `Hdim_vo`** | logical extent — the count of *real* elements | any integer 1..512, **no alignment guarantee** | caller, as `Q.size(3)` / `V.size(3)` |
+| **`pitch`** | storage stride of the `D` axis | multiple of 8 elements (16 B), `>= ceil8(Hdim)` | allocator |
+| **`BLOCK_DMODEL`** | compile-time tile width | from the ladder, `round_value(max(Hdim_qk, Hdim_vo))` | build axis |
+
+`attn_fwd.cc` makes the relationship explicit:
+
+```c++
+int hdim_qk = in.Q.size(3);                                  // logical, unaligned
+int16_t hdim_rounded = round_value(hdim_max, compiled_head_dims);
+.BLOCK_DMODEL = hdim_rounded,
+.Hdim_qk = hdim_qk, .Hdim_vo = hdim_vo,
+.PADDED_HEAD = (hdim_rounded != hdim_qk || hdim_rounded != hdim_vo),
+```
+
+So **`Hdim_qk` can be 7.** PyTorch's `pad_last_dim` grows the *allocation* to a
+multiple of 8, but the AOTriton API contract requires the caller to slice back
+to the real extent (`[:, :, :, :hdim]`), so the kernel receives the logical
+size. The padding shows up as `pitch`, not as `Hdim`.
+
+**`pitch` is an analysis-only term and must never appear in the kernel
+source.** It is already carried by the strides, and with a flexible memory
+layout there is no way to say *which* stride it is. The rule is: **whichever of
+`B`, `H`, `S` is innermost in memory supplies the pitch** — and under the fixed
+BHSD *shape*, that can be any of the three. Examples, not an enumeration:
+
+| memory layout | innermost of B/H/S | the "pitch" is |
+|---|---|---|
+| BHSD | `S` | `stride_q2` |
+| BSHD | `H` | `stride_q1` |
+| SHBD | `B` | `stride_q0` |
+
+Every permutation of the leading three axes is legal (§0), so the question
+"which stride is the pitch" has no answer the kernel could compute — it is a
+function of the runtime stride *values*, never of the shape. The kernel has no
+business asking.
+
+Its only job is in this document — it is what licenses the claim that a whole
+8-element chunk starting on a multiple of 8 cannot fault. That is a property of
+the §0 contract, not a quantity to compute. Everything the kernel actually
+does is expressed in terms of the two things it is given: **strides** for
+addressing, **`Hdim_qk`/`Hdim_vo`** for bounds. If `pitch` ever shows up as a
+variable, something has been derived that should have been passed.
+
+### The alignment contract the kernel may assume
+
+**Where the guarantee comes from matters:** PyTorch itself promises nothing
+about the memory layout of an SDPA input. The contract below is upheld by the
+**shim layer shared by the CUDA and ROCm backends** (§0), which normalises
+whatever the user allocated before it reaches the flash API. Treat it as a
+property of that layer, not of PyTorch — if a future caller bypasses the shim,
+the contract does not hold and this kernel is not safe on its inputs.
+
+1. **Base tensors are always 16-byte aligned.**
+2. **The `D` axis is contiguous with a 16-byte-multiple stride**, i.e. `pitch`
+   is a multiple of 8 elements at f16/bf16. Every other axis is free.
+3. **Nothing about `Hdim` itself**, and **nothing about the content of
+   `[Hdim, pitch)`** — it may have been zero-filled by `at::pad_symint`, but a
+   tensor that arrived by another route need not have been. Do not rely on it;
+   AOTriton does not (`composed_load(..., other=0.0)` regardless).
+
+Consequence: a whole 8-element chunk starting at a multiple of 8 and lying
+inside `pitch` is always **safe to load** — never a fault — but its tail may be
+**garbage** whenever `Hdim % 8 != 0`.
+
+`ENABLE_LDS_VEC16` (32-byte loads, currently on by default) is **not** covered
+by the 16-byte guarantee and must be fixed or gated in P1.
+### Out-of-range loads: two different problems, one of them free
+
+There are **three** regions, not two, and they need three different treatments:
+
+| region | where | risk | fix |
+|---|---|---|---|
+| `[Hdim, pitch)` | inside the allocation, straddles one 8-chunk | garbage values | **per-element mask, `other=0`** |
+| `[pitch, BLOCK_DMODEL)` | next head's columns (BSHD interleaves H and D) | wrong values | **skip whole chunks** |
+| past `seqlen` | outside the allocation | **memory fault** | **buffer bounds** (hardware) |
+
+Accessing beyond `[-1, -1, -1, :]` is a real OOB access, so the seqlen case is
+the critical one — it cannot be repaired after the fact, and it is the one
+buffer addressing solves for free.
+
+Neither `D` region is a fault hazard, and both are easy to get backwards:
+
+- `[Hdim, pitch)` is **in-allocation but not guaranteed zero**, and because
+  `Hdim` carries no alignment guarantee this region can start mid-chunk. So
+  **per-element masking on the straddling chunk is genuinely required** when
+  `Hdim % 8 != 0`. (An earlier draft claimed it never was, on the mistaken
+  belief that the kernel receives a pre-rounded `Hdim`. It does not — see the
+  terminology table.)
+- `[pitch, BLOCK_DMODEL)` is a different animal: in BSHD the `H` and `D` axes
+  are adjacent, so those columns belong to head `h+1` — in-bounds memory
+  holding the wrong data. Only at the final head of the final token is it past
+  the allocation. Hardware bounds checking does not help; skipping the chunk
+  does.
+
+Both `D` regions collapse when `PADDED_HEAD=False`, where
+`Hdim_qk == Hdim_vo == BLOCK_DMODEL` by construction (`attn_fwd.cc` derives
+exactly this) and no masking is emitted at all. That is the common case and the
+one the perf ladder measures; `PADDED_HEAD=True` is the correctness fallback.
+Only `Q` and `K` need the treatment — `V`'s `D` tail lands in output columns
+the masked `O` store discards, and WMMA accumulates each output element
+independently, so it cannot reach a live column.
+
+**Buffer addressing solves the seqlen case in hardware, for free.** RDNA4 ISA
+§9.4 (buffer out-of-range rules):
+
+> Address Out-of-Range if: `offset >= ((stride==0 ? 1 : stride) * num_records)`.
+> 1. Loads that go out-of-range **return zero**. Stores that are out of range
+>    do not store anything.
+> 3. Load/store-DWORD-x{2,3,4} perform range-check **per component**.
+
+Per-component checking is the important clause: a 16-byte `dwordx4` (our
+`v8f16`) straddling the end returns zeros for exactly the components past it
+and real data for the rest. No branch, no clamp, no VALU cost, no fault — the
+addressing mode does it.
+
+FlyDSL exposes this: `buffer_ops.create_buffer_resource(...,
+num_records_bytes=...)` plus `buffer_ops.buffer_load(rsrc, offset, vec_width,
+...)`, whose offset is **i32 in elements**. That is our existing 64-bit-base +
+32-bit-offset split, except enforced by the hardware addressing mode instead of
+by hand — so adopting it replaces `_split_ptr` rather than adding to it.
+
+**The exception: `GLOBAL_LOAD_TR_B128` has no buffer form.** ISA §11.6.2 lists
+only `GLOBAL_LOAD_TR_B128` / `_B64`, and says "all fields of these instructions
+are identical to GLOBAL_LOAD_B64 and _B128" — global addressing only. Our
+transposed-V path (the default for head_dim >= 48) therefore cannot get
+hardware bounds checking and must keep an explicit clamp. That is
+correctness-safe: a masked-out KV row has `P = 0` after softmax, so whatever V
+holds contributes nothing; the clamp only has to prevent the *fault*, not
+produce the right value.
+
+So the P1 plan is:
+
+- **Q, K, O, row-major V → buffer loads.** Fault-free by construction, and the
+  seqlen tail needs no guard at all.
+- **Transposed V → keep the clamp**, documented as fault-avoidance only.
+- **`D` tail on Q and K → per-element mask on the straddling chunk, whole-chunk
+  skip beyond `pitch`.** Emitted only in `PADDED_HEAD=True` builds.
+- The one-time LDS-prologue zero-fill from plan 0 §2.5 **does not survive
+  contact with a straddling chunk**: the cooperative K store writes whole
+  8-element vectors, so it would overwrite pre-zeroed columns in that one
+  chunk. Either mask register-side between the global load and the LDS store,
+  or restrict the prologue trick to `Hdim % 8 == 0`. The trick is still free in
+  the `PADDED_HEAD=False` case, which is where it matters for perf.
+
+### `MASK_STEPS`: don't pay for the guard on blocks that don't need it
+
+Follow AOTriton's inner-kernel pattern (`_attn_fwd_inner(...,
+MASK_STEPS: tl.constexpr)`): put a **`constexpr[bool]` on the inner loop body**
+and use the clamped/guarded load form *only* when it is true. The full-block
+region is then emitted with plain unguarded loads, and the guarded form exists
+only in the masked region.
+
+This composes exactly with the interval decomposition (P2), which already
+splits the KV range into full and masked regions for other reasons — the full
+region calls the body with `MASK_STEPS=False`, the left/right masked regions
+with `MASK_STEPS=True`. No new structure, just a second use of the split.
+
+Three consequences, in descending order of importance:
+
+1. **It resolves the `GLOBAL_LOAD_TR_B128` problem.** The TR load cannot get
+   hardware bounds checking, but with this pattern it does not need it on the
+   hot path: for a `seqlen_k` divisible by `BLOCK_N` the clamped variant is
+   never instantiated, and for a ragged one it is confined to the handful of
+   tail blocks where the extra VALU is amortised over almost nothing. The
+   asymmetry between buffer-addressable and global-only loads stops mattering.
+2. **It is a win for the buffer-loaded tensors too**, not just TR. Even free
+   hardware bounds checking costs a wider addressing setup; skipping the guard
+   entirely on full blocks is strictly better.
+3. **It removes a cost we pay today unconditionally.** The current `kv_addr`
+   clamps on *every* iteration at *every* head_dim, because the schedule has no
+   notion of which blocks are interior.
+
+**Contingency: dynamic VGPR allocation across the `MASK_STEPS` boundary.**
+Only if register pressure turns out to be the binding constraint — otherwise
+disregard.
+
+Plan 0 §2.5.1 rejected dynamic VGPR, but on reasons that do not all carry over
+to this particular boundary, so it is worth re-examining rather than treating
+as settled:
+
+- The killer there was that `S_ALLOC_VGPR` drains the pipeline **twice per KV
+  tile** if placed at the GEMM1/GEMM2 boundary. Here the boundary is between
+  *whole regions* — masked, full, masked — which is crossed **O(1) times per
+  kernel invocation**, not once per tile. The drain amortises to nothing.
+- The other killer was that the register peak is loop-carried (`o_accs`,
+  `q_b_packs`) and so cannot be shrunk. That still bounds the *minimum*
+  allocation, but the masked region's extra state — mask predicates, guarded
+  address arithmetic, and under gSWA the window bounds and piecewise `start_n`
+  — is genuinely region-local. So unlike the GEMM-boundary case, there is
+  something real to release.
+
+What does **not** change: the segment size is a chip-wide config we cannot set,
+dynamic-VGPR workgroups take over a whole WGP, and hardware reserves forward
+progress for only one wave per SIMD while our workgroups run 8-16 waves that
+would all want the larger allocation at once. That last one is the ISA's
+explicitly un-mitigated deadlock case and is the reason to treat this as a
+contingency rather than a plan.
+
+Expected size of the win: **small at P2** (a mask is ~16 compares and 16
+selects at `BLOCK_N=32`, needing few temporaries beyond the full path), and
+**larger at P6**, where gSWA adds window bounds and two-region index logic to
+the masked path only. So if it is ever tried, P6 is the point, and only after a
+measurement shows occupancy — not latency — is what is limiting us.
+
+**Residual to handle, not a blocker.** Binding prefetch runs one tile ahead, so
+the last iteration of the full-block region addresses block `fb_hi + 1` — which
+is the masked region's first block when one exists, and past the end when it
+does not. So `MASK_STEPS=False` cannot mean "no bounds logic at all"; either
+the *prefetch address* keeps a clamp (cheap: one clamp on `tile_start`, on data
+that is discarded anyway, versus today's per-row clamp) or the loop peels its
+final iteration. Prefer the clamp-the-prefetch form first and measure peeling
+only if it shows up.
+
+**Coupling with D5 — the current clamps become safety-critical.** Today the
+kernel cannot fault on the seqlen axis, but not because of anything it does:
+`F.pad` hands it tensors already rounded up to `BLOCK_M`, so every address the
+clamps admit is inside a real allocation. The moment `F.pad` is deleted the
+kernel reads unpadded tensors directly, and `kv_addr`'s clamp stops being a
+tidiness measure and becomes the only thing between us and a memory violation.
+That is a second reason to land D5 and the masking in one commit, and a reason
+to prefer buffer addressing over the clamp wherever the instruction allows it:
+a hardware bound cannot be accidentally removed by a later refactor, and a
+hand-written clamp can.
+
+### Note arising: "causal" is not a build axis in the shipped set
+
+`@ati.scalar('CAUSAL_TYPE', options=[0, 3])` — only *two* values ship, and
+neither is the top-left (1) or bottom-right (2) variant. Causal is expressed as
+a **window**: type 3 with `Window_left`/`Window_right`, including the
+`0x80000001` / `0x80000002` sentinels for varlen.
+
+This does not change the phase order you set (gSWA last), but it does mean P6
+is not an optional extra — for AOT parity it is the *only* causal path, and the
+constexpr `CAUSAL_TYPE` introduced in P2 is strictly an intermediate. Worth
+knowing before P2's masking work is designed, so it is built to have its window
+values promoted to arguments rather than reworked.
+
+---
+
+## 4. Phases
+
+Unchanged in substance from plan 0; ordering still follows your constraints
+(dropout before gSWA; gSWA and persistent-dynamic last; no INT8). Deltas only:
+
+**P0 — price the de-constexpr-ing.** Unchanged, and now cheaper to run: one
+builder, one set of knobs, and per D2 the kernel *body* needs no branch —
+FlyDSL's arithmetic accepts a Python `int` or an `fx.Int32` interchangeably, so
+only the binding site differs. Promote `sm_scale` and the strides
+(`stride_q0/q1/q2`, per your numeric-naming instruction). Output is the price
+of AOT, not a go/no-go.
+
+**P1 — layout generality, MQA/GQA, LSE, numerics.** Simplified by N3:
+- **One constexpr tile width.** Rename the `head_dim` build parameter to
+  `BLOCK_DMODEL` to match AOTriton, add runtime `Hdim_qk` / `Hdim_vo` and
+  constexpr `PADDED_HEAD`. No two-width split, no table rework, no asymmetric
+  tuning. This is a much smaller item than plan 0 scoped.
+- **Strides become arguments, and shape stops implying layout.** Today
+  `STRIDE_TOKEN = num_heads * head_dim` derives the layout from the shape. The
+  caller hands us BHSD shape over BSHD memory (§0), so that derivation is wrong
+  for the actual production call — not merely inflexible. Name them
+  `stride_q0/q1/q2` numerically per your porting instruction; `stride_?3` is
+  the contiguous `D` axis and stays 1.
+- **Move Q/K/O and row-major V to buffer loads** (§3, "Out-of-range loads"),
+  which makes the seqlen axis fault-free in hardware and replaces the
+  hand-rolled 64/32 address split. Transposed V keeps its clamp — no buffer
+  form of `GLOBAL_LOAD_TR_B128` exists — which the `MASK_STEPS` knob then
+  keeps off the hot path.
+- `D` tail: on `Q`/`K`, skip the trailing `(BLOCK_DMODEL - Hdim)/8` chunks and
+  zero their registers — whole chunks only, never per-element. `V` needs
+  nothing beyond masking the `O` store. `PADDED_HEAD=False` builds have
+  `Hdim == BLOCK_DMODEL` and skip this entirely.
+- **Fix or gate `ENABLE_LDS_VEC16`** — 32-byte loads over a 16-byte-guaranteed
+  pitch is an out-of-allocation read once arbitrary `Hdim` is legal.
+- MQA/GQA on a 3D grid (also a P-later prerequisite for persistent-dynamic).
+- LSE as a single branch-free offset formula (see LSE above), fp32, rank 2,
+  behind an `L != nullptr` gate.
+- **structural assertions** per §2.2 accompany each change.
+
+Still carries the three numerics items, of which the FMA one is a real defect
+we have (`p = exp2(fma(s_raw, sm_scale_log2e, -sm_scale_log2e * m_new))` is
+structurally the pattern AOTriton flags in ROCm/aotriton#54), and it lands
+together with LSE because both need `m_i` kept in the scaled domain.
+
+**P2 — interval decomposition, in-kernel ragged masking.** Now also carries the
+`MASK_STEPS` constexpr (§3): the full-block region emits unguarded loads, the
+masked regions emit guarded ones. That is the same full/masked split the
+interval decomposition already produces, so it costs no extra structure — and
+it is what keeps the un-buffer-able TR load off the hot path. It is also the
+point at which the legacy oracles retire (N2 — record their numbers first).
+Deletes the 16-named-scalar causal unroll, which is duplicated in all four
+kernels today and is the reason `causal` requires `BLOCK_N == 32`. Design the
+window values as *promotable*: per the note above, the shipped AOT set has no
+CAUSAL_TYPE 1/2, so P2's constexpr causal is an intermediate on the way to P6's
+runtime window, not a parallel path.
+
+**P3 varlen · P4 bias · P5 dropout · P6 gSWA.** Unchanged.
+
+**Deferred:** persistent-dynamic (own task, wants P1's 3D grid), `NUM_XCDS`,
+INT8, fused `RETURN_ENCODED_SOFTMAX`, `PRE_LOAD_V`, mxfp8. Dynamic VGPR
+allocation is **rejected**, not deferred — see plan 0 §2.5.1; the register peak
+is loop-carried, so there is nothing to shrink at a phase boundary.
+
+---
+
+## 5. Verification standard (revised)
+
+Supersedes plan 0 §5. Three gates, not one:
+
+1. **Correctness** — bitwise against a preserved oracle where the FP reduction
+   order is unchanged; tolerance against fp32 SDPA where it is not
+   (`QK_SHARDS > 1`).
+2. **Structure** — explicit assertions on BLOCK_M, wave count, prefetch
+   distances and barrier count. Added because §2.2 found two performance bugs
+   that every correctness gate passed.
+3. **Performance** — `bench_aiw_ab.py`: interleaved 3-rep A/B, median of
+   per-rep *ratios*, full head_dim ladder × causal, reported with VGPR and
+   spill counts from `21_final_isa.s`. Never two sweeps compared after the
+   fact; the board drifts ~5%.
+
+Cumulative-risk table (each phase adds to a loop already latency-bound and
+spilling at head_dim 512):
+
+| phase | adds | watch |
+|---|---|---|
+| P0/P1 | ~12 stride SGPRs, address `v_mad`s | VGPR at hdim 192/256 |
+| P2 | dynamic trip count, piecewise `start_n` | loss of the unrolled inner loop |
+| P4 | a second global stream in the hot loop | LDS budget, `s_waitcnt` bubbles |
+| P5 | Philox VALU + state | VGPR at hdim >= 192; spills |
+
+Standing baseline: `B=1 H=8 N=4096 f16`, causal and non-causal, head_dim ∈
+{16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 384, 512}. Captured at every
+phase boundary.
+
+### 5.1 Shape matrix — AOTriton's `test_fast`, plus two adversarial cases
+
+Our current tests use round numbers throughout (`seq_len` 256/384/512,
+`num_heads` 2, `batch` 1-2). That is exactly the matrix that hides ragged-tail
+bugs, and it is why the cooperative-load batch-count defect reached NaN before
+being caught.
+
+The full AOTriton matrix (`REGULAR_SEQLEN` × `PRIME_SEQLEN_*` × all head dims ×
+…) is ~300K cases — not affordable. Use **`test_backward.py::test_fast`'s
+subset** instead, which is AOTriton's own answer to the same problem:
+
+| axis | values | note |
+|---|---|---|
+| `BATCH` | 3 | non-round: at 1 a batch-stride bug is invisible |
+| `N_HEADS` | 5, **(10, 2)** | the tuple is GQA — 10 Q heads, 2 KV heads |
+| `D_HEAD` | 8, 64, 184, **(24, 152)**, **(120, 8)** | tuples are `(Hdim_qk, Hdim_vo)` |
+| `seqlen_q` | 11, 523, 2048 | prime / prime / regular |
+| `seqlen_k` | 31, 337, 1063 | **different list from q** |
+| `causal` | False, True | |
+| `dropout_p` | 0.0 (, 0.5 from P5) | |
+| `dtype` | f16, bf16 | `DTYPES` also has f32; we do not support it |
+| `sm_scale` | `'l1'` | |
+| `storage_flip` | True | transposes axes (1,2) of the **allocation** |
+
+Roughly **360 forward cases** before dropout, 720 after — tractable per phase.
+
+Four things this encodes that our current tests do not:
+
+- **`seqlen_q` and `seqlen_k` come from different lists.** Any surviving
+  `Lq == Lk` assumption — which our kernel currently enforces outright — fails
+  immediately rather than on some later shape.
+- **`storage_flip=True` is the layout test.** It permutes the allocation dims
+  while keeping the logical shape, asserting only `x != 3 and y != 3` ("last
+  dimension must be continuous"). That is precisely the `xxxD`-permutation
+  contract from §0, and the thing a shape-derived `STRIDE_TOKEN` cannot
+  survive.
+- **Tuple `D_HEAD` values are asymmetric `Hdim_qk` / `Hdim_vo`.** `(24, 152)`
+  and `(120, 8)` are the cases N3 declined to *optimise* — they still have to
+  be *correct*.
+- **`D_HEAD = 184`** is a multiple of 8 that is not on the ladder, so it forces
+  `BLOCK_DMODEL = 192` and `PADDED_HEAD = True`; `D_HEAD = 8` forces
+  `BLOCK_DMODEL = 16`.
+
+#### Two extra cases
+
+1. **`D_HEAD = 512`.** The top of the ladder, and the only point that spills
+   (3 registers) today. Not in `test_fast`.
+
+2. **`Hdim = 113` in a 128-wide allocation, padding pre-filled with NaN.**
+   Allocate `D = 128`, fill the whole tensor with `NaN`, then write real data
+   into `[0, 113)` and pass `Hdim_qk = Hdim_vo = 113`. Any unmasked read of
+   `[113, 128)` propagates `NaN` straight to the output, so the assertion is
+   simply `torch.isfinite(out).all()`.
+
+   This is the sharpest test in the set because it covers **both** `D`-tail
+   regions at once: `[113, 120)` is the straddling chunk that needs per-element
+   masking, and `[120, 128)` is whole chunks past `ceil8(Hdim)`. It would have
+   caught the claim — made and retracted twice in this document — that
+   per-element `D` masking is never required. Add it as a standing regression,
+   not just a P1 check.
+
+   (`_common_test.py` already has the `fillnan` helper for this idiom; AOTriton
+   uses it on output and backward tensors to prove unwritten regions are never
+   read. Same trick, applied to input padding.)
