@@ -418,6 +418,84 @@ def test_gqa_head_mapping_is_grouped_not_strided():
         assert rel < 5e-3, f"query head {h} did not read KV head {kh} (rel={rel:.3e})"
 
 
+_PADDED = [(113, 128), (40, 48), (8, 16), (120, 128), (200, 224), (7, 16)]
+
+
+def _poisoned(hdim, tile, seq, heads, poison, gen):
+    """A tensor of logical width `hdim` inside an allocation of width `tile`.
+
+    The gap is pre-filled with `poison`, so any unmasked read of it shows up in
+    the output. This is the shape the AOTriton API actually delivers: the
+    allocation is padded, and the caller slices back to the real extent.
+    """
+    full = torch.full((1, seq, heads, tile), poison, dtype=torch.float16, device="cuda")
+    full[..., :hdim] = torch.randn(
+        1, seq, heads, hdim, dtype=torch.float16, device="cuda", generator=gen
+    )
+    return full[..., :hdim]
+
+
+@pytest.mark.parametrize("poison", [float("nan"), 1e4], ids=["nan", "big"])
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("hdim,tile", _PADDED, ids=[f"{h}in{t}" for h, t in _PADDED])
+def test_padded_head_never_reads_the_pad(hdim, tile, causal, poison):
+    """`Hdim` need not equal the tile width, and the gap must not be read.
+
+    Poisoning with NaN is the sharp version: a single unmasked element makes
+    the whole output non-finite. Poisoning with a large finite value catches
+    the case where a NaN would have been silently flushed somewhere.
+
+    The two poisons must give **identical** results -- that is the real
+    assertion, stronger than either one passing alone.
+    """
+    _require_env()
+    seq, heads = 256, 4
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v = (_poisoned(hdim, tile, seq, heads, poison, gen) for _ in range(3))
+    o = torch.full(
+        (1, seq, heads, tile), poison, dtype=torch.float16, device="cuda"
+    )[..., :hdim]
+
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=heads, head_dim=tile, causal=causal, dtype_str="f16",
+        padded_head=True,
+    )
+    exe(q, k, v, o, 1, seq)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(o).all(), "the pad leaked into the output"
+    qb, kb, vb = (x.transpose(1, 2).float() for x in (q, k, v))
+    ref = F.scaled_dot_product_attention(qb, kb, vb, is_causal=causal).transpose(1, 2)
+    rel = _rel(o, ref)
+    assert rel < 5e-3, f"hdim={hdim} tile={tile} causal={causal} rel={rel:.3e}"
+
+
+@pytest.mark.parametrize("hdim,tile", [(113, 128), (40, 48)], ids=["113in128", "40in48"])
+def test_padded_head_is_independent_of_pad_contents(hdim, tile):
+    """Two different poisons must produce bitwise-identical output.
+
+    Stronger than "the answer is close to the reference": it proves the pad is
+    not read at all, rather than read and then diluted below tolerance.
+    """
+    _require_env()
+    seq, heads = 256, 4
+    outs = []
+    for poison in (float("nan"), 1e4, -7.5):
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        q, k, v = (_poisoned(hdim, tile, seq, heads, poison, gen) for _ in range(3))
+        o = torch.full(
+            (1, seq, heads, tile), poison, dtype=torch.float16, device="cuda"
+        )[..., :hdim]
+        build_flash_attn_func_aiw_module(
+            num_heads=heads, head_dim=tile, causal=False, dtype_str="f16",
+            padded_head=True,
+        )(q, k, v, o, 1, seq)
+        torch.cuda.synchronize()
+        outs.append(o.clone())
+    for other in outs[1:]:
+        assert torch.equal(outs[0], other), "output depends on the pad contents"
+
+
 def test_shard_resolution_respects_narrow_window():
     """A narrow V window must not inherit a shard count it cannot divide.
 

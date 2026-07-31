@@ -108,6 +108,24 @@ def _aiw_knobs(head_dim: int, use_binding_prefetch: bool, variant: str) -> dict:
     return knobs
 
 
+# The compiled tile widths. `head_dim` is rounded up to the smallest of these
+# that covers it; the real extent then rides along as a runtime argument and the
+# kernel masks the difference. Mirrors AOTriton's `block_dmodel_values()`, which
+# is the same list minus 384.
+_BLOCK_DMODEL_LADDER = (16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 384, 512)
+
+
+def _round_to_ladder(head_dim: int) -> int:
+    """Smallest compiled tile width covering `head_dim`."""
+    for w in _BLOCK_DMODEL_LADDER:
+        if w >= head_dim:
+            return w
+    raise ValueError(
+        f"head_dim {head_dim} exceeds the largest compiled tile "
+        f"({_BLOCK_DMODEL_LADDER[-1]})"
+    )
+
+
 def _v_slice_width(head_dim: int) -> int:
     """Column-slice width for V/O; head_dim itself means no slicing."""
     if head_dim <= _V_SLICE_ABOVE:
@@ -143,6 +161,7 @@ def _get_kernel(
     variant: str = "",
     head_dim_v: int | None = None,
     d_offset: int = 0,
+    padded_head: bool = False,
 ):
     if variant == "legacy_m32":
         builder = build_flash_attn_func_m32_module
@@ -159,6 +178,7 @@ def _get_kernel(
         kwargs = {"head_dim_v": head_dim_v, "d_offset": d_offset}
     if builder is build_flash_attn_func_aiw_module:
         kwargs.update(_aiw_knobs(head_dim, use_bp, variant))
+        kwargs["padded_head"] = padded_head
     return builder(
         num_heads=num_heads,
         head_dim=head_dim,
@@ -256,15 +276,53 @@ def flydsl_flash_attn_func_gfx1201(
         )
 
     batch, seq_len_real, num_heads, head_dim = q.shape
-    if head_dim < 16 or head_dim % 16 != 0 or head_dim > _MAX_HEAD_DIM:
+    if head_dim < 1 or head_dim > _MAX_HEAD_DIM:
+        raise ValueError(f"kernel requires 1 <= head_dim <= {_MAX_HEAD_DIM}, got {head_dim}")
+    # The tile width is a build axis; the real extent is a runtime argument.
+    block_dmodel = _round_to_ladder(head_dim)
+    padded_head = block_dmodel != head_dim
+    if padded_head:
+        # The D-axis pitch must be a multiple of 16 bytes -- 8 elements at
+        # f16/bf16. This is the alignment contract (see sdpa-close-gap-plan1.md
+        # section 3), upheld upstream by the shim layer shared by the CUDA and
+        # ROCm backends, which pads the last dimension before dispatch exactly
+        # as `pad_last_dim` does.
+        #
+        # It is load-bearing here, not decorative. Loads and stores are 8
+        # columns wide, so the chunk containing `head_dim` runs to
+        # ceil8(head_dim); an 8-aligned pitch guarantees that lands inside the
+        # tensor's own padding. A tightly-packed tensor -- e.g. contiguous
+        # (B, S, H, 100), pitch 100 -- has no such padding, and the store at
+        # column 96 would write columns 100..103 of the *next head*.
+        for name, t in (("q", q), ("k", k), ("v", v)):
+            if t.stride(2) % 8:
+                raise ValueError(
+                    f"{name} has a D-axis pitch of {t.stride(2)} elements, which is "
+                    f"not a multiple of 8 (16 bytes). head_dim {head_dim} is not a "
+                    f"compiled tile width, so the kernel operates on "
+                    f"ceil8({head_dim})={(head_dim + 7) // 8 * 8} columns and needs "
+                    f"the allocation padded to match. Pad the last dimension before "
+                    f"calling, as PyTorch's SDPA shim does."
+                )
+    if padded_head and variant in _LEGACY_VARIANTS:
         raise ValueError(
-            f"kernel requires 16 <= head_dim <= {_MAX_HEAD_DIM} and head_dim % 16 == 0, "
-            f"got {head_dim}"
+            f"variant={variant!r} predates PADDED_HEAD and requires head_dim to "
+            f"be one of {_BLOCK_DMODEL_LADDER}, got {head_dim}"
         )
-    if head_dim > _V_SLICE_ABOVE and head_dim % _V_SLICE_WIDTH != 0:
+    if (
+        variant == "legacy"
+        and block_dmodel > _V_SLICE_ABOVE
+        and block_dmodel % _V_SLICE_WIDTH
+    ):
+        # Only the legacy baseline builder computes wide heads in V column
+        # slices. aiw covers the whole ladder in a single pass via head-dim
+        # sharding plus chunked V staging, so this constraint does not apply to
+        # it -- and applying it anyway rejected every off-ladder head_dim above
+        # 256 (e.g. 272, which rounds to a 384 tile).
         raise ValueError(
-            f"head_dim above {_V_SLICE_ABOVE} is computed in V column slices of "
-            f"{_V_SLICE_WIDTH}, so it must be a multiple of {_V_SLICE_WIDTH}; got {head_dim}"
+            f"variant='legacy' computes head_dim above {_V_SLICE_ABOVE} in V column "
+            f"slices of {_V_SLICE_WIDTH}, so the tile width must be a multiple of "
+            f"{_V_SLICE_WIDTH}; got {block_dmodel}"
         )
 
     dtype_str = _torch_dtype_to_str(q.dtype)
@@ -276,18 +334,22 @@ def flydsl_flash_attn_func_gfx1201(
     # scale the output. Padded queries produce garbage rows that we slice
     # off before returning.
     # Must match the kernel's own choice: it sets the seq_len padding below.
-    use_bp = _use_bp(head_dim, use_binding_prefetch, variant)
+    # Everything below keys on the *tile* width, per N3: BLOCK_DMODEL is the
+    # single tuning key, and hdim rides along as a runtime argument.
+    use_bp = _use_bp(block_dmodel, use_binding_prefetch, variant)
     if variant == "legacy_m32":
         block_m = 256
     elif variant == "legacy_bp":
-        block_m = bp_block_m(head_dim)
+        block_m = bp_block_m(block_dmodel)
     elif variant == "legacy":
-        block_m = default_block_m(head_dim)
+        block_m = default_block_m(block_dmodel)
     else:
         # aiw. BLOCK_M is invariant to q_row_tiles by construction (see the
         # Q_TILES_PER_BLOCK comment in the kernel), so only the prefetch
         # distance matters here.
-        block_m = aiw_block_m(head_dim, 1 if use_bp else aiw_prefetch_dist(head_dim))
+        block_m = aiw_block_m(
+            block_dmodel, 1 if use_bp else aiw_prefetch_dist(block_dmodel)
+        )
     seq_len_pad = ((seq_len_real + block_m - 1) // block_m) * block_m
     n_pad = seq_len_pad - seq_len_real
     if not causal and n_pad > 0 and n_pad / seq_len_pad > _MAX_NONCAUSAL_PAD_RATIO:
@@ -306,11 +368,26 @@ def flydsl_flash_attn_func_gfx1201(
         k_p = F.pad(k.contiguous(), (0, 0, 0, 0, 0, n_pad))
         v_p = F.pad(v.contiguous(), (0, 0, 0, 0, 0, n_pad))
     else:
-        q_p = q.contiguous()
-        k_p = k.contiguous()
-        v_p = v.contiguous()
+        # No `.contiguous()`: aiw reads strides, so any xxxD permutation is
+        # already supported, and forcing a copy would both cost a copy and
+        # destroy a padded D pitch (re-packing a (.., 100)-in-104 view back to
+        # a tight 100). Only the legacy variants need contiguity, and they get
+        # it via `.reshape(-1)` at the call site.
+        q_p, k_p, v_p = q, k, v
 
-    o_p = torch.empty_like(q_p)
+    # Allocate O with the D axis padded to the same 8-element multiple the
+    # inputs are required to have. `torch.empty_like` would give a tightly
+    # packed tensor, whose last 8-wide store chunk would spill into the next
+    # head. See the pitch check above.
+    _o_pitch = (head_dim + 7) // 8 * 8
+    if _o_pitch == head_dim:
+        o_p = torch.empty(
+            batch, seq_len_pad, num_heads, head_dim, dtype=q.dtype, device=q.device
+        )
+    else:
+        o_p = torch.empty(
+            batch, seq_len_pad, num_heads, _o_pitch, dtype=q.dtype, device=q.device
+        )[..., :head_dim]
 
     # Wrap kernel build + launch in q.device context so multi-GPU callers
     # whose current device differs from q.device get the kernel compiled
@@ -330,19 +407,20 @@ def flydsl_flash_attn_func_gfx1201(
         # Only the legacy baseline builder relies on slicing. The capability is
         # kept and tested in aiw (head_dim_v / d_offset) because the AOTriton
         # gap work needs an independent Hdim_vo anyway.
-        slice_w = _v_slice_width(head_dim) if variant == "legacy" else head_dim
-        for d_off in range(0, head_dim, slice_w):
+        slice_w = _v_slice_width(block_dmodel) if variant == "legacy" else block_dmodel
+        for d_off in range(0, block_dmodel, slice_w):
             exe = _get_kernel(
                 num_heads=num_heads,
-                head_dim=head_dim,
+                head_dim=block_dmodel,
                 causal=causal,
                 dtype_str=dtype_str,
                 waves_per_eu=waves_per_eu,
                 daz=daz,
                 use_bp=use_bp,
                 variant=variant,
-                head_dim_v=None if slice_w == head_dim else slice_w,
-                d_offset=0 if slice_w == head_dim else d_off,
+                head_dim_v=None if slice_w == block_dmodel else slice_w,
+                d_offset=0 if slice_w == block_dmodel else d_off,
+                padded_head=padded_head,
             )
             if variant in _LEGACY_VARIANTS:
                 # The pre-unification builders take flat pointers and derive

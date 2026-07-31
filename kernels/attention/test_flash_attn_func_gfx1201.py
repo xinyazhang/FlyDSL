@@ -251,10 +251,51 @@ def test_head_dim_ladder(head_dim, causal):
     assert cos > 0.9999, f"head_dim={head_dim} causal={causal} cos={cos:.6f}"
 
 
-@pytest.mark.parametrize("head_dim", [8, 24, 100, 272, 640])
+def test_head_dim_requires_aligned_pitch():
+    """An off-ladder head_dim needs an 8-element-aligned D pitch."""
+    _require_env()
+    q, k, v = _qkv(1, 256, 2, 100, torch.float16)   # contiguous, pitch 100
+    with pytest.raises(ValueError, match="pitch"):
+        flydsl_flash_attn_func_gfx1201(q, k, v, causal=False)
+
+
+@pytest.mark.parametrize("head_dim", [640, 1024])
 def test_head_dim_validation(head_dim):
-    """head_dim must be a multiple of WMMA_K=16 and within the register budget."""
+    """Only head_dim beyond the largest compiled tile is rejected.
+
+    Values that are not themselves tile widths are no longer an error: they
+    round up to the next compiled BLOCK_DMODEL and the real extent rides along
+    as a runtime argument (PADDED_HEAD). See test_head_dim_off_ladder.
+    """
     _require_env()
     q, k, v = _qkv(1, 256, 2, head_dim, torch.float16)
     with pytest.raises(ValueError, match="head_dim"):
         flydsl_flash_attn_func_gfx1201(q, k, v, causal=False)
+
+
+@pytest.mark.parametrize("head_dim", [8, 24, 100, 113, 200, 272])
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_head_dim_off_ladder(head_dim, causal):
+    """head_dim need not be a compiled tile width, nor a multiple of 16.
+
+    These previously raised. They now round up to the next BLOCK_DMODEL, and
+    the kernel masks the difference.
+    """
+    _require_env()
+    # Allocate with the D axis padded to a multiple of 8 elements, then slice
+    # back -- the alignment contract, and what PyTorch's SDPA shim delivers.
+    pitch = (head_dim + 7) // 8 * 8
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v = (
+        torch.randn(1, 256, 2, pitch, dtype=torch.float16, device="cuda", generator=gen)[
+            ..., :head_dim
+        ]
+        for _ in range(3)
+    )
+    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal)
+    torch.cuda.synchronize()
+    assert out.shape == q.shape
+    assert torch.isfinite(out).all(), f"head_dim={head_dim} produced non-finite output"
+    rel, cos = _compare(out, _reference(q, k, v, causal))
+    assert rel < 5e-3, f"head_dim={head_dim} causal={causal} rel={rel:.3e}"
+    assert cos > 0.9999, f"head_dim={head_dim} causal={causal} cos={cos:.6f}"

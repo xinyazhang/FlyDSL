@@ -337,6 +337,7 @@ def build_flash_attn_func_aiw_module_primary(
     v_lds_layout=None,
     strides_constexpr=False,
     safe_softmax=True,
+    padded_head=False,
     q_row_tiles=1,
     shards=None,
     unsafe_fp_math=True,
@@ -604,6 +605,17 @@ def build_flash_attn_func_aiw_module_primary(
     #     m + log2(l) in the scaled domain.
     SAFE_SOFTMAX = safe_softmax
 
+    # `head_dim` is BLOCK_DMODEL: the compile-time tile width, drawn from the
+    # ladder. The *real* extents are the runtime `hdim_qk` / `hdim_vo`
+    # arguments, and PADDED_HEAD says whether they differ from the tile.
+    # AOTriton derives exactly this (`attn_fwd.cc`):
+    #     hdim_rounded = round_value(max(hdim_qk, hdim_vo), ladder)
+    #     PADDED_HEAD  = (hdim_rounded != hdim_qk || hdim_rounded != hdim_vo)
+    # With PADDED_HEAD false the two are equal to the tile and no masking is
+    # emitted at all -- that is the common case and the one the ladder measures.
+    PADDED_HEAD = padded_head
+    BLOCK_DMODEL = head_dim
+
     # ---- LDS layout ----
     # K is padded rather than XOR-swizzled (a swizzle was implemented and
     # measured a net loss; see sdpa_lore_gfx1201.md). Chunking bounds the V
@@ -616,7 +628,16 @@ def build_flash_attn_func_aiw_module_primary(
     VT_STRIDE = BLOCK_N + _LDS_PAD
     V_STRIDE = VO_WIDTH + _LDS_PAD          # row-major V
 
-    ENABLE_LDS_VEC16 = os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
+    # 32-byte (16-element) loads need the D-axis pitch to be a multiple of 16
+    # elements. The contract only guarantees 8 (16 bytes), and it is only
+    # BLOCK_DMODEL -- itself always a multiple of 16 -- that makes the wider
+    # load safe when hdim == the tile. Under PADDED_HEAD the real extent can
+    # end on any 8-boundary, so a 16-element load can run past the allocation
+    # at the tensor tail. Drop to 8 there.
+    ENABLE_LDS_VEC16 = (
+        os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
+        and not PADDED_HEAD
+    )
     VEC_WIDTH = 16 if ENABLE_LDS_VEC16 else 8
 
     def _load_geom(width):
@@ -685,6 +706,8 @@ def build_flash_attn_func_aiw_module_primary(
         seq_len: fx.Int32,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
+        hdim_qk: fx.Int32,
+        hdim_vo: fx.Int32,
         stride_q0: fx.Int64,
         stride_q1: fx.Int64,
         stride_q2: fx.Int64,
@@ -956,6 +979,51 @@ def build_flash_attn_func_aiw_module_primary(
         def v_addr(tile_start, row_in_tile, col):
             return _kv_addr(v_tbase, v_toff, tile_start, row_in_tile, col)
 
+        # ---- PADDED_HEAD column handling ----
+        #
+        # Exactly one rule: an element is valid iff its column < hdim. It covers
+        # both invalid regions without the kernel ever knowing the pitch:
+        #
+        #   [hdim, ceil8(hdim))   pad inside the allocation. Safe to load (the
+        #                         chunk containing hdim ends at ceil8(hdim),
+        #                         which is <= pitch by the contract), but the
+        #                         contents are not guaranteed zero.
+        #   [ceil8(hdim), tile)   past the row entirely. In BSHD these bytes
+        #                         belong to head h+1, and at the last head of
+        #                         the last token they are past the allocation.
+        #                         Must not be addressed.
+        #
+        # So: a chunk whose *start* is >= hdim is redirected to column 0 (always
+        # valid) and then masked away wholesale; a chunk that straddles is
+        # loaded as-is and masked per element. Both fall out of the same two
+        # operations, which is why there is no case analysis below.
+        _hdim_qk_i = fx.Index(hdim_qk)
+        _hdim_vo_i = fx.Index(hdim_vo)
+
+        def _col_safe(col, hdim_i):
+            """Redirect a wholly-invalid chunk to column 0 so the load is safe."""
+            if const_expr(not PADDED_HEAD):
+                return col
+            return fx.Index(ArithValue(col < hdim_i).select(col, fx.Index(0)))
+
+        def _col_mask(col, hdim_i, width):
+            """i1 vector, element j set iff column `col + j` holds real data.
+
+            Built from a loop-invariant column, so for the cooperative loads
+            this is hoisted out of the KV loop entirely and costs one vector
+            select per load inside it.
+            """
+            return Vec.from_elements(
+                [(col + fx.Index(j)) < hdim_i for j in range_constexpr(width)],
+                fx.Boolean,
+            )
+
+        def _apply_col_mask(vec, col, hdim_i, width):
+            if const_expr(not PADDED_HEAD):
+                return vec
+            zeros = Vec.filled(width, 0.0, elem_dtype)
+            return _col_mask(col, hdim_i, width).select(Vec(vec), zeros).ir_value()
+
         def _split_ptr(ptr, base64, off32):
             """ptr + base64 (uniform, 64-bit) + off32 (divergent, 32-bit)."""
             p = buffer_ops.get_element_ptr(ptr, fx.Int64(base64), elem_type=elem_type)
@@ -1034,9 +1102,15 @@ def build_flash_attn_func_aiw_module_primary(
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 b64, o32 = k_addr(
-                    tile_start, load_row_in_batch + row_offset, load_col_base
+                    tile_start, load_row_in_batch + row_offset,
+                    _col_safe(load_col_base, _hdim_qk_i),
                 )
-                vecs.append(load_global_f16xN(k_ptr, b64, o32))
+                vecs.append(
+                    _apply_col_mask(
+                        load_global_f16xN(k_ptr, b64, o32),
+                        load_col_base, _hdim_qk_i, VEC_WIDTH,
+                    )
+                )
             return vecs
 
         def coop_store_k_lds(vecs, buf_id=0):
@@ -1074,15 +1148,25 @@ def build_flash_attn_func_aiw_module_primary(
                 if const_expr(KV_NEEDS_GUARD):
                     row_valid = lds_row < fx.Index(BLOCK_N)
                     if row_valid:
-                        b64, o32 = k_addr(tile_start, lds_row, load_col_base)
+                        b64, o32 = k_addr(
+                            tile_start, lds_row, _col_safe(load_col_base, _hdim_qk_i)
+                        )
                         _lds_store_vx(
-                            load_global_f16xN(k_ptr, b64, o32),
+                            _apply_col_mask(
+                                load_global_f16xN(k_ptr, b64, o32),
+                                load_col_base, _hdim_qk_i, VEC_WIDTH,
+                            ),
                             k_base + lds_row * K_STRIDE + load_col_base,
                         )
                 else:
-                    b64, o32 = k_addr(tile_start, lds_row, load_col_base)
+                    b64, o32 = k_addr(
+                        tile_start, lds_row, _col_safe(load_col_base, _hdim_qk_i)
+                    )
                     _lds_store_vx(
-                        load_global_f16xN(k_ptr, b64, o32),
+                        _apply_col_mask(
+                            load_global_f16xN(k_ptr, b64, o32),
+                            load_col_base, _hdim_qk_i, VEC_WIDTH,
+                        ),
                         k_base + lds_row * K_STRIDE + load_col_base,
                     )
 
@@ -1130,7 +1214,10 @@ def build_flash_attn_func_aiw_module_primary(
                         col = fx.Index(chunk * VO_CHUNK_COLS) + col
                     if const_expr(D_OFFSET):
                         col = fx.Index(D_OFFSET) + col
-                    b64, o32 = v_addr(tile_start, kv_base + _tr_kv_off, col)
+                    b64, o32 = v_addr(
+                        tile_start, kv_base + _tr_kv_off,
+                        _col_safe(col, _hdim_vo_i),
+                    )
                     vecs.append(_global_load_tr_v8(v_ptr_i64, b64, o32))
             else:
                 for batch in range_constexpr(NUM_BATCHES_V):
@@ -1138,7 +1225,10 @@ def build_flash_attn_func_aiw_module_primary(
                     col = v_col_base
                     if const_expr(D_OFFSET):
                         col = fx.Index(D_OFFSET) + col
-                    b64, o32 = v_addr(tile_start, v_row_in_batch + row_offset, col)
+                    b64, o32 = v_addr(
+                        tile_start, v_row_in_batch + row_offset,
+                        _col_safe(col, _hdim_vo_i),
+                    )
                     vecs.append(load_global_f16xN(v_ptr, b64, o32))
             return vecs
 
@@ -1201,7 +1291,11 @@ def build_flash_attn_func_aiw_module_primary(
             _packs = []
             for ks in range_constexpr(K_STEPS_QK):
                 q_col = shard_qk_off + fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
-                raw = load_global_v8f16(q_ptr, q_tile_base, q_toff(_safe, q_col))
+                raw = load_global_v8f16(
+                    q_ptr, q_tile_base,
+                    q_toff(_safe, _col_safe(q_col, _hdim_qk_i)),
+                )
+                raw = _apply_col_mask(raw, q_col, _hdim_qk_i, 8)
                 _packs.append(ArithValue(_in).select(raw, c_zero_v8f16))
             q_in_bounds_all.append(_in)
             q_b_packs_all.append(_packs)
@@ -1673,12 +1767,27 @@ def build_flash_attn_func_aiw_module_primary(
                         d_col = fx.Index(vc * VO_CHUNK_COLS) + d_col
                     if const_expr(D_OFFSET):
                         d_col = fx.Index(D_OFFSET) + d_col
-                    _store_global_half(
-                        o_ptr,
-                        o_tbase(q_start),
-                        o_toff(q_rows_in_tile[qt], d_col),
-                        o_trunc,
-                    )
+                    # The store is 8 columns wide, so under PADDED_HEAD its
+                    # last chunk can straddle hdim_vo. Only whole-chunk
+                    # skipping is available for a store, and that is exact
+                    # here: O is the caller's tensor, whose D pitch is a
+                    # 16-byte multiple, so columns in [hdim_vo,
+                    # ceil8(hdim_vo)) lie inside O's own allocation. They
+                    # receive computed-but-unused values, mirroring the pad
+                    # region of the inputs, which the caller slices off.
+                    def _emit_o_store():
+                        _store_global_half(
+                            o_ptr,
+                            o_tbase(q_start),
+                            o_toff(q_rows_in_tile[qt], d_col),
+                            o_trunc,
+                        )
+
+                    if const_expr(PADDED_HEAD):
+                        if d_col < _hdim_vo_i:
+                            _emit_o_store()
+                    else:
+                        _emit_o_store()
 
     @flyc.jit
     def launch_flash_attn_aiw(
@@ -1690,6 +1799,8 @@ def build_flash_attn_func_aiw_module_primary(
         seq_len: fx.Int32,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
+        hdim_qk: fx.Int32,
+        hdim_vo: fx.Int32,
         stride_q0: fx.Int64,
         stride_q1: fx.Int64,
         stride_q2: fx.Int64,
@@ -1720,6 +1831,7 @@ def build_flash_attn_func_aiw_module_primary(
         launcher = flash_attn_func_aiw_kernel(
             Q, K, V, O, seq_len,
             num_head_q, num_head_k,
+            hdim_qk, hdim_vo,
             stride_q0, stride_q1, stride_q2,
             stride_k0, stride_k1, stride_k2,
             stride_v0, stride_v1, stride_v2,
@@ -1826,6 +1938,20 @@ def build_flash_attn_func_aiw_module_primary(
             )
         return t.stride(0), t.stride(1), t.stride(2)
 
+    def _resolve_scale(Q, scale):
+        """Default sm_scale from the tensor's *real* head dim, not the tile.
+
+        The builder can only default to `1/sqrt(BLOCK_DMODEL)`, since it has no
+        idea what `hdim_qk` will be -- and under PADDED_HEAD that is the wrong
+        number. Deriving it here from `Q.shape[3]` is right in both cases and
+        identical to the builder default whenever hdim == the tile.
+        """
+        if scale is not None:
+            return float(scale)
+        if PADDED_HEAD and hasattr(Q, "shape"):
+            return 1.0 / host_math.sqrt(Q.shape[3])
+        return float(sm_scale)
+
     def _prep(Q, K, V, O):  # noqa: E741
         """Pointers, head counts and the twelve strides, in launch order.
 
@@ -1839,6 +1965,7 @@ def build_flash_attn_func_aiw_module_primary(
         # BSHD: axis 2 is the head axis. Read rather than assumed -- under
         # MQA/GQA K and V carry fewer heads than Q.
         nhq, nhk = Q.shape[2], K.shape[2]
+        hqk, hvo = Q.shape[3], V.shape[3]
         if V.shape[2] != nhk:
             raise ValueError(f"K and V must share num_heads, got {nhk} and {V.shape[2]}")
         if O.shape[2] != nhq:
@@ -1847,35 +1974,33 @@ def build_flash_attn_func_aiw_module_primary(
             raise ValueError(
                 f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})"
             )
-        return [_ptr_arg(t) for t in (Q, K, V, O)], nhq, nhk, st
+        return [_ptr_arg(t) for t in (Q, K, V, O)], (nhq, nhk, hqk, hvo), st
 
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
     def _launch(Q, K, V, O, batch_size, seq_len, scale=None, stream=None):  # noqa: E741
-        ptrs, nhq, nhk, st = _prep(Q, K, V, O)
+        ptrs, meta, st = _prep(Q, K, V, O)
         _run_compiled(
             launch_flash_attn_aiw,
             *ptrs,
             batch_size,
             seq_len,
-            nhq,
-            nhk,
+            *meta,
             *st,
-            float(sm_scale if scale is None else scale),
+            _resolve_scale(Q, scale),
             stream if stream is not None else fx.Stream(None),
         )
 
     def _compile(Q, K, V, O, batch_size, seq_len, scale=None, stream=None):  # noqa: E741
-        ptrs, nhq, nhk, st = _prep(Q, K, V, O)
+        ptrs, meta, st = _prep(Q, K, V, O)
         return flyc.compile(
             launch_flash_attn_aiw,
             *ptrs,
             batch_size,
             seq_len,
-            nhq,
-            nhk,
+            *meta,
             *st,
-            float(sm_scale if scale is None else scale),
+            _resolve_scale(Q, scale),
             fx.Stream(stream),
         )
 
