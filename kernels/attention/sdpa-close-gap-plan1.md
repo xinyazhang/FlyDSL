@@ -609,9 +609,16 @@ oracles stay usable:
 - `m_i` initialises to `-3.40282e+38`; the mask fill stays `-inf`. This is
   **preventative** — with the current causal implementation the first KV tile is
   never fully masked (tile 0 always contains `kv = 0 <= q_row`), so `-inf - -inf`
-  is unreachable today. It becomes load-bearing in P2 (`seqlen_q > seqlen_k`
-  leaves whole rows masked) and P6 (a window can exclude an entire tile). Not
-  tested yet because it cannot be reached; add the test with the feature.
+  is unreachable today.
+
+  **It becomes verifiable at P4, with bias.** A bias tensor may hold any
+  non-NaN value, `-inf` included, and callers routinely use a large negative
+  bias as an attention mask. A bias that covers the whole first KV tile drives
+  its row max to `-inf`, and an `-inf`-initialised `m_i` then computes
+  `exp2(-inf - -inf) = NaN`. That is the first configuration in which the bug
+  is reachable at all, so the regression test belongs in P4 — not P2 or P6,
+  which merely widen the exposure (`seqlen_q > seqlen_k` leaving whole rows
+  masked, and windows excluding entire tiles).
 - The QK scale moves *before* the row max, replacing
   `exp2(fma(s, qk_scale, -qk_scale*m))`. **Demonstrated**, not just conformed
   to: with `causal=True` the first query row attends to exactly one key, so its
@@ -644,9 +651,7 @@ pressure: at head_dim 32 the corrected form uses **fewer** VGPRs (93 vs 98) and
 gets *higher* occupancy (16 vs 14 waves/SIMD). It is straightforward VALU in a
 loop where softmax already dominates.
 
-Accepted: correctness over 1%. **Follow-up:** `_DIST0_BLOCK_N_BY_HEAD_DIM_NONCAUSAL`
-was measured under the cheap softmax and should be re-swept for head_dim 16/32
-— this is the first concrete instance of the table-revision work N3 flagged.
+Accepted: correctness over 1%. Logged in §6 for the post-gap optimisation pass.
 
 **P1 — layout generality, MQA/GQA, LSE, numerics.** Simplified by N3:
 - **One constexpr tile width.** Rename the `head_dim` build parameter to
@@ -794,3 +799,49 @@ Four things this encodes that our current tests do not:
    (`_common_test.py` already has the `fillnan` helper for this idiom; AOTriton
    uses it on output and backward tensors to prove unwritten regions are never
    read. Same trick, applied to input padding.)
+
+---
+
+## 6. Outstanding costs — for the optimisation pass after the gap closes
+
+Every feature phase buys correctness with some performance. Rather than
+stopping to reclaim each one as it appears — which would interleave badly with
+the feature work and risk tuning against a moving target — they are recorded
+here and revisited **once functional parity is reached**.
+
+The discipline: a cost only belongs here if it has been *measured* (interleaved
+A/B, 3+ reps, per §5) and *diagnosed* far enough to say what would be tried.
+"Probably slower" is not an entry.
+
+### 6.1 `safe_softmax` at small head_dim — P1a
+
+| config | ratio |
+|---|---|
+| head_dim 32, non-causal | **0.895** |
+| head_dim 16, non-causal | 0.963 |
+| median over the full ladder | 0.989 |
+
+7-rep medians; the head_dim 32 spread is 0.887–0.903, so this is a real effect
+and not board drift.
+
+**Cause.** An exact softmax needs `2N` VALU ops per KV tile where the (wrong)
+FMA form needed `N` — both scale-then-subtract and subtract-then-scale are
+`2N`, and no exact `N` form exists. Both affected configs are the wide-`BLOCK_N`
+cases the tuning table already annotates as softmax-bound rather than
+saturation-bound, so extra VALU lands directly on the critical path.
+
+**Not** register pressure: at head_dim 32 the corrected form uses *fewer* VGPRs
+(93 vs 98) and reaches *higher* occupancy (16 vs 14 waves/SIMD).
+
+**To try, in order:**
+
+1. Re-sweep `_DIST0_BLOCK_N_BY_HEAD_DIM_NONCAUSAL` for head_dim 16/32. Those
+   entries (128 and 64) were measured under the cheap softmax, and the balance
+   they encode has moved. This is the first concrete instance of the
+   table-revision work N3 flagged, and the cheapest thing to try.
+2. Check whether the scale can ride the `q_b_packs` load instead. Rejected once
+   already — Q is f16, so scaling it costs a rounding of ~2^-11, which is worse
+   than the FMA error it would replace — but worth re-examining if a f32 staging
+   path exists that does not cost registers.
+3. Accept it. These are the two smallest head dims, and correctness is not
+   negotiable against 10% on one config.

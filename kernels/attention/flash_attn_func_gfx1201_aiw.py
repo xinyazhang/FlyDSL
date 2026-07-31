@@ -563,6 +563,13 @@ def build_flash_attn_func_aiw_module_primary(
     #     exp2(0) = 1 and the masked probabilities exp2(-inf - m) = 0, which is
     #     the right answer. The *mask* fill stays -inf; only the init changes.
     #
+    #     Unreachable as the kernel stands -- the first KV tile always contains
+    #     kv = 0 <= q_row, so it is never fully masked. It becomes reachable
+    #     with **bias**, which may hold any non-NaN value including -inf and is
+    #     routinely used as an attention mask: a bias covering the whole first
+    #     tile drives its row max to -inf. The regression test therefore belongs
+    #     with the bias feature, not here.
+    #
     # (b) The QK scale is applied to the scores **before** the row max, and
     #     `m_i` is therefore kept in the scaled domain. The kernel previously
     #     kept `m_i` unscaled and folded the scale into the exponent as
