@@ -551,6 +551,29 @@ def build_flash_attn_func_aiw_module_primary(
     # real mix-ups during AOTriton's kernel development. Axis 3 is `D`, which is
     # contiguous by contract, so it is never passed.
     #
+    # Longest-processing-time-first dispatch for causal. Under causal masking
+    # a workgroup's cost grows with its q_tile (tile 0 walks one KV block, tile
+    # N-1 walks N), and grid.y is dispatched in increasing order -- so the
+    # cheapest blocks go first and the most expensive land in the tail, which
+    # is the worst possible order. Reversing the index puts the expensive
+    # blocks first and leaves only cheap ones to fill the tail.
+    #
+    # Measured B=1 H=8 N=4096 f16 causal, TFLOPS forward -> reversed:
+    #   head_dim  16   31.8 -> 35.7  (+12%)
+    #             32   51.2 -> 59.5  (+16%)
+    #             64   67.1 -> 77.8  (+16%)
+    #            128   74.8 -> 87.0  (+16%)
+    #            256   68.8 -> 72.8  (+6%)
+    #            512   43.9 -> 46.6  (+6%)
+    #
+    # Non-causal is untouched: every tile costs the same there, so the reversal
+    # would be pure arithmetic for no gain and is not emitted.
+    #
+    # This is orthogonal to the *axis* order (see the grid comment below) --
+    # that one decides whether a scheduling group has uniform duration, this
+    # one decides the order the groups are issued in. Both matter, and neither
+    # of the pre-unification kernels had either.
+    _REVERSE_Q_TILES = os.environ.get("FMHA_REVERSE_Q_TILES", "1") == "1"
     STRIDES_CONSTEXPR = strides_constexpr
 
     # Two softmax corrections, both from AOTriton's hard-won list. Kept behind
@@ -817,7 +840,14 @@ def build_flash_attn_func_aiw_module_primary(
         # verbatim without persistent-dynamic would reintroduce the regression
         # above. Revisit this ordering when persistent-dynamic lands.
         head_q = fx.Index(gpu.block_idx.x)
-        q_tile_idx = fx.Index(gpu.block_idx.y)
+        if const_expr(CAUSAL and _REVERSE_Q_TILES):
+            # Longest-processing-time-first: under causal, cost grows with
+            # q_tile, so dispatching the expensive tiles first leaves only
+            # cheap ones to fill the tail.
+            _ntiles = (seq_len_v + (BLOCK_M - 1)) // BLOCK_M
+            q_tile_idx = _ntiles - fx.Index(1) - fx.Index(gpu.block_idx.y)
+        else:
+            q_tile_idx = fx.Index(gpu.block_idx.y)
         batch_idx = fx.Index(gpu.block_idx.z)
         q_start = q_tile_idx * BLOCK_M
 
