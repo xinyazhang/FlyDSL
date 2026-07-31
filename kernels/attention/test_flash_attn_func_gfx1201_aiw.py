@@ -341,6 +341,83 @@ def test_safe_softmax_is_exact_for_large_inputs(mag):
     )
 
 
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("nhq,nhk", [(8, 8), (8, 2), (8, 1), (10, 2)],
+                         ids=["mha", "gqa4", "mqa", "gqa5"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_mqa_gqa_matches_sdpa(head_dim, nhq, nhk, causal):
+    """Several query heads may share one KV head.
+
+    `(10, 2)` is deliberately non-power-of-two on both axes, following
+    AOTriton's `test_fast`: a ratio of 5 catches a head-index derivation that
+    happens to work for shifts.
+    """
+    _require_env()
+    seq = 256
+    gen = torch.Generator(device="cuda").manual_seed(0)
+
+    def _t(h):
+        return torch.randn(
+            1, seq, h, head_dim, dtype=torch.float16, device="cuda", generator=gen
+        )
+
+    q, k, v = _t(nhq), _t(nhk), _t(nhk)
+    o = torch.empty_like(q)
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=nhq, head_dim=head_dim, causal=causal, dtype_str="f16"
+    )
+    exe(q, k, v, o, 1, seq)
+    torch.cuda.synchronize()
+
+    # enable_gqa broadcasts the KV heads across each query-head group.
+    qb, kb, vb = (x.transpose(1, 2).float() for x in (q, k, v))
+    ref = F.scaled_dot_product_attention(
+        qb, kb, vb, is_causal=causal, enable_gqa=(nhq != nhk)
+    ).transpose(1, 2)
+
+    assert torch.isfinite(o).all(), f"nhq={nhq} nhk={nhk} produced non-finite output"
+    rel = _rel(o, ref)
+    assert rel < 5e-3, f"nhq={nhq} nhk={nhk} hd={head_dim} causal={causal} rel={rel:.3e}"
+
+
+def test_gqa_head_mapping_is_grouped_not_strided():
+    """Query head h must read KV head h // (Hq/Hk), not h % Hk.
+
+    Both derivations give identical results whenever the KV heads happen to be
+    interchangeable, so this uses distinct per-head KV content and compares
+    against an explicit per-head reference.
+    """
+    _require_env()
+    seq, head_dim, nhq, nhk = 128, 64, 8, 2
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    q = torch.randn(1, seq, nhq, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    k = torch.randn(1, seq, nhk, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    v = torch.randn(1, seq, nhk, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    # Make the two KV heads maximally distinguishable.
+    k[:, :, 1] *= -1.0
+    v[:, :, 1] += 4.0
+
+    o = torch.empty_like(q)
+    build_flash_attn_func_aiw_module(
+        num_heads=nhq, head_dim=head_dim, causal=False, dtype_str="f16"
+    )(q, k, v, o, 1, seq)
+    torch.cuda.synchronize()
+
+    def _one_head(x, h):
+        """(B, S, H, D) -> (B, 1, S, D), the layout SDPA expects."""
+        return x[:, :, h].unsqueeze(1).float()
+
+    ratio = nhq // nhk
+    for h in range(nhq):
+        kh = h // ratio          # grouped, not h % nhk
+        ref = F.scaled_dot_product_attention(
+            _one_head(q, h), _one_head(k, kh), _one_head(v, kh)
+        ).squeeze(1)
+        got = o[:, :, h].float()
+        rel = (got - ref).abs().max().item() / ref.abs().max().item()
+        assert rel < 5e-3, f"query head {h} did not read KV head {kh} (rel={rel:.3e})"
+
+
 def test_shard_resolution_respects_narrow_window():
     """A narrow V window must not inherit a shard count it cannot divide.
 

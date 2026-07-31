@@ -660,6 +660,8 @@ def build_flash_attn_func_aiw_module_primary(
         V: fx.Pointer,
         O: fx.Pointer,  # noqa: E741
         seq_len: fx.Int32,
+        num_head_q: fx.Int32,
+        num_head_k: fx.Int32,
         stride_q0: fx.Int64,
         stride_q1: fx.Int64,
         stride_q2: fx.Int64,
@@ -778,7 +780,6 @@ def build_flash_attn_func_aiw_module_primary(
         def _red_load(i_f32):
             return _llvm.LoadOp(ir.F32Type.get(), _red_addr(i_f32)).result
 
-        block_id = fx.Index(gpu.block_idx.x)
         tid = fx.Index(gpu.thread_idx.x)
 
         wave_id = tid // WARP_SIZE
@@ -796,12 +797,34 @@ def build_flash_attn_func_aiw_module_primary(
         shard_qk_off = shard_id * fx.Index(QK_SLICE)   # into Q/K head_dim
         shard_vo_off = shard_id * fx.Index(VO_SLICE)   # into the V/O window
 
-        head_idx = block_id % NUM_HEADS
-        batch_q_tile_id = block_id // NUM_HEADS
-        num_q_tiles = (seq_len_v + BLOCK_M - 1) // BLOCK_M
-        q_tile_idx = batch_q_tile_id % num_q_tiles
-        batch_idx = batch_q_tile_id // num_q_tiles
+        # 3D grid: (head_q, q_tile, batch). A flat grid would need two integer
+        # divisions here to recover these, and with num_heads runtime neither
+        # would fold away.
+        #
+        # **The axis order is load-bearing for causal.** Under causal masking a
+        # workgroup's cost grows with its q_tile -- tile 0 walks one KV block,
+        # tile N-1 walks N. The x axis dispatches fastest, so putting q_tile
+        # there spreads durations 1..N across every scheduling group, while
+        # putting head there gives each group a uniform duration. Measured at
+        # B=1 H=8 N=4096 f16 causal, q_tile-fastest against head-fastest:
+        # head_dim 16 0.587, 32 0.612, 64 0.715, 128 0.769. Non-causal is
+        # indifferent (all within 1%), which is what identifies the cause.
+        #
+        # Note AOTriton uses dim3{S,H,B} -- q_tile fastest -- for NUM_XCDS == 1.
+        # That is not a contradiction: it also forces PERSISTENT_TYPE = 2 for
+        # every causal functional, which replaces the grid with a work-stealing
+        # loop and makes the axis order irrelevant. Porting its grid_calculator
+        # verbatim without persistent-dynamic would reintroduce the regression
+        # above. Revisit this ordering when persistent-dynamic lands.
+        head_q = fx.Index(gpu.block_idx.x)
+        q_tile_idx = fx.Index(gpu.block_idx.y)
+        batch_idx = fx.Index(gpu.block_idx.z)
         q_start = q_tile_idx * BLOCK_M
+
+        # MQA/GQA: Num_head_q / Num_head_k query heads share each KV head.
+        # The ratio is uniform and computed once, so the scalar divide is
+        # immaterial; the per-head division below is by that ratio.
+        head_k = head_q // (fx.Index(num_head_q) // fx.Index(num_head_k))
 
         load_row_in_batch = tid // THREADS_PER_ROW_LOAD
         load_lane_in_row = tid % THREADS_PER_ROW_LOAD
@@ -862,12 +885,12 @@ def build_flash_attn_func_aiw_module_primary(
 
             return tbase, toff
 
-        # head_idx is used for all four today; P1 splits it into off_h_q for
-        # Q/O and off_h_k for K/V when MQA/GQA lands.
-        q_tbase, q_toff = _addr_pair(q_st, head_idx)
-        k_tbase, k_toff = _addr_pair(k_st, head_idx)
-        v_tbase, v_toff = _addr_pair(v_st, head_idx)
-        o_tbase, o_toff = _addr_pair(o_st, head_idx)
+        # Q and O are indexed by the query head; K and V by the KV head they
+        # share. At num_head_q == num_head_k these coincide.
+        q_tbase, q_toff = _addr_pair(q_st, head_q)
+        k_tbase, k_toff = _addr_pair(k_st, head_k)
+        v_tbase, v_toff = _addr_pair(v_st, head_k)
+        o_tbase, o_toff = _addr_pair(o_st, head_q)
 
         def _kv_addr(tbase, toff, tile_start, row_in_tile, col):
             """(uniform base, divergent offset) for a KV row, clamped in bounds.
@@ -1635,6 +1658,8 @@ def build_flash_attn_func_aiw_module_primary(
         O: fx.Pointer,  # noqa: E741
         batch_size: fx.Int32,
         seq_len: fx.Int32,
+        num_head_q: fx.Int32,
+        num_head_k: fx.Int32,
         stride_q0: fx.Int64,
         stride_q1: fx.Int64,
         stride_q2: fx.Int64,
@@ -1655,7 +1680,6 @@ def build_flash_attn_func_aiw_module_primary(
         bs_idx = fx.Index(batch_size)
         sl_idx = fx.Index(seq_len)
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
-        grid_x = bs_idx * num_q_tiles * NUM_HEADS
 
         # Strides come from the caller, read off the real tensors -- never
         # derived here from num_heads/head_dim. The shape does not determine
@@ -1665,6 +1689,7 @@ def build_flash_attn_func_aiw_module_primary(
         # read them, which is what keeps the two arms directly comparable.
         launcher = flash_attn_func_aiw_kernel(
             Q, K, V, O, seq_len,
+            num_head_q, num_head_k,
             stride_q0, stride_q1, stride_q2,
             stride_k0, stride_k1, stride_k2,
             stride_v0, stride_v1, stride_v2,
@@ -1726,7 +1751,11 @@ def build_flash_attn_func_aiw_module_primary(
             if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
                 op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
 
-        launcher.launch(grid=(grid_x, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
+        launcher.launch(
+            grid=(fx.Index(num_head_q), num_q_tiles, bs_idx),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
 
     _fmha_compile_hints = {
         "fast_fp_math": fast_fp_math,
@@ -1768,7 +1797,7 @@ def build_flash_attn_func_aiw_module_primary(
         return t.stride(0), t.stride(1), t.stride(2)
 
     def _prep(Q, K, V, O):  # noqa: E741
-        """Pointers plus the twelve strides, in launch order.
+        """Pointers, head counts and the twelve strides, in launch order.
 
         Deliberately does **not** flatten: `t.reshape(-1)` materialises a copy
         for any non-contiguous tensor, which would silently defeat the whole
@@ -1777,29 +1806,44 @@ def build_flash_attn_func_aiw_module_primary(
         st = []
         for t, name in ((Q, "Q"), (K, "K"), (V, "V"), (O, "O")):
             st.extend(_strides_of(t, name))
-        return [_ptr_arg(t) for t in (Q, K, V, O)], st
+        # BSHD: axis 2 is the head axis. Read rather than assumed -- under
+        # MQA/GQA K and V carry fewer heads than Q.
+        nhq, nhk = Q.shape[2], K.shape[2]
+        if V.shape[2] != nhk:
+            raise ValueError(f"K and V must share num_heads, got {nhk} and {V.shape[2]}")
+        if O.shape[2] != nhq:
+            raise ValueError(f"O and Q must share num_heads, got {O.shape[2]} and {nhq}")
+        if nhq % nhk:
+            raise ValueError(
+                f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})"
+            )
+        return [_ptr_arg(t) for t in (Q, K, V, O)], nhq, nhk, st
 
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
     def _launch(Q, K, V, O, batch_size, seq_len, scale=None, stream=None):  # noqa: E741
-        ptrs, st = _prep(Q, K, V, O)
+        ptrs, nhq, nhk, st = _prep(Q, K, V, O)
         _run_compiled(
             launch_flash_attn_aiw,
             *ptrs,
             batch_size,
             seq_len,
+            nhq,
+            nhk,
             *st,
             float(sm_scale if scale is None else scale),
             stream if stream is not None else fx.Stream(None),
         )
 
     def _compile(Q, K, V, O, batch_size, seq_len, scale=None, stream=None):  # noqa: E741
-        ptrs, st = _prep(Q, K, V, O)
+        ptrs, nhq, nhk, st = _prep(Q, K, V, O)
         return flyc.compile(
             launch_flash_attn_aiw,
             *ptrs,
             batch_size,
             seq_len,
+            nhq,
+            nhk,
             *st,
             float(sm_scale if scale is None else scale),
             fx.Stream(stream),

@@ -161,7 +161,39 @@ Our tables are therefore **already correctly keyed** — `head_dim` is
 `BLOCK_DMODEL` under a different name. No 2-D sweep, no register-budget model,
 no fallback policy. See **[N3 — RESOLVED]**.
 
-### 2.4 V column slicing was dead code in production
+### 2.4 Grid axis order is load-bearing for causal — and AOTriton's is a trap
+
+Found while landing the 3D grid in P1. Under causal masking a workgroup's cost
+grows with its `q_tile`: tile 0 walks one KV block, tile N-1 walks N. The x axis
+dispatches fastest, so the order decides whether each scheduling group gets a
+uniform duration or a 1..N spread.
+
+Measured at B=1 H=8 N=4096 f16 **causal**, `(q_tile, head, batch)` against
+`(head, q_tile, batch)`:
+
+| head_dim | ratio |
+|---|---|
+| 16 | 0.587 |
+| 32 | 0.612 |
+| 64 | 0.715 |
+| 128 | 0.769 |
+
+Non-causal is indifferent (within 1% either way), which is what identifies the
+cause as scheduling rather than locality.
+
+**AOTriton uses `dim3{S, H, B}` — q_tile fastest — for `NUM_XCDS == 1`.** That
+is not a contradiction, and porting it verbatim would be a mistake: it also
+derives `PERSISTENT_TYPE = 2` for *every* causal functional
+(`@ati.derives('PERSISTENT_TYPE', to=2, when=ati.ne('CAUSAL_TYPE', 0))`), which
+replaces the grid with a work-stealing loop and makes the axis order irrelevant.
+Its grid is effectively the non-causal grid. Until persistent-dynamic lands we
+need head-fastest, and the ordering should be revisited when it does.
+
+This is the second time a piece of AOTriton has only made sense together with a
+feature we have not built yet; the first was `CAUSAL_TYPE` shipping only as
+`{0, 3}` because causal is expressed as a window.
+
+### 2.5 V column slicing was dead code in production
 
 `_use_bp()` returns True for every `head_dim >= 48`, and the interface computed
 `slice_w = head_dim if use_bp else _v_slice_width(head_dim)` — so the slicing
@@ -173,7 +205,7 @@ It is now alive and tested in aiw, deliberately: P1 needs an independent
 retired. But it means the code path had no production coverage before this
 work, and its measured cost is unknown.
 
-### 2.5 The merge added a fourth copy of the scaffolding
+### 2.6 The merge added a fourth copy of the scaffolding
 
 Plan 0 step 5 (extract the ~440 lines of shared preamble/tail into a common
 module) did **not** happen, because you asked to keep the originals. aiw

@@ -225,11 +225,26 @@ def flydsl_flash_attn_func_gfx1201(
     arch_base = arch.lower().split(":")[0] if arch else ""
     if not arch_base.startswith("gfx1201"):
         raise ValueError(f"flydsl_flash_attn_func_gfx1201 requires gfx1201, got {arch!r}")
-    if not (q.shape == k.shape == v.shape):
-        raise ValueError(
-            "flydsl_flash_attn_func_gfx1201 is self-attention; q/k/v must share "
-            f"shape, got q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
-        )
+    if k.shape != v.shape:
+        raise ValueError(f"k and v must share shape, got k={tuple(k.shape)} v={tuple(v.shape)}")
+    if q.dim() == 4 and k.dim() == 4:
+        # MQA/GQA: several query heads share one KV head. Everything except the
+        # head axis must still agree -- this is self-attention, so Lq == Lk.
+        if q.shape[0] != k.shape[0] or q.shape[1] != k.shape[1] or q.shape[3] != k.shape[3]:
+            raise ValueError(
+                "q/k must share batch, seq_len and head_dim; only num_heads may "
+                f"differ (GQA). Got q={tuple(q.shape)} k={tuple(k.shape)}"
+            )
+        if q.shape[2] % k.shape[2]:
+            raise ValueError(
+                f"num_heads_q ({q.shape[2]}) must be divisible by num_heads_k "
+                f"({k.shape[2]})"
+            )
+        if q.shape[2] != k.shape[2] and variant in _LEGACY_VARIANTS:
+            raise ValueError(
+                f"variant={variant!r} predates MQA/GQA and requires "
+                f"num_heads_q == num_heads_k"
+            )
     if not (q.dtype == k.dtype == v.dtype):
         raise ValueError(f"q/k/v dtype must match: {q.dtype}/{k.dtype}/{v.dtype}")
     if q.dim() != 4:
