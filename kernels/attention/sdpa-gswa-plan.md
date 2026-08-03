@@ -102,6 +102,29 @@ rb = rsec ∩ vb          # right-masked
 fb = [lsec.hi + 1, rsec.lo - 1] ∩ vb   # full, only if lsec and rsec are disjoint
 ```
 
+**Implemented differently, and better.** Two changes, both forced by making
+the bitwise gate hold:
+
+1. **Cut one range instead of intersecting three.** Compute the *visited*
+   range `[v_lo, v_hi]` — outside it every column is dead for every row in
+   this Q block — then cut it at the full region. The three parts are then
+   contiguous and non-overlapping *by construction*, so lb and rb can never
+   double-count a block and there is no separate merge step.
+2. **Exact boundaries, not the conservative-by-one form above.** `rsec.lo` as
+   written marks the first block *touched* by the right edge, but when the
+   boundary column lands exactly on a tile edge that tile is still wholly
+   live. The exact forms are
+
+   ```
+   first full block   (left)  = ceil(((q_hi - 1) - w_left) / BLOCK_N)
+   first masked block (right) = div_rd(start_M + w_right + 1, BLOCK_N)
+   ```
+
+   Rounding either the conservative way sends a live tile through the masked
+   body. A tolerance test cannot see that — the two bodies compute the same
+   thing — but the bitwise gate can, and the pre-gSWA causal split is already
+   exact, so anything else stops reproducing it.
+
 ### 2.2 The three special cases
 
 Each is a real shape, not a corner case to hand-wave:
@@ -117,6 +140,15 @@ Each is a real shape, not a corner case to hand-wave:
    trailing block *out* of `fb` and give it to `rb`. This is the case our KV
    tail mask handles today, and it must be folded into the interval logic
    rather than left as a separate unconditional mask.
+
+**Two of the three cost nothing under the cut-one-range formulation.** Case 1
+needs no handling at all: bounding the rows by `q_hi = min(start_M + BLOCK_M,
+seqlen_q)` throughout is already exact, and rows past `seqlen_q` are never
+stored. Case 2 falls out as "the full region came out empty" — one signed
+compare, which turns the remaining range into a single masked run. Only case 3
+is explicit, as a second block bound: `div_rd(seqlen_k, BLOCK_N) - 1` is the
+last *whole* block against `div_rd(seqlen_k - 1, BLOCK_N)` for the last block
+that exists at all. The old code spelled the same distinction `_full_seq`.
 
 ### 2.3 The loop shape: two bodies, not three
 
@@ -136,12 +168,26 @@ for i in range(n_left + n_right):
 So the emitted structure stays at **two bodies**:
 
 ```
-    masked loop   over lb ++ rb   (piecewise start_n, MASK_STEPS=True)
     full loop     over fb         (MASK_STEPS=False)
+    masked loop   over lb ++ rb   (piecewise start_n, MASK_STEPS=True)
 ```
 
 Cost is one select per masked iteration to pick `start_n`. Cheap, and it is
 paid only in the masked region.
+
+**The full loop must run first, and that is not cosmetic.** Online softmax is
+order-independent mathematically but not in floating point, so masked-first is
+equally correct and would throw away the bitwise gate of §4: with an unbounded
+left window the left run is empty, and full-then-masked collapses to exactly
+the pre-gSWA full-then-tail order.
+
+**Two bodies is not itself the requirement** — a third would be legitimate if
+gSWA needed one. The requirement is that *causal pays nothing for the leading
+run at runtime*, and `n_l = 0` there because `q_hi - 1 - w_left <= -1` floors
+to block 0. Note the bitwise gate does **not** establish this: a fully dead
+tile is a bitwise no-op (`corr = exp2(0) = 1.0`, `p = 0`), so the kernel could
+walk leading dead tiles and still agree to the last bit, just slower. It needs
+a measurement, not an assertion.
 
 **Consequence for the prefetch.** The distance-1 K/V prefetch currently runs
 one tile past the region end, which is harmless because the next tile is
@@ -238,6 +284,19 @@ showing the ladder has not regressed. Also assert the emitted structure — two
 loop bodies, not three — since §2.3's whole point is invisible to a
 correctness test.
 
+**Outcome — all met.** Bitwise equivalence holds at 90/90 across head_dim
+16/64/128/192/256 × 9 shapes × both alignments. WMMA instruction counts are
+identical between causal and gSWA (64/96/128 at head_dim 128/192/256), i.e.
+two bodies. A causal-equivalent window runs at 0.98–1.02× the dedicated causal
+path, so the leading run really is skipped rather than walked and discarded.
+The ladder is unchanged (median +1.1%; the one apparent −8% at head_dim 32
+non-causal reversed sign under a 7-rep re-measurement). Cost is +25 VGPRs at
+head_dim 128 with no spill, and slightly deeper spilling where it already
+existed (head_dim 192 scratch 16 → 24 B, head_dim 256 104 → 116 B).
+
+Payoff at B=1 H=8 N=4096 f16, a 256-wide window against causal: **2.2–3.3×**
+across the ladder.
+
 ### Step 3 — delete `CAUSAL_TYPE` 1 and 2
 
 The objective. Kernel keeps `0` and `3`. The host maps 1/2 to windows, exactly
@@ -277,31 +336,23 @@ Four properties worth asserting beyond "matches the reference":
    reproduce `CAUSAL_TYPE=2`. This is the test that justifies deleting them,
    and it must be written in step 1 while both paths still exist.
 
-   **Bitwise was the wrong bar, and step 1 measured why.** The two are separate
-   builds, and the window path is a structurally different kernel -- in step 1
-   it masks every tile where the causal path masks only the diagonal ones.
-   Under `reassoc`/`contract` fast-math LLVM may fuse and reorder them
-   differently, so bit-equality is not something the toolchain owes us. About
-   40% of the shape matrix does come out bit-identical, which is exactly the
-   trap: bitwise would have looked plausible and then failed on the rest.
+   **Bitwise holds from step 2 on, and is the sharpest oracle here.** The
+   masked and unmasked bodies are two separately-optimised copies of the same
+   computation and do *not* agree to the last bit, so a single tile routed to
+   the wrong body shows up immediately — even where the two are mathematically
+   identical and every tolerance test passes. That is what settled the
+   exact-vs-conservative boundary question and caught the gSWA prologue still
+   prefetching tile 0.
 
-   What the bar must catch is a wrong *set of columns*, so the test proves it
-   can rather than asserting it: the same window shifted one column right is
-   run too and must differ by a wide margin. Measured over the §4 matrix at
-   head_dim 64 and 128:
+   **Step 1 could not assert it**, because with no full region every tile went
+   through the masked body. About 40% of the matrix came out identical anyway,
+   which is the trap: bitwise looked plausible there and would have failed on
+   the rest. Step 1 used a tolerance with a negative control instead — the
+   same window shifted one column, which must differ by a wide margin. Matched
+   agreed to 2.5e-4 and a one-column shift differed by at least 2.2e-1, ~850×
+   apart. The negative control is kept in the step-2 test: bitwise equality
+   only means something if the two builds *could* have differed.
 
-   | | worst | weakest |
-   |---|---|---|
-   | matched window vs causal | 2.5e-4 | — |
-   | one-column shift vs causal | — | 2.2e-1 |
-
-   ~850x apart, so the bar sits at 1e-3: 4x above the noise, 200x below the
-   smallest real error. A negative control is what makes a tolerance an
-   assertion about the kernel rather than about the number chosen.
-2. **Empty windows.** A window admitting no keys for some rows is reachable
-   here far more easily than under causal — `window_left + window_right < 0`
-   does it. Those rows must give `O = 0` and `LSE = +inf`. Already handled, but
-   gSWA is the first feature that makes it *easy* to hit, so test it directly.
 3. **A window narrower than `BLOCK_N`**, which triggers §2.2 case 2 (lb and rb
    merge) and leaves no full blocks at all.
 4. **A window wider than `seqlen_k`**, which should degenerate to no masking.
@@ -313,7 +364,7 @@ Four properties worth asserting beyond "matches the reference":
 | risk | why it matters | mitigation |
 |---|---|---|
 | **A third loop body** | 2 bodies already cost 63 VGPRs at hd 128 and spilled hd 192 | piecewise `start_n`, §2.3; assert the body count |
-| Prefetch across the seam | discontinuous `start_n`; wrong tile is invisible to correctness tests | prefetch via the same piecewise map; test with a window that forces a seam mid-loop |
+| Prefetch across the seam | discontinuous `start_n`; wrong tile is invisible to correctness tests | **Materialised in step 2 — and not at the seam.** The *prologue* still fetched tile 0, which is wrong the moment a left window makes tile 0 unvisited: rel=1.3 on a shape whose interval arithmetic was provably correct against brute force. Isolated in one experiment by disabling the prefetch. |
 | Interval arithmetic on negatives | `fx.Index` is unsigned and `fx.Int32` compares default to unsigned; this already cost a debugging round in P2b | the rules in §2.4, applied without exception |
 | `-inf` through fast-math | already bit us once | mask stays after the scale; `ninf` stays off |
 | Tuning tables go stale again | third time now (256 after LSE, 128 after P2a) | re-sweep after step 2, before declaring the phase done |
