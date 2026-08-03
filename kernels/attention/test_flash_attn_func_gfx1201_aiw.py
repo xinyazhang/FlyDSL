@@ -683,6 +683,192 @@ def test_alignments_differ_when_lengths_differ():
     )
 
 
+# ---------------------------------------------------------------------------
+# Generalized sliding-window attention (CAUSAL_TYPE 3)
+# ---------------------------------------------------------------------------
+
+
+def _swa_mask(Lq, Lk, w_left, w_right):
+    """Boolean visibility: key j is live for query i iff it is in the band."""
+    i = torch.arange(Lq, device="cuda")[:, None]
+    j = torch.arange(Lk, device="cuda")[None, :]
+    return (j <= i + w_right) & (j >= i - w_left)
+
+
+@pytest.mark.parametrize("ctype", [1, 2], ids=["topleft", "botright"])
+@pytest.mark.parametrize("Lq,Lk", _XATTN_SHAPES, ids=[f"{a}x{b}" for a, b in _XATTN_SHAPES])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_window_reproduces_causal(head_dim, Lq, Lk, ctype):
+    """A window must reproduce the dedicated causal path, and the bar must
+    provably be tight enough to see a one-column error.
+
+    This is the test that licenses deleting CAUSAL_TYPE 1 and 2, so it has to
+    exist while both paths still do -- afterwards there is nothing left to
+    compare against. The mapping it asserts is spelled out inline rather than
+    taken from a shared helper: if both sides called the same derivation the
+    test would only prove the helper agrees with itself.
+
+        top-left      (seqlen_q, 0)
+        bottom-right  (seqlen_q, seqlen_k - seqlen_q)
+
+    ``window_left = seqlen_q`` is "unbounded" -- no row can reach further back
+    than the start of its own sequence -- so the left term of the mask is false
+    for every live row and the two paths mask exactly the same columns.
+
+    **Not bitwise**, which sdpa-gswa-plan.md originally asked for. The two are
+    separate builds and the window path currently masks every tile where the
+    causal path masks only the diagonal ones, so they are structurally
+    different kernels; under `reassoc`/`contract` fast-math LLVM may fuse and
+    reorder them differently. Many shapes here do come out bit-identical, but
+    it is not a property the toolchain owes us, and asserting it would be
+    testing the scheduler rather than the masking.
+
+    What the bar has to catch is a wrong *set of columns*, so the test proves
+    it can: the same window shifted one column right is compared too, and must
+    fail by a wide margin. Measured over this shape matrix, agreement is at
+    worst 2.5e-4 while a one-column shift is at least 2.2e-1 -- a separation of
+    ~850x, so 1e-3 sits four times above the noise and two hundred times below
+    the smallest real error.
+    """
+    _require_env()
+    gen = torch.Generator(device="cuda").manual_seed(0)
+
+    def _t(n):
+        return torch.randn(
+            1, n, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen
+        )
+
+    q, k, v = _t(Lq), _t(Lk), _t(Lk)
+    common = dict(num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16")
+
+    o_causal = torch.empty_like(q)
+    build_flash_attn_func_aiw_module(causal_type=ctype, **common)(
+        q, k, v, o_causal, 1, Lq, Lk
+    )
+
+    def _window_run(w):
+        o = torch.empty_like(q)
+        build_flash_attn_func_aiw_module(causal_type=3, **common)(
+            q, k, v, o, 1, Lq, Lk, window=w
+        )
+        return o
+
+    w_left = Lq
+    w_right = 0 if ctype == 1 else Lk - Lq
+    o_window = _window_run((w_left, w_right))
+    o_shifted = _window_run((w_left, w_right + 1))
+    torch.cuda.synchronize()
+
+    r_match = _rel(o_window, o_causal)
+    r_shift = _rel(o_shifted, o_causal)
+    assert r_match < 1e-3, (
+        f"window ({w_left}, {w_right}) differs from causal_type={ctype} at "
+        f"{Lq}x{Lk} hd={head_dim}: rel={r_match:.3e}"
+    )
+    # Negative control: without it, a bar of 1e-3 is just an assertion.
+    assert r_shift > 1e-2, (
+        f"shifting the window one column right changed the result by only "
+        f"{r_shift:.3e} at {Lq}x{Lk} hd={head_dim} -- the tolerance above "
+        f"cannot distinguish a wrong diagonal"
+    )
+
+
+_SWA_WINDOWS = [
+    (0, 0),        # the diagonal alone
+    (1, 1),        # narrower than any BLOCK_N -- no full tiles exist
+    (16, 0),
+    (64, 64),
+    (0, 64),       # anti-causal: only keys ahead of the query
+    (-16, 64),     # band shifted off the diagonal, left bound negative
+    (64, -16),     # ... and the other way
+    (10_000, 10_000),  # wider than seqlen_k: degenerates to no masking
+]
+
+
+@pytest.mark.parametrize("w_left,w_right", _SWA_WINDOWS, ids=[f"{a}_{b}" for a, b in _SWA_WINDOWS])
+@pytest.mark.parametrize("Lq,Lk", [(256, 256), (200, 300), (300, 200), (523, 337)],
+                         ids=["256x256", "200x300", "300x200", "523x337"])
+def test_sliding_window(Lq, Lk, w_left, w_right):
+    """The band, including negative bounds on either side.
+
+    Negative is the entire content of the word "generalized": ``(-16, 64)``
+    admits only keys strictly ahead of the query, and rows near the start of
+    the sequence then see nothing at all. Those rows are checked separately --
+    an empty softmax gives O = 0, where the reference gives NaN.
+    """
+    _require_env()
+    head_dim = 64
+    gen = torch.Generator(device="cuda").manual_seed(0)
+
+    def _t(n):
+        return torch.randn(
+            1, n, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen
+        )
+
+    q, k, v = _t(Lq), _t(Lk), _t(Lk)
+    o = torch.empty_like(q)
+    build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, causal_type=3,
+        dtype_str="f16",
+    )(q, k, v, o, 1, Lq, Lk, window=(w_left, w_right))
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(o).all(), "window produced non-finite output"
+    m = _swa_mask(Lq, Lk, w_left, w_right)
+    live = m.any(-1)
+    qb, kb, vb = (x.transpose(1, 2).float() for x in (q, k, v))
+
+    dead = ~live
+    if dead.any():
+        assert o[:, dead].abs().max().item() == 0.0, "rows with no keys must be zero"
+    if not live.any():
+        return
+    ref = F.scaled_dot_product_attention(qb, kb, vb, attn_mask=m).transpose(1, 2)
+    rel = _rel(o[:, live], ref[:, live])
+    assert rel < 5e-3, f"{Lq}x{Lk} window=({w_left},{w_right}) rel={rel:.3e}"
+
+
+def test_window_wider_than_seqlen_is_unmasked():
+    """A band covering everything must equal plain non-causal attention.
+
+    Cheap, but it pins the degenerate end of the range: if either bound were
+    compared unsigned, a large positive window would still pass here while
+    a negative one failed -- which is why the negative cases above exist.
+    """
+    _require_env()
+    Lq = Lk = 256
+    head_dim = 64
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v = (
+        torch.randn(1, n, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+        for n in (Lq, Lk, Lk)
+    )
+    o = torch.empty_like(q)
+    build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, causal_type=3,
+        dtype_str="f16",
+    )(q, k, v, o, 1, Lq, Lk, window=(Lk, Lk))
+    torch.cuda.synchronize()
+    qb, kb, vb = (x.transpose(1, 2).float() for x in (q, k, v))
+    ref = F.scaled_dot_product_attention(qb, kb, vb).transpose(1, 2)
+    rel = _rel(o, ref)
+    assert rel < 5e-3, f"full window differs from unmasked attention, rel={rel:.3e}"
+
+
+def test_window_requires_explicit_bounds():
+    """causal_type=3 with no window is a caller error, not a silent default."""
+    _require_env()
+    q, k, v = (
+        torch.randn(1, 64, _NUM_HEADS, 64, dtype=torch.float16, device="cuda")
+        for _ in range(3)
+    )
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=64, causal=True, causal_type=3, dtype_str="f16",
+    )
+    with pytest.raises(ValueError, match="requires window"):
+        exe(q, k, v, torch.empty_like(q), 1, 64, 64)
+
+
 def test_logsumexp_is_plus_inf_for_rows_with_no_keys():
     """AOTriton's convention: +inf, so the backward pass zeroes those rows.
 

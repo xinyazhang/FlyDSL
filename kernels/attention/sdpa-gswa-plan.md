@@ -219,9 +219,8 @@ rather than a diagonal.
 - The interval logic is unchanged: `window_left = seqlen_q` keeps `lb` empty,
   so the existing two-region split still applies.
 
-**Gate:** every existing causal test passes bit-for-bit against P2b. If the
-windows are derived correctly this is a pure refactor, and bitwise is the right
-bar precisely because nothing should have changed.
+**Gate:** a window must reproduce the dedicated causal path. **Not bitwise** --
+see the note below; the bar is a tight tolerance with a negative control.
 
 ### Step 2 — the left interval
 
@@ -274,10 +273,31 @@ Beyond `test_fast` (plan1 §5.1), gSWA needs its own axes:
 Four properties worth asserting beyond "matches the reference":
 
 1. **Causal equivalence.** `window_left = seqlen_q, window_right = 0` must
-   reproduce `CAUSAL_TYPE=1` **bitwise**, and `window_right = seqlen_k -
-   seqlen_q` must reproduce `CAUSAL_TYPE=2` bitwise. This is the test that
-   justifies deleting them, and it must be written in step 1 while both paths
-   still exist.
+   reproduce `CAUSAL_TYPE=1`, and `window_right = seqlen_k - seqlen_q` must
+   reproduce `CAUSAL_TYPE=2`. This is the test that justifies deleting them,
+   and it must be written in step 1 while both paths still exist.
+
+   **Bitwise was the wrong bar, and step 1 measured why.** The two are separate
+   builds, and the window path is a structurally different kernel -- in step 1
+   it masks every tile where the causal path masks only the diagonal ones.
+   Under `reassoc`/`contract` fast-math LLVM may fuse and reorder them
+   differently, so bit-equality is not something the toolchain owes us. About
+   40% of the shape matrix does come out bit-identical, which is exactly the
+   trap: bitwise would have looked plausible and then failed on the rest.
+
+   What the bar must catch is a wrong *set of columns*, so the test proves it
+   can rather than asserting it: the same window shifted one column right is
+   run too and must differ by a wide margin. Measured over the §4 matrix at
+   head_dim 64 and 128:
+
+   | | worst | weakest |
+   |---|---|---|
+   | matched window vs causal | 2.5e-4 | — |
+   | one-column shift vs causal | — | 2.2e-1 |
+
+   ~850x apart, so the bar sits at 1e-3: 4x above the noise, 200x below the
+   smallest real error. A negative control is what makes a tolerance an
+   assertion about the kernel rather than about the number chosen.
 2. **Empty windows.** A window admitting no keys for some rows is reachable
    here far more easily than under causal — `window_left + window_right < 0`
    does it. Those rows must give `O = 0` and `LSE = +inf`. Already handled, but

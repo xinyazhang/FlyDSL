@@ -671,6 +671,14 @@ def build_flash_attn_func_aiw_module_primary(
     #   top-left      key j is visible to query i iff  j <= i
     #   bottom-right  ...                        iff  j <= i + (seqlen_k - seqlen_q)
     #
+    # 3 = generalized sliding window: the test becomes a two-sided band,
+    # `i - window_left <= j <= i + window_right`, with both bounds signed
+    # runtime arguments. It subsumes 1 and 2 exactly -- (seqlen_q, 0) and
+    # (seqlen_q, seqlen_k - seqlen_q) respectively -- which is why AOTriton
+    # ships only {0, 3} and resolves 1/2 on the host. Types 1 and 2 survive
+    # here only until that equivalence is nailed down by a test; see
+    # sdpa-gswa-plan.md.
+    #
     # PyTorch's is_causal=True is top-left; see
     # https://github.com/pytorch/pytorch/issues/108108 for the debate about
     # changing that default.
@@ -678,8 +686,8 @@ def build_flash_attn_func_aiw_module_primary(
         CAUSAL_TYPE = 1 if causal else 0
     else:
         CAUSAL_TYPE = causal_type
-    if CAUSAL_TYPE not in (0, 1, 2):
-        raise ValueError(f"causal_type must be 0, 1 or 2, got {CAUSAL_TYPE}")
+    if CAUSAL_TYPE not in (0, 1, 2, 3):
+        raise ValueError(f"causal_type must be 0, 1, 2 or 3, got {CAUSAL_TYPE}")
     if bool(CAUSAL_TYPE) != bool(causal):
         raise ValueError(
             f"causal={causal} disagrees with causal_type={CAUSAL_TYPE}"
@@ -798,6 +806,8 @@ def build_flash_attn_func_aiw_module_primary(
         L: fx.Pointer,
         seqlen_q: fx.Int32,
         seqlen_k: fx.Int32,
+        window_left: fx.Int32,
+        window_right: fx.Int32,
         lse_stride: fx.Int64,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
@@ -1427,11 +1437,19 @@ def build_flash_attn_func_aiw_module_primary(
         def reduction_peer(v_f32):
             return fx.Float32(v_f32).shuffle_xor(shuf_16_i32, width_i32)
 
-        # Diagonal offset: key j is visible to query i iff j <= i + _diag.
-        # 0 for top-left, seqlen_k - seqlen_q for bottom-right. It is signed --
-        # with seqlen_q > seqlen_k it goes negative, and whole leading Q rows
-        # then see no keys at all.
-        if const_expr(CAUSAL_TYPE == 2):
+        # Right edge of the visible band: key j is visible to query i only if
+        # j <= i + _diag. This *is* `window_right` -- 0 for top-left,
+        # seqlen_k - seqlen_q for bottom-right, and an explicit argument under
+        # gSWA. It is signed: with seqlen_q > seqlen_k it goes negative, and
+        # whole leading Q rows then see no keys at all.
+        #
+        # Everything derived from a window stays fx.Int32 with explicit signed
+        # predicates, per sdpa-gswa-plan.md section 2.4. fx.Index is unsigned,
+        # so a negative window reaching it silently becomes enormous.
+        if const_expr(CAUSAL_TYPE == 3):
+            _diag_i32 = fx.Int32(window_right)
+            _wl_i32 = fx.Int32(window_left)
+        elif const_expr(CAUSAL_TYPE == 2):
             _diag_i32 = fx.Int32(seqlen_k) - fx.Int32(seqlen_q)
         else:
             _diag_i32 = fx.Int32(0)
@@ -1514,7 +1532,15 @@ def build_flash_attn_func_aiw_module_primary(
         # guard at all, because the region boundary blocks scheduling in a
         # latency-bound loop. A static split has no such boundary.
         _full_seq = (seqlen_k_v // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N)
-        if const_expr(CAUSAL):
+        if const_expr(CAUSAL_TYPE == 3):
+            # A left window can kill columns in *any* tile, including tile 0,
+            # so "every earlier tile is fully live" no longer holds and no tile
+            # is unconditionally full. Correct but slow: step 2 of
+            # sdpa-gswa-plan.md replaces this with the three intervals, which
+            # restores a full region between the two masked runs. Until then
+            # gSWA pays the mask on every tile.
+            _full_end = fx.Index(0)
+        elif const_expr(CAUSAL):
             # Tile t is clear of the diagonal iff its last column
             # <= q_start + _diag, using the lowest Q row in this block. Clamped
             # at 0 so a negative diagonal simply gives an empty full region.
@@ -1727,6 +1753,18 @@ def build_flash_attn_func_aiw_module_primary(
                                     arith.CmpIPredicate.sgt,
                                     _raw(_col),
                                     _raw(q_row_i32 + _diag_i32),
+                                )
+                            )
+                        if const_expr(CAUSAL_TYPE == 3):
+                            # Left edge of the band. Signed: q_row - w_left is
+                            # negative for every row when w_left is
+                            # "unbounded" (== seqlen_q), which is how types 1
+                            # and 2 map onto this path with the term inert.
+                            _dead = _dead | ArithValue(
+                                arith.cmpi(
+                                    arith.CmpIPredicate.slt,
+                                    _raw(_col),
+                                    _raw(q_row_i32 - _wl_i32),
                                 )
                             )
                         s_raw[_i] = ArithValue(_dead).select(c_neg_inf, s_raw[_i])
@@ -2040,6 +2078,8 @@ def build_flash_attn_func_aiw_module_primary(
         batch_size: fx.Int32,
         seqlen_q: fx.Int32,
         seqlen_k: fx.Int32,
+        window_left: fx.Int32,
+        window_right: fx.Int32,
         lse_stride: fx.Int64,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
@@ -2073,7 +2113,8 @@ def build_flash_attn_func_aiw_module_primary(
         # Always forwarded: with STRIDES_CONSTEXPR the kernel simply does not
         # read them, which is what keeps the two arms directly comparable.
         launcher = flash_attn_func_aiw_kernel(
-            Q, K, V, O, L, seqlen_q, seqlen_k, lse_stride,
+            Q, K, V, O, L, seqlen_q, seqlen_k,
+            window_left, window_right, lse_stride,
             num_head_q, num_head_k,
             hdim_qk, hdim_vo,
             stride_q0, stride_q1, stride_q2,
@@ -2201,6 +2242,31 @@ def build_flash_attn_func_aiw_module_primary(
             )
         return _ptr_arg(lse), lse.stride(0)
 
+    def _resolve_window(window, seqlen_q, seqlen_k):
+        """(window_left, window_right), signed, as the kernel wants them.
+
+        Only CAUSAL_TYPE 3 reads them. The other types still forward a pair so
+        both arms share one ABI and stay directly comparable -- the same reason
+        the strides are always passed even under STRIDES_CONSTEXPR.
+
+        Deliberately does *not* know how to derive a window from causal_type.
+        The mapping (top-left is `(seqlen_q, 0)`, bottom-right is
+        `(seqlen_q, seqlen_k - seqlen_q)`) is what the equivalence test has to
+        establish before types 1 and 2 can be deleted, so the test spells it
+        out itself; sharing a helper here would make that test tautological.
+        """
+        if CAUSAL_TYPE != 3:
+            return 0, 0
+        if window is None:
+            raise ValueError(
+                "causal_type=3 is generalized sliding-window attention and "
+                "requires window=(left, right); "
+                f"pass ({seqlen_q}, 0) for top-left causal or "
+                f"({seqlen_q}, {seqlen_k - seqlen_q}) for bottom-right"
+            )
+        wl, wr = window
+        return int(wl), int(wr)
+
     def _resolve_scale(Q, scale):
         """Default sm_scale from the tensor's *real* head dim, not the tile.
 
@@ -2241,10 +2307,11 @@ def build_flash_attn_func_aiw_module_primary(
 
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
-    def _launch(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None):  # noqa: E741
+    def _launch(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
         _lse_p, _lse_s = _lse_args(lse, seqlen_q)
+        _wl, _wr = _resolve_window(window, seqlen_q, seqlen_k)
         _run_compiled(
             launch_flash_attn_aiw,
             *ptrs,
@@ -2252,6 +2319,8 @@ def build_flash_attn_func_aiw_module_primary(
             batch_size,
             seqlen_q,
             seqlen_k,
+            _wl,
+            _wr,
             _lse_s,
             *meta,
             *st,
@@ -2259,10 +2328,11 @@ def build_flash_attn_func_aiw_module_primary(
             stream if stream is not None else fx.Stream(None),
         )
 
-    def _compile(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None):  # noqa: E741
+    def _compile(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
         _lse_p, _lse_s = _lse_args(lse, seqlen_q)
+        _wl, _wr = _resolve_window(window, seqlen_q, seqlen_k)
         return flyc.compile(
             launch_flash_attn_aiw,
             *ptrs,
@@ -2270,6 +2340,8 @@ def build_flash_attn_func_aiw_module_primary(
             batch_size,
             seqlen_q,
             seqlen_k,
+            _wl,
+            _wr,
             _lse_s,
             *meta,
             *st,
