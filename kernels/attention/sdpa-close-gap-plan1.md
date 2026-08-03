@@ -887,7 +887,42 @@ The discipline: a cost only belongs here if it has been *measured* (interleaved
 A/B, 3+ reps, per §5) and *diagnosed* far enough to say what would be tried.
 "Probably slower" is not an entry.
 
-### 6.2 logsumexp at head_dim 256 — P1d
+### 6.2 ~~logsumexp at head_dim 256~~ — RESOLVED by re-tuning
+
+The 8% LSE regression at head_dim 256 non-causal is gone, and the config is
+now 1.15x *faster* than the kernel it replaced. Kept below because the cause is
+worth remembering.
+
+Re-sweeping `(shards, q_tiles)` found the old entry was simply mistuned:
+
+    (shards, q_tiles)   BLOCK_M  waves | non-causal  causal
+    (2, 4)  <- old         64       8  |    74.1      71.8
+    (1, 16) <- new        256      16  |    92.6      74.9
+
+1.25x non-causal, 1.05x causal. Two things this teaches:
+
+- **The old note said "16 waves rejected: reduction buffer over LDS".** True
+  only *with* sharding -- that buffer exists solely when `QK_SHARDS > 1`. The
+  sweep had varied waves while holding shards at 2, so unsharded 16 waves was
+  never tried. A rejection reason recorded against one axis silently pruned a
+  point on another.
+- **The new config spills 3 registers where the old spilled none** (241 -> 256
+  VGPRs) and is still 25% faster. BLOCK_M 64 -> 256 quarters the workgroup
+  count and the K/V traffic with it. Spill count is not a proxy for speed.
+
+384 and 512 were swept the same way and are already optimal (384: 61.4/60.9 at
+(3,4), best alternative 54.2; 512: 52.2/44.6 at (4,2), best alternative 36.7).
+Only 256 was wrong.
+
+**Still open:** the rest of the ladder has not been re-swept since
+`safe_softmax` and LSE moved the register budget. head_dim 256 is unlikely to
+be the only entry whose measurement has gone stale -- see 6.1, which is the
+same class of problem.
+
+<details>
+<summary>Original entry (P1d)</summary>
+
+### 6.2b logsumexp at head_dim 256 — P1d
 
 | config | ratio |
 |---|---|
@@ -919,6 +954,8 @@ live range is the cost, not the work.
    what the runtime gate exists to avoid -- only worth it if 1 fails and the
    8% matters.
 3. Accept. It is one config, and LSE is not optional for training.
+
+</details>
 
 ### 6.1 `safe_softmax` at small head_dim — P1a
 

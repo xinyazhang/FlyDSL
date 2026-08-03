@@ -207,9 +207,28 @@ _ROWS_PER_Q_TILE = 16
 #
 # The 16-wave rejections are LDS: the cross-shard reduction buffer scales with
 # NUM_WAVES, and past 8 waves it no longer fits inside the V window it aliases.
-_SHARDS_BY_HEAD_DIM = {224: 2}
+#
+# head_dim 256 re-swept after safe_softmax and LSE moved the register budget.
+# The old entry (2 shards, 4 q_tiles -> BLOCK_M 64, 8 waves) came from a sweep
+# whose note reads "16 waves rejected: reduction buffer over LDS" -- true only
+# *with* sharding, since that buffer exists only when QK_SHARDS > 1. Unsharded
+# 16 waves was therefore never tried, and it is much better:
+#
+#   (shards, q_tiles)   BLOCK_M  waves | non-causal  causal
+#   (2, 4)  <- old         64       8  |    74.1      71.8
+#   (1, 16) <- new        256      16  |    92.6      74.9
+#
+# i.e. 1.25x non-causal and 1.05x causal, despite spilling 3 registers where
+# the old config spilled none (241 -> 256 VGPRs). BLOCK_M 64 -> 256 quarters
+# the workgroup count and the K/V traffic with it, which outweighs the spills
+# by a wide margin -- a reminder that spill count is not a proxy for speed.
+#
+# 384 and 512 were swept the same way and are already at their optimum
+# (384: 61.4/60.9 at (3,4), best alternative 54.2; 512: 52.2/44.6 at (4,2),
+# best alternative 36.7). Only 256 was mistuned.
+_SHARDS_BY_HEAD_DIM = {224: 2, 256: 1}
 _Q_TILES_BY_HEAD_DIM = {48: 8, 64: 16, 80: 16, 96: 16, 128: 16, 160: 16,
-                        192: 8, 224: 8, 256: 4, 384: 4, 512: 2}
+                        192: 8, 224: 8, 256: 16, 384: 4, 512: 2}
 
 # BLOCK_M for the distance-0 schedule. Per-wave register use is dominated by
 # two head_dim-proportional terms -- o_accs = VO_WIDTH/2 VGPRs and
