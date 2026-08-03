@@ -969,10 +969,18 @@ Two findings worth carrying forward:
 per-sequence, which is meaningless without per-sequence lengths. The host-side
 `_CAUSAL_WINDOW` table is where they land.
 
-**P3 varlen · P4 bias · P5 dropout.** Unchanged in content, and each is now
-simpler than plan 0 scoped it: there is one masking path to extend, not two.
-P3 additionally inherits P6 step 4. P4 still carries the `m_i` floor regression
-test, which is only *reachable* with bias.
+**P3 varlen.** Detailed separately in `sdpa-varlen-plan.md`. Larger than plan
+0 scoped it in one respect and smaller in another: AOTriton ships **four**
+`VarlenType` values, not two — two of them added for Transformer Engine in
+`04cdead5`, which decouple "where a sequence starts" from "how long it is" —
+but all four reduce to six scalars computed once in the prologue, and the
+kernel's addressing and LSE offset are already written in the shape that needs.
+
+**P4 bias · P5 dropout.** Unchanged in content, and each is now simpler than
+plan 0 scoped it: there is one masking path to extend, not two. P4 still
+carries the `m_i` floor regression test, which is only *reachable* with bias.
+Both gain a varlen dimension once P3 lands — bias is indexed per sequence, and
+dropout's Philox offset must be per-sequence to stay reproducible.
 
 **Still owed before the phase set is clean:** the tuning re-sweep (§5 of the
 gSWA plan -- the tables have now gone stale a fourth time, and gSWA moved
