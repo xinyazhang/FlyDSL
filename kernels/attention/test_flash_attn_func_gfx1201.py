@@ -153,16 +153,53 @@ def test_causal_seqlen_not_multiple_of_block(use_binding_prefetch):
     assert cos > _COS_TOL, f"cosine similarity {cos:.6f}"
 
 
-def test_noncausal_padding_ratio_rejected():
-    """Non-causal padding beyond 0.5% must raise, not silently scale the output.
+_IRREGULAR_SEQLENS = [11, 17, 37, 67, 157, 200, 257, 523, 1033, 2063]
 
-    Padded K/V keys give QK^T = 0, but exp(0) = 1 still enters the softmax
-    denominator.
+
+@pytest.mark.parametrize("seq", _IRREGULAR_SEQLENS)
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_irregular_seqlen(seq, causal):
+    """seq_len need not divide BLOCK_M, and is no longer padded host-side.
+
+    This used to raise for non-causal shapes: the interface rounded seq_len up
+    with F.pad, and a zero-padded key gives QK^T = 0 whose exp(0) = 1 still
+    lands in the softmax denominator, so anything beyond 0.5% padding was
+    rejected outright. The kernel now masks the KV tail to -inf instead, so
+    the copy and the restriction are both gone.
+
+    Values are AOTriton's PRIME_SEQLEN_Q, plus 200 for the case the old guard
+    rejected.
+    """
+    _require_env()
+    q, k, v = _qkv(1, seq, _NUM_HEADS, 128, torch.float16)
+    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal)
+    torch.cuda.synchronize()
+    assert out.shape == q.shape
+    assert torch.isfinite(out).all(), f"seq={seq} causal={causal} not finite"
+    rel, cos = _compare(out, _reference(q, k, v, causal))
+    assert rel < 5e-3, f"seq={seq} causal={causal} rel={rel:.3e}"
+
+
+def test_irregular_seqlen_does_not_copy():
+    """The inputs must reach the kernel untouched -- no F.pad, no contiguous().
+
+    Regression guard: the padding copy was three tensors per call, and its
+    removal is only real if nothing reintroduces it.
     """
     _require_env()
     q, k, v = _qkv(1, 200, _NUM_HEADS, 128, torch.float16)
-    with pytest.raises(ValueError, match="padding ratio"):
-        flydsl_flash_attn_func_gfx1201(q, k, v, causal=False)
+    before = (q.data_ptr(), k.data_ptr(), v.data_ptr())
+    flydsl_flash_attn_func_gfx1201(q, k, v, causal=False)
+    torch.cuda.synchronize()
+    assert (q.data_ptr(), k.data_ptr(), v.data_ptr()) == before
+
+
+def test_legacy_variant_still_rejects_noncausal_padding():
+    """The pre-unification kernels have no KV mask and still need the padding."""
+    _require_env()
+    q, k, v = _qkv(1, 200, _NUM_HEADS, 128, torch.float16)
+    with pytest.raises(ValueError, match="no in-kernel KV mask"):
+        flydsl_flash_attn_func_gfx1201(q, k, v, causal=False, variant="legacy_bp")
 
 
 @pytest.mark.parametrize(

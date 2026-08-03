@@ -328,13 +328,6 @@ def flydsl_flash_attn_func_gfx1201(
 
     dtype_str = _torch_dtype_to_str(q.dtype)
 
-    # Pad seq_len up to the kernel's tile size. Tight padding (<= 0.5% of
-    # S_pad) is empirically below the bf16 noise floor on production shapes.
-    # Higher ratios are rejected above: padded K/V tokens produce QK^T = 0
-    # but exp(0) = 1 still contributes to the softmax denominator and would
-    # scale the output. Padded queries produce garbage rows that we slice
-    # off before returning.
-    # Must match the kernel's own choice: it sets the seq_len padding below.
     # Everything below keys on the *tile* width, per N3: BLOCK_DMODEL is the
     # single tuning key, and hdim rides along as a runtime argument.
     use_bp = _use_bp(block_dmodel, use_binding_prefetch, variant)
@@ -351,24 +344,36 @@ def flydsl_flash_attn_func_gfx1201(
         block_m = aiw_block_m(
             block_dmodel, 1 if use_bp else aiw_prefetch_dist(block_dmodel)
         )
-    seq_len_pad = ((seq_len_real + block_m - 1) // block_m) * block_m
-    n_pad = seq_len_pad - seq_len_real
-    if not causal and n_pad > 0 and n_pad / seq_len_pad > _MAX_NONCAUSAL_PAD_RATIO:
-        raise ValueError(
-            "flydsl_flash_attn_func_gfx1201: non-causal path with padding ratio "
-            f"{n_pad}/{seq_len_pad}={n_pad / seq_len_pad:.4f} exceeds 0.5% "
-            "safety threshold; padded K/V tokens contribute to softmax "
-            "denominator and would scale outputs. Either set causal=True, "
-            "pad seq_len to a multiple of 128 before calling, or use a "
-            "self-attn kernel with explicit attention masking."
-        )
-    if seq_len_pad != seq_len_real:
-        # F.pad pads from the last dim; for BSHD (last=head_dim) the seq dim
-        # is dim 1, so we pad (D_left, D_right, H_left, H_right, S_left, S_right).
-        q_p = F.pad(q.contiguous(), (0, 0, 0, 0, 0, n_pad))
-        k_p = F.pad(k.contiguous(), (0, 0, 0, 0, 0, n_pad))
-        v_p = F.pad(v.contiguous(), (0, 0, 0, 0, 0, n_pad))
+    # aiw masks the KV tail in-kernel, so seq_len is passed through as-is.
+    #
+    # It used to be rounded up to BLOCK_M with F.pad -- three tensor copies per
+    # call (~25 MB at B=1 H=8 N=4096 d=128 f16) -- and non-causal calls with
+    # more than 0.5% padding were *rejected*, because a zero-padded key gives
+    # QK^T = 0 and exp(0) = 1 still lands in the softmax denominator, silently
+    # scaling the output. Neither the copy nor the rejection is needed now: the
+    # tail columns are masked to -inf and contribute nothing.
+    #
+    # The legacy builders have no such mask and still require the padding, so
+    # they keep it.
+    if variant in _LEGACY_VARIANTS:
+        seq_len_pad = ((seq_len_real + block_m - 1) // block_m) * block_m
+        n_pad = seq_len_pad - seq_len_real
+        if not causal and n_pad > 0 and n_pad / seq_len_pad > _MAX_NONCAUSAL_PAD_RATIO:
+            raise ValueError(
+                f"variant={variant!r} has no in-kernel KV mask, so a non-causal "
+                f"padding ratio of {n_pad}/{seq_len_pad}="
+                f"{n_pad / seq_len_pad:.4f} would scale the output. Use the "
+                f"default variant, which masks the tail instead of padding it."
+            )
+        if n_pad:
+            # F.pad pads from the last dim; for BSHD the seq axis is dim 1.
+            q_p, k_p, v_p = (
+                F.pad(t.contiguous(), (0, 0, 0, 0, 0, n_pad)) for t in (q, k, v)
+            )
+        else:
+            q_p, k_p, v_p = q, k, v
     else:
+        seq_len_pad = seq_len_real
         # No `.contiguous()`: aiw reads strides, so any xxxD permutation is
         # already supported, and forcing a copy would both cost a copy and
         # destroy a padded D pitch (re-packing a (.., 100)-in-104 view back to

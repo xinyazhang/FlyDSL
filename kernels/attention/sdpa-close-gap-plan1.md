@@ -1028,6 +1028,40 @@ live range is the cost, not the work.
 
 </details>
 
+### 6.3 KV tail mask on aligned shapes — P1e (D5)
+
+| config | ratio (was, pre-mask) |
+|---|---|
+| head_dim 16 non-causal | **0.783** (0.945) |
+| head_dim 32 non-causal | 0.891 (0.969) |
+| head_dim 512 non-causal | 0.860 (0.988) |
+| median over the ladder | 0.991 |
+
+**Cause.** The mask is `NUM_S_VALS` compare+selects per KV tile, applied
+unconditionally. It is worst exactly where `BLOCK_N` is widest and the loop is
+most softmax-bound: head_dim 16 uses `BLOCK_N = 128`, so `NUM_S_VALS = 64` and
+the mask adds 128 VALU ops per tile.
+
+**Things already tried and rejected:**
+
+- *Guarding it* with "is this the tail tile" -- much worse (head_dim 192
+  non-causal 78.0 against 98.3 TFLOPS). The `scf.if` region boundary blocks
+  scheduling across it in a latency-bound loop, costing more than the selects
+  it skips.
+- *Vectorising it* onto the eight-wide accumulators, which requires vectorising
+  the scale too -- helped head_dim 512 (0.860 -> 0.967) but hurt the small dims
+  more (16: 0.783 -> 0.692). Net worse.
+
+**The real fix is P2.** The interval decomposition peels the tail into its own
+region, so full blocks are emitted with no mask at all -- `MASK_STEPS` proper,
+where the split is structural rather than a per-tile branch. This entry should
+disappear then; if it does not, revisit the two rejected options with the new
+loop shape.
+
+**Not a reason to keep host padding.** The mask is what allows a ragged seqlen
+to reach the kernel at all, and doing so is worth 1.42x at seqlen 4000 and
+2.08x at 1033, against a legacy path that pays for three tensor copies.
+
 ### 6.1 `safe_softmax` at small head_dim — P1a
 
 | config | ratio |

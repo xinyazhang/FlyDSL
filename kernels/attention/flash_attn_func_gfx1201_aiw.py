@@ -642,6 +642,11 @@ def build_flash_attn_func_aiw_module_primary(
     PADDED_HEAD = padded_head
     BLOCK_DMODEL = head_dim
 
+    # Mask KV columns past seqlen_k. Required whenever seqlen need not divide
+    # BLOCK_N -- i.e. always, now that the interface no longer pads. The guard
+    # inside is dynamic, so interior tiles cost one scalar compare.
+    NEEDS_KV_TAIL_MASK = True
+
     # ---- LDS layout ----
     # K is padded rather than XOR-swizzled (a swizzle was implemented and
     # measured a net loss; see sdpa_lore_gfx1201.md). Chunking bounds the V
@@ -1348,11 +1353,21 @@ def build_flash_attn_func_aiw_module_primary(
 
         _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
-            kv_upper = fx.Index(
+            _kv_lim = fx.Index(
                 ArithValue(_q_end < seq_len_v).select(_q_end, seq_len_v)
             )
         else:
-            kv_upper = seq_len_v
+            _kv_lim = seq_len_v
+        # Round the bound *up* to a whole BLOCK_N. The loop steps by BLOCK_N,
+        # so a bound that is not a multiple of it drops the final partial tile
+        # entirely -- at seqlen 40 with BLOCK_N 32 the kernel attended to only
+        # the first 32 keys, which is wrong for every row, not just the tail.
+        # The tail tile's invalid columns are handled by the KV mask below;
+        # this only has to make sure the tile runs at all.
+        kv_upper = fx.Index(
+            ((_kv_lim + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N))
+            * fx.Index(BLOCK_N)
+        )
 
         # ---- Prologue: at distance 1, tile 0's K / V go to registers ----
         if const_expr(K_PREFETCH_DIST):
@@ -1504,14 +1519,75 @@ def build_flash_attn_func_aiw_module_primary(
                 m_running = m_run[qt]
                 l_running = l_run[qt]
 
+                # ---- KV tail mask: columns >= seqlen_k are not real keys ----
+                #
+                # seqlen is never padded, so the final KV tile of a ragged
+                # sequence covers columns past the end. `kv_addr` clamps those
+                # *addresses* so the loads stay in bounds, which means they read
+                # a duplicate real row -- safe, but the scores are garbage and
+                # would enter the softmax. Mask them to -inf here.
+                #
+                # Done on the eight-wide accumulators rather than the unpacked
+                # scalars: NUM_S_ACCS is at most 8 (BLOCK_N 128), so the
+                # branch's live set stays small, and one vector select replaces
+                # eight scalar ones.
+                #
+                # Guarded, so only the tail tile pays. Interior tiles cost a
+                # single scalar compare. (This is `MASK_STEPS` with a dynamic
+                # guard instead of a structural one; P2's interval
+                # decomposition replaces it with the structural form.)
                 s_raw = []
                 for st in range_constexpr(NUM_S_ACCS):
                     for r in range_constexpr(8):
                         s_raw.append(Vec(s_accs[st])[r])
+
                 if const_expr(SAFE_SOFTMAX):
-                    # Scale here, before the row max, so m_i lives in the
-                    # scaled domain and the exponent is a plain subtract.
+                    # Scale before the row max, so m_i lives in the scaled
+                    # domain and the exponent is a plain subtract.
                     s_raw = [_fmul(v, c_sm_scale_log2e) for v in s_raw]
+
+                if const_expr(NEEDS_KV_TAIL_MASK):
+                    # ---- KV tail: columns >= seqlen_k are not real keys ----
+                    #
+                    # seqlen is never padded, so the last KV tile of a ragged
+                    # sequence covers columns past the end. `kv_addr` clamps
+                    # those *addresses*, so the loads are safe but return a
+                    # duplicate real row; the scores are garbage and would
+                    # otherwise enter the softmax. Mask them to -inf.
+                    #
+                    # Element i of the flattened accumulators is KV column
+                    #   (i//16)*32 + ((i//8)%2)*16 + klane*8 + i%8
+                    # -- the GEMM1 unroll walks (sub-tile, half) pairs, and
+                    # within a 16-row WMMA block a lane holds rows
+                    # klane*8 + si. Same mapping the causal mask below uses.
+                    #
+                    # **Must run after the sm_scale multiply.** The kernel is
+                    # built with unsafe-fp-math / no-nans-fp-math, so an -inf
+                    # passing through a fast-math arithmetic op may simply be
+                    # folded away: LLVM is entitled to assume it cannot occur.
+                    # Masking before the scale silently did nothing -- the mask
+                    # was emitted and demonstrably live, `_fmul(-inf, scale)`
+                    # erased it, and the tail columns went on contributing to
+                    # the denominator. The causal mask is correct for the same
+                    # reason: it already runs after the scale.
+                    #
+                    # Applied unconditionally. Wrapping it in "is this the tail
+                    # tile" measured far worse (head_dim 192 non-causal 78.0
+                    # against 98.3 TFLOPS): the scf.if region boundary blocks
+                    # scheduling across it in a latency-bound loop, costing
+                    # more than the selects it skips.
+                    _kv_i32 = fx.Int32(kv_block_start)
+                    _klane_off = fx.Int32(klane) * fx.Int32(8)
+                    _seq_i32 = fx.Int32(seq_len_v)
+                    for _i in range_constexpr(NUM_S_VALS):
+                        _col = (
+                            _kv_i32
+                            + fx.Int32((_i // 16) * 32 + ((_i // 8) % 2) * 16 + _i % 8)
+                            + _klane_off
+                        )
+                        s_raw[_i] = ArithValue(_col >= _seq_i32).select(
+                            c_neg_inf, s_raw[_i]
+                        )
 
                 if const_expr(CAUSAL):
                     kv_start_i32 = fx.Int32(kv_block_start)
