@@ -423,6 +423,12 @@ def build_flash_attn_func_aiw_module_primary(
     if BLOCK_N % K_SUB_N:
         raise ValueError(f"BLOCK_N ({BLOCK_N}) must be a multiple of K_SUB_N ({K_SUB_N})")
 
+    if BLOCK_N & (BLOCK_N - 1):
+        # `_sdiv_rd` in the kernel is an arithmetic shift, which is only a
+        # floor-division when BLOCK_N is a power of two.
+        raise ValueError(f"BLOCK_N ({BLOCK_N}) must be a power of two")
+    _BLOCK_N_LOG2 = BLOCK_N.bit_length() - 1
+
     N_SUB_TILES = BLOCK_N // K_SUB_N
     NUM_S_ACCS = N_SUB_TILES * 2
     NUM_S_VALS = NUM_S_ACCS * 8
@@ -1446,6 +1452,39 @@ def build_flash_attn_func_aiw_module_primary(
         # Everything derived from a window stays fx.Int32 with explicit signed
         # predicates, per sdpa-gswa-plan.md section 2.4. fx.Index is unsigned,
         # so a negative window reaching it silently becomes enormous.
+        def _scmp_i32(pred, a, b):
+            """A *signed* integer compare. The `<` and `>` overloads on
+            fx.Int32 pick unsigned, which on a negative window silently
+            compares against something enormous -- plan section 2.4 rule 2."""
+            return ArithValue(
+                arith.cmpi(pred, _raw(fx.Int32(a)), _raw(fx.Int32(b)))
+            )
+
+        def _ssel_i32(pred, a, b):
+            return fx.Int32(ArithValue(pred).select(fx.Int32(a), fx.Int32(b)))
+
+        def _smin_i32(a, b):
+            return _ssel_i32(_scmp_i32(arith.CmpIPredicate.slt, a, b), a, b)
+
+        def _smax_i32(a, b):
+            return _ssel_i32(_scmp_i32(arith.CmpIPredicate.sgt, a, b), a, b)
+
+        def _sdiv_rd(x):
+            """floor(x / BLOCK_N), signed -- plan section 2.4 rule 4.
+
+            BLOCK_N is a power of two, so an arithmetic right shift *is* the
+            round-toward-negative-infinity division. `arith.divsi` truncates
+            toward zero instead, which is wrong for every window that reaches
+            past the start of the sequence: at BLOCK_N 32, floor(-1/32) is -1
+            but truncation gives 0, and the left run would then start one tile
+            too late and silently drop live columns.
+            """
+            return fx.Int32(
+                ArithValue(
+                    arith.shrsi(_raw(fx.Int32(x)), _raw(fx.Int32(_BLOCK_N_LOG2)))
+                )
+            )
+
         if const_expr(CAUSAL_TYPE == 3):
             _diag_i32 = fx.Int32(window_right)
             _wl_i32 = fx.Int32(window_left)
@@ -1491,11 +1530,157 @@ def build_flash_attn_func_aiw_module_primary(
             * fx.Index(BLOCK_N)
         )
 
-        # ---- Prologue: at distance 1, tile 0's K / V go to registers ----
+        # ---- Split the KV range into full and masked regions ----
+        #
+        # A tile needs masking only if it runs past seqlen_k, or (causal) past
+        # this Q block's diagonal. Every earlier tile is fully live. Emitting
+        # the two regions as separate loops means the masks exist only in the
+        # second one -- `MASK_STEPS` in AOTriton's terms, with the split
+        # structural rather than a per-tile branch.
+        #
+        # This is what pays back the unconditional mask P1e had to use: a
+        # dynamic `scf.if` guard inside one loop measured much worse than no
+        # guard at all, because the region boundary blocks scheduling in a
+        # latency-bound loop. A static split has no such boundary.
+        _full_seq = (seqlen_k_v // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N)
+        if const_expr(CAUSAL_TYPE == 3):
+            # ---- gSWA: three regions over one contiguous block range ----
+            #
+            # A left window can kill columns in any tile, including tile 0, so
+            # the masked tiles are a prefix as well as a suffix:
+            #
+            #     [ left-masked ][ full ][ right-masked ]
+            #
+            # The three are *contiguous and non-overlapping by construction*
+            # here, because they are derived by cutting one visited range
+            # rather than intersected as three independent intervals. That
+            # collapses two of the three special cases in sdpa-gswa-plan.md
+            # section 2.2: a window narrower than a block leaves the full
+            # region empty, which is detected once and turns the other two
+            # into a single masked run, and an irregular seqlen_q needs no
+            # special handling because `_q_hi` already bounds the rows.
+            #
+            # Bounds for the rows this Q block actually owns, [q_start, q_hi):
+            #   a column c is live for row i iff  i - w_left <= c <= i + w_right
+            # so over the whole block the live columns span
+            #   [ q_start - w_left, (q_hi - 1) + w_right ]
+            # and a tile is *fully* live iff every one of its columns is live
+            # for every row -- worst case the largest row on the left and the
+            # smallest on the right.
+            _q_start_i32 = fx.Int32(q_start)
+            _q_hi_i32 = _smin_i32(
+                _q_start_i32 + fx.Int32(BLOCK_M), fx.Int32(seqlen_q)
+            )
+            _q_last_i32 = _q_hi_i32 - fx.Int32(1)
+
+            # Blocks that exist at all, and the last block that is *whole*.
+            # Splitting these two is section 2.2 case 3: a ragged seqlen_k
+            # leaves a partial final tile, which must be masked rather than
+            # counted as full. The old code spelled the same thing
+            # `_full_seq`.
+            _blk_last = _sdiv_rd(fx.Int32(seqlen_k) - fx.Int32(1))
+            _blk_last_whole = _sdiv_rd(fx.Int32(seqlen_k)) - fx.Int32(1)
+
+            # The visited range: outside it every column is dead for every row
+            # in this Q block, so those tiles are not walked at all.
+            _v_lo = _smax_i32(_sdiv_rd(_q_start_i32 - _wl_i32), fx.Int32(0))
+            _v_hi = _smin_i32(_blk_last, _sdiv_rd(_q_last_i32 + _diag_i32))
+
+            # First tile clear of the left edge: ceil(((q_hi-1) - w_left)/BN).
+            # First tile touched by the right edge: floor((q_start+w_right+1)/BN).
+            #
+            # Both are *exact*, not the conservative-by-one form the plan
+            # sketched: when the boundary column falls exactly on a tile edge
+            # that tile is still wholly live, and rounding it into the masked
+            # run would send a tile through the other loop body. That is
+            # invisible to a tolerance test but not to the bitwise one -- and
+            # the pre-gSWA causal split is exact here too, so anything else
+            # would stop reproducing it.
+            _l_first_full = _sdiv_rd(
+                _q_last_i32 - _wl_i32 + fx.Int32(BLOCK_N - 1)
+            )
+            _r_first_mask = _sdiv_rd(_q_start_i32 + _diag_i32 + fx.Int32(1))
+
+            _fb_lo = _smax_i32(_l_first_full, _v_lo)
+            _fb_hi = _smin_i32(
+                _smin_i32(_r_first_mask - fx.Int32(1), _blk_last_whole), _v_hi
+            )
+            _fb_empty = _scmp_i32(arith.CmpIPredicate.sgt, _fb_lo, _fb_hi)
+
+            # Cut [_v_lo, _v_hi] at the full region. With no full region the
+            # whole range becomes one masked run, which is section 2.2 case 2
+            # (the window is narrower than a block) falling out for free.
+            _lb_hi = _ssel_i32(_fb_empty, _v_hi, _fb_lo - fx.Int32(1))
+            _rb_lo = _ssel_i32(_fb_empty, _v_hi + fx.Int32(1), _fb_hi + fx.Int32(1))
+            _n_l = _smax_i32(_lb_hi - _v_lo + fx.Int32(1), fx.Int32(0))
+            _n_f = _smax_i32(_fb_hi - _fb_lo + fx.Int32(1), fx.Int32(0))
+            _n_r = _smax_i32(_v_hi - _rb_lo + fx.Int32(1), fx.Int32(0))
+
+            _BN_I32 = fx.Int32(BLOCK_N)
+            _l_col0 = _v_lo * _BN_I32
+            _r_col0 = _rb_lo * _BN_I32
+            _f_col0 = _fb_lo * _BN_I32
+            # First tile of the masked run, which is also what the full loop's
+            # last prefetch must fetch: the two loops are adjacent only when
+            # the left run is empty.
+            # Clamped: with a window that admits no key at all every run is
+            # empty and `_rb_lo` sits below zero, and this value still reaches
+            # the prologue's address computation.
+            _m_col0 = _smax_i32(
+                _ssel_i32(
+                    _scmp_i32(arith.CmpIPredicate.sgt, _n_l, fx.Int32(0)),
+                    _l_col0, _r_col0,
+                ),
+                fx.Int32(0),
+            )
+            _n_masked = fx.Index(_n_l + _n_r)
+            _n_l_idx = fx.Index(_n_l)
+        elif const_expr(CAUSAL):
+            # Tile t is clear of the diagonal iff its last column
+            # <= q_start + _diag, using the lowest Q row in this block. Clamped
+            # at 0 so a negative diagonal simply gives an empty full region.
+            _fc_i32 = fx.Int32(q_start) + _diag_i32 + fx.Int32(1)
+            _fc_i32 = fx.Int32(
+                ArithValue(
+                    arith.cmpi(
+                        arith.CmpIPredicate.sgt, _raw(_fc_i32), _raw(fx.Int32(0))
+                    )
+                ).select(_fc_i32, fx.Int32(0))
+            )
+            _full_causal = (
+                fx.Index(_fc_i32) // fx.Index(BLOCK_N)
+            ) * fx.Index(BLOCK_N)
+            _full_end = fx.Index(
+                ArithValue(_full_seq < _full_causal).select(_full_seq, _full_causal)
+            )
+        else:
+            _full_end = _full_seq
+
+        # ---- Prologue: at distance 1, the first tile's K / V go to registers ----
+        #
+        # "First" is tile 0 for everything except gSWA, where a left window
+        # can make the first *visited* tile any block -- loading tile 0 there
+        # feeds the first iteration the wrong K and V. That was worth a
+        # relative error of 1.3 on a shape whose interval arithmetic was
+        # already correct, which is the failure mode plan section 5 predicted:
+        # a prefetch bug survives every check that only looks at the loop
+        # bounds.
+        if const_expr(CAUSAL_TYPE == 3):
+            _first_col = fx.Index(
+                _smax_i32(
+                    _ssel_i32(
+                        _scmp_i32(arith.CmpIPredicate.sgt, _n_f, fx.Int32(0)),
+                        _f_col0, _m_col0,
+                    ),
+                    fx.Int32(0),
+                )
+            )
+        else:
+            _first_col = fx.Index(0)
         if const_expr(K_PREFETCH_DIST):
-            _k_vecs_init = coop_load_k_global(fx.Index(0))
+            _k_vecs_init = coop_load_k_global(_first_col)
         if const_expr(V_PREFETCH_DIST):
-            _v_vecs_init = coop_load_v_global(fx.Index(0))
+            _v_vecs_init = coop_load_v_global(_first_col)
 
         # Loop-carried state layout:
         #   [0 .. 2*Q_ROW_TILES)             m/l per Q row-tile, interleaved
@@ -1519,52 +1704,18 @@ def build_flash_attn_func_aiw_module_primary(
             for batch in range_constexpr(V_LOADS):
                 init_args.append(_v_vecs_init[batch])
 
-        # ---- Split the KV range into full and masked regions ----
-        #
-        # A tile needs masking only if it runs past seqlen_k, or (causal) past
-        # this Q block's diagonal. Every earlier tile is fully live. Emitting
-        # the two regions as separate loops means the masks exist only in the
-        # second one -- `MASK_STEPS` in AOTriton's terms, with the split
-        # structural rather than a per-tile branch.
-        #
-        # This is what pays back the unconditional mask P1e had to use: a
-        # dynamic `scf.if` guard inside one loop measured much worse than no
-        # guard at all, because the region boundary blocks scheduling in a
-        # latency-bound loop. A static split has no such boundary.
-        _full_seq = (seqlen_k_v // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N)
-        if const_expr(CAUSAL_TYPE == 3):
-            # A left window can kill columns in *any* tile, including tile 0,
-            # so "every earlier tile is fully live" no longer holds and no tile
-            # is unconditionally full. Correct but slow: step 2 of
-            # sdpa-gswa-plan.md replaces this with the three intervals, which
-            # restores a full region between the two masked runs. Until then
-            # gSWA pays the mask on every tile.
-            _full_end = fx.Index(0)
-        elif const_expr(CAUSAL):
-            # Tile t is clear of the diagonal iff its last column
-            # <= q_start + _diag, using the lowest Q row in this block. Clamped
-            # at 0 so a negative diagonal simply gives an empty full region.
-            _fc_i32 = fx.Int32(q_start) + _diag_i32 + fx.Int32(1)
-            _fc_i32 = fx.Int32(
-                ArithValue(
-                    arith.cmpi(
-                        arith.CmpIPredicate.sgt, _raw(_fc_i32), _raw(fx.Int32(0))
-                    )
-                ).select(_fc_i32, fx.Int32(0))
-            )
-            _full_causal = (
-                fx.Index(_fc_i32) // fx.Index(BLOCK_N)
-            ) * fx.Index(BLOCK_N)
-            _full_end = fx.Index(
-                ArithValue(_full_seq < _full_causal).select(_full_seq, _full_causal)
-            )
-        else:
-            _full_end = _full_seq
-
         loop_results = init_args
-        def _kv_body(kv_block_start, inner_iter_args, _MASK_STEPS):
+        def _kv_body(kv_block_start, inner_iter_args, _MASK_STEPS,
+                     next_kv_start=None):
             """One KV tile. `_MASK_STEPS` is a Python bool resolved at trace
-            time, so the masked and unmasked regions emit different code."""
+            time, so the masked and unmasked regions emit different code.
+
+            `next_kv_start` is the tile the distance-1 prefetch should fetch.
+            It defaults to the following tile, which is right whenever the
+            region being walked is contiguous. gSWA's masked loop walks two
+            disjoint runs, so it passes the piecewise successor explicitly --
+            getting that wrong fetches the wrong tile and is invisible to a
+            correctness test whenever the value is overwritten before use."""
             m_run = [inner_iter_args[2 * qt] for qt in range_constexpr(Q_ROW_TILES)]
             l_run = [inner_iter_args[2 * qt + 1] for qt in range_constexpr(Q_ROW_TILES)]
             o_accs_all = [
@@ -1583,7 +1734,8 @@ def build_flash_attn_func_aiw_module_primary(
                     inner_iter_args[_VOFF + b] for b in range_constexpr(V_LOADS)
                 ]
 
-            next_kv_start = kv_block_start + fx.Index(BLOCK_N_OUT)
+            if const_expr(next_kv_start is None):
+                next_kv_start = kv_block_start + fx.Index(BLOCK_N_OUT)
 
             # At distance 1 this tile's K is already in registers: publish it,
             # then immediately issue the *next* tile's K load so it is in flight
@@ -1940,19 +2092,76 @@ def build_flash_attn_func_aiw_module_primary(
                     _yield_args.append(_v_vecs_next[batch])
             return _yield_args
 
-        # Region 1: tiles that are wholly live -- no masking emitted at all.
         loop_results = init_args
-        for kv_block_start, inner_iter_args in range(
-            fx.Index(0), _full_end, BLOCK_N_OUT, init=init_args
-        ):
-            loop_results = yield _kv_body(kv_block_start, inner_iter_args, False)
+        if const_expr(CAUSAL_TYPE == 3):
+            # Still **two** emitted bodies, not three. The body already costs
+            # 63 VGPRs at head_dim 128 and spills head_dim 192 at two copies
+            # (plan1 sections 6.2, 2.6), so the two masked runs share one loop
+            # walked over a piecewise index -- one select per masked iteration,
+            # paid only in the masked region.
+            #
+            # Order is full, then left-masked, then right-masked. Running the
+            # full region *first* is what keeps a causal-equivalent window
+            # bit-identical to CAUSAL_TYPE 1/2: with an unbounded left window
+            # the left run is empty and the order collapses to full-then-tail,
+            # exactly the pre-gSWA split. Online softmax is order-independent
+            # mathematically but not in floating point, so walking the masked
+            # runs first would have been just as correct and would have lost
+            # that property.
+            for kv_block_start, inner_iter_args in range(
+                fx.Index(_f_col0), fx.Index(_f_col0 + _n_f * _BN_I32),
+                BLOCK_N_OUT, init=init_args,
+            ):
+                # The successor of the last full tile is the first masked one,
+                # which is only the adjacent tile when the left run is empty.
+                _nxt = fx.Index(
+                    _ssel_i32(
+                        _scmp_i32(
+                            arith.CmpIPredicate.slt,
+                            fx.Int32(kv_block_start) + _BN_I32,
+                            _f_col0 + _n_f * _BN_I32,
+                        ),
+                        fx.Int32(kv_block_start) + _BN_I32,
+                        _m_col0,
+                    )
+                )
+                loop_results = yield _kv_body(
+                    kv_block_start, inner_iter_args, False, next_kv_start=_nxt
+                )
 
-        # Region 2: the tail, where columns can be past seqlen_k or past the
-        # causal diagonal.
-        for kv_block_start, inner_iter_args in range(
-            _full_end, kv_upper, BLOCK_N_OUT, init=loop_results
-        ):
-            loop_results = yield _kv_body(kv_block_start, inner_iter_args, True)
+            def _masked_col(i_idx):
+                """Tile column for masked iteration i: the left run, then the
+                right one. Discontinuous at the seam, which is exactly why the
+                prefetch has to go through this same map."""
+                _i = fx.Int32(i_idx)
+                return _ssel_i32(
+                    _scmp_i32(arith.CmpIPredicate.slt, _i, _n_l),
+                    _l_col0 + _i * _BN_I32,
+                    _r_col0 + (_i - _n_l) * _BN_I32,
+                )
+
+            for _mi, inner_iter_args in range(
+                fx.Index(0), _n_masked, 1, init=loop_results
+            ):
+                loop_results = yield _kv_body(
+                    fx.Index(_masked_col(_mi)),
+                    inner_iter_args,
+                    True,
+                    next_kv_start=fx.Index(_masked_col(fx.Int32(_mi) + fx.Int32(1))),
+                )
+        else:
+            # Region 1: tiles that are wholly live -- no masking emitted at all.
+            for kv_block_start, inner_iter_args in range(
+                fx.Index(0), _full_end, BLOCK_N_OUT, init=init_args
+            ):
+                loop_results = yield _kv_body(kv_block_start, inner_iter_args, False)
+
+            # Region 2: the tail, where columns can be past seqlen_k or past the
+            # causal diagonal.
+            for kv_block_start, inner_iter_args in range(
+                _full_end, kv_upper, BLOCK_N_OUT, init=loop_results
+            ):
+                loop_results = yield _kv_body(kv_block_start, inner_iter_args, True)
 
         # ---- logsumexp ----
         # LSE = (m + log2(l)) * ln2, with m in the base-2 scaled domain -- which

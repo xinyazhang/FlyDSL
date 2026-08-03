@@ -699,8 +699,7 @@ def _swa_mask(Lq, Lk, w_left, w_right):
 @pytest.mark.parametrize("Lq,Lk", _XATTN_SHAPES, ids=[f"{a}x{b}" for a, b in _XATTN_SHAPES])
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_window_reproduces_causal(head_dim, Lq, Lk, ctype):
-    """A window must reproduce the dedicated causal path, and the bar must
-    provably be tight enough to see a one-column error.
+    """A window must reproduce the dedicated causal path **bit for bit**.
 
     This is the test that licenses deleting CAUSAL_TYPE 1 and 2, so it has to
     exist while both paths still do -- afterwards there is nothing left to
@@ -712,23 +711,21 @@ def test_window_reproduces_causal(head_dim, Lq, Lk, ctype):
         bottom-right  (seqlen_q, seqlen_k - seqlen_q)
 
     ``window_left = seqlen_q`` is "unbounded" -- no row can reach further back
-    than the start of its own sequence -- so the left term of the mask is false
-    for every live row and the two paths mask exactly the same columns.
+    than the start of its own sequence -- so the left run is empty, the region
+    split collapses to the pre-gSWA full-then-tail one, and every tile goes
+    through the same loop body it did before.
 
-    **Not bitwise**, which sdpa-gswa-plan.md originally asked for. The two are
-    separate builds and the window path currently masks every tile where the
-    causal path masks only the diagonal ones, so they are structurally
-    different kernels; under `reassoc`/`contract` fast-math LLVM may fuse and
-    reorder them differently. Many shapes here do come out bit-identical, but
-    it is not a property the toolchain owes us, and asserting it would be
-    testing the scheduler rather than the masking.
+    Bitwise is not a stylistic choice here, it is the sharpest oracle the
+    interval arithmetic has. The masked and unmasked loop bodies are two
+    separately-optimised copies of the same computation and do *not* agree to
+    the last bit, so a single tile routed to the wrong one shows up
+    immediately -- even where the two are mathematically identical and every
+    tolerance test would pass. It is what caught the gSWA prologue still
+    prefetching tile 0.
 
-    What the bar has to catch is a wrong *set of columns*, so the test proves
-    it can: the same window shifted one column right is compared too, and must
-    fail by a wide margin. Measured over this shape matrix, agreement is at
-    worst 2.5e-4 while a one-column shift is at least 2.2e-1 -- a separation of
-    ~850x, so 1e-3 sits four times above the noise and two hundred times below
-    the smallest real error.
+    (Step 1 could not assert this: with no full region every tile went through
+    the masked body, and about 40% of this matrix still came out identical --
+    the trap being that bitwise looked plausible there and failed on the rest.)
     """
     _require_env()
     gen = torch.Generator(device="cuda").manual_seed(0)
@@ -759,17 +756,16 @@ def test_window_reproduces_causal(head_dim, Lq, Lk, ctype):
     o_shifted = _window_run((w_left, w_right + 1))
     torch.cuda.synchronize()
 
-    r_match = _rel(o_window, o_causal)
-    r_shift = _rel(o_shifted, o_causal)
-    assert r_match < 1e-3, (
+    assert torch.equal(o_causal, o_window), (
         f"window ({w_left}, {w_right}) differs from causal_type={ctype} at "
-        f"{Lq}x{Lk} hd={head_dim}: rel={r_match:.3e}"
+        f"{Lq}x{Lk} hd={head_dim}: max |delta| "
+        f"{(o_causal.float() - o_window.float()).abs().max().item():.3e}"
     )
-    # Negative control: without it, a bar of 1e-3 is just an assertion.
-    assert r_shift > 1e-2, (
-        f"shifting the window one column right changed the result by only "
-        f"{r_shift:.3e} at {Lq}x{Lk} hd={head_dim} -- the tolerance above "
-        f"cannot distinguish a wrong diagonal"
+    # Negative control: bitwise equality is only meaningful if the two builds
+    # could have differed. Shifting the window one column must break it.
+    assert not torch.equal(o_causal, o_shifted), (
+        f"shifting the window one column right changed nothing at {Lq}x{Lk} "
+        f"hd={head_dim} -- the comparison above is not exercising the diagonal"
     )
 
 
