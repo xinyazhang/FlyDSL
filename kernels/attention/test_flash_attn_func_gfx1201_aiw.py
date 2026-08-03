@@ -310,7 +310,13 @@ def test_safe_softmax_is_exact_for_large_inputs(mag):
     invisible; this test is at 300 and 1000, where it is not.
     """
     _require_env()
-    head_dim, seq = 128, 256
+    # seq == BLOCK_M, so there is exactly one Q block and every KV tile goes
+    # through the masked region. The exactness this checks is a property of the
+    # softmax formulation, but it is only *observable* when the row's maximum
+    # is reached through masked tiles -- a Q block with a leading unmasked
+    # region accumulates its max differently and the difference is swamped.
+    # Pin the shape rather than depend on the tuning table, which moves.
+    head_dim, seq = 128, aiw_block_m(128, 1)
     gen = torch.Generator(device="cuda").manual_seed(0)
     q, k, v = (
         torch.randn(

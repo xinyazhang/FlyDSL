@@ -660,6 +660,40 @@ Three consequences, in descending order of importance:
    clamps on *every* iteration at *every* head_dim, because the schedule has no
    notion of which blocks are interior.
 
+**Dynamic VGPR across the `MASK_STEPS` boundary: tried, not usable.**
+
+Attempted at the start of P2. Setting `amdgpu-dynamic-vgpr-block-size=32` in the
+function passthrough is *accepted* -- the kernel compiles and runs -- but the
+toolchain only half-wires it for an amdhsa compute kernel:
+
+- **No descriptor bit.** The emitted `.amdhsa_kernel` block has no dynamic-VGPR
+  field; LLVM writes `.dynamic_vgpr_en` into *PAL* metadata only
+  (`AMDGPUAsmPrinter.cpp:1659`), which this target does not use.
+- **No prologue allocation.** The only `s_alloc_vgpr` emitted is
+  `s_alloc_vgpr 0` immediately before `s_endpgm` -- the epilogue dealloc. A
+  wave in dynamic-VGPR mode starts with one block and must allocate up before
+  touching anything else; nothing does that.
+- **But the register allocator believes it.** VGPR count moved 241 -> 226,
+  i.e. LLVM allocated against a budget the hardware will not be in a position
+  to provide.
+
+Per ISA 3.3.3, `S_ALLOC_VGPR` is *ignored* when the wave was not launched in
+dynamic-VGPR mode, so the kernel ran correctly only because the mode was never
+actually enabled. The attribute is therefore not merely inert, it is
+misleading: it perturbs allocation without delivering the mechanism.
+
+Neither FlyDSL nor MLIR's ROCDL dialect exposes an `s_alloc_vgpr` op, so using
+it at all would mean raw intrinsic emission -- and that would still leave the
+dispatch-mode problem, which is a runtime and firmware matter rather than a
+codegen one.
+
+Independently of reachability, the expected win was small: the full and masked
+regions differ by a handful of mask temporaries, not by an occupancy step, and
+the large state (`o_accs`, `q_b_packs`) is loop-carried across both. **Closed.**
+
+<details>
+<summary>Original contingency reasoning</summary>
+
 **Contingency: dynamic VGPR allocation across the `MASK_STEPS` boundary.**
 Only if register pressure turns out to be the binding constraint — otherwise
 disregard.
@@ -691,6 +725,8 @@ selects at `BLOCK_N=32`, needing few temporaries beyond the full path), and
 **larger at P6**, where gSWA adds window bounds and two-region index logic to
 the masked path only. So if it is ever tried, P6 is the point, and only after a
 measurement shows occupancy — not latency — is what is limiting us.
+
+</details>
 
 **Residual to handle, not a blocker.** Binding prefetch runs one tile ahead, so
 the last iteration of the full-block region addresses block `fb_hi + 1` — which
@@ -1079,7 +1115,28 @@ live range is the cost, not the work.
 
 </details>
 
-### 6.3 KV tail mask on aligned shapes — P1e (D5)
+### 6.3 ~~KV tail mask on aligned shapes~~ — RESOLVED by the P2 region split
+
+Gone. Splitting the KV range into a full region (no masks emitted) and a tail
+region (KV + causal, fused into one select) removed the per-tile mask cost and
+took the ladder from median 0.995 to **1.063**. head_dim 16 non-causal, the
+worst case at 0.783, is now 0.865; every causal config improved, several
+dramatically (192: 1.170 -> 1.373).
+
+Two things learned doing it:
+
+- **The body has to be emitted twice**, and that is not free: duplicating it
+  pushed head_dim 128 from 149 to 212 VGPRs and head_dim 192 from 219 to 256
+  with 3 spills. Re-sweeping recovered head_dim 128 (q_tiles 16 -> 8, 84.4 ->
+  92.5 non-causal, 81.2 -> 92.0 causal); 192 was already optimal and keeps a
+  0.938. **Any change that alters register pressure invalidates the tuning
+  tables** -- third time now (256 after LSE, 128 after this).
+- **The AST rewriter will not transform `range()` inside a nested Python
+  loop** -- it falls through to the builtin and fails on the `init=` kwarg. The
+  two regions therefore call a extracted `_kv_body()` from two explicit loops
+  rather than looping over a list of regions.
+
+### 6.4 (retired) KV tail mask on aligned shapes — P1e (D5)
 
 | config | ratio (was, pre-mask) |
 |---|---|

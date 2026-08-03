@@ -226,8 +226,14 @@ _ROWS_PER_Q_TILE = 16
 # 384 and 512 were swept the same way and are already at their optimum
 # (384: 61.4/60.9 at (3,4), best alternative 54.2; 512: 52.2/44.6 at (4,2),
 # best alternative 36.7). Only 256 was mistuned.
+#
+# head_dim 128 re-swept after the P2 region split, which duplicates the loop
+# body and pushed its VGPR count 149 -> 212. 16 q_tiles (BLOCK_M 256, 16 waves)
+# no longer fits; 8 is 92.5/92.0 against 84.4/81.2 TFLOPS non-causal/causal.
+# 48/80/96/160 were swept at the same time and are unchanged; 192 is already
+# at its optimum.
 _SHARDS_BY_HEAD_DIM = {224: 2, 256: 1}
-_Q_TILES_BY_HEAD_DIM = {48: 8, 64: 16, 80: 16, 96: 16, 128: 16, 160: 16,
+_Q_TILES_BY_HEAD_DIM = {48: 8, 64: 16, 80: 16, 96: 16, 128: 8, 160: 16,
                         192: 8, 224: 8, 256: 16, 384: 4, 512: 2}
 
 # BLOCK_M for the distance-0 schedule. Per-wave register use is dominated by
@@ -1449,10 +1455,35 @@ def build_flash_attn_func_aiw_module_primary(
             for batch in range_constexpr(V_LOADS):
                 init_args.append(_v_vecs_init[batch])
 
+        # ---- Split the KV range into full and masked regions ----
+        #
+        # A tile needs masking only if it runs past seqlen_k, or (causal) past
+        # this Q block's diagonal. Every earlier tile is fully live. Emitting
+        # the two regions as separate loops means the masks exist only in the
+        # second one -- `MASK_STEPS` in AOTriton's terms, with the split
+        # structural rather than a per-tile branch.
+        #
+        # This is what pays back the unconditional mask P1e had to use: a
+        # dynamic `scf.if` guard inside one loop measured much worse than no
+        # guard at all, because the region boundary blocks scheduling in a
+        # latency-bound loop. A static split has no such boundary.
+        _full_seq = (seq_len_v // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N)
+        if const_expr(CAUSAL):
+            # Tile t is clear of the diagonal iff its last column <= q_start,
+            # the lowest Q row in this block.
+            _full_causal = (
+                (q_start + fx.Index(1)) // fx.Index(BLOCK_N)
+            ) * fx.Index(BLOCK_N)
+            _full_end = fx.Index(
+                ArithValue(_full_seq < _full_causal).select(_full_seq, _full_causal)
+            )
+        else:
+            _full_end = _full_seq
+
         loop_results = init_args
-        for kv_block_start, inner_iter_args in range(
-            0, kv_upper, BLOCK_N_OUT, init=init_args
-        ):
+        def _kv_body(kv_block_start, inner_iter_args, _MASK_STEPS):
+            """One KV tile. `_MASK_STEPS` is a Python bool resolved at trace
+            time, so the masked and unmasked regions emit different code."""
             m_run = [inner_iter_args[2 * qt] for qt in range_constexpr(Q_ROW_TILES)]
             l_run = [inner_iter_args[2 * qt + 1] for qt in range_constexpr(Q_ROW_TILES)]
             o_accs_all = [
@@ -1598,36 +1629,34 @@ def build_flash_attn_func_aiw_module_primary(
                     # domain and the exponent is a plain subtract.
                     s_raw = [_fmul(v, c_sm_scale_log2e) for v in s_raw]
 
-                if const_expr(NEEDS_KV_TAIL_MASK):
-                    # ---- KV tail: columns >= seqlen_k are not real keys ----
+                if const_expr(_MASK_STEPS):
+                    # ---- Masked region: KV tail and causal, fused ----
                     #
-                    # seqlen is never padded, so the last KV tile of a ragged
-                    # sequence covers columns past the end. `kv_addr` clamps
-                    # those *addresses*, so the loads are safe but return a
-                    # duplicate real row; the scores are garbage and would
-                    # otherwise enter the softmax. Mask them to -inf.
+                    # Only tiles in the masked region reach this. Full tiles
+                    # are emitted by the other region with no mask at all,
+                    # which is the entire point of the split: masking used to
+                    # be paid on every tile.
                     #
                     # Element i of the flattened accumulators is KV column
                     #   (i//16)*32 + ((i//8)%2)*16 + klane*8 + i%8
                     # -- the GEMM1 unroll walks (sub-tile, half) pairs, and
                     # within a 16-row WMMA block a lane holds rows
-                    # klane*8 + si. Same mapping the causal mask below uses.
+                    # klane*8 + si.
+                    #
+                    # Two conditions, one select: a column is dead if it is
+                    # past seqlen_k, or (causal) beyond this row's diagonal.
                     #
                     # **Must run after the sm_scale multiply.** The kernel is
-                    # built with unsafe-fp-math / no-nans-fp-math, so an -inf
-                    # passing through a fast-math arithmetic op may simply be
-                    # folded away: LLVM is entitled to assume it cannot occur.
-                    # Masking before the scale silently did nothing -- the mask
-                    # was emitted and demonstrably live, `_fmul(-inf, scale)`
-                    # erased it, and the tail columns went on contributing to
-                    # the denominator. The causal mask is correct for the same
-                    # reason: it already runs after the scale.
+                    # built with nnan but *not* ninf precisely so an -inf can
+                    # survive arithmetic; even so, keeping the mask after the
+                    # scale avoids relying on that. Masking before it silently
+                    # did nothing when ninf was still enabled.
                     #
-                    # Applied unconditionally. Wrapping it in "is this the tail
-                    # tile" measured far worse (head_dim 192 non-causal 78.0
-                    # against 98.3 TFLOPS): the scf.if region boundary blocks
-                    # scheduling across it in a latency-bound loop, costing
-                    # more than the selects it skips.
+                    # No `scf.if` guard: a runtime "does this tile need it"
+                    # branch measured far worse than just doing the selects
+                    # (head_dim 192 non-causal 78.0 against 98.3 TFLOPS), the
+                    # region boundary blocking scheduling in a latency-bound
+                    # loop. The region split gives the same benefit statically.
                     _kv_i32 = fx.Int32(kv_block_start)
                     _klane_off = fx.Int32(klane) * fx.Int32(8)
                     _seq_i32 = fx.Int32(seq_len_v)
@@ -1637,93 +1666,10 @@ def build_flash_attn_func_aiw_module_primary(
                             + fx.Int32((_i // 16) * 32 + ((_i // 8) % 2) * 16 + _i % 8)
                             + _klane_off
                         )
-                        s_raw[_i] = ArithValue(_col >= _seq_i32).select(
-                            c_neg_inf, s_raw[_i]
-                        )
-
-                if const_expr(CAUSAL):
-                    kv_start_i32 = fx.Int32(kv_block_start)
-                    klane_i32 = fx.Int32(klane)
-                    q_start_i32 = fx.Int32(q_start)
-                    max_kv_col_i32 = kv_start_i32 + fx.Int32(BLOCK_N - 1)
-                    tile_needs_mask = max_kv_col_i32 > q_start_i32
-
-                    # FlyDSL's `if` rewriter requires each conditional state
-                    # variable to be a single MLIR Value, not a list. Unfold
-                    # s_raw into NUM_S_VALS named scalars, reassign each inside
-                    # the branch, then rebuild the list. NUM_S_VALS == 16 for
-                    # BLOCK_N == 32, which is why causal is gated to that.
-                    # (This whole block dies with the interval decomposition.)
-                    s_v0 = s_raw[0]
-                    s_v1 = s_raw[1]
-                    s_v2 = s_raw[2]
-                    s_v3 = s_raw[3]
-                    s_v4 = s_raw[4]
-                    s_v5 = s_raw[5]
-                    s_v6 = s_raw[6]
-                    s_v7 = s_raw[7]
-                    s_v8 = s_raw[8]
-                    s_v9 = s_raw[9]
-                    s_v10 = s_raw[10]
-                    s_v11 = s_raw[11]
-                    s_v12 = s_raw[12]
-                    s_v13 = s_raw[13]
-                    s_v14 = s_raw[14]
-                    s_v15 = s_raw[15]
-                    if tile_needs_mask:
-                        klane_off_i32 = klane_i32 * fx.Int32(8)
-                        # st=0
-                        _b0 = kv_start_i32 + fx.Int32(0) + klane_off_i32
-                        s_v0 = ArithValue(_b0 > q_row_i32).select(c_neg_inf, s_v0)
-                        _b1 = kv_start_i32 + fx.Int32(1) + klane_off_i32
-                        s_v1 = ArithValue(_b1 > q_row_i32).select(c_neg_inf, s_v1)
-                        _b2 = kv_start_i32 + fx.Int32(2) + klane_off_i32
-                        s_v2 = ArithValue(_b2 > q_row_i32).select(c_neg_inf, s_v2)
-                        _b3 = kv_start_i32 + fx.Int32(3) + klane_off_i32
-                        s_v3 = ArithValue(_b3 > q_row_i32).select(c_neg_inf, s_v3)
-                        _b4 = kv_start_i32 + fx.Int32(4) + klane_off_i32
-                        s_v4 = ArithValue(_b4 > q_row_i32).select(c_neg_inf, s_v4)
-                        _b5 = kv_start_i32 + fx.Int32(5) + klane_off_i32
-                        s_v5 = ArithValue(_b5 > q_row_i32).select(c_neg_inf, s_v5)
-                        _b6 = kv_start_i32 + fx.Int32(6) + klane_off_i32
-                        s_v6 = ArithValue(_b6 > q_row_i32).select(c_neg_inf, s_v6)
-                        _b7 = kv_start_i32 + fx.Int32(7) + klane_off_i32
-                        s_v7 = ArithValue(_b7 > q_row_i32).select(c_neg_inf, s_v7)
-                        # st=1 (st_base=16)
-                        _b8 = kv_start_i32 + fx.Int32(16) + klane_off_i32
-                        s_v8 = ArithValue(_b8 > q_row_i32).select(c_neg_inf, s_v8)
-                        _b9 = kv_start_i32 + fx.Int32(17) + klane_off_i32
-                        s_v9 = ArithValue(_b9 > q_row_i32).select(c_neg_inf, s_v9)
-                        _b10 = kv_start_i32 + fx.Int32(18) + klane_off_i32
-                        s_v10 = ArithValue(_b10 > q_row_i32).select(c_neg_inf, s_v10)
-                        _b11 = kv_start_i32 + fx.Int32(19) + klane_off_i32
-                        s_v11 = ArithValue(_b11 > q_row_i32).select(c_neg_inf, s_v11)
-                        _b12 = kv_start_i32 + fx.Int32(20) + klane_off_i32
-                        s_v12 = ArithValue(_b12 > q_row_i32).select(c_neg_inf, s_v12)
-                        _b13 = kv_start_i32 + fx.Int32(21) + klane_off_i32
-                        s_v13 = ArithValue(_b13 > q_row_i32).select(c_neg_inf, s_v13)
-                        _b14 = kv_start_i32 + fx.Int32(22) + klane_off_i32
-                        s_v14 = ArithValue(_b14 > q_row_i32).select(c_neg_inf, s_v14)
-                        _b15 = kv_start_i32 + fx.Int32(23) + klane_off_i32
-                        s_v15 = ArithValue(_b15 > q_row_i32).select(c_neg_inf, s_v15)
-                    s_raw = [
-                        s_v0,
-                        s_v1,
-                        s_v2,
-                        s_v3,
-                        s_v4,
-                        s_v5,
-                        s_v6,
-                        s_v7,
-                        s_v8,
-                        s_v9,
-                        s_v10,
-                        s_v11,
-                        s_v12,
-                        s_v13,
-                        s_v14,
-                        s_v15,
-                    ]
+                        _dead = _col >= _seq_i32
+                        if const_expr(CAUSAL):
+                            _dead = _dead | (_col > q_row_i32)
+                        s_raw[_i] = ArithValue(_dead).select(c_neg_inf, s_raw[_i])
 
                 local_max = s_raw[0]
                 for r in range_constexpr(NUM_S_VALS - 1):
@@ -1907,7 +1853,21 @@ def build_flash_attn_func_aiw_module_primary(
             if const_expr(V_PREFETCH_DIST):
                 for batch in range_constexpr(V_LOADS):
                     _yield_args.append(_v_vecs_next[batch])
-            loop_results = yield _yield_args
+            return _yield_args
+
+        # Region 1: tiles that are wholly live -- no masking emitted at all.
+        loop_results = init_args
+        for kv_block_start, inner_iter_args in range(
+            fx.Index(0), _full_end, BLOCK_N_OUT, init=init_args
+        ):
+            loop_results = yield _kv_body(kv_block_start, inner_iter_args, False)
+
+        # Region 2: the tail, where columns can be past seqlen_k or past the
+        # causal diagonal.
+        for kv_block_start, inner_iter_args in range(
+            _full_end, kv_upper, BLOCK_N_OUT, init=loop_results
+        ):
+            loop_results = yield _kv_body(kv_block_start, inner_iter_args, True)
 
         # ---- logsumexp ----
         # LSE = (m + log2(l)) * ln2, with m in the base-2 scaled domain -- which
