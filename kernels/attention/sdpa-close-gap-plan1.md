@@ -887,6 +887,39 @@ The discipline: a cost only belongs here if it has been *measured* (interleaved
 A/B, 3+ reps, per §5) and *diagnosed* far enough to say what would be tried.
 "Probably slower" is not an entry.
 
+### 6.2 logsumexp at head_dim 256 — P1d
+
+| config | ratio |
+|---|---|
+| head_dim 256, non-causal | **0.916** (was 0.987 pre-LSE) |
+| every other ladder point | within 1% |
+
+5-rep medians, spread 0.916-0.918.
+
+**Cause.** `m_final` was dead at loop exit and is now live into the epilogue,
+because LSE is `(m + log2(l)) * ln2`. VGPRs 238 -> 241. head_dim 256 is the one
+config sitting on a register cliff -- `QK_SHARDS=2` and already the joint
+highest VGPR count on the ladder -- so three registers land differently there
+and nowhere else. Occupancy is unchanged at either count, so the mechanism is
+scheduling rather than wave count.
+
+Not the unconditional arithmetic: hoisting the `log2`, the scale and the
+address computation inside the store guard changed nothing (still 0.916). The
+live range is the cost, not the work.
+
+**Cost is paid whether or not LSE is requested**, because the gate is on the
+`L` pointer at runtime. Requesting it is then free (1.000-1.001 everywhere).
+
+**To try, in order:**
+
+1. Retune head_dim 256 -- it is the only ladder point at this cliff, and
+   `_Q_TILES_BY_HEAD_DIM[256] = 4` was measured before three registers moved.
+2. Make LSE a build axis instead of a runtime gate, so inference builds do not
+   carry it. Doubles the functional count for this kernel, which is exactly
+   what the runtime gate exists to avoid -- only worth it if 1 fails and the
+   8% matters.
+3. Accept. It is one config, and LSE is not optional for training.
+
 ### 6.1 `safe_softmax` at small head_dim — P1a
 
 | config | ratio |

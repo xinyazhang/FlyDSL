@@ -200,6 +200,7 @@ def flydsl_flash_attn_func_gfx1201(
     stream: torch.cuda.Stream | None = None,
     use_binding_prefetch: bool = False,
     variant: str = "",
+    return_lse: bool = False,
 ) -> torch.Tensor:
     """Run FlyDSL Flash Attention on RDNA4 (gfx1201).
 
@@ -389,6 +390,17 @@ def flydsl_flash_attn_func_gfx1201(
             batch, seq_len_pad, num_heads, _o_pitch, dtype=q.dtype, device=q.device
         )[..., :head_dim]
 
+    # logsumexp, (B*H, S_pad) fp32 -- AOTriton's non-varlen layout. Sliced back
+    # to the real seq_len on return, like O.
+    if return_lse:
+        if variant in _LEGACY_VARIANTS:
+            raise ValueError(f"variant={variant!r} predates logsumexp output")
+        lse_p = torch.empty(
+            batch * num_heads, seq_len_pad, dtype=torch.float32, device=q.device
+        )
+    else:
+        lse_p = None
+
     # Wrap kernel build + launch in q.device context so multi-GPU callers
     # whose current device differs from q.device get the kernel compiled
     # and launched on the right device/stream.
@@ -440,9 +452,16 @@ def flydsl_flash_attn_func_gfx1201(
                 # a copy for any non-contiguous input and would silently defeat
                 # the point of reading strides at all.
                 exe(
-                    q_p, k_p, v_p, o_p, batch, seq_len_pad, stream=launch_stream
+                    q_p, k_p, v_p, o_p, batch, seq_len_pad,
+                    stream=launch_stream, lse=lse_p,
                 )
 
-    if seq_len_pad != seq_len_real:
-        return o_p[:, :seq_len_real, :, :].contiguous()
-    return o_p
+    out = (
+        o_p[:, :seq_len_real, :, :].contiguous()
+        if seq_len_pad != seq_len_real
+        else o_p
+    )
+    if not return_lse:
+        return out
+    lse = lse_p.view(batch, num_heads, seq_len_pad)[:, :, :seq_len_real]
+    return out, lse

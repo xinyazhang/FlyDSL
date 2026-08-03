@@ -92,6 +92,8 @@ Grid:   (batch * num_q_tiles * num_heads,)
 import math as host_math
 import os
 
+from torch import float32 as torch_f32
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -111,6 +113,7 @@ from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
 
 KERNEL_NAME = "flash_attn_func_gfx1201_aiw_kernel"
 _LOG2E = host_math.log2(host_math.e)
+_LN2 = 0.6931471824645996  # matches AOTriton's literal exactly
 
 # `dtype_to_elem_type` and `_run_compiled` are inlined copies of
 # `kernels.common.kernels_common.dtype_to_elem_type` and
@@ -703,7 +706,9 @@ def build_flash_attn_func_aiw_module_primary(
         K: fx.Pointer,
         V: fx.Pointer,
         O: fx.Pointer,  # noqa: E741
+        L: fx.Pointer,
         seq_len: fx.Int32,
+        lse_stride: fx.Int64,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
@@ -1750,6 +1755,61 @@ def build_flash_attn_func_aiw_module_primary(
                     _yield_args.append(_v_vecs_next[batch])
             loop_results = yield _yield_args
 
+        # ---- logsumexp ----
+        # LSE = (m + log2(l)) * ln2, with m in the base-2 scaled domain -- which
+        # is exactly the convention safe_softmax established, so nothing extra
+        # is needed there. `rocdl.log` is v_log_f32, i.e. base 2.
+        #
+        # One value per (batch, head, q_row). A lane's m/l belong to its own
+        # q_row (lane16), replicated across the klane halves by the shuffle_xor
+        # reduction and across shards by the cross-shard reduction, so exactly
+        # one lane per row must store: klane 0 of shard 0.
+        #
+        # Layout is AOTriton's single branch-free formula
+        #   offset = (b * H + h) * S + s
+        # with (b=batch, s=0, S=Max_seqlen_q) giving (B*H, S). Varlen will pass
+        # (b=0, s=cu_seqlens_q_start, S=total) for (H, TotalS) without changing
+        # anything here -- that is the point of computing the base on the host.
+        # Conditions are combined with arith.andi, not Python `and`/`not`:
+        # those call __bool__ on the MLIR value and are resolved at trace time,
+        # which silently folded this whole block away on the first attempt.
+        _f32_ty = ir.F32Type.get()
+        _l_valid = arith.cmpi(
+            arith.CmpIPredicate.ne, _raw(fx.Int64(fx.ptrtoint(L))), _raw(fx.Int64(0))
+        )
+        _lse_writer = arith.andi(
+            _l_valid,
+            arith.andi(
+                _raw(klane == fx.Index(0)), _raw(shard_id == fx.Index(0))
+            ),
+        )
+        # Everything -- the log2, the scale, the address -- lives inside the
+        # guard. Hoisting it out cost 8% at head_dim 256 non-causal even though
+        # the store itself was still predicated: the values stay live across
+        # the epilogue and lengthen it for every wave, including the ones that
+        # never store and the whole kernel when L is null.
+        for qt in range_constexpr(Q_ROW_TILES):
+            _do_store = arith.andi(_lse_writer, _raw(q_in_bounds_all[qt]))
+            if _do_store:
+                _m = loop_results[2 * qt]
+                _l = loop_results[2 * qt + 1]
+                if const_expr(not SAFE_SOFTMAX):
+                    _m = _fmul(_m, c_sm_scale_log2e)
+                _lse = _fmul(
+                    _fadd(_m, rocdl.log(_f32_ty, _raw(_l))), fx.Float32(_LN2)
+                )
+                _lse_base = (
+                    batch_idx * fx.Index(num_head_q) + head_q
+                ) * fx.Index(lse_stride)
+                _pointer_store(
+                    _lse,
+                    buffer_ops.get_element_ptr(
+                        _pointer_to_llvm_ptr(L),
+                        fx.Int64(_lse_base + q_rows[qt]),
+                        elem_type=_f32_ty,
+                    ),
+                )
+
         # ---- Normalize and store O ----
         for qt in range_constexpr(Q_ROW_TILES):
             l_final = loop_results[2 * qt + 1]
@@ -1795,8 +1855,10 @@ def build_flash_attn_func_aiw_module_primary(
         K: fx.Pointer,
         V: fx.Pointer,
         O: fx.Pointer,  # noqa: E741
+        L: fx.Pointer,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
+        lse_stride: fx.Int64,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
@@ -1829,7 +1891,7 @@ def build_flash_attn_func_aiw_module_primary(
         # Always forwarded: with STRIDES_CONSTEXPR the kernel simply does not
         # read them, which is what keeps the two arms directly comparable.
         launcher = flash_attn_func_aiw_kernel(
-            Q, K, V, O, seq_len,
+            Q, K, V, O, L, seq_len, lse_stride,
             num_head_q, num_head_k,
             hdim_qk, hdim_vo,
             stride_q0, stride_q1, stride_q2,
@@ -1938,6 +2000,24 @@ def build_flash_attn_func_aiw_module_primary(
             )
         return t.stride(0), t.stride(1), t.stride(2)
 
+    def _lse_args(lse, seq_len):
+        """(pointer, row stride) for the logsumexp tensor; a null pointer skips it.
+
+        The kernel gates on the pointer rather than on a build flag, matching
+        AOTriton, so training and inference share one binary instead of
+        doubling the functional count.
+        """
+        if lse is None:
+            return flyc.from_c_void_p(fx.Uint8, 0), int(seq_len)
+        if lse.dtype != torch_f32:
+            raise ValueError(f"logsumexp must be float32, got {lse.dtype}")
+        if lse.dim() != 2 or lse.stride(1) != 1:
+            raise ValueError(
+                f"logsumexp must be rank 2 with a contiguous last dim, got "
+                f"shape {tuple(lse.shape)} strides {lse.stride()}"
+            )
+        return _ptr_arg(lse), lse.stride(0)
+
     def _resolve_scale(Q, scale):
         """Default sm_scale from the tensor's *real* head dim, not the tile.
 
@@ -1978,26 +2058,32 @@ def build_flash_attn_func_aiw_module_primary(
 
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
-    def _launch(Q, K, V, O, batch_size, seq_len, scale=None, stream=None):  # noqa: E741
+    def _launch(Q, K, V, O, batch_size, seq_len, scale=None, stream=None, lse=None):  # noqa: E741
         ptrs, meta, st = _prep(Q, K, V, O)
+        _lse_p, _lse_s = _lse_args(lse, seq_len)
         _run_compiled(
             launch_flash_attn_aiw,
             *ptrs,
+            _lse_p,
             batch_size,
             seq_len,
+            _lse_s,
             *meta,
             *st,
             _resolve_scale(Q, scale),
             stream if stream is not None else fx.Stream(None),
         )
 
-    def _compile(Q, K, V, O, batch_size, seq_len, scale=None, stream=None):  # noqa: E741
+    def _compile(Q, K, V, O, batch_size, seq_len, scale=None, stream=None, lse=None):  # noqa: E741
         ptrs, meta, st = _prep(Q, K, V, O)
+        _lse_p, _lse_s = _lse_args(lse, seq_len)
         return flyc.compile(
             launch_flash_attn_aiw,
             *ptrs,
+            _lse_p,
             batch_size,
             seq_len,
+            _lse_s,
             *meta,
             *st,
             _resolve_scale(Q, scale),

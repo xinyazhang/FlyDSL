@@ -32,6 +32,7 @@ Run it individually, per this directory's prototype convention::
     cd kernels/attention && python3 -m pytest test_flash_attn_func_gfx1201_aiw.py -v
 """
 
+import math
 import os
 
 import pytest
@@ -500,6 +501,110 @@ def test_padded_head_is_independent_of_pad_contents(hdim, tile):
         outs.append(o.clone())
     for other in outs[1:]:
         assert torch.equal(outs[0], other), "output depends on the pad contents"
+
+
+def _lse_reference(q, k, causal, head_dim):
+    """Natural-log logsumexp of the scaled, masked scores. Shape (B*H, S)."""
+    qb, kb = (x.transpose(1, 2).double() for x in (q, k))
+    sc = (qb @ kb.transpose(-1, -2)) / math.sqrt(head_dim)
+    if causal:
+        s = q.shape[1]
+        sc = sc.masked_fill(
+            torch.triu(torch.ones(s, s, dtype=torch.bool, device=q.device), 1),
+            float("-inf"),
+        )
+    return torch.logsumexp(sc, dim=-1).reshape(-1, q.shape[1])
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("head_dim", [16, 64, 128, 256, 512])
+def test_logsumexp_matches_torch(head_dim, causal):
+    """LSE = (m + log2(l)) * ln2, in natural-log units, layout (B*H, S)."""
+    _require_env()
+    seq, batch = 256, 2
+    q, k, v = _qkv(batch, seq, head_dim, torch.float16)
+    o = torch.empty_like(q)
+    lse = torch.zeros(batch * _NUM_HEADS, seq, dtype=torch.float32, device="cuda")
+    build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16"
+    )(q, k, v, o, batch, seq, lse=lse)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(lse).all(), "logsumexp is not finite"
+    ref = _lse_reference(q, k, causal, head_dim)
+    err = (lse.double() - ref).abs().max().item()
+    assert err < 2e-2, f"hd={head_dim} causal={causal} max|lse-ref|={err:.3e}"
+
+
+def test_logsumexp_null_pointer_is_a_noop():
+    """Omitting the LSE tensor must not change O, and must not fault.
+
+    The gate is on the pointer, not a build flag, so training and inference
+    share one binary rather than doubling the functional count.
+    """
+    _require_env()
+    seq = 256
+    q, k, v = _qkv(1, seq, 64, torch.float16)
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16"
+    )
+    o_without = _run(exe, q, k, v, 1, seq)
+    o_with = torch.empty_like(q)
+    lse = torch.zeros(_NUM_HEADS, seq, dtype=torch.float32, device="cuda")
+    exe(q, k, v, o_with, 1, seq, lse=lse)
+    torch.cuda.synchronize()
+    assert torch.equal(o_without, o_with), "requesting LSE perturbed O"
+    assert (lse != 0).any(), "LSE was requested but never written"
+
+
+def test_logsumexp_with_gqa():
+    """LSE is indexed by the *query* head, so GQA must not collapse rows."""
+    _require_env()
+    seq, nhq, nhk, head_dim = 256, 8, 2, 64
+    gen = torch.Generator(device="cuda").manual_seed(0)
+
+    def _t(h):
+        return torch.randn(
+            1, seq, h, head_dim, dtype=torch.float16, device="cuda", generator=gen
+        )
+
+    q, k, v = _t(nhq), _t(nhk), _t(nhk)
+    o = torch.empty_like(q)
+    lse = torch.zeros(nhq, seq, dtype=torch.float32, device="cuda")
+    build_flash_attn_func_aiw_module(
+        num_heads=nhq, head_dim=head_dim, causal=False, dtype_str="f16"
+    )(q, k, v, o, 1, seq, lse=lse)
+    torch.cuda.synchronize()
+
+    ratio = nhq // nhk
+    for h in range(nhq):
+        qb = q[:, :, h].unsqueeze(1).double()
+        kb = k[:, :, h // ratio].unsqueeze(1).double()
+        ref = torch.logsumexp(
+            (qb @ kb.transpose(-1, -2)) / math.sqrt(head_dim), dim=-1
+        ).squeeze()
+        err = (lse[h].double() - ref).abs().max().item()
+        assert err < 2e-2, f"query head {h}: max|lse-ref|={err:.3e}"
+
+
+@pytest.mark.parametrize(
+    "lse_factory, match",
+    [
+        (lambda s: torch.zeros(2, s, dtype=torch.float16, device="cuda"), "float32"),
+        (lambda s: torch.zeros(2, 2, s, dtype=torch.float32, device="cuda"), "rank 2"),
+        (lambda s: torch.zeros(s, 2, dtype=torch.float32, device="cuda").t(), "rank 2"),
+    ],
+    ids=["f16", "rank3", "noncontig"],
+)
+def test_logsumexp_validation(lse_factory, match):
+    _require_env()
+    seq = 256
+    q, k, v = _qkv(1, seq, 64, torch.float16)
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16"
+    )
+    with pytest.raises(ValueError, match=match):
+        exe(q, k, v, torch.empty_like(q), 1, seq, lse=lse_factory(seq))
 
 
 def test_shard_resolution_respects_narrow_window():
