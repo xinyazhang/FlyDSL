@@ -810,17 +810,10 @@ Four things this encodes that our current tests do not:
   `BLOCK_DMODEL = 192` and `PADDED_HEAD = True`; `D_HEAD = 8` forces
   `BLOCK_DMODEL = 16`.
 
-**One test is deliberately over-constrained.**
-`test_padded_head_is_independent_of_pad_contents` asserts that different pad
-poisons give *bitwise identical* output, which pins down how correctness is
-achieved rather than only that it is: it rules out reading the pad and
-cancelling it afterwards, and it rules out a reduction order that varies with
-which columns are live. Splitting the head_dim reduction (split-K) is the
-concrete thing it would forbid. That is an acceptable trade while split-K is
-not planned, and it is what lets the test distinguish "masked" from "read but
-harmless" -- but it should be relaxed to per-poison tolerance comparisons
-(keeping the NaN case, which is the actual leak detector) if that freedom is
-ever needed. Noted at the test itself as well.
+`test_padded_head_is_independent_of_pad_contents` asserts bitwise-identical
+output across pad poisons, which also fails for correct but non-deterministic
+algorithms (split-K over head_dim). None are planned; if that changes, relax it
+to per-poison tolerance and keep the NaN case.
 
 #### Two extra cases
 

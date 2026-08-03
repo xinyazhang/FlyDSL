@@ -474,24 +474,11 @@ def test_padded_head_never_reads_the_pad(hdim, tile, causal, poison):
 def test_padded_head_is_independent_of_pad_contents(hdim, tile):
     """Two different poisons must produce bitwise-identical output.
 
-    Stronger than "the answer is close to the reference": it proves the pad is
-    not read at all, rather than read and then diluted below tolerance.
+    Stronger than a tolerance check: it proves the pad is not read at all,
+    rather than read and diluted below tolerance.
 
-    **Deliberately over-constrained -- read this before "fixing" a failure.**
-    The assertion pins down *how* correctness is achieved, not just that it is.
-    It rules out any scheme that lets the pad enter the arithmetic and cancels
-    its contribution afterwards, and any scheme whose reduction order depends
-    on which columns are live. Splitting the head_dim reduction (split-K) is
-    the concrete example: a correct implementation that partitions the
-    reduction differently once padding is present would produce a different
-    -- still correct -- rounding, and fail here.
-
-    That is an acceptable trade today because split-K is not planned for this
-    kernel, and the extra strictness is what makes the test able to distinguish
-    "masked" from "read but harmless". If a future optimisation does need the
-    freedom, relax this to comparing each poison against the fp32 reference
-    separately and keep the NaN case, which is the actual leak detector; do
-    not simply delete it.
+    Note this also fails for correct but non-deterministic algorithms (split-K
+    over head_dim, say). None are planned here.
     """
     _require_env()
     seq, heads = 256, 4
