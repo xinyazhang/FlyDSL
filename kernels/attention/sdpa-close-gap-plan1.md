@@ -524,6 +524,43 @@ So the P1 plan is:
   or restrict the prologue trick to `Hdim % 8 == 0`. The trick is still free in
   the `PADDED_HEAD=False` case, which is where it matters for perf.
 
+### No out-of-bounds access is *argued*, not tested
+
+Worth being blunt about the limits of the poison tests: they show the pad does
+not influence the output. They cannot show it was never read, because a kernel
+may read and discard. Only an unmapped guard page immediately after the
+allocation turns a stray read into a fault -- and a guard page acts at page
+granularity, so a test would have to place the tensor so its last valid byte
+lands exactly on a page boundary, for every shape under test. Deferred.
+
+So the property is maintained by construction, on one invariant:
+
+> **Every index the kernel forms is inside its axis's extent** -- `batch < B`,
+> `head_q < Num_head_q`, `head_k < Num_head_k`, `row < seqlen`, `col < pitch`.
+> An address is `base + b*s0 + h*s2 + row*s1 + col`, so if each index is in
+> range the address is inside the tensor, whatever the layout.
+
+Where each falls out:
+
+| index | bounded by |
+|---|---|
+| `batch`, `head_q` | grid extents |
+| `head_k` | `head_q // (Num_head_q/Num_head_k)`, so `< Num_head_k` |
+| `row` (KV) | `kv_addr` clamps `tile_start` to `<= seq_last`, then the in-tile row so `ts + row < seqlen` |
+| `row` (Q, O) | `q_in_bounds` selects row 0 for the load and gates the store |
+| `col` | see below |
+
+The column bound is the only non-obvious one. Loads are 8 wide at 8-aligned
+columns, and `_col_safe` redirects any chunk with `col >= hdim` to column 0. So
+the largest column actually addressed is `8*floor((hdim-1)/8) + 7`, i.e. the
+chunk end is `ceil8(hdim)` -- and `ceil8(hdim) <= pitch` is exactly the
+alignment contract. **That is what the 16-byte pitch guarantee buys**, and why
+violating it (a tight `(B,S,H,100)` tensor) produced a real out-of-row write.
+
+Anything that changes the load width, the redirect, or the pitch contract
+invalidates this argument and needs it redone -- which is the point of writing
+it down rather than relying on a test that cannot see the difference.
+
 ### `MASK_STEPS`: don't pay for the guard on blocks that don't need it
 
 Follow AOTriton's inner-kernel pattern (`_attn_fwd_inner(...,

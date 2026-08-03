@@ -474,11 +474,14 @@ def test_padded_head_never_reads_the_pad(hdim, tile, causal, poison):
 def test_padded_head_is_independent_of_pad_contents(hdim, tile):
     """Two different poisons must produce bitwise-identical output.
 
-    Stronger than a tolerance check: it proves the pad is not read at all,
-    rather than read and diluted below tolerance.
+    Proves the pad does not *influence* the result -- stronger than a tolerance
+    check, which cannot tell "masked" from "read but diluted". It does not
+    prove the pad is unread; the kernel may read and discard it. Only a guard
+    page shows that, and only at page granularity. Not-reading-OOB is argued
+    rather than tested; see plan1 section 3.
 
-    Note this also fails for correct but non-deterministic algorithms (split-K
-    over head_dim, say). None are planned here.
+    Also fails for correct but non-deterministic algorithms (split-K over
+    head_dim, say). None are planned here.
     """
     _require_env()
     seq, heads = 256, 4
