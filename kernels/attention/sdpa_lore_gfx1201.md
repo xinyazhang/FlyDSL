@@ -389,3 +389,28 @@ recoverable time at high occupancy (both recorded in `gfx1201_fmha.md`).
 
 The remaining gaps in the table above are structural, and none of them is a
 micro-scheduling problem.
+
+## head_dim 32 non-causal is bimodal; the ladder A/B cannot resolve it
+
+`bench_aiw_ab.py` at head_dim 32 non-causal returns either ~58.3 or ~63
+TFLOPS, and **which one is not a function of the code**. Alternating the
+pre-gSWA kernel against the gSWA one, three runs each:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| pre-gSWA | 63.6 | 58.2 | 58.3 |
+| gSWA | 58.3 | 62.9 | 58.3 |
+
+The legacy reference measured in the same reps is stable throughout (70.9 to
+71.6), so this is not board drift and the interleaved-ratio discipline does
+not remove it — the ratio column swings 0.82 to 0.89 with it.
+
+This cost a round of bisecting: the same -8% appeared in two consecutive
+before/after comparisons, looked reproducible, and was neither a regression
+nor noise in the usual sense. A single A/B at this point can produce a
+confident-looking -8% in either direction.
+
+**Treat any head_dim 32 non-causal delta below ~10% as unresolved unless at
+least three alternating runs agree.** The point is plausibly bistable in a
+clock or allocation state rather than in the kernel; nobody has chased it
+down. head_dim 16 non-causal, measured alongside, is stable to 0.5%.

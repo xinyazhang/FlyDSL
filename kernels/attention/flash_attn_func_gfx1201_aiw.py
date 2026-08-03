@@ -669,10 +669,11 @@ def build_flash_attn_func_aiw_module_primary(
     PADDED_HEAD = padded_head
     BLOCK_DMODEL = head_dim
 
-    # Causal masking, AOTriton's CAUSAL_TYPE. 0 = none, 1 = top-left aligned,
-    # 2 = bottom-right aligned. The two alignments differ only in where the
-    # diagonal sits, and they coincide when seqlen_q == seqlen_k -- which is
-    # why a single `causal` bool sufficed until now.
+    # Causal masking. `causal_type` is the *caller's* vocabulary, AOTriton's
+    # CAUSAL_TYPE: 0 = none, 1 = top-left aligned, 2 = bottom-right aligned,
+    # 3 = an explicit sliding window. The two alignments differ only in where
+    # the diagonal sits, and they coincide when seqlen_q == seqlen_k -- which
+    # is why a single `causal` bool sufficed for a long time.
     #
     #   top-left      key j is visible to query i iff  j <= i
     #   bottom-right  ...                        iff  j <= i + (seqlen_k - seqlen_q)
@@ -689,15 +690,22 @@ def build_flash_attn_func_aiw_module_primary(
     # https://github.com/pytorch/pytorch/issues/108108 for the debate about
     # changing that default.
     if causal_type is None:
-        CAUSAL_TYPE = 1 if causal else 0
+        HOST_CAUSAL_TYPE = 1 if causal else 0
     else:
-        CAUSAL_TYPE = causal_type
-    if CAUSAL_TYPE not in (0, 1, 2, 3):
-        raise ValueError(f"causal_type must be 0, 1, 2 or 3, got {CAUSAL_TYPE}")
-    if bool(CAUSAL_TYPE) != bool(causal):
+        HOST_CAUSAL_TYPE = causal_type
+    if HOST_CAUSAL_TYPE not in (0, 1, 2, 3):
+        raise ValueError(f"causal_type must be 0, 1, 2 or 3, got {HOST_CAUSAL_TYPE}")
+    if bool(HOST_CAUSAL_TYPE) != bool(causal):
         raise ValueError(
-            f"causal={causal} disagrees with causal_type={CAUSAL_TYPE}"
+            f"causal={causal} disagrees with causal_type={HOST_CAUSAL_TYPE}"
         )
+    # **The kernel only ever sees 0 or 3.** 1 and 2 are host-side conveniences
+    # that resolve to a window before dispatch, which is what AOTriton ships
+    # (`@ati.scalar('CAUSAL_TYPE', options=[0, 3])`). Keeping them in the
+    # kernel would leave two ways to express one diagonal, free to drift apart
+    # under maintenance. The window path reproduces both *bitwise*, which is
+    # what licensed removing them; see sdpa-gswa-plan.md section 0.
+    CAUSAL_TYPE = 0 if HOST_CAUSAL_TYPE == 0 else 3
 
     # Mask KV columns past seqlen_k. Required whenever seqlen need not divide
     # BLOCK_N -- i.e. always, now that the interface no longer pads. The guard
@@ -1485,50 +1493,9 @@ def build_flash_attn_func_aiw_module_primary(
                 )
             )
 
-        if const_expr(CAUSAL_TYPE == 3):
-            _diag_i32 = fx.Int32(window_right)
-            _wl_i32 = fx.Int32(window_left)
-        elif const_expr(CAUSAL_TYPE == 2):
-            _diag_i32 = fx.Int32(seqlen_k) - fx.Int32(seqlen_q)
-        else:
-            _diag_i32 = fx.Int32(0)
-
-        _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
-            # Highest key any row in this block can see, +1, clamped into
-            # [0, seqlen_k]. Computed in i32 because _diag can be negative.
-            # Explicitly *signed* comparisons. fx.Int32 comparisons default to
-            # unsigned, and _diag can be negative -- an unsigned `> 0` on -128
-            # is true, which propagated a huge bound into the loop. Same trap
-            # the Q-row bound check documents.
-            _lim_i32 = fx.Int32(_q_end) + _diag_i32
-            _lim_i32 = fx.Int32(
-                ArithValue(
-                    arith.cmpi(
-                        arith.CmpIPredicate.slt, _raw(_lim_i32), _raw(fx.Int32(seqlen_k))
-                    )
-                ).select(_lim_i32, fx.Int32(seqlen_k))
-            )
-            _lim_i32 = fx.Int32(
-                ArithValue(
-                    arith.cmpi(
-                        arith.CmpIPredicate.sgt, _raw(_lim_i32), _raw(fx.Int32(0))
-                    )
-                ).select(_lim_i32, fx.Int32(0))
-            )
-            _kv_lim = fx.Index(_lim_i32)
-        else:
-            _kv_lim = seqlen_k_v
-        # Round the bound *up* to a whole BLOCK_N. The loop steps by BLOCK_N,
-        # so a bound that is not a multiple of it drops the final partial tile
-        # entirely -- at seqlen 40 with BLOCK_N 32 the kernel attended to only
-        # the first 32 keys, which is wrong for every row, not just the tail.
-        # The tail tile's invalid columns are handled by the KV mask below;
-        # this only has to make sure the tile runs at all.
-        kv_upper = fx.Index(
-            ((_kv_lim + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N))
-            * fx.Index(BLOCK_N)
-        )
+            _wr_i32 = fx.Int32(window_right)
+            _wl_i32 = fx.Int32(window_left)
 
         # ---- Split the KV range into full and masked regions ----
         #
@@ -1542,8 +1509,7 @@ def build_flash_attn_func_aiw_module_primary(
         # dynamic `scf.if` guard inside one loop measured much worse than no
         # guard at all, because the region boundary blocks scheduling in a
         # latency-bound loop. A static split has no such boundary.
-        _full_seq = (seqlen_k_v // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N)
-        if const_expr(CAUSAL_TYPE == 3):
+        if const_expr(CAUSAL):
             # ---- gSWA: three regions over one contiguous block range ----
             #
             # A left window can kill columns in any tile, including tile 0, so
@@ -1584,7 +1550,7 @@ def build_flash_attn_func_aiw_module_primary(
             # The visited range: outside it every column is dead for every row
             # in this Q block, so those tiles are not walked at all.
             _v_lo = _smax_i32(_sdiv_rd(_q_start_i32 - _wl_i32), fx.Int32(0))
-            _v_hi = _smin_i32(_blk_last, _sdiv_rd(_q_last_i32 + _diag_i32))
+            _v_hi = _smin_i32(_blk_last, _sdiv_rd(_q_last_i32 + _wr_i32))
 
             # First tile clear of the left edge: ceil(((q_hi-1) - w_left)/BN).
             # First tile touched by the right edge: floor((q_start+w_right+1)/BN).
@@ -1599,7 +1565,7 @@ def build_flash_attn_func_aiw_module_primary(
             _l_first_full = _sdiv_rd(
                 _q_last_i32 - _wl_i32 + fx.Int32(BLOCK_N - 1)
             )
-            _r_first_mask = _sdiv_rd(_q_start_i32 + _diag_i32 + fx.Int32(1))
+            _r_first_mask = _sdiv_rd(_q_start_i32 + _wr_i32 + fx.Int32(1))
 
             _fb_lo = _smax_i32(_l_first_full, _v_lo)
             _fb_hi = _smin_i32(
@@ -1634,27 +1600,18 @@ def build_flash_attn_func_aiw_module_primary(
                 fx.Int32(0),
             )
             _n_masked = fx.Index(_n_l + _n_r)
-            _n_l_idx = fx.Index(_n_l)
-        elif const_expr(CAUSAL):
-            # Tile t is clear of the diagonal iff its last column
-            # <= q_start + _diag, using the lowest Q row in this block. Clamped
-            # at 0 so a negative diagonal simply gives an empty full region.
-            _fc_i32 = fx.Int32(q_start) + _diag_i32 + fx.Int32(1)
-            _fc_i32 = fx.Int32(
-                ArithValue(
-                    arith.cmpi(
-                        arith.CmpIPredicate.sgt, _raw(_fc_i32), _raw(fx.Int32(0))
-                    )
-                ).select(_fc_i32, fx.Int32(0))
-            )
-            _full_causal = (
-                fx.Index(_fc_i32) // fx.Index(BLOCK_N)
-            ) * fx.Index(BLOCK_N)
-            _full_end = fx.Index(
-                ArithValue(_full_seq < _full_causal).select(_full_seq, _full_causal)
-            )
         else:
-            _full_end = _full_seq
+            # No mask beyond the KV tail: one full region, then one partial
+            # tile. `kv_upper` is rounded *up* to a whole BLOCK_N because the
+            # loop steps by BLOCK_N, and a bound that is not a multiple of it
+            # drops the final partial tile entirely -- at seqlen 40 with
+            # BLOCK_N 32 the kernel attended to only the first 32 keys, which
+            # is wrong for every row rather than just the tail.
+            _full_end = (seqlen_k_v // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N)
+            kv_upper = fx.Index(
+                ((seqlen_k_v + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N))
+                * fx.Index(BLOCK_N)
+            )
 
         # ---- Prologue: at distance 1, the first tile's K / V go to registers ----
         #
@@ -1665,7 +1622,7 @@ def build_flash_attn_func_aiw_module_primary(
         # already correct, which is the failure mode plan section 5 predicted:
         # a prefetch bug survives every check that only looks at the loop
         # bounds.
-        if const_expr(CAUSAL_TYPE == 3):
+        if const_expr(CAUSAL):
             _first_col = fx.Index(
                 _smax_i32(
                     _ssel_i32(
@@ -1900,18 +1857,18 @@ def build_flash_attn_func_aiw_module_primary(
                         )
                         _dead = _col >= _seq_i32
                         if const_expr(CAUSAL):
+                            # Both edges of the band. Signed throughout:
+                            # q_row - w_left is negative for every row when
+                            # w_left is "unbounded" (== seqlen_q), which is how
+                            # plain causal maps onto this path with the left
+                            # term inert.
                             _dead = _dead | ArithValue(
                                 arith.cmpi(
                                     arith.CmpIPredicate.sgt,
                                     _raw(_col),
-                                    _raw(q_row_i32 + _diag_i32),
+                                    _raw(q_row_i32 + _wr_i32),
                                 )
                             )
-                        if const_expr(CAUSAL_TYPE == 3):
-                            # Left edge of the band. Signed: q_row - w_left is
-                            # negative for every row when w_left is
-                            # "unbounded" (== seqlen_q), which is how types 1
-                            # and 2 map onto this path with the term inert.
                             _dead = _dead | ArithValue(
                                 arith.cmpi(
                                     arith.CmpIPredicate.slt,
@@ -2093,7 +2050,7 @@ def build_flash_attn_func_aiw_module_primary(
             return _yield_args
 
         loop_results = init_args
-        if const_expr(CAUSAL_TYPE == 3):
+        if const_expr(CAUSAL):
             # Still **two** emitted bodies, not three. The body already costs
             # 63 VGPRs at head_dim 128 and spills head_dim 192 at two copies
             # (plan1 sections 6.2, 2.6), so the two masked runs share one loop
@@ -2101,13 +2058,14 @@ def build_flash_attn_func_aiw_module_primary(
             # paid only in the masked region.
             #
             # Order is full, then left-masked, then right-masked. Running the
-            # full region *first* is what keeps a causal-equivalent window
-            # bit-identical to CAUSAL_TYPE 1/2: with an unbounded left window
-            # the left run is empty and the order collapses to full-then-tail,
-            # exactly the pre-gSWA split. Online softmax is order-independent
-            # mathematically but not in floating point, so walking the masked
-            # runs first would have been just as correct and would have lost
-            # that property.
+            # full region *first* is what made a causal-equivalent window
+            # bit-identical to the dedicated causal path that used to live
+            # here: with an unbounded left window the left run is empty and
+            # the order collapses to full-then-tail, exactly the pre-gSWA
+            # split. Online softmax is order-independent mathematically but
+            # not in floating point, so walking the masked runs first would
+            # have been just as correct and would have lost that property --
+            # which is the property that licensed deleting CAUSAL_TYPE 1/2.
             for kv_block_start, inner_iter_args in range(
                 fx.Index(_f_col0), fx.Index(_f_col0 + _n_f * _BN_I32),
                 BLOCK_N_OUT, init=init_args,
@@ -2451,29 +2409,47 @@ def build_flash_attn_func_aiw_module_primary(
             )
         return _ptr_arg(lse), lse.stride(0)
 
+    # Where causal alignment lives now that the kernel has only {0, 3}.
+    #
+    # `window_left = seqlen_q` is "unbounded": no row can reach further back
+    # than the start of its own sequence, so the left edge of the band never
+    # binds and the mask degenerates to a diagonal. This is `calculate_swa` in
+    # AOTriton's `mha_fwd_aot`.
+    #
+    # It has to be resolved *here* rather than at build time because both
+    # entries depend on the runtime lengths -- which is also why the varlen
+    # sentinels of step 4 exist: with per-sequence lengths there is no single
+    # seqlen_q to compute a uniform window from.
+    _CAUSAL_WINDOW = {
+        1: lambda sq, sk: (sq, 0),           # top-left
+        2: lambda sq, sk: (sq, sk - sq),     # bottom-right
+    }
+
     def _resolve_window(window, seqlen_q, seqlen_k):
         """(window_left, window_right), signed, as the kernel wants them.
 
-        Only CAUSAL_TYPE 3 reads them. The other types still forward a pair so
-        both arms share one ABI and stay directly comparable -- the same reason
-        the strides are always passed even under STRIDES_CONSTEXPR.
-
-        Deliberately does *not* know how to derive a window from causal_type.
-        The mapping (top-left is `(seqlen_q, 0)`, bottom-right is
-        `(seqlen_q, seqlen_k - seqlen_q)`) is what the equivalence test has to
-        establish before types 1 and 2 can be deleted, so the test spells it
-        out itself; sharing a helper here would make that test tautological.
+        Non-causal still forwards a pair so both arms share one ABI and stay
+        directly comparable -- the same reason the strides are always passed
+        even under STRIDES_CONSTEXPR.
         """
-        if CAUSAL_TYPE != 3:
+        if CAUSAL_TYPE == 0:
             return 0, 0
-        if window is None:
-            raise ValueError(
-                "causal_type=3 is generalized sliding-window attention and "
-                "requires window=(left, right); "
-                f"pass ({seqlen_q}, 0) for top-left causal or "
-                f"({seqlen_q}, {seqlen_k - seqlen_q}) for bottom-right"
-            )
-        wl, wr = window
+        if HOST_CAUSAL_TYPE in _CAUSAL_WINDOW:
+            if window is not None:
+                raise ValueError(
+                    f"causal_type={HOST_CAUSAL_TYPE} already fixes the window; "
+                    "pass causal_type=3 to choose one"
+                )
+            wl, wr = _CAUSAL_WINDOW[HOST_CAUSAL_TYPE](seqlen_q, seqlen_k)
+        else:
+            if window is None:
+                raise ValueError(
+                    "causal_type=3 is generalized sliding-window attention and "
+                    "requires window=(left, right); "
+                    f"pass ({seqlen_q}, 0) for top-left causal or "
+                    f"({seqlen_q}, {seqlen_k - seqlen_q}) for bottom-right"
+                )
+            wl, wr = window
         return int(wl), int(wr)
 
     def _resolve_scale(Q, scale):
