@@ -1,316 +1,393 @@
 # P3 in detail: Variable-Length Sequences
 
-Companion to `sdpa-close-gap-plan1.md`, which resolves the naming (D3) and the
-LSE layout but not the mechanism. This is the implementation plan.
+Companion to `sdpa-close-gap-plan1.md`, which resolves the LSE layout but whose
+D3 naming (`seq_info_q/k`) this plan supersedes — see §3.
 
 Written after P6, and shaped by it: the gSWA phase established that a *bitwise*
 equivalence to an existing path is both achievable and the sharpest oracle in
-this codebase. Varlen admits the same kind of gate, for the same reason, and
-§6 makes it the headline requirement rather than an afterthought.
+this codebase. Varlen admits the same gate, for the same reason, and §7 makes
+it the headline requirement rather than an afterthought.
 
 ---
 
 ## 0. The goal, including the one that is easy to leave unstated
 
-1. **Support variable-length sequences** — plural layouts, see §1.
-2. **Absorb P6 step 4.** `Window_left`/`Window_right` must accept the
-   sentinels `0x80000001` (top-left) and `0x80000002` (bottom-right), resolved
-   *per sequence*. gSWA deferred this here because a sentinel is meaningless
-   without per-sequence lengths. The phase is not done until the host-side
-   `_CAUSAL_WINDOW` table has an in-kernel counterpart.
-3. **Do not add an `if varlen_mode` to the body.** The mode may branch exactly
-   once, in the prologue, to produce six scalars. Everything downstream reads
-   those scalars and cannot tell which mode it is in.
-
-Objective 3 is a design constraint with teeth, and it is the reason this phase
-is small. It is also what AOTriton does: its prologue is a three-way branch and
-its body has no varlen conditionals at all.
+1. **Support variable-length sequences** — which is not one feature but a
+   product of three independent choices, §1.
+2. **Absorb P6 step 4.** `Window_left`/`Window_right` must accept the sentinels
+   `0x80000001` / `0x80000002`, resolved *per sequence*. gSWA deferred this
+   here because a sentinel is meaningless without per-sequence lengths.
+3. **Do not add an `if varlen_mode` to the body.** The bits may be decoded
+   exactly once, in the prologue, into six scalars. Everything downstream reads
+   those scalars and cannot tell what layout it is in.
 
 **Success criterion for objective 3:** outside the prologue, the kernel
-contains no reference to `varlen_mode`, `cu_seqlens`, or `seq_strides`.
+contains no reference to `varlen_bits`, `seqinfo_*`, or `Max_seqlen_*`.
 
 ---
 
-## 1. There are four modes, not two
+## 1. Varlen is three orthogonal choices, not an enum
 
-This is the part most likely to be under-scoped. `varlen` is not one feature;
-AOTriton ships four `VarlenType` values, and two of them exist specifically for
-Transformer Engine (added in `04cdead5`, "Support Additional Varlen Memory
-Layouts"):
+AOTriton models this as `VarlenType ∈ {None, CompactVarlen, PaddedVarlen,
+StridedVarlen}`. That enum is a *sample* of the space, not a description of it,
+and PyTorch already ships a case outside it — see §1.4. The three axes:
 
-| `VarlenType` | tensor shape | lengths from | LSE layout |
+### A. Is the token axis stacked?
+
+| | shape | how sequence `z` is selected |
+|---|---|---|
+| `BATCHED` | BHSD | the batch index: `batch_index = z` |
+| `STACKED` | 1THD (rank 4, `B` fixed at 1) | a row offset along `T` |
+
+### B. How is the *length* of sequence `z` given?
+
+| | array shape | `seqlen(z)` |
+|---|---|---|
+| `MAX` | — | `Max_seqlen` (every sequence the same) |
+| `CUMULATIVE` | `(N+1,)` | `a[z+1] - a[z]` |
+| `INDIVIDUAL` | `(N,)` | `a[z]` |
+
+### C. Where does sequence `z` *start* along the token axis?
+
+| | `row_off(z)` |
+|---|---|
+| `IMPLIED` | `0` if `BATCHED`, else `z * Max_seqlen` |
+| `ARRAY` | `b[z]`, from a cumulative position array |
+
+**All three are per-side.** Q and K may differ, and the case that forces this
+is ordinary: packed queries against a rectangular KV cache.
+
+### 1.1 Why A cannot be folded into C
+
+It is tempting to drop `STACKED` and say `BATCHED` is just `row_off = z *
+Max_seqlen`. That is true only when `stride_batch == Max_seqlen * stride_seq`,
+i.e. for a contiguous BHSD tensor — and plan1 §0 is explicit that **shape does
+not imply layout**. `storage_flip` alone breaks it. The batch stride is an
+independent number the kernel reads off the tensor, so selecting a batch slice
+and offsetting within one are two different operations.
+
+### 1.2 Why C has two states, not the three you might expect
+
+The natural reading is three: *reuse `cu_seqlens`*, *use `seq_strides`*, or
+*regular*. But the first two are **the same kernel code with a different
+pointer** — both compute `row_off = b[z]` from a cumulative array; `cu_seqlens`
+and TE's `cu_seqlens_padded` differ only in whether the sequences have gaps
+between them, which the kernel never needs to know.
+
+So `CompactVarlen` and `StridedVarlen` are not two modes. They are one mode
+called with two different arrays. That collapse is the main return on
+decomposing at all, and it is worth stating as a result rather than hiding as
+an implementation detail.
+
+(A third state `REUSE`, meaning "position array == length array", would save
+one live pointer. It is representable in the reserved bits if a measurement
+ever justifies it. Not now.)
+
+### 1.3 AOTriton's four types, decomposed
+
+| `VarlenType` | Q side | K side |
+|---|---|---|
+| `None` | BATCHED, MAX, IMPLIED | BATCHED, MAX, IMPLIED |
+| `CompactVarlen` | STACKED, CUMULATIVE, ARRAY(`cu_q`) | STACKED, CUMULATIVE, ARRAY(`cu_k`) |
+| `PaddedVarlen` | BATCHED, CUMULATIVE, IMPLIED | BATCHED, CUMULATIVE, IMPLIED |
+| `StridedVarlen` | STACKED, CUMULATIVE, ARRAY(`sst_q`) | STACKED, CUMULATIVE, ARRAY(`sst_k`) |
+
+### 1.4 The case the enum cannot express
+
+`torch.nn.attention.varlen.varlen_attn` takes `cu_seq_k` **and** `seqused_k`
+together:
+
+> `seqused_k` — Number of valid KV tokens per batch element; shape `(N,)`.
+> When set, only the first `seqused_k[i]` tokens in the key/value sequence for
+> batch element `i` participate in attention. Useful for KV-cache decoding
+> where the cache slot is larger than the actual sequence.
+
+That is **length from an individual array, position from a cumulative one** —
+axis B and axis C taking their values from *different tensors*. No
+`VarlenType` covers it, because the enum assumes one array serves both roles.
+
+Decomposed, it is just: K side = `STACKED, INDIVIDUAL, ARRAY`.
+
+And the rectangular-cache variant — a BHSD cache with `seqused_k` and no
+`cu_seq_k` at all — is `BATCHED, INDIVIDUAL, IMPLIED`. Also uncovered by the
+enum, also free here.
+
+---
+
+## 2. `VarlenBits : u32`
+
+One byte per side, identically decoded, so the kernel has **one** decoder
+called twice.
+
+```
+  bits  0      STACKED     0 = BHSD              1 = 1THD
+  bits  2:1    LENGTH      0 = MAX               1 = CUMULATIVE   2 = INDIVIDUAL
+  bits  3      POSITION    0 = IMPLIED           1 = ARRAY
+  bits  7:4    reserved
+
+  VarlenBits = q_byte | (k_byte << 8)
+  bits 31:16   reserved   (paged KV, §8)
+```
+
+`VarlenBits == 0` is BHSD / MAX / IMPLIED on both sides — the conventional
+dense case, and the default, exactly as required.
+
+| configuration | bits |
+|---|---|
+| dense | `0x0000` |
+| compact varlen | `0x0B0B` |
+| padded varlen | `0x0202` |
+| strided varlen | `0x0B0B` *(same code; `seqinfo_?1` differs)* |
+| packed Q, `seqused_k` on packed KV | `0x0D0B` |
+| packed Q, `seqused_k` on a BHSD cache | `0x040B` |
+
+That two AOTriton types share `0x0B0B` is the §1.2 collapse showing up in the
+encoding.
+
+---
+
+## 3. `seqinfo_q0 / q1 / k0 / k1`
+
+Supersedes D3's `seq_info_q/k`, which assumed one array per side. Two are
+needed because B and C can read different tensors (§1.4). They are named by
+**role**, so the bits say only how to *interpret* them, never which slot to
+look in:
+
+| | role | read when | indexed |
 |---|---|---|---|
-| `None` = 0 | BHSD | `Max_seqlen_q/k` | `(B*H, Max_seqlen_q)` |
-| `CompactVarlen` = 1 | THD (packed, no gaps) | `cu_seqlens_q/k` | `(H, TotalS)` |
-| `PaddedVarlen` = 2 | BHSD | `cu_seqlens_q/k` | `(B*H, Max_seqlen_q)` |
-| `StridedVarlen` = 3 | THD with gaps | `cu_seqlens_q/k` for *length*, `seq_strides_q/k` for *position* | `(H, TotalS_padded)` |
+| `seqinfo_?0` | **length** source | `LENGTH != MAX` | `[z]`, `[z+1]` |
+| `seqinfo_?1` | **position** source | `POSITION == ARRAY` | `[z]`, and `[N]` for the total |
 
-The two TE modes are the interesting ones because they separate two things
-that coincide in classical varlen:
+Compact varlen passes the same pointer as both `?0` and `?1`. That redundancy
+is deliberate: fixing the roles keeps the decoder branch-free on *which*
+pointer, at the cost of one duplicated argument.
 
-- **`PaddedVarlen`** keeps the rank-4 layout and only shortens the sequences.
-  Positions are unchanged; just the lengths come from `cu_seqlens`.
-- **`StridedVarlen`** packs sequences but leaves padding *between* them, so the
-  position of sequence `z` is no longer `cu_seqlens_q[z]`. TE calls the
-  position array `cu_seqlens_padded`.
+### 3.1 The decoder
 
-So "where sequence `z` starts" and "how long it is" are independent, and the
-prologue must treat them as two separate lookups. Any design that assumes
-`start[z+1] - start[z] == length[z]` handles compact varlen and silently
-corrupts strided.
+```python
+def decode_side(bits8, z, N, max_seqlen, s0, s1):
+    stacked = bits8 & 1
+    lenmode = (bits8 >> 1) & 3
+    posmode = (bits8 >> 3) & 1
+
+    seqlen = (max_seqlen        if lenmode == 0 else
+              s0[z + 1] - s0[z] if lenmode == 1 else
+              s0[z])
+
+    row_off = s1[z] if posmode else (z * max_seqlen if stacked else 0)
+    batch_index = 0 if stacked else z
+    return seqlen, row_off, batch_index
+```
+
+Called twice. The Q call additionally yields the LSE stride:
+
+```python
+lse_stride = s1_q[N] if q_posmode else (N * max_seqlen_q if q_stacked
+                                        else max_seqlen_q)
+```
+
+### 3.2 LSE is not a fourth choice
+
+Plan1 resolved LSE as one branch-free offset formula, `(b*H + h)*S + s`. Under
+this decomposition that is **exactly Q's addressing applied to a rank-2
+tensor**: `b = batch_index_q`, `s = row_off_q`, `S = lse_stride`. So the
+`(B*H, Max_seqlen_q)` and `(H, TotalS)` layouts are not modes to select
+between — they are what the formula produces for `BATCHED` and `STACKED`. No
+LSE bits, and nothing to keep in sync.
+
+This is the strongest evidence that the decomposition is the right one: a
+choice that looked independent turns out to be derived.
 
 ---
 
-## 2. What actually changes: six scalars, computed once
+## 4. What changes in the kernel: six scalars
 
-Every mode reduces to the same six values, after which the kernel is identical:
+After the prologue, everything is one of:
 
 | | `seqlen_q` | `seqlen_k` | `q_row_off` | `k_row_off` | `batch_index` | `lse_stride` |
 |---|---|---|---|---|---|---|
-| None | `Max_seqlen_q` | `Max_seqlen_k` | 0 | 0 | `z` | `Max_seqlen_q` |
-| Compact | `cu_q[z+1]-cu_q[z]` | `cu_k[z+1]-cu_k[z]` | `cu_q[z]` | `cu_k[z]` | **0** | `TotalS` |
-| Padded | `cu_q[z+1]-cu_q[z]` | `cu_k[z+1]-cu_k[z]` | **0** | **0** | `z` | `Max_seqlen_q` |
-| Strided | `cu_q[z+1]-cu_q[z]` | `cu_k[z+1]-cu_k[z]` | `sst_q[z]` | `sst_k[z]` | **0** | `sst_q[N]` |
 
-`batch_index = 0` for the packed modes is the whole trick: a packed tensor is
-one batch whose sequence axis is `T`, so the batch stride must not be applied
-and the row offset does the work instead.
+and the two places that consume them are already written in the right shape.
 
-### 2.1 The kernel is already shaped for this
+**Addressing.** `_addr_pair` computes `bh = batch_idx * s_batch + head *
+s_head`. Adding `+ q_row_off * s_seq` covers every configuration, for all four
+tensors. Note `batch_index` is *also* now decoded rather than
+`gpu.block_idx.z` — the one existing line that changes.
 
-Both places that would have to change are already written in the right form,
-which is worth stating because it bounds the work.
+**LSE.** `_lse_base = (batch_idx * num_head_q + head_q) * lse_stride` becomes
+the same expression `+ q_row_off`, per §3.2.
 
-**Addressing.** `_addr_pair` computes
-
-```python
-bh = batch_idx * s_batch + head * s_head
-tbase = bh + tile_start * s_seq
-```
-
-and AOTriton's is
-
-```python
-o_base = Out + batch_index * stride_oz + off_h_q * stride_oh
-             + cu_seqlens_q_start * stride_om
-```
-
-The only difference is the third term. Adding `q_row_off * s_seq` into `bh`
-covers all four modes, for all four tensors, with no other change — and it goes
-into the **64-bit base**, not the 32-bit offset, which §4 explains is required.
-
-**LSE.** The kernel computes
-
-```python
-_lse_base = (batch_idx * num_head_q + head_q) * lse_stride
-```
-
-against AOTriton's `_lse_offset(b, h, s, H, S) = (b*H + h)*S + s`. Same
-expression with `s = 0`. Adding `+ q_row_off` completes it. Plan1's LSE
-decision already called for exactly this ("the mode selects the *inputs*"), so
-this is that decision being cashed in.
-
-### 2.2 What the prologue costs
-
-`off_z` is uniform across the workgroup, so `cu_seqlens_q[off_z]` and its three
-siblings are **scalar** loads, four to six of them, once per workgroup. They
-land in SGPRs and do not touch the VGPR budget that gSWA just pushed up.
-
-The prologue's branch is a genuine branch, but on a uniform condition and
-outside every loop.
+**Cost.** `z` is uniform per workgroup, so the `seqinfo` reads are **scalar**
+loads — at most six, once, into SGPRs. They do not touch the VGPR budget gSWA
+just raised.
 
 ---
 
-## 3. The grid grows, and a workgroup must be able to do nothing
+## 5. Row offsets are 64-bit; the hazard is width, not sign
 
-Today the grid's Q axis is `ceil(seqlen_q / BLOCK_M)`, which is exact. Under
-varlen there is no single `seqlen_q`, so it becomes
-`ceil(Max_seqlen_q / BLOCK_M)` and **every sequence gets the longest
-sequence's worth of workgroups.** Sequences shorter than the maximum therefore
-dispatch workgroups with nothing to do.
+gSWA's arithmetic hazard was signedness. This one points the other way.
 
-Two consequences:
+`q_row_off * s_seq` on a packed tensor is a *whole-batch* quantity: at
+`T = 128K`, `H = 32`, `D = 128` the byte offset passes 2^32. The kernel's
+addressing is deliberately a **64-bit base plus a 32-bit offset** (plan1). So:
 
-### 3.1 An early exit, without an early `return`
+1. **`q_row_off` / `k_row_off` go into the 64-bit base**, never the 32-bit
+   per-lane offset. §4's `bh` is the insertion point; `toff` must not see them.
+2. `seqinfo` values are `int32` on the wire — they are, in both PyTorch and TE
+   — and must be widened *before* multiplying by a stride.
+3. Lengths stay signed `int32`, and everything in gSWA plan §2.4 still applies,
+   because `window_right = seqlen_k - seqlen_q` is computed from them.
 
-`CLAUDE.md` forbids branch-local `return`/`yield` in traced functions, and the
-kernel is one long single-exit trace. So `if start_M >= seqlen_q: return` is
-not available.
-
-The structural equivalent is to make the workgroup's *work* empty rather than
-skip it:
-
-- Force the KV loop counts to zero. Under gSWA this is already the natural
-  representation — `n_l = n_f = n_r = 0` — so causal needs nothing new. The
-  non-causal path needs its `kv_upper` clamped the same way.
-- Rely on the existing row-bound masking for the O and LSE stores, which
-  already suppresses rows past `seqlen_q`. **Verify this covers the LSE store
-  too**, not just O; it is a separate store with its own guard.
-
-The workgroup still launches, loads Q (wastefully), and runs a no-op epilogue.
-That is the price of a one-size-fits-all grid, and it is bounded.
-
-### 3.2 This is the case for persistent-dynamic, and it should be recorded
-
-plan1 §2.4 defers persistent-dynamic and notes AOTriton forces
-`PERSISTENT_TYPE = 2` for causal. Varlen makes the argument sharper: with a
-skewed length distribution the wasted fraction is
-`1 - mean(seqlen) / max(seqlen)`, which is large for realistic batches. AOTriton
-excludes varlen from persistent (`unsupported_by_persistent = Num_seqlens != 0`),
-so it currently eats the same cost.
-
-Out of scope here. But **measure the waste** as part of this phase so the
-persistent-dynamic task has a number to beat, rather than an intuition.
+An overflowed offset produces a wrong address inside the same allocation, so it
+reads plausible data. Like the gSWA prefetch bug, it is invisible at test
+scale — hence the one deliberately large case in §7.
 
 ---
 
-## 4. Row offsets are 64-bit, and that is not the same trap as gSWA's
+## 6. The grid grows, and a workgroup must be able to do nothing
 
-gSWA's arithmetic hazard was *signedness*. Varlen's is *width*, and it points
-the other way.
+The Q grid axis becomes `ceil(Max_seqlen_q / BLOCK_M)`, so **every sequence
+gets the longest sequence's worth of workgroups**.
 
-A packed tensor's `T` axis is the sum over the batch, so `q_row_off * s_seq`
-is routinely far larger than any single sequence's extent — at `T = 128K`,
-`num_heads = 32`, `head_dim = 128`, the byte offset exceeds 2^32 comfortably.
-The kernel's addressing is deliberately a **64-bit base plus a 32-bit
-offset** (plan1; the split is what made the ISA diverge from the pre-unification
-kernels). The rule that falls out:
+### 6.1 An early exit without an early `return`
 
-1. **`q_row_off` / `k_row_off` are added to the 64-bit base**, never to the
-   32-bit per-lane offset. §2.1's `bh` is the correct insertion point; the
-   `toff` path must not see them.
-2. **`cu_seqlens` values are `int32` on the wire** (they are, in both PyTorch
-   and TE) but must be widened before multiplying by a stride.
-3. Sequence *lengths* stay `int32` and stay signed — everything §2.4 of the
-   gSWA plan says about window arithmetic applies unchanged, because
-   `window_right = seqlen_k - seqlen_q` is still computed from them.
+`CLAUDE.md` forbids branch-local `return` in traced functions, and this kernel
+is one long single-exit trace. The structural equivalent is to make the work
+empty rather than skip it:
 
-An offset that overflows produces a wrong address rather than a fault, so it
-reads plausible data from the same allocation. Like the gSWA prefetch bug, it
-survives any test that only looks at small shapes — see §6.
+- Force the KV loop counts to zero. Under gSWA that is already the natural
+  representation (`n_l = n_f = n_r = 0`), so the causal path needs nothing new;
+  the non-causal path needs `kv_upper` clamped the same way.
+- Rely on the existing row-bound masking for the stores. **Verify this covers
+  the LSE store**, which is a separate store with its own guard, not just O.
 
----
+### 6.2 Measure the waste
 
-## 5. Steps
-
-Each lands independently and leaves the tree green.
-
-### Step 1 — the prologue, and `CompactVarlen`
-
-Introduce `seq_info_q` / `seq_info_k` (pointers) and `varlen_mode` (runtime
-`i32`), and the six-scalar prologue. Implement modes `None` and
-`CompactVarlen` only; the other two return from the same table.
-
-- Grid Q axis keys on `Max_seqlen_q`.
-- The empty-work path of §3.1.
-- LSE `(H, TotalS)`.
-
-**Gate:** §6's bitwise equivalence for compact varlen, plus the whole existing
-suite unchanged — mode `None` must be bit-identical to today, which it will be
-if the prologue folds correctly.
-
-### Step 2 — `PaddedVarlen`
-
-Two table entries (`q_row_off = 0`, `batch_index = z`). Should be a handful of
-lines if step 1's prologue is factored right; if it is not, that is the signal
-to refactor before continuing.
-
-### Step 3 — `StridedVarlen`
-
-Adds `seq_strides_q/k` and decouples position from length (§1). The mode most
-likely to expose an assumption baked in during step 1.
-
-### Step 4 — the window sentinels (P6 step 4)
-
-`parse_window` moves into the kernel: `Window_left == 0x80000001` resolves to
-`(seqlen_q, 0)` and `0x80000002` to `(seqlen_q, seqlen_k - seqlen_q)`, per
-sequence. AOTriton's is 20 lines and ours is the same shape.
-
-The host-side `_CAUSAL_WINDOW` table stays for the non-varlen path — it costs
-nothing there and keeps the sentinel off the hot path — but the two must
-agree, which §6 tests directly.
+The idle fraction is `1 - mean(seqlen)/max(seqlen)`, which is large for real
+batches. AOTriton excludes varlen from persistent
+(`unsupported_by_persistent = Num_seqlens != 0`) and eats the same cost. Fixing
+it is persistent-dynamic's job, not this phase's — but **produce the number
+here** so that task starts with a measurement instead of an intuition.
 
 ---
 
-## 6. Test matrix, and the oracle that makes it cheap
+## 7. Test matrix, and the oracle that makes it cheap
 
-**The headline gate: varlen with `B` sequences must equal `B` separate
-non-varlen calls, bitwise.**
+**Headline gate: varlen with `N` sequences must equal `N` separate dense calls,
+bitwise.**
 
-This holds for a reason, not by luck. A varlen workgroup and its non-varlen
-counterpart compute over the same tiles, in the same order, with the same
-values; only the base address differs. Every floating-point operation is
-identical, so the results must be too. It is the same argument that made the
-gSWA gate work, and it has the same payoff: **an addressing bug that lands
-inside the right allocation still shows up**, because the data it reads is
-different data.
+This holds for a reason, not by luck. A varlen workgroup and its dense
+counterpart cover the same tiles, in the same order, with the same values; only
+the base address differs. Every floating-point operation is identical.
 
-A tolerance-based comparison against a reference would miss exactly the bugs
-this phase is most likely to produce.
-
-Two caveats to state in the test, so a future reader does not weaken it:
-
-- The grid differs (varlen dispatches `ceil(Max_S/BLOCK_M)` per sequence), and
-  under `_REVERSE_Q_TILES` the tile-to-workgroup mapping differs too. Neither
-  changes what any surviving workgroup computes.
-- LSE lives in a different layout, so compare per-sequence slices, not buffers.
+It is the right gate here specifically because **an addressing bug that lands
+inside the right allocation reads plausible data** — a tolerance comparison
+against a reference would accept it. Two caveats to write into the test so a
+later reader does not weaken it: the grid differs (and under `_REVERSE_Q_TILES`
+so does the tile-to-workgroup mapping), which changes nothing any surviving
+workgroup computes; and LSE lives in a different layout, so compare
+per-sequence slices rather than buffers.
 
 ### Axes
 
 | axis | values | why |
 |---|---|---|
-| `varlen_type` | compact, padded, strided | §1 — three code paths through one prologue |
-| length distribution | uniform; one-long-many-short; all-equal | all-equal is the degenerate case that hides position bugs |
-| `n_seqlen` | 1, 2, 7, 22 | 1 must reduce to non-varlen exactly |
-| `seqlen = 0` | leading, middle, trailing | an empty sequence must write nothing at all |
+| Q byte × K byte | the six rows of §2, plus mixed Q/K | the point of the decomposition |
+| length distribution | uniform; one-long-many-short; all-equal | all-equal hides position bugs |
+| `N` | 1, 2, 7, 22 | `N = 1` must reduce to dense exactly |
+| `seqlen = 0` | leading, middle, trailing | must write nothing at all |
 | `seqlen_k = 0`, `seqlen_q > 0` | | every row dead: `O = 0`, `LSE = +inf` |
-| ragged lengths | prime values | tiles that end mid-sequence |
+| ragged lengths | primes | tiles ending mid-sequence |
 | causal | off, top-left, bottom-right, window | `window_right` is per-sequence now |
-| sentinels | `0x80000001`, `0x80000002` | step 4; must match the host table |
+| sentinels | `0x80000001`, `0x80000002` | objective 2; must match the host table |
 
-### Three properties beyond "matches the reference"
+### Properties beyond "matches the reference"
 
-1. **Single-sequence reduction.** `n_seqlen = 1` compact varlen must be
-   bitwise identical to the non-varlen call. The cheapest possible instance of
-   the headline gate, and the first thing to make pass.
-2. **Padded vs compact agreement.** The same logical batch expressed both ways
-   must give the same numbers. This is what catches a `batch_index` /
-   `row_off` mix-up, since the two modes differ in *precisely* those two
-   fields and nothing else.
-3. **Strided is not compact.** Build a strided case whose gaps are non-zero
-   and assert it differs from the compact interpretation of the same buffer —
-   otherwise a strided implementation that ignores `seq_strides` passes
-   everything.
-
-### One shape that must be large
-
-The 64-bit offset of §4 is unreachable at test scale. Include **one** case with
-`T` large enough that `q_row_off * stride` exceeds 2^32, even if it must be
-`num_heads = 1` and a short run, and mark it `large_shape`. A correctness suite
-that tops out at a few thousand tokens cannot see the bug this guards.
+1. **Single-sequence reduction.** `N = 1` compact must be bitwise identical to
+   the dense call. Cheapest instance of the headline gate; make it pass first.
+2. **Padded vs compact agreement.** The same logical batch both ways. Catches a
+   `batch_index` / `row_off` mix-up, because those two configurations differ in
+   *precisely* those fields.
+3. **Position array actually read.** Build a case whose gaps are non-zero and
+   assert it differs from the gapless interpretation of the same buffer —
+   otherwise an implementation that ignores `seqinfo_?1` passes everything.
+4. **`seqused_k` shortens, and only K.** With `seqused_k[z] < cu_k[z+1]-cu_k[z]`
+   the result must equal a dense call on the truncated K, and must *differ*
+   from one on the full K. This is the §1.4 case; nothing else covers it.
+5. **One large case**, `T` big enough that `q_row_off * stride` exceeds 2^32,
+   marked `large_shape`. §5 is unreachable at normal test scale.
 
 ---
 
-## 7. Risks
+## 8. Steps
 
-| risk | why it matters | mitigation |
-|---|---|---|
-| **Scope read as one mode** | `varlen` sounds like one feature; it is four, two of them TE-specific | §1's table up front; steps 2 and 3 are separate landings |
-| Position vs length conflated | compact makes `start[z+1]-start[z] == length[z]` true, strided makes it false | §1; test property 3 |
-| 32-bit offset overflow | wrong address inside the same allocation, so it reads plausible data | §4 rule 1; the `large_shape` case |
-| Early exit needs a `return` | not available in a single-exit trace | §3.1 — empty work, not skipped work |
-| LSE store guard | O's row bound is well tested; LSE's is a separate store | assert it explicitly in the empty-sequence case |
-| Grid waste on skewed batches | can dominate; invisible in a uniform-length test | measure it in this phase, fix it in persistent-dynamic |
-| Tuning tables go stale | fifth time (LSE, P2a, gSWA, and the sweep still owed) | the sweep is already outstanding; do not re-sweep twice |
+### Step 1 — bits, decoder, and the stacked/cumulative path
+`VarlenBits`, the four `seqinfo` pointers, the §3.1 decoder, the six scalars,
+the empty-work path, LSE via §3.2. Enable `0x0000` and `0x0B0B` only; reject
+other bytes with a clear error.
+
+**Gate:** §7 property 1, then the headline gate for compact. Dense must be
+**bit-identical to today** — it will be if the decoder folds at `bits == 0`.
+
+### Step 2 — `IMPLIED` positions and `BATCHED` stacking
+Enables `0x0202` (padded varlen) and, for free, THD-with-uniform-stride.
+Should be small if step 1 factored the decoder properly; if it is not, that is
+the signal to refactor before continuing.
+
+### Step 3 — `INDIVIDUAL` lengths
+Enables `0x0D0B` and `0x040B` — the PyTorch `seqused_k` cases. Two lines in the
+decoder plus §7 property 4.
+
+Strided varlen needs **no step**: it is `0x0B0B` with a different pointer
+(§1.2). Add it to the test matrix, not to the kernel.
+
+### Step 4 — the window sentinels (P6 step 4)
+`parse_window` moves into the kernel: `0x80000001 → (seqlen_q, 0)` and
+`0x80000002 → (seqlen_q, seqlen_k - seqlen_q)`, per sequence. The host-side
+`_CAUSAL_WINDOW` stays for the dense path — it costs nothing there and keeps
+the sentinel off the hot path — but the two must agree, which §7 tests.
 
 ---
 
-## 8. What this phase does *not* do
+## 9. Coverage: what these bits cannot say
 
-- **Persistent-dynamic**, though §3.2 argues varlen strengthens its case and
-  asks for a number.
-- **Backward.** The dk/dv kernel needs the same six scalars, and the window
-  sentinels transposed (gSWA plan §6). Name the prologue so it can be lifted.
-- **P4 bias / P5 dropout**, which both gain a varlen dimension once this lands
-  — bias is indexed per sequence, and dropout's Philox offset must be
-  per-sequence to stay reproducible. Note it now; neither is in scope here.
+Asked for explicitly, so stated explicitly. The encoding spans
+`2 × 3 × 2 = 12` configurations per side, 144 pairs. Every one is either
+meaningful or harmless — `BATCHED + ARRAY`, for instance, means "slice `z`,
+then skip `b[z]` rows", which is unusual but well-defined and free. What falls
+*outside*:
+
+1. **Paged / block-table KV.** `torch.nn.attention.varlen` accepts a
+   `block_table` of shape `(N, max_pages_per_seq)` with K/V shaped
+   `(total_pages, page_size, H, D)`. A sequence is then a *list* of physical
+   pages, so position is per-page, not per-sequence, and no scalar `row_off`
+   can express it. This needs an indirection load inside the KV loop — a real
+   feature, not an encoding gap. Bits 31:16 are reserved for it.
+2. **Per-sequence head counts or head dims.** Not expressible, and not a thing
+   any API asks for.
+3. **Differing `N` between Q and K.** The sequence count is shared by
+   construction; the bits are per-side but `z` is not.
+4. **Non-cumulative position arrays.** `POSITION = ARRAY` reads `b[z]`, which
+   works for any array, cumulative or not. But `lse_stride` reads `b[N]`, which
+   assumes the array is a prefix sum with a total in the last slot. An arbitrary
+   scatter of starts would need the total supplied separately. Both TE's
+   `cu_seqlens_padded` and `cu_seqlens` satisfy this, so it costs nothing today
+   — but it is an assumption, and it should be asserted on the host rather than
+   discovered later.
+5. **A sequence starting mid-slot with a length that runs past the next
+   sequence's start.** Representable, and the kernel would happily read another
+   sequence's tokens. Nothing validates non-overlap. Host-side check.
+
+Items 4 and 5 are the two places where the encoding is more permissive than the
+semantics, and both are cheap to guard on the host.
+
+---
+
+## 10. What this phase does *not* do
+
+- **Paged KV** (§9.1) and **persistent-dynamic** (§6.2).
+- **Backward.** The dk/dv kernel needs the same six scalars and the sentinels
+  transposed (gSWA plan §6). Name the decoder so it can be lifted, not copied.
+- **P4 bias / P5 dropout**, both of which gain a varlen dimension once this
+  lands: bias is indexed per sequence, and Philox offsets must be per-sequence
+  to stay reproducible. Noted now, scoped later.

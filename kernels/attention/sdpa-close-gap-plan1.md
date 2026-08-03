@@ -321,10 +321,19 @@ The maintenance half of D2 therefore dissolves: keeping both paths is one
 delta**, but now only to know the price of AOT, not to decide whether we can
 afford two paths.
 
-### [D3 — RESOLVED] `seq_info_q` / `seq_info_k`, and `varlen_mode`
+### [D3 — RESOLVED, then SUPERSEDED] `seqinfo_q0/q1/k0/k1` and `VarlenBits`
 
-`seq_info_q/k` — "bounds" wrongly implies interval endpoints when the packed
-case holds cumulative lengths. `varlen_mode` as proposed.
+Originally: `seq_info_q/k` — "bounds" wrongly implies interval endpoints when
+the packed case holds cumulative lengths — plus `varlen_mode`.
+
+**Superseded by `sdpa-varlen-plan.md` §1–3**, on two counts. One array per side
+is not enough: PyTorch's `seqused_k` supplies *lengths* individually while
+`cu_seq_k` supplies *positions* cumulatively, so B and C read different
+tensors. Hence `seqinfo_?0` (length) and `seqinfo_?1` (position), named by
+role. And `varlen_mode` as an enum samples the space rather than describing it
+— varlen is a product of three orthogonal choices, so it becomes
+`VarlenBits : u32`, one identically-decoded byte per side, `0` meaning the
+conventional dense case.
 
 ### [D4 — RESOLVED] ALIBI out of scope
 
@@ -969,12 +978,17 @@ Two findings worth carrying forward:
 per-sequence, which is meaningless without per-sequence lengths. The host-side
 `_CAUSAL_WINDOW` table is where they land.
 
-**P3 varlen.** Detailed separately in `sdpa-varlen-plan.md`. Larger than plan
-0 scoped it in one respect and smaller in another: AOTriton ships **four**
-`VarlenType` values, not two — two of them added for Transformer Engine in
-`04cdead5`, which decouple "where a sequence starts" from "how long it is" —
-but all four reduce to six scalars computed once in the prologue, and the
-kernel's addressing and LSE offset are already written in the shape that needs.
+**P3 varlen.** Detailed separately in `sdpa-varlen-plan.md`. Varlen is not an
+enum but a product of **three orthogonal choices** — is the token axis stacked,
+how is length given, where does a sequence start — encoded as `VarlenBits :
+u32` with one identically-decoded byte per side. That subsumes AOTriton's four
+`VarlenType` values, collapses two of them (compact and strided differ only in
+a pointer, not in code), and covers a case the enum cannot express at all:
+PyTorch's `seqused_k`, which takes lengths from an individual array and
+positions from a cumulative one. All of it still reduces to six scalars
+computed once in the prologue, and the kernel's addressing and LSE offset are
+already written in the shape that needs — the LSE layout turns out not to be an
+independent choice at all, but Q's addressing applied to a rank-2 tensor.
 
 **P4 bias · P5 dropout.** Unchanged in content, and each is now simpler than
 plan 0 scoped it: there is one masking path to extend, not two. P4 still
