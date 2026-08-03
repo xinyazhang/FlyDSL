@@ -684,17 +684,35 @@ def build_flash_attn_func_aiw_module_primary(
     VT_STRIDE = BLOCK_N + _LDS_PAD
     V_STRIDE = VO_WIDTH + _LDS_PAD          # row-major V
 
-    # 32-byte (16-element) loads need the D-axis pitch to be a multiple of 16
-    # elements. The contract only guarantees 8 (16 bytes), and it is only
-    # BLOCK_DMODEL -- itself always a multiple of 16 -- that makes the wider
-    # load safe when hdim == the tile. Under PADDED_HEAD the real extent can
-    # end on any 8-boundary, so a 16-element load can run past the allocation
-    # at the tensor tail. Drop to 8 there.
-    ENABLE_LDS_VEC16 = (
-        os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
-        and not PADDED_HEAD
-    )
-    VEC_WIDTH = 16 if ENABLE_LDS_VEC16 else 8
+    # Cooperative-load vector width, in elements. 8 == 16 bytes.
+    #
+    # Fixed at 8, which is exactly what the alignment contract guarantees: the
+    # D-axis pitch is a multiple of 16 bytes, nothing more. A 16-element
+    # (32-byte) load needs 32-byte alignment, and there is no way to establish
+    # it -- the row address is `base + row * stride_seq`, and `stride_seq` need
+    # only be a multiple of the pitch. A tensor whose pitch is an odd multiple
+    # of 8 elements (say a 16-wide head sliced out of a 24-wide allocation)
+    # puts every odd row on a 16-byte boundary, and the wider load is then
+    # undefined behaviour. This is the same over-promised-alignment failure
+    # documented on `_lds_load_v8` for LDS, where it cost 2.2x.
+    #
+    # It is also not a win. Measured 8 against 16 (B=1 H=8 N=4096 f16, TFLOPS):
+    #
+    #   head_dim   non-causal        causal
+    #       16    37.4 -> 40.2   28.2 -> 35.7
+    #       32    64.0 -> 61.4   47.0 -> 47.2
+    #       64    81.0 -> 81.4   74.3 -> 70.2
+    #      128    92.3 -> 92.1   83.9 -> 81.9
+    #      192    97.7 -> 94.5   74.0 -> 76.5
+    #      256    89.1 -> 90.1   72.6 -> 73.7
+    #      512    45.7 -> 55.1   43.1 -> 51.6
+    #
+    # Median +0.8%, best +27% (head_dim 16 causal), worst -5.5%. So the wider
+    # load was buying nothing on average while carrying an alignment hazard
+    # that no test would catch -- it would fault or corrupt only on layouts we
+    # do not currently generate. Removed rather than tuned: tuning an unsound
+    # knob just spreads the hazard across more configs.
+    VEC_WIDTH = 8
 
     def _load_geom(width):
         """Cooperative-load geometry for a row of `width` elements."""

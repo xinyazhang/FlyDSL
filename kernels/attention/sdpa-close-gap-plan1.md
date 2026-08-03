@@ -779,9 +779,20 @@ only the binding site differs. Promote `sm_scale` and the strides
 (`stride_q0/q1/q2`, per your numeric-naming instruction). Output is the price
 of AOT, not a go/no-go.
 
-**P1 status.** Numerics done (`safe_softmax`, default on). Remaining: MQA/GQA
-+ 3D grid, `BLOCK_DMODEL`/`Hdim_qk`/`Hdim_vo`/`PADDED_HEAD`, LSE, buffer loads,
-`ENABLE_LDS_VEC16`.
+**P1 status: DONE.** Numerics (`safe_softmax`), MQA/GQA on a 3D grid,
+`BLOCK_DMODEL` / runtime `Hdim_qk` / `Hdim_vo` / `PADDED_HEAD`, logsumexp,
+per-tensor strides, in-kernel KV masking with host padding removed (D5), and
+`VEC_WIDTH` fixed at 8. Buffer loads are deferred to P2 with reasons recorded
+above.
+
+Against the three kernels aiw replaced, B=1 H=8 N=4096 f16, full ladder x
+causal: **median 0.995, min 0.843, max 1.170**, ahead on every causal config
+from head_dim 48 up. Ragged seqlen, which those kernels could only serve by
+copying through `F.pad`: **1.40x at seqlen 4000, 2.04x at 1033**.
+
+The two configs still below 0.9 -- head_dim 16 and 32 non-causal -- are the
+`safe_softmax` and KV-mask costs logged in sections 6.1 and 6.3, both of which
+P2 should recover.
 
 *Numerics result.* Both corrections landed behind one knob so the pre-unification
 oracles stay usable:
