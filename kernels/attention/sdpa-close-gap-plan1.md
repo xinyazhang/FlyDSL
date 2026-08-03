@@ -924,7 +924,14 @@ window values as *promotable*: per the note above, the shipped AOT set has no
 CAUSAL_TYPE 1/2, so P2's constexpr causal is an intermediate on the way to P6's
 runtime window, not a parallel path.
 
-**P3 varlen · P4 bias · P5 dropout · P6 gSWA.** Unchanged.
+**P3 varlen · P4 bias · P5 dropout.** Unchanged.
+
+**P6 gSWA.** Detailed separately in `sdpa-gswa-plan.md`, because P2b
+changed its shape: `_diag_i32` *is* `window_right`, so the kernel already
+implements gSWA with `window_left` pinned to unbounded. What remains is the
+left interval, `calculate_intervals`, and -- the objective, not a tidy-up --
+**deleting `CAUSAL_TYPE` 1 and 2**, which gSWA subsumes exactly and which
+AOTriton already ships only as host-side conveniences (`options=[0, 3]`).
 
 **Deferred:** persistent-dynamic (own task, wants P1's 3D grid), `NUM_XCDS`,
 INT8, fused `RETURN_ENCODED_SOFTMAX`, `PRE_LOAD_V`, mxfp8. Dynamic VGPR
