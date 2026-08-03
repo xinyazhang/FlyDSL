@@ -597,6 +597,10 @@ def build_flash_attn_func_aiw_module_primary(
     # one decides the order the groups are issued in. Both matter, and neither
     # of the pre-unification kernels had either.
     _REVERSE_Q_TILES = os.environ.get("FMHA_REVERSE_Q_TILES", "1") == "1"
+    # Measurement-only: drops the KV row clamp. UNSAFE in general -- it is
+    # what buffer bounds checking would replace -- but valid for a benchmark
+    # where seq_len is an exact multiple of BLOCK_M.
+    _NO_KV_CLAMP = os.environ.get("FMHA_UNSAFE_NO_KV_CLAMP", "0") == "1"
     STRIDES_CONSTEXPR = strides_constexpr
 
     # Two softmax corrections, both from AOTriton's hard-won list. Kept behind
@@ -985,9 +989,12 @@ def build_flash_attn_func_aiw_module_primary(
             pure VALU.
             """
             if const_expr(
-                K_PREFETCH_DIST == 0
-                and V_PREFETCH_DIST == 0
-                and not KV_NEEDS_GUARD
+                _NO_KV_CLAMP
+                or (
+                    K_PREFETCH_DIST == 0
+                    and V_PREFETCH_DIST == 0
+                    and not KV_NEEDS_GUARD
+                )
             ):
                 return tbase(tile_start), toff(row_in_tile, col)
             ts = fx.Index(

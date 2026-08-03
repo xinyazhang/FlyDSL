@@ -510,7 +510,78 @@ correctness-safe: a masked-out KV row has `P = 0` after softmax, so whatever V
 holds contributes nothing; the clamp only has to prevent the *fault*, not
 produce the right value.
 
-So the P1 plan is:
+**Measured, and deferred past P2** -- but note the measurement below is of the
+*wrong workload*, which is itself the reason to defer.
+
+Buffer bounds catch **out-of-allocation** accesses. On the `D` axis nothing is
+out of allocation (see the three-region table above), so they cannot help
+irregular head dims. On the **seqlen** axis they can -- that is where a ragged
+tail genuinely runs past the tensor. So the feature they serve is **irregular
+seqlen**, and that path does not exist yet: today the interface pads seq_len
+host-side with `F.pad` (a three-tensor copy) or rejects the call outright, so a
+ragged tail never reaches the kernel. Everything measured below is therefore
+the *residual clamp overhead on regular shapes*, not the case buffer loads are
+for.
+
+First, the detail on why the `D` axis is out of reach. `num_records` is a single
+linear bound over the whole tensor, so it cannot express "stop at column hdim
+of every row"; a per-row limit would need a per-lane descriptor and descriptors
+are uniform SGPR quads. `[Hdim, pitch)` is inside the allocation and
+`[pitch, BLOCK_DMODEL)` belongs to the next head, so only the final row's tail
+would ever trip the bound. **PADDED_HEAD masking is unaffected either way.**
+
+Second, `GLOBAL_LOAD_TR_B128` has no buffer form, and transposed V is the
+*default* path from head_dim 48 up -- so the hot V load cannot use buffer
+addressing regardless.
+
+That leaves the seqlen clamp on Q/K/O. Its cost, measured by removing it
+(`FMHA_UNSAFE_NO_KV_CLAMP=1`, valid only because the benchmark's seq_len is an
+exact multiple of BLOCK_M) -- this is the *ceiling* for what buffer loads could
+recover:
+
+| head_dim | causal | with clamp | without | delta |
+|---|---|---|---|---|
+| 16 | 0 | 45.6 | 41.9 | **-8.1%** |
+| 16 | 1 | 36.1 | 36.5 | +1.1% |
+| 64 | 0 | 89.3 | 94.7 | +6.0% |
+| 64 | 1 | 78.4 | 81.7 | +4.2% |
+| 128 | 0 | 98.1 | 100.4 | +2.3% |
+| 128 | 1 | 87.3 | 91.2 | +4.5% |
+| 256 | 0 | 94.1 | 93.4 | -0.7% |
+| 256 | 1 | 76.4 | 80.1 | +4.8% |
+| 512 | 0 | 52.7 | 43.8 | **-16.9%** |
+| 512 | 1 | 45.1 | 45.2 | +0.2% |
+
+Removing work makes two configs *slower*, which says the clamp is not costing
+VALU so much as perturbing register allocation -- head_dim 512 already spills,
+and 16 is the narrowest tile. So the honest ceiling is "up to 5% on the middle
+of the ladder, negative at both ends".
+
+**`MASK_STEPS` (below) gets the same benefit structurally**, by not emitting the
+guard on full blocks at all, and it costs nothing extra because P2's interval
+decomposition already produces the full/masked split. Doing buffer loads first
+would be paying for a partial version of it.
+
+**Decision: defer buffer loads until P2**, and evaluate them there against the
+workload they actually serve -- a ragged `seqlen` reaching the kernel with
+`F.pad` removed (D5). Three things should be measured then, none of which are
+measurable now:
+
+1. The copy `F.pad` currently performs, which buffer loads plus in-kernel
+   masking delete outright. At B=1 H=8 N=4096 d=128 f16 that is ~25 MB of
+   copy per call on any unaligned shape -- almost certainly the largest single
+   number in this whole comparison, and invisible to the table above because
+   the benchmark uses aligned shapes.
+2. Whether `MASK_STEPS` has already removed the clamp from the hot path, in
+   which case the residual above is gone anyway.
+3. Whether the tail blocks, which are the only ones left holding a guard,
+   prefer hardware bounds to the clamp.
+
+Independently of performance, buffer loads would turn the OOB argument in this
+section from an invariant we maintain into one the hardware enforces. That is
+worth something on its own, and does not depend on any of the above.
+
+The original P1 shape, for reference:
 
 - **Q, K, O, row-major V → buffer loads.** Fault-free by construction, and the
   seqlen tail needs no guard at all.
