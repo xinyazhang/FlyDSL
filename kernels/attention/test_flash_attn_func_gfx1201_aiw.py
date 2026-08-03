@@ -99,7 +99,7 @@ def _rel(got, ref):
 
 
 def _parity(head_dim, causal, dtype, batch, seq, oracle, aiw_kwargs):
-    """aiw at `aiw_kwargs` must equal `oracle` bitwise."""
+    """aiw at `aiw_kwargs` must match `oracle` to tolerance."""
     q, k, v = _qkv(batch, seq, head_dim, dtype)
     common = dict(
         num_heads=_NUM_HEADS,
@@ -107,20 +107,24 @@ def _parity(head_dim, causal, dtype, batch, seq, oracle, aiw_kwargs):
         causal=causal,
         dtype_str="f16" if dtype == torch.float16 else "bf16",
     )
-    # safe_softmax=False: the oracles predate both corrections, so bitwise
-    # parity is only meaningful against the same arithmetic. The corrected
-    # path is covered by test_safe_softmax_* below.
     got = _run(
-        build_flash_attn_func_aiw_module(
-            **common, **aiw_kwargs, safe_softmax=False
-        ),
+        build_flash_attn_func_aiw_module(**common, **aiw_kwargs),
         q, k, v, batch, seq,
     )
     want = _run(oracle(**common), q, k, v, batch, seq, legacy=True)
     assert torch.isfinite(got).all(), "aiw produced non-finite output"
-    assert torch.equal(got, want), (
-        f"max |aiw - oracle| = {(got.float() - want.float()).abs().max().item():.3e}"
-    )
+    # Tolerance, not bitwise. The oracles predate the softmax correction
+    # -- they scale inside the exponent via FMA -- and that correction is
+    # now unconditional, so exact agreement is no longer the right bar.
+    # What this still checks is that the *scheduling* knobs (prefetch
+    # distance, V LDS layout, Q row-tiles) do not change the answer,
+    # which is what they were introduced to verify.
+    # bf16 carries an 8-bit mantissa, so the two softmax formulations
+    # diverge about an order of magnitude further than in f16.
+    tol = 2e-3 if dtype == torch.float16 else 1e-2
+    rel = ((got.float() - want.float()).abs().max().item()
+           / want.float().abs().max().item())
+    assert rel < tol, f"aiw vs oracle rel = {rel:.3e} (tol {tol:.0e})"
 
 
 _BITWISE_DTYPES = [torch.float16, torch.bfloat16]
@@ -129,7 +133,7 @@ _BITWISE_DTYPES = [torch.float16, torch.bfloat16]
 @pytest.mark.parametrize("dtype", _BITWISE_DTYPES, ids=["f16", "bf16"])
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_bitwise_vs_bp(head_dim, causal, dtype):
+def test_matches_bp(head_dim, causal, dtype):
     """Distance-1 + transposed-V reproduces the binding-prefetch kernel."""
     _require_env()
     _parity(
@@ -145,7 +149,7 @@ def test_bitwise_vs_bp(head_dim, causal, dtype):
 
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
 @pytest.mark.parametrize("head_dim", [16, 32, 64, 128])
-def test_bitwise_vs_baseline(head_dim, causal):
+def test_matches_baseline(head_dim, causal):
     """K distance 0 + V distance 1 + row-major V reproduces the baseline kernel.
 
     Note the asymmetric distances: the baseline pre-issues V one tile ahead and
@@ -164,7 +168,7 @@ def test_bitwise_vs_baseline(head_dim, causal):
 
 
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-def test_bitwise_vs_m32(causal):
+def test_matches_m32(causal):
     """Two Q row-tiles per wave reproduces the m32 kernel."""
     _require_env()
     _parity(
@@ -292,30 +296,23 @@ def test_rejects_non_rank4_and_ragged_last_dim():
 
 
 @pytest.mark.parametrize("mag", [300.0, 1000.0], ids=lambda m: f"mag{int(m)}")
-def test_safe_softmax_is_exact_for_large_inputs(mag):
-    """The corrected softmax is exact where the FMA form is not.
+def test_softmax_is_exact_for_large_inputs(mag):
+    """At large magnitudes the softmax saturates and the result is exact.
 
-    With `causal=True` the first query row attends to exactly one key, so its
-    softmax is 1.0 and its output is V[0] exactly. The corrected form scales the
-    scores *before* the row max, so `s - m` is exactly 0 for the max element and
-    `exp2(0) == 1` exactly.
+    Every row becomes effectively one-hot, so O is a single V row. The kernel
+    scales the scores *before* the row max, so `s - m` is exactly 0 for the
+    maximum and `exp2(0) == 1` exactly.
 
-    The old form scaled the max separately (`fma(s, scale, -scale*m)`), so for
-    the max element it computed the rounding error of `scale*m` rather than
-    zero, giving `exp2(eps) = 1 + eps'`. That error is ~1 ulp of `scale*m` and
-    therefore **grows with input magnitude** -- which is exactly what AOTriton
-    warns about in ROCm/aotriton#54.
+    The alternative -- scaling the max separately and folding the scale into
+    the exponent via FMA, which the pre-unification kernels do -- gives
+    `exp2(eps)`, an error of ~1 ulp of `qk_scale*m` that grows with magnitude.
+    It measured 4-7e-4 on these shapes where this is 0.
 
-    Below magnitude ~100 the difference is under the f16 output precision and
-    invisible; this test is at 300 and 1000, where it is not.
+    seq == BLOCK_M so there is one Q block and every KV tile is masked; a block
+    with a leading unmasked region accumulates its max differently and the
+    exactness is not observable.
     """
     _require_env()
-    # seq == BLOCK_M, so there is exactly one Q block and every KV tile goes
-    # through the masked region. The exactness this checks is a property of the
-    # softmax formulation, but it is only *observable* when the row's maximum
-    # is reached through masked tiles -- a Q block with a leading unmasked
-    # region accumulates its max differently and the difference is swamped.
-    # Pin the shape rather than depend on the tuning table, which moves.
     head_dim, seq = 128, aiw_block_m(128, 1)
     gen = torch.Generator(device="cuda").manual_seed(0)
     q, k, v = (
@@ -326,26 +323,16 @@ def test_safe_softmax_is_exact_for_large_inputs(mag):
         for _ in range(3)
     )
     assert torch.isfinite(q).all(), "inputs overflowed f16; pick a smaller mag"
-
-    common = dict(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16"
-    )
-    got_safe = _run(build_flash_attn_func_aiw_module(**common), q, k, v, 1, seq)
-    got_old = _run(
-        build_flash_attn_func_aiw_module(**common, safe_softmax=False),
+    got = _run(
+        build_flash_attn_func_aiw_module(
+            num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16"
+        ),
         q, k, v, 1, seq,
     )
-
     qb, kb, vb = (x.transpose(1, 2).double() for x in (q, k, v))
     ref = F.scaled_dot_product_attention(qb, kb, vb, is_causal=True).transpose(1, 2)
-    scale = ref.abs().max().item()
-    err_safe = (got_safe.double() - ref).abs().max().item() / scale
-    err_old = (got_old.double() - ref).abs().max().item() / scale
-
-    assert err_safe < err_old / 10.0, (
-        f"corrected softmax should be markedly more accurate at mag={mag}: "
-        f"safe={err_safe:.3e} old={err_old:.3e}"
-    )
+    err = (got.double() - ref).abs().max().item() / ref.abs().max().item()
+    assert err < 1e-6, f"saturated softmax should be exact at mag={mag}: {err:.3e}"
 
 
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
@@ -611,6 +598,113 @@ def test_logsumexp_validation(lse_factory, match):
     )
     with pytest.raises(ValueError, match=match):
         exe(q, k, v, torch.empty_like(q), 1, seq, lse=lse_factory(seq))
+
+
+def _causal_mask(Lq, Lk, ctype):
+    """Boolean visibility mask. ctype 1 = top-left, 2 = bottom-right."""
+    i = torch.arange(Lq, device="cuda")[:, None]
+    j = torch.arange(Lk, device="cuda")[None, :]
+    return j <= i + (0 if ctype == 1 else Lk - Lq)
+
+
+_XATTN_SHAPES = [(256, 256), (256, 512), (512, 256), (200, 300), (300, 200),
+                 (11, 31), (523, 337), (1033, 571)]
+
+
+@pytest.mark.parametrize("ctype", [0, 1, 2], ids=["full", "topleft", "botright"])
+@pytest.mark.parametrize("Lq,Lk", _XATTN_SHAPES, ids=[f"{a}x{b}" for a, b in _XATTN_SHAPES])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_seqlen_q_ne_seqlen_k(head_dim, Lq, Lk, ctype):
+    """seqlen_q and seqlen_k are independent, with both causal alignments.
+
+    They coincide when Lq == Lk, which is why a single `causal` flag sufficed
+    until now. Apart is where they diverge: top-left keeps the diagonal at
+    j == i, bottom-right shifts it to j == i + (Lk - Lq).
+    """
+    _require_env()
+    gen = torch.Generator(device="cuda").manual_seed(0)
+
+    def _t(n):
+        return torch.randn(
+            1, n, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen
+        )
+
+    q, k, v = _t(Lq), _t(Lk), _t(Lk)
+    o = torch.empty_like(q)
+    build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=bool(ctype),
+        causal_type=ctype, dtype_str="f16",
+    )(q, k, v, o, 1, Lq, Lk)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(o).all(), f"{Lq}x{Lk} ctype={ctype} produced non-finite output"
+    qb, kb, vb = (x.transpose(1, 2).float() for x in (q, k, v))
+    if ctype == 0:
+        ref = F.scaled_dot_product_attention(qb, kb, vb).transpose(1, 2)
+        live = torch.ones(Lq, dtype=torch.bool, device="cuda")
+    else:
+        m = _causal_mask(Lq, Lk, ctype)
+        live = m.any(-1)
+        ref = F.scaled_dot_product_attention(qb, kb, vb, attn_mask=m).transpose(1, 2)
+
+    # Bottom-right with Lq > Lk leaves the leading Lq - Lk rows with no visible
+    # key at all. An empty softmax has an all-zero output; the reference gives
+    # NaN there, so those rows are checked separately.
+    dead = ~live
+    if dead.any():
+        assert o[:, dead].abs().max().item() == 0.0, "rows with no keys must be zero"
+    rel = _rel(o[:, live], ref[:, live])
+    assert rel < 5e-3, f"{Lq}x{Lk} ctype={ctype} hd={head_dim} rel={rel:.3e}"
+
+
+def test_alignments_differ_when_lengths_differ():
+    """Top-left and bottom-right must not be the same kernel.
+
+    They agree exactly when Lq == Lk, so a test that only ever used square
+    shapes would pass with the diagonal offset wired to zero.
+    """
+    _require_env()
+    Lq, Lk, head_dim = 256, 384, 64
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(1, Lq, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    k = torch.randn(1, Lk, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    v = torch.randn(1, Lk, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    outs = []
+    for ctype in (1, 2):
+        o = torch.empty_like(q)
+        build_flash_attn_func_aiw_module(
+            num_heads=_NUM_HEADS, head_dim=head_dim, causal=True,
+            causal_type=ctype, dtype_str="f16",
+        )(q, k, v, o, 1, Lq, Lk)
+        torch.cuda.synchronize()
+        outs.append(o.clone())
+    assert not torch.allclose(outs[0], outs[1], atol=1e-2), (
+        "top-left and bottom-right produced the same result at Lq != Lk"
+    )
+
+
+def test_logsumexp_is_plus_inf_for_rows_with_no_keys():
+    """AOTriton's convention: +inf, so the backward pass zeroes those rows.
+
+    exp(qk - LSE) with LSE = +inf is 0, which is what a row that attends to
+    nothing must contribute. -inf would give the opposite.
+    """
+    _require_env()
+    Lq, Lk, head_dim = 300, 200, 64
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(1, Lq, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    k = torch.randn(1, Lk, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    v = torch.randn(1, Lk, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    o = torch.empty_like(q)
+    lse = torch.zeros(_NUM_HEADS, Lq, dtype=torch.float32, device="cuda")
+    build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, causal_type=2,
+        dtype_str="f16",
+    )(q, k, v, o, 1, Lq, Lk, lse=lse)
+    torch.cuda.synchronize()
+    dead = Lq - Lk          # rows 0 .. dead-1 see no keys
+    assert torch.isinf(lse[:, :dead]).all() and (lse[:, :dead] > 0).all()
+    assert torch.isfinite(lse[:, dead:]).all()
 
 
 def test_shard_resolution_respects_narrow_window():

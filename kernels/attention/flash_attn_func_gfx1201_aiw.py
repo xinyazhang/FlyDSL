@@ -107,7 +107,6 @@ from flydsl.expr import (
     range_constexpr,
     rocdl,
 )
-from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
 
@@ -208,7 +207,7 @@ _ROWS_PER_Q_TILE = 16
 # The 16-wave rejections are LDS: the cross-shard reduction buffer scales with
 # NUM_WAVES, and past 8 waves it no longer fits inside the V window it aliases.
 #
-# head_dim 256 re-swept after safe_softmax and LSE moved the register budget.
+# head_dim 256 re-swept after the softmax correction and LSE moved the budget.
 # The old entry (2 shards, 4 q_tiles -> BLOCK_M 64, 8 waves) came from a sweep
 # whose note reads "16 waves rejected: reduction buffer over LDS" -- true only
 # *with* sharding, since that buffer exists only when QK_SHARDS > 1. Unsharded
@@ -364,8 +363,8 @@ def build_flash_attn_func_aiw_module_primary(
     v_prefetch_dist=1,
     v_lds_layout=None,
     strides_constexpr=False,
-    safe_softmax=True,
     padded_head=False,
+    causal_type=None,
     q_row_tiles=1,
     shards=None,
     unsafe_fp_math=True,
@@ -626,7 +625,7 @@ def build_flash_attn_func_aiw_module_primary(
     # permission bought nothing and cost a silent miscompile.
     #
     # `nnan` is retained. NaN can only arise here from -inf minus -inf, which
-    # the m_i floor in safe_softmax rules out, and the API contract excludes
+    # the m_i floor rules out, and the API contract excludes
     # NaN inputs.
     #
     # "fast" restores the old behaviour for A/B; "safe" additionally drops
@@ -634,9 +633,10 @@ def build_flash_attn_func_aiw_module_primary(
     _FP_MODE = os.environ.get("FMHA_FP_MODE", "noninf")
     STRIDES_CONSTEXPR = strides_constexpr
 
-    # Two softmax corrections, both from AOTriton's hard-won list. Kept behind
-    # one knob so the pre-unification kernels remain usable as bitwise oracles
-    # (they have neither fix), and so the cost can be measured.
+    # Two softmax corrections, unconditional. Both come from AOTriton's
+    # hard-won list and there is no reason to keep the un-corrected form
+    # reachable -- a knob selecting known-wrong numerics is a liability, not a
+    # feature.
     #
     # (a) `m_i` initialises to -3.40282e+38, not -inf. If a tile is entirely
     #     masked its row max is -inf, and with an -inf init the rescale becomes
@@ -644,23 +644,13 @@ def build_flash_attn_func_aiw_module_primary(
     #     exp2(0) = 1 and the masked probabilities exp2(-inf - m) = 0, which is
     #     the right answer. The *mask* fill stays -inf; only the init changes.
     #
-    #     Unreachable as the kernel stands -- the first KV tile always contains
-    #     kv = 0 <= q_row, so it is never fully masked. It becomes reachable
-    #     with **bias**, which may hold any non-NaN value including -inf and is
-    #     routinely used as an attention mask: a bias covering the whole first
-    #     tile drives its row max to -inf. The regression test therefore belongs
-    #     with the bias feature, not here.
-    #
-    # (b) The QK scale is applied to the scores **before** the row max, and
-    #     `m_i` is therefore kept in the scaled domain. The kernel previously
-    #     kept `m_i` unscaled and folded the scale into the exponent as
-    #     `exp2(fma(s, qk_scale, -qk_scale * m))`, which is exactly the FMA
-    #     pattern AOTriton flags in ROCm/aotriton#54 as producing numerical
-    #     errors on large inputs. Costs NUM_S_VALS multiplies per tile and
-    #     saves the FMA; on a loop this LDS-latency-bound that is close to free.
-    #     It is also the convention LSE needs, since logsumexp is
-    #     m + log2(l) in the scaled domain.
-    SAFE_SOFTMAX = safe_softmax
+    # (b) The QK scale is applied to the scores **before** the row max, so
+    #     `m_i` lives in the scaled domain and the exponent is a plain
+    #     subtract. The alternative -- `exp2(fma(s, qk_scale, -qk_scale*m))` --
+    #     is exactly the FMA pattern AOTriton flags in ROCm/aotriton#54, and it
+    #     measurably loses accuracy at large input magnitudes: at head_dim 128
+    #     causal the corrected form is *exact* against an fp64 reference from
+    #     magnitude 300 up, where the FMA form sits at 4-7e-4.
 
     # `head_dim` is BLOCK_DMODEL: the compile-time tile width, drawn from the
     # ladder. The *real* extents are the runtime `hdim_qk` / `hdim_vo`
@@ -672,6 +662,28 @@ def build_flash_attn_func_aiw_module_primary(
     # emitted at all -- that is the common case and the one the ladder measures.
     PADDED_HEAD = padded_head
     BLOCK_DMODEL = head_dim
+
+    # Causal masking, AOTriton's CAUSAL_TYPE. 0 = none, 1 = top-left aligned,
+    # 2 = bottom-right aligned. The two alignments differ only in where the
+    # diagonal sits, and they coincide when seqlen_q == seqlen_k -- which is
+    # why a single `causal` bool sufficed until now.
+    #
+    #   top-left      key j is visible to query i iff  j <= i
+    #   bottom-right  ...                        iff  j <= i + (seqlen_k - seqlen_q)
+    #
+    # PyTorch's is_causal=True is top-left; see
+    # https://github.com/pytorch/pytorch/issues/108108 for the debate about
+    # changing that default.
+    if causal_type is None:
+        CAUSAL_TYPE = 1 if causal else 0
+    else:
+        CAUSAL_TYPE = causal_type
+    if CAUSAL_TYPE not in (0, 1, 2):
+        raise ValueError(f"causal_type must be 0, 1 or 2, got {CAUSAL_TYPE}")
+    if bool(CAUSAL_TYPE) != bool(causal):
+        raise ValueError(
+            f"causal={causal} disagrees with causal_type={CAUSAL_TYPE}"
+        )
 
     # Mask KV columns past seqlen_k. Required whenever seqlen need not divide
     # BLOCK_N -- i.e. always, now that the interface no longer pads. The guard
@@ -784,7 +796,8 @@ def build_flash_attn_func_aiw_module_primary(
         V: fx.Pointer,
         O: fx.Pointer,  # noqa: E741
         L: fx.Pointer,
-        seq_len: fx.Int32,
+        seqlen_q: fx.Int32,
+        seqlen_k: fx.Int32,
         lse_stride: fx.Int64,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
@@ -894,7 +907,8 @@ def build_flash_attn_func_aiw_module_primary(
                 ).result
             return rocdl.wmma_f32_16x16x16_f16(v8f32_type, a_v8, b_v8, c_v8).result
 
-        seq_len_v = fx.Index(seq_len)
+        seqlen_q_v = fx.Index(seqlen_q)
+        seqlen_k_v = fx.Index(seqlen_k)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_kv = lds.kv.ptr
@@ -958,7 +972,7 @@ def build_flash_attn_func_aiw_module_primary(
             # Longest-processing-time-first: under causal, cost grows with
             # q_tile, so dispatching the expensive tiles first leaves only
             # cheap ones to fill the tail.
-            _ntiles = (seq_len_v + (BLOCK_M - 1)) // BLOCK_M
+            _ntiles = (seqlen_q_v + (BLOCK_M - 1)) // BLOCK_M
             q_tile_idx = _ntiles - fx.Index(1) - fx.Index(gpu.block_idx.y)
         else:
             q_tile_idx = fx.Index(gpu.block_idx.y)
@@ -977,7 +991,7 @@ def build_flash_attn_func_aiw_module_primary(
         v_row_in_batch = tid // V_TPR_LOAD
         v_col_base = (tid % V_TPR_LOAD) * VEC_WIDTH
 
-        seq_last = seq_len_v - fx.Index(1)
+        seq_last = seqlen_k_v - fx.Index(1)
 
         # ---- Address split: 64-bit uniform base + 32-bit divergent offset ----
         #
@@ -1000,8 +1014,11 @@ def build_flash_attn_func_aiw_module_primary(
         if const_expr(STRIDES_CONSTEXPR):
             # Axis 0 (batch) still depends on the runtime seq_len, so it is
             # never a compile-time constant even here; only 1 and 2 fold.
-            _st = (seq_len_v * STRIDE_TOKEN, STRIDE_TOKEN, HEAD_DIM)
-            q_st = k_st = v_st = o_st = _st
+            # Diagnostic arm only, and valid solely when seqlen_q == seqlen_k.
+            _stq = (seqlen_q_v * STRIDE_TOKEN, STRIDE_TOKEN, HEAD_DIM)
+            _stk = (seqlen_k_v * STRIDE_TOKEN, STRIDE_TOKEN, HEAD_DIM)
+            q_st = o_st = _stq
+            k_st = v_st = _stk
             sm_log2e = fx.Float32(sm_scale * _LOG2E)
         else:
             q_st = (fx.Index(stride_q0), fx.Index(stride_q1), fx.Index(stride_q2))
@@ -1061,9 +1078,9 @@ def build_flash_attn_func_aiw_module_primary(
             ):
                 return tbase(tile_start), toff(row_in_tile, col)
             ts = fx.Index(
-                ArithValue(tile_start < seq_len_v).select(tile_start, seq_last)
+                ArithValue(tile_start < seqlen_k_v).select(tile_start, seq_last)
             )
-            in_range = (ts + row_in_tile) < seq_len_v
+            in_range = (ts + row_in_tile) < seqlen_k_v
             row = fx.Index(ArithValue(in_range).select(row_in_tile, seq_last - ts))
             return tbase(ts), toff(row, col)
 
@@ -1377,7 +1394,7 @@ def build_flash_attn_func_aiw_module_primary(
             # Explicit signed-less-than predicate: fx.Index defaults to unsigned,
             # which lowers to v_cmp_gt_u64_e64 instead of the signed form.
             _in = arith.cmpi(
-                arith.CmpIPredicate.slt, _raw(q_rows[qt]), _raw(seq_len_v)
+                arith.CmpIPredicate.slt, _raw(q_rows[qt]), _raw(seqlen_q_v)
             )
             _safe = fx.Index(
                 ArithValue(_in).select(q_rows_in_tile[qt], fx.Index(0))
@@ -1398,7 +1415,8 @@ def build_flash_attn_func_aiw_module_primary(
         # Mask fill: genuinely -inf, so exp2(-inf - m) is exactly 0.
         c_neg_inf = fx.Float32(float("-inf"))
         # m_i floor: finite, so an all-masked tile cannot produce -inf - -inf.
-        c_m_init = fx.Float32(-3.40282e38 if SAFE_SOFTMAX else float("-inf"))
+        # Finite floor, so an all-masked row cannot produce -inf - -inf.
+        c_m_init = fx.Float32(-3.40282e38)
         c_zero_f = fx.Float32(0.0)
         c_one_f = fx.Float32(1.0)
         c_sm_scale_log2e = sm_log2e
@@ -1409,13 +1427,41 @@ def build_flash_attn_func_aiw_module_primary(
         def reduction_peer(v_f32):
             return fx.Float32(v_f32).shuffle_xor(shuf_16_i32, width_i32)
 
+        # Diagonal offset: key j is visible to query i iff j <= i + _diag.
+        # 0 for top-left, seqlen_k - seqlen_q for bottom-right. It is signed --
+        # with seqlen_q > seqlen_k it goes negative, and whole leading Q rows
+        # then see no keys at all.
+        if const_expr(CAUSAL_TYPE == 2):
+            _diag_i32 = fx.Int32(seqlen_k) - fx.Int32(seqlen_q)
+        else:
+            _diag_i32 = fx.Int32(0)
+
         _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
-            _kv_lim = fx.Index(
-                ArithValue(_q_end < seq_len_v).select(_q_end, seq_len_v)
+            # Highest key any row in this block can see, +1, clamped into
+            # [0, seqlen_k]. Computed in i32 because _diag can be negative.
+            # Explicitly *signed* comparisons. fx.Int32 comparisons default to
+            # unsigned, and _diag can be negative -- an unsigned `> 0` on -128
+            # is true, which propagated a huge bound into the loop. Same trap
+            # the Q-row bound check documents.
+            _lim_i32 = fx.Int32(_q_end) + _diag_i32
+            _lim_i32 = fx.Int32(
+                ArithValue(
+                    arith.cmpi(
+                        arith.CmpIPredicate.slt, _raw(_lim_i32), _raw(fx.Int32(seqlen_k))
+                    )
+                ).select(_lim_i32, fx.Int32(seqlen_k))
             )
+            _lim_i32 = fx.Int32(
+                ArithValue(
+                    arith.cmpi(
+                        arith.CmpIPredicate.sgt, _raw(_lim_i32), _raw(fx.Int32(0))
+                    )
+                ).select(_lim_i32, fx.Int32(0))
+            )
+            _kv_lim = fx.Index(_lim_i32)
         else:
-            _kv_lim = seq_len_v
+            _kv_lim = seqlen_k_v
         # Round the bound *up* to a whole BLOCK_N. The loop steps by BLOCK_N,
         # so a bound that is not a multiple of it drops the final partial tile
         # entirely -- at seqlen 40 with BLOCK_N 32 the kernel attended to only
@@ -1467,12 +1513,21 @@ def build_flash_attn_func_aiw_module_primary(
         # dynamic `scf.if` guard inside one loop measured much worse than no
         # guard at all, because the region boundary blocks scheduling in a
         # latency-bound loop. A static split has no such boundary.
-        _full_seq = (seq_len_v // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N)
+        _full_seq = (seqlen_k_v // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N)
         if const_expr(CAUSAL):
-            # Tile t is clear of the diagonal iff its last column <= q_start,
-            # the lowest Q row in this block.
+            # Tile t is clear of the diagonal iff its last column
+            # <= q_start + _diag, using the lowest Q row in this block. Clamped
+            # at 0 so a negative diagonal simply gives an empty full region.
+            _fc_i32 = fx.Int32(q_start) + _diag_i32 + fx.Int32(1)
+            _fc_i32 = fx.Int32(
+                ArithValue(
+                    arith.cmpi(
+                        arith.CmpIPredicate.sgt, _raw(_fc_i32), _raw(fx.Int32(0))
+                    )
+                ).select(_fc_i32, fx.Int32(0))
+            )
             _full_causal = (
-                (q_start + fx.Index(1)) // fx.Index(BLOCK_N)
+                fx.Index(_fc_i32) // fx.Index(BLOCK_N)
             ) * fx.Index(BLOCK_N)
             _full_end = fx.Index(
                 ArithValue(_full_seq < _full_causal).select(_full_seq, _full_causal)
@@ -1624,10 +1679,9 @@ def build_flash_attn_func_aiw_module_primary(
                     for r in range_constexpr(8):
                         s_raw.append(Vec(s_accs[st])[r])
 
-                if const_expr(SAFE_SOFTMAX):
-                    # Scale before the row max, so m_i lives in the scaled
-                    # domain and the exponent is a plain subtract.
-                    s_raw = [_fmul(v, c_sm_scale_log2e) for v in s_raw]
+                # Scale before the row max, so m_i lives in the scaled
+                # domain and the exponent is a plain subtract.
+                s_raw = [_fmul(v, c_sm_scale_log2e) for v in s_raw]
 
                 if const_expr(_MASK_STEPS):
                     # ---- Masked region: KV tail and causal, fused ----
@@ -1659,7 +1713,7 @@ def build_flash_attn_func_aiw_module_primary(
                     # loop. The region split gives the same benefit statically.
                     _kv_i32 = fx.Int32(kv_block_start)
                     _klane_off = fx.Int32(klane) * fx.Int32(8)
-                    _seq_i32 = fx.Int32(seq_len_v)
+                    _seq_i32 = fx.Int32(seqlen_k_v)
                     for _i in range_constexpr(NUM_S_VALS):
                         _col = (
                             _kv_i32
@@ -1668,7 +1722,13 @@ def build_flash_attn_func_aiw_module_primary(
                         )
                         _dead = _col >= _seq_i32
                         if const_expr(CAUSAL):
-                            _dead = _dead | (_col > q_row_i32)
+                            _dead = _dead | ArithValue(
+                                arith.cmpi(
+                                    arith.CmpIPredicate.sgt,
+                                    _raw(_col),
+                                    _raw(q_row_i32 + _diag_i32),
+                                )
+                            )
                         s_raw[_i] = ArithValue(_dead).select(c_neg_inf, s_raw[_i])
 
                 local_max = s_raw[0]
@@ -1678,29 +1738,16 @@ def build_flash_attn_func_aiw_module_primary(
                 row_max = _fmax(local_max, peer_max)
                 m_new_raw = _fmax(m_running, row_max)
 
-                if const_expr(SAFE_SOFTMAX):
-                    # m is already scaled, so no scale appears in either
-                    # exponent -- this is the whole point of the change.
-                    corr = rocdl.exp2(
-                        ir.F32Type.get(), _raw(_fsub(m_running, m_new_raw))
-                    )
-                    neg_m = _fsub(c_zero_f, m_new_raw)
-                else:
-                    diff_m_raw = _fsub(m_running, m_new_raw)
-                    diff_m_scaled = _fmul(diff_m_raw, c_sm_scale_log2e)
-                    corr = rocdl.exp2(ir.F32Type.get(), _raw(diff_m_scaled))
-                    scaled_max = _fmul(c_sm_scale_log2e, m_new_raw)
-                    neg_m = _fsub(c_zero_f, scaled_max)
+                # m is already scaled, so no scale appears in either exponent.
+                corr = rocdl.exp2(
+                    ir.F32Type.get(), _raw(_fsub(m_running, m_new_raw))
+                )
+                neg_m = _fsub(c_zero_f, m_new_raw)
 
                 p_vals = []
                 local_sum = _raw(c_zero_f)
                 for r in range_constexpr(NUM_S_VALS):
-                    if const_expr(SAFE_SOFTMAX):
-                        diff = _fadd(s_raw[r], neg_m)
-                    else:
-                        diff = fmath.fma(
-                            s_raw[r], _raw(c_sm_scale_log2e), neg_m
-                        )
+                    diff = _fadd(s_raw[r], neg_m)
                     p = rocdl.exp2(ir.F32Type.get(), _raw(diff))
                     p_vals.append(p)
                     local_sum = _fadd(local_sum, p)
@@ -1871,7 +1918,7 @@ def build_flash_attn_func_aiw_module_primary(
 
         # ---- logsumexp ----
         # LSE = (m + log2(l)) * ln2, with m in the base-2 scaled domain -- which
-        # is exactly the convention safe_softmax established, so nothing extra
+        # is exactly the convention the scaled-m softmax establishes, so nothing extra
         # is needed there. `rocdl.log` is v_log_f32, i.e. base 2.
         #
         # One value per (batch, head, q_row). A lane's m/l belong to its own
@@ -1907,11 +1954,21 @@ def build_flash_attn_func_aiw_module_primary(
             if _do_store:
                 _m = loop_results[2 * qt]
                 _l = loop_results[2 * qt + 1]
-                if const_expr(not SAFE_SOFTMAX):
-                    _m = _fmul(_m, c_sm_scale_log2e)
                 _lse = _fmul(
                     _fadd(_m, rocdl.log(_f32_ty, _raw(_l))), fx.Float32(_LN2)
                 )
+                # A row with no live keys gets +inf, not -inf: the backward
+                # pass subtracts LSE from qk, so +inf makes exp(qk - inf)
+                # zero for exactly the rows that must contribute nothing.
+                # l is bit-exact 0 there, so test the bit pattern; integer
+                # compares lower predictably.
+                _lse = ArithValue(
+                    arith.cmpi(
+                        arith.CmpIPredicate.ne,
+                        _raw(_bitcast_i32(fx.Float32(_l))),
+                        _raw(fx.Int32(0)),
+                    )
+                ).select(fx.Float32(_lse), fx.Float32(float("inf")))
                 _lse_base = (
                     batch_idx * fx.Index(num_head_q) + head_q
                 ) * fx.Index(lse_stride)
@@ -1927,7 +1984,17 @@ def build_flash_attn_func_aiw_module_primary(
         # ---- Normalize and store O ----
         for qt in range_constexpr(Q_ROW_TILES):
             l_final = loop_results[2 * qt + 1]
-            inv_l = arith.divf(_raw(c_one_f), _raw(l_final), fastmath=fm_fast)
+            # A row can legitimately see *no* keys: bottom-right causal with
+            # seqlen_q > seqlen_k leaves the leading seqlen_q - seqlen_k rows
+            # fully masked, and bias or a sliding window will do the same.
+            # Then l is exactly 0, 1/l is +inf, and o_acc * inf is NaN even
+            # though o_acc is exactly 0.
+            #
+            # Clamp rather than branch: for a live row l >= 1 always, since
+            # the running max contributes exp2(0) = 1, so this is a no-op
+            # there.
+            _l_safe = _fmax(l_final, fx.Float32(1e-30))
+            inv_l = arith.divf(_raw(c_one_f), _raw(_l_safe), fastmath=fm_fast)
             inv_l_vec = (
                 Vec.from_elements([inv_l], fx.Float32).broadcast_to(8).ir_value()
             )
@@ -1971,7 +2038,8 @@ def build_flash_attn_func_aiw_module_primary(
         O: fx.Pointer,  # noqa: E741
         L: fx.Pointer,
         batch_size: fx.Int32,
-        seq_len: fx.Int32,
+        seqlen_q: fx.Int32,
+        seqlen_k: fx.Int32,
         lse_stride: fx.Int64,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
@@ -1995,7 +2063,7 @@ def build_flash_attn_func_aiw_module_primary(
         ctx = CompilationContext.get_current()
 
         bs_idx = fx.Index(batch_size)
-        sl_idx = fx.Index(seq_len)
+        sl_idx = fx.Index(seqlen_q)
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
 
         # Strides come from the caller, read off the real tensors -- never
@@ -2005,7 +2073,7 @@ def build_flash_attn_func_aiw_module_primary(
         # Always forwarded: with STRIDES_CONSTEXPR the kernel simply does not
         # read them, which is what keeps the two arms directly comparable.
         launcher = flash_attn_func_aiw_kernel(
-            Q, K, V, O, L, seq_len, lse_stride,
+            Q, K, V, O, L, seqlen_q, seqlen_k, lse_stride,
             num_head_q, num_head_k,
             hdim_qk, hdim_vo,
             stride_q0, stride_q1, stride_q2,
@@ -2173,15 +2241,17 @@ def build_flash_attn_func_aiw_module_primary(
 
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
-    def _launch(Q, K, V, O, batch_size, seq_len, scale=None, stream=None, lse=None):  # noqa: E741
+    def _launch(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None):  # noqa: E741
+        seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
-        _lse_p, _lse_s = _lse_args(lse, seq_len)
+        _lse_p, _lse_s = _lse_args(lse, seqlen_q)
         _run_compiled(
             launch_flash_attn_aiw,
             *ptrs,
             _lse_p,
             batch_size,
-            seq_len,
+            seqlen_q,
+            seqlen_k,
             _lse_s,
             *meta,
             *st,
@@ -2189,15 +2259,17 @@ def build_flash_attn_func_aiw_module_primary(
             stream if stream is not None else fx.Stream(None),
         )
 
-    def _compile(Q, K, V, O, batch_size, seq_len, scale=None, stream=None, lse=None):  # noqa: E741
+    def _compile(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None):  # noqa: E741
+        seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
-        _lse_p, _lse_s = _lse_args(lse, seq_len)
+        _lse_p, _lse_s = _lse_args(lse, seqlen_q)
         return flyc.compile(
             launch_flash_attn_aiw,
             *ptrs,
             _lse_p,
             batch_size,
-            seq_len,
+            seqlen_q,
+            seqlen_k,
             _lse_s,
             *meta,
             *st,
