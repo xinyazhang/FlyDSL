@@ -712,6 +712,46 @@ to prefer buffer addressing over the clamp wherever the instruction allows it:
 a hardware bound cannot be accidentally removed by a later refactor, and a
 hand-written clamp can.
 
+### Fast-math: `ninf` is not affordable once bias exists
+
+`-inf` is not an edge case in this kernel, it is the masking mechanism -- and
+with **bias** it becomes a *user-supplied* value, since a boolean attention
+mask cast to float is a matrix of `-inf`. That makes the `ninf` fast-math flag
+(and the function-level `unsafe-fp-math` / `no-nans-fp-math` attributes)
+untenable: they license the compiler to assume no operand is infinite, so an
+`-inf` flowing through a fast-math op can simply be folded away.
+
+This is not speculative. It silently deleted the KV tail mask in P1e: the mask
+was emitted and demonstrably live, `_fmul(-inf, sm_scale)` erased it, and the
+tail columns went on contributing to the softmax denominator. Three wrong
+theories and an LSE probe were needed to find it.
+
+**Measured cost of giving `ninf` up**, with `denormal-fp-math-f32` held
+constant (B=1 H=8 N=4096 f16):
+
+| head_dim | causal | `fast` | `noninf` |
+|---|---|---|---|
+| 16 | 0 | 37.2 | 37.2 |
+| 64 | 0 | 79.8 | 79.3 |
+| 128 | 0 | 91.5 | 91.9 |
+| 256 | 0 | 88.5 | 88.4 |
+| 512 | 0 | 45.5 | 45.4 |
+
+Within noise everywhere. **The permission bought nothing and cost a silent
+miscompile**, so the default is now `noninf`: `fast` minus `ninf`, with the two
+function attributes dropped. DAZ is kept in every mode -- it is about
+denormals, not infinities, and it is where the actual win was all along.
+
+`nnan` is retained: NaN can only arise here from `-inf - -inf`, which the
+`m_i` floor rules out, and the API contract excludes NaN inputs. Dropping it
+too costs ~0.6% and is available as `FMHA_FP_MODE=safe`.
+
+**Consequence for P4 (bias).** The `-inf`-through-fast-math trap is now closed
+at the source, but the *placement* rule still stands and applies to every mask
+yet to come: an `-inf` must not pass through an arithmetic op that could fold
+it. Bias is added to `qk` before the row max, which is the same position the
+KV mask had to move to.
+
 ### Note arising: "causal" is not a build axis in the shipped set
 
 `@ati.scalar('CAUSAL_TYPE', options=[0, 3])` — only *two* values ship, and

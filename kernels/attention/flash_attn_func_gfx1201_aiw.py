@@ -601,6 +601,31 @@ def build_flash_attn_func_aiw_module_primary(
     # what buffer bounds checking would replace -- but valid for a benchmark
     # where seq_len is an exact multiple of BLOCK_M.
     _NO_KV_CLAMP = os.environ.get("FMHA_UNSAFE_NO_KV_CLAMP", "0") == "1"
+    # Floating-point latitude granted to the compiler.
+    #
+    # "noninf" (default) is `fast` minus `ninf`, and drops the function-level
+    # `unsafe-fp-math` / `no-nans-fp-math` attributes. `denormal-fp-math-f32`
+    # (DAZ) is kept in every mode -- it is about denormals, not infinities, and
+    # it is where the actual win is.
+    #
+    # Why: `ninf` lets the compiler assume no operand is infinite, so an -inf
+    # flowing through a fast-math op may simply be folded away. That is not
+    # hypothetical -- it silently deleted the KV tail mask (see the comment
+    # there), and it will do the same to a bias tensor, where a boolean
+    # attention mask cast to float is exactly a matrix of -inf.
+    #
+    # Cost of giving it up, measured with DAZ held constant (B=1 H=8 N=4096
+    # f16, head_dim 16/64/128/256/512 x causal): **within noise everywhere** --
+    # 91.5 vs 91.9 TFLOPS at head_dim 128 non-causal, 45.5 vs 45.4 at 512. The
+    # permission bought nothing and cost a silent miscompile.
+    #
+    # `nnan` is retained. NaN can only arise here from -inf minus -inf, which
+    # the m_i floor in safe_softmax rules out, and the API contract excludes
+    # NaN inputs.
+    #
+    # "fast" restores the old behaviour for A/B; "safe" additionally drops
+    # `nnan` (~0.6%).
+    _FP_MODE = os.environ.get("FMHA_FP_MODE", "noninf")
     STRIDES_CONSTEXPR = strides_constexpr
 
     # Two softmax corrections, both from AOTriton's hard-won list. Kept behind
@@ -766,7 +791,16 @@ def build_flash_attn_func_aiw_module_primary(
         v_ptr = _pointer_to_llvm_ptr(V)
         v_ptr_i64 = _to_global_ptr_i64(V)
         o_ptr = _pointer_to_llvm_ptr(O)
-        fm_fast = arith.FastMathFlags.fast
+        # Fast-math set for the softmax arithmetic. `fast` includes `ninf`,
+        # which is what silently deleted the KV tail mask (see the comment at
+        # that mask). FMHA_FP_MODE selects a narrower set for measurement.
+        _F = arith.FastMathFlags
+        if const_expr(_FP_MODE == "fast"):
+            fm_fast = _F.fast
+        elif const_expr(_FP_MODE == "noninf"):
+            fm_fast = _F.reassoc | _F.nnan | _F.nsz | _F.arcp | _F.contract | _F.afn
+        else:  # "safe": also drop nnan
+            fm_fast = _F.reassoc | _F.nsz | _F.arcp | _F.contract | _F.afn
 
         # Local fast-math arithmetic helpers -- preserve the fastmath flag while
         # using the lowercase op names that accept _raw() unwrapping.
@@ -2043,16 +2077,17 @@ def build_flash_attn_func_aiw_module_primary(
                     ]
                 )
             )
-            passthrough_entries.append(
-                ir.ArrayAttr.get(
-                    [ir.StringAttr.get("no-nans-fp-math"), ir.StringAttr.get("true")]
+            if const_expr(_FP_MODE == "fast"):
+                passthrough_entries.append(
+                    ir.ArrayAttr.get(
+                        [ir.StringAttr.get("no-nans-fp-math"), ir.StringAttr.get("true")]
+                    )
                 )
-            )
-            passthrough_entries.append(
-                ir.ArrayAttr.get(
-                    [ir.StringAttr.get("unsafe-fp-math"), ir.StringAttr.get("true")]
+                passthrough_entries.append(
+                    ir.ArrayAttr.get(
+                        [ir.StringAttr.get("unsafe-fp-math"), ir.StringAttr.get("true")]
+                    )
                 )
-            )
         for op in ctx.gpu_module_body.operations:
             if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
                 op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
