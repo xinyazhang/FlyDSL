@@ -805,8 +805,19 @@ values promoted to arguments rather than reworked.
 
 ## 4. Phases
 
-Unchanged in substance from plan 0; ordering still follows your constraints
-(dropout before gSWA; gSWA and persistent-dynamic last; no INT8). Deltas only:
+Unchanged in substance from plan 0, with one **ordering change**: gSWA (P6)
+landed early, ahead of P3/P4/P5, at your direction. The original constraint was
+dropout before `Window_left/right`, on the grounds that "SWA is incremental
+over causal but still needs lots of work, and dropout is a bigger gap".
+
+Taking it early turned out to be the cheaper order, for a reason that was not
+visible when the constraint was set: P6's real content is *deleting*
+`CAUSAL_TYPE` 1 and 2, not adding windows. Had it stayed last, varlen, bias
+and dropout would each have been built against **two** masking paths and then
+had one of them removed underneath. They now build against one. The remaining
+constraints hold: persistent-dynamic last, no INT8.
+
+Deltas only:
 
 **P0 — price the de-constexpr-ing.** Unchanged, and now cheaper to run: one
 builder, one set of knobs, and per D2 the kernel *body* needs no branch —
@@ -924,14 +935,49 @@ window values as *promotable*: per the note above, the shipped AOT set has no
 CAUSAL_TYPE 1/2, so P2's constexpr causal is an intermediate on the way to P6's
 runtime window, not a parallel path.
 
-**P3 varlen · P4 bias · P5 dropout.** Unchanged.
+**P6 gSWA — DONE except step 4.** Planned and executed in
+`sdpa-gswa-plan.md`; steps 1-3 are in. Both objectives are met: sliding windows
+generalized to negative bounds on either side, and `CAUSAL_TYPE` 1 and 2
+**deleted from the kernel**, which now ships `{0, 3}` exactly as AOTriton does.
+The plan's grep criterion returns 0 and the diagonal exists only as
+`window_right`.
 
-**P6 gSWA.** Detailed separately in `sdpa-gswa-plan.md`, because P2b
-changed its shape: `_diag_i32` *is* `window_right`, so the kernel already
-implements gSWA with `window_left` pinned to unbounded. What remains is the
-left interval, `calculate_intervals`, and -- the objective, not a tidy-up --
-**deleting `CAUSAL_TYPE` 1 and 2**, which gSWA subsumes exactly and which
-AOTriton already ships only as host-side conveniences (`options=[0, 3]`).
+| | |
+|---|---|
+| 256-wide window vs causal, B=1 H=8 N=4096 | **2.2-3.3x** across the ladder |
+| causal routed through the window path | ladder median +0.77%, worst -0.55% |
+| cost | +25 VGPRs at head_dim 128 (no spill); head_dim 192/256 spill slightly deeper |
+| structure | two loop bodies, not three (identical WMMA counts) |
+
+Two findings worth carrying forward:
+
+- **Bitwise equivalence between the window path and the deleted causal path is
+  achievable, and is the sharpest oracle in this codebase.** The masked and
+  unmasked loop bodies are separately-optimised copies of the same computation
+  and do *not* agree to the last bit, so a single tile routed to the wrong one
+  shows up immediately -- even where the two are mathematically identical and
+  every tolerance test passes. It caught a prefetch bug and settled an
+  off-by-one in the interval boundaries. It holds only because the full region
+  is walked *first*; ordering the masked runs first is equally correct and
+  would have thrown it away.
+- **It does not prove work is skipped.** A fully dead tile is a bitwise no-op
+  (`corr = exp2(0) = 1.0`, `p = 0`), so the kernel could walk leading dead
+  tiles and still agree to the last bit. That needs a measurement, and got one.
+
+**Step 4 (varlen sentinels) is deferred into P3**, not outstanding here.
+`Window_left`/`Window_right` must accept `0x80000001` / `0x80000002` resolved
+per-sequence, which is meaningless without per-sequence lengths. The host-side
+`_CAUSAL_WINDOW` table is where they land.
+
+**P3 varlen · P4 bias · P5 dropout.** Unchanged in content, and each is now
+simpler than plan 0 scoped it: there is one masking path to extend, not two.
+P3 additionally inherits P6 step 4. P4 still carries the `m_i` floor regression
+test, which is only *reachable* with bias.
+
+**Still owed before the phase set is clean:** the tuning re-sweep (§5 of the
+gSWA plan -- the tables have now gone stale a fourth time, and gSWA moved
+register pressure again), and the legacy oracles' retirement (N2), which P2
+was supposed to carry and did not.
 
 **Deferred:** persistent-dynamic (own task, wants P1's 3D grid), `NUM_XCDS`,
 INT8, fused `RETURN_ENCODED_SOFTMAX`, `PRE_LOAD_V`, mxfp8. Dynamic VGPR

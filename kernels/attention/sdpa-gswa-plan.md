@@ -26,6 +26,12 @@ them again, and the phase is not finished until it has.
 == 2"` in the kernel returns 0, and the diagonal is expressed only through
 `window_right`.
 
+> **Status: steps 1–3 done, both objectives met.** The grep returns 0 and the
+> kernel ships `CAUSAL_TYPE ∈ {0, 3}`. Step 4 is deferred into P3. Outcomes
+> are recorded against each step below; the two that changed the design most
+> are §2.1 (exact rather than conservative interval boundaries) and §2.3 (the
+> full region must be walked first).
+
 ---
 
 ## 1. What P2b already built
@@ -306,6 +312,21 @@ as `mha_fwd_aot` does via `calculate_swa`. `_diag_i32` disappears into
 **Gate:** the grep in §0 returns 0, and the causal tests — unchanged — still
 pass, now running through the window path.
 
+**Outcome — met.** `_diag_i32` is renamed `_wr_i32` so no second vocabulary
+for the diagonal survives. Two blocks *disappeared* rather than moved: the
+causal KV upper bound with its signed clamps, and the dedicated causal
+full-region split. The interval code derives both from the same window, and a
+tighter bound at that — it bounds by `q_hi` where the old code used
+`q_start + BLOCK_M`. Causal through the window path costs nothing: ladder
+median +0.77%, worst −0.55%. 229 tests pass.
+
+One consequence to note rather than paper over: **§4's causal-equivalence test
+is now a host-mapping test.** Both sides build the same kernel, so it only
+pins the `_CAUSAL_WINDOW` table. It is kept at that reduced value — a wrong
+table is a real bug nothing else catches directly — but the end-to-end causal
+semantics now rest on `test_seqlen_q_ne_seqlen_k` against a reference mask.
+A test that licenses a deletion cannot survive it with its original meaning.
+
 ### Step 4 — varlen sentinels
 
 `Window_left`/`Window_right` accept `0x80000001` (causal top-left) and
@@ -313,8 +334,11 @@ pass, now running through the window path.
 sequence's `seqlen_q`/`seqlen_k`. Needed because varlen has no single
 `seqlen_q` to compute a uniform window from (slide 17).
 
-**Depends on P3.** Do not attempt before varlen exists; the sentinel is
-meaningless without per-sequence lengths.
+**Depends on P3, and is therefore folded into it** rather than left
+outstanding here. The sentinel is meaningless without per-sequence lengths.
+The landing site is the host-side `_CAUSAL_WINDOW` table, which already
+resolves alignment against runtime lengths for exactly this reason — the
+non-varlen case just happens to have one length to resolve against.
 
 ---
 
