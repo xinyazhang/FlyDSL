@@ -153,6 +153,57 @@ the value is overwritten before use.
 
 ---
 
+### 2.4 Everything derived from a window is signed. Use i32 and say so.
+
+`Window_left` and `Window_right` are **signed and routinely negative** — that
+is the entire content of the word "generalized". Bottom-right causal at
+`seqlen_q > seqlen_k` already gives `window_right < 0` today, and a caller may
+pass negative values on either side deliberately to shift a band off the
+diagonal.
+
+This is not a theoretical hazard. It cost a debugging round in P2b: clamping
+the KV bound with `_lim > 0` **kept** `-128` instead of replacing it, because
+`fx.Int32` comparisons default to *unsigned* and `-128` as `u32` is enormous. A
+huge bound then reached the loop. The Q-row bound check in the kernel carries a
+comment about the same trap, from before that.
+
+**Rules, applied without exception to anything downstream of a window:**
+
+1. **Compute in `fx.Int32`, never `fx.Index`.** `fx.Index` is unsigned; the
+   moment a negative intermediate touches it the value is garbage rather than
+   negative.
+2. **Use explicit signed predicates** — `arith.CmpIPredicate.slt` / `sgt` /
+   `sle` / `sge`. Do not rely on the `<` and `>` operator overloads, which pick
+   unsigned.
+3. **Convert to `fx.Index` only after clamping to a known-non-negative range,**
+   and clamp with a signed compare. Loop bounds and block counts are the only
+   things that should ever become `Index`.
+4. **`div_rd` must round toward negative infinity**, not toward zero.
+   `start_M - w_left` is negative whenever the window reaches past the start of
+   the sequence, and C-style truncation gives the wrong block index there.
+   Python's `//` already floors; a hand-written `x // y` in the DSL may not.
+
+**Where this bites specifically:**
+
+| quantity | can be negative |
+|---|---|
+| `w_left`, `w_right` | by definition |
+| `start_M - w_left`, `start_M + w_right` | the `lsec` / `rsec` endpoints |
+| `lsec.lo`, `rsec.lo` after `div_rd` | block indices below 0 |
+| `fb = [lsec.hi + 1, rsec.lo - 1]` | empty *and* inverted |
+| `q_row + w_right`, `q_row - w_left` | the mask comparison operands |
+
+The interval helpers make this manageable if ported faithfully:
+`closed_interval_isect` returns a deliberately inverted sentinel `(-114, -514)`
+for the empty case, and `is_closed_interval_empty` is `lo > hi` — so emptiness
+is representable without a separate flag, but only if the comparison is signed.
+
+**Suggested guard:** keep window-derived values in a distinct naming
+convention (`_w*` / `*_i32`) so a review can spot an `fx.Index(...)` wrapped
+around one. A silent unsigned compare produces plausible-looking output on
+square shapes and fails only where the window goes negative, which is exactly
+the region the tests in §4 target.
+
 ## 3. Steps
 
 Each lands independently and leaves the tree green.
@@ -243,7 +294,7 @@ Four properties worth asserting beyond "matches the reference":
 |---|---|---|
 | **A third loop body** | 2 bodies already cost 63 VGPRs at hd 128 and spilled hd 192 | piecewise `start_n`, §2.3; assert the body count |
 | Prefetch across the seam | discontinuous `start_n`; wrong tile is invisible to correctness tests | prefetch via the same piecewise map; test with a window that forces a seam mid-loop |
-| Interval arithmetic on negatives | `fx.Int32` compares are **unsigned** by default — this already cost a debugging round in P2b | explicit signed predicates everywhere; `div_rd` must round toward -inf |
+| Interval arithmetic on negatives | `fx.Index` is unsigned and `fx.Int32` compares default to unsigned; this already cost a debugging round in P2b | the rules in §2.4, applied without exception |
 | `-inf` through fast-math | already bit us once | mask stays after the scale; `ninf` stays off |
 | Tuning tables go stale again | third time now (256 after LSE, 128 after P2a) | re-sweep after step 2, before declaring the phase done |
 
