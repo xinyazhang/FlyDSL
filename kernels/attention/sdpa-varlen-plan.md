@@ -24,6 +24,28 @@ it the headline requirement rather than an afterthought.
 **Success criterion for objective 3:** outside the prologue, the kernel
 contains no reference to `varlen_bits`, `seqinfo_*`, or `Max_seqlen_*`.
 
+### 0.1 This one is not a port
+
+Every other phase in `sdpa-close-gap-plan1.md` closes a gap *against* AOTriton:
+the target exists, and the work is to reach it. This phase overshoots it. The
+decomposition in §1 expresses configurations AOTriton's `VarlenType` enum
+cannot — `seqused_k` paired with `cu_seq_k` (§1.4) is shipped by
+`torch.nn.attention.varlen` and has no AOTriton spelling at all — and the LSE
+layout field (§3.2) covers a Transformer Engine requirement that AOTriton's
+kernel does not express either.
+
+Two consequences worth keeping in view while implementing:
+
+- **AOTriton is not the oracle here.** For every other phase, "does it match
+  AOTriton" was available as a check. For the configurations beyond the enum
+  there is nothing to differentially test against, which is why §7's headline
+  gate is equivalence against *N separate dense calls* — an oracle built out of
+  the kernel's own dense path rather than borrowed from elsewhere.
+- **The design is not constrained to AOTriton's ABI.** Where the two disagree —
+  `REUSE` avoiding a load AOTriton always pays (§1.2), `lse_stride` read from
+  the tensor rather than the device (§4.2) — the divergence is deliberate and
+  recorded, not drift.
+
 ---
 
 ## 1. Varlen is three orthogonal choices, not an enum
