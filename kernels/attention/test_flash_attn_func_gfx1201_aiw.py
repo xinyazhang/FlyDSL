@@ -585,7 +585,10 @@ def test_logsumexp_with_gqa():
     [
         (lambda s: torch.zeros(2, s, dtype=torch.float16, device="cuda"), "float32"),
         (lambda s: torch.zeros(2, 2, s, dtype=torch.float32, device="cuda"), "rank 2"),
-        (lambda s: torch.zeros(s, 2, dtype=torch.float32, device="cuda").t(), "rank 2"),
+        # Rank 2 but not contiguous. The kernel derives the logsumexp pitches
+        # from VarlenBits rather than reading strides, so a strided buffer is
+        # rejected outright rather than silently mis-indexed.
+        (lambda s: torch.zeros(s, 2, dtype=torch.float32, device="cuda").t(), "contiguous"),
     ],
     ids=["f16", "rank3", "noncontig"],
 )
@@ -950,3 +953,256 @@ def test_knob_validity_predicate(kwargs, match):
     base.update(kwargs)
     with pytest.raises(ValueError, match=match):
         build_flash_attn_func_aiw_module(**base)
+
+# ---------------------------------------------------------------------------
+# Variable-length sequences (VarlenBits)
+# ---------------------------------------------------------------------------
+#
+# The headline gate is that varlen with N sequences equals N separate dense
+# calls **bitwise**. That holds for a reason rather than by luck: a varlen
+# workgroup and its dense counterpart cover the same tiles in the same order
+# with the same values, and only the base address differs, so every
+# floating-point operation is identical.
+#
+# It is the right gate here specifically because an addressing bug that lands
+# inside the right allocation reads *plausible* data -- a tolerance comparison
+# against a reference would accept it. See sdpa-varlen-plan.md section 7.
+
+
+# VARLEN_LSE_LAYOUT_TH, byte 2 of VarlenBits. Spelled out rather than imported
+# so the test pins the wire encoding, not just the builder's opinion of it.
+_LSE_LAYOUT_TH = 1 << 16
+
+
+def _cu(lens):
+    return torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(),
+                        dtype=torch.int32, device="cuda")
+
+
+def _packed_qkv(lens_q, lens_k, head_dim, seed=0):
+    """1THD tensors for a compact-varlen batch, plus their cu_seqlens."""
+    cq, ck = _cu(lens_q), _cu(lens_k)
+    Tq, Tk = int(cq[-1]), int(ck[-1])
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+
+    def _t(n):
+        # A zero-length batch still needs a valid allocation.
+        return torch.randn(1, max(n, 1), _NUM_HEADS, head_dim,
+                           dtype=torch.float16, device="cuda", generator=gen)
+
+    return _t(Tq), _t(Tk), _t(Tk), cq, ck
+
+
+def _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck,
+                                 label, lse=None, dense_lse=True):
+    """Every sequence must match its own dense call, bit for bit."""
+    for z, (lq, lk) in enumerate(zip(lens_q, lens_k)):
+        if lq == 0:
+            continue
+        qs, ks = int(cq[z]), int(ck[z])
+        qz = q[:, qs:qs + lq].contiguous()
+        kz = k[:, ks:ks + lk].contiguous()
+        vz = v[:, ks:ks + lk].contiguous()
+        ref = torch.empty_like(qz)
+        ref_lse = (torch.zeros(_NUM_HEADS, lq, dtype=torch.float32, device="cuda")
+                   if lse is not None else None)
+        exe(qz, kz, vz, ref, 1, lq, lk, lse=ref_lse)
+        torch.cuda.synchronize()
+        got = o[:, qs:qs + lq]
+        assert torch.equal(ref, got), (
+            f"{label} sequence {z} (Lq={lq}, Lk={lk}) differs from its dense "
+            f"call: max |delta| {(ref.float() - got.float()).abs().max():.3e}"
+        )
+        if lse is not None:
+            assert torch.equal(ref_lse, lse[:, qs:qs + lq]), (
+                f"{label} sequence {z} logsumexp differs from its dense call"
+            )
+
+
+_VARLEN_LENGTHS = [
+    ([3, 128, 40, 200], "mixed"),
+    ([64, 64, 64], "all_equal"),
+    ([1000, 5, 7, 3], "one_long"),
+    ([523, 337, 1033], "ragged_primes"),
+    ([0, 96, 40], "zero_leading"),
+    ([96, 0, 40], "zero_middle"),
+    ([96, 40, 0], "zero_trailing"),
+    ([77], "single"),
+]
+
+
+@pytest.mark.parametrize("lens_q,label", _VARLEN_LENGTHS, ids=[x[1] for x in _VARLEN_LENGTHS])
+@pytest.mark.parametrize("ctype", [0, 1, 2], ids=["full", "topleft", "botright"])
+def test_varlen_compact_lengths(lens_q, label, ctype):
+    """Suite A: one mode, many length patterns (plan §7).
+
+    `seqlen_k != seqlen_q` throughout, so the per-sequence window that
+    `causal_type=2` derives is exercised rather than collapsing to the
+    top-left one.
+    """
+    _require_env()
+    head_dim = 64
+    lens_k = [x + 7 if x else 0 for x in lens_q]
+    N = len(lens_q)
+    q, k, v, cq, ck = _packed_qkv(lens_q, lens_k, head_dim)
+    o = torch.zeros_like(q)
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=bool(ctype),
+        causal_type=ctype or None, dtype_str="f16",
+    )
+    mq, mk = max(lens_q), max(lens_k)
+    exe(q, k, v, o, N, mq, mk,
+        varlen=exe.varlen_compact(cq, ck, mq, mk))
+    torch.cuda.synchronize()
+    _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck,
+                                 f"compact/{label}/ctype={ctype}")
+
+
+def test_varlen_zero_length_writes_nothing():
+    """A zero-length sequence must not be written at all.
+
+    Distinct from "writes zeros": the buffer is poisoned first, so a store of
+    0.0 to a row that should not exist still fails. This is what checks the
+    empty-work path of plan §6.1, including that it covers the *logsumexp*
+    store, which is guarded separately from O.
+    """
+    _require_env()
+    head_dim, lens_q = 64, [0, 96, 0, 40, 0]
+    lens_k = [x + 7 if x else 0 for x in lens_q]
+    N = len(lens_q)
+    q, k, v, cq, ck = _packed_qkv(lens_q, lens_k, head_dim)
+    poison = float("nan")
+    o = torch.full_like(q, poison)
+    lse = torch.full((_NUM_HEADS, max(int(cq[-1]), 1)), poison,
+                     dtype=torch.float32, device="cuda")
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16",
+    )
+    mq, mk = max(lens_q), max(lens_k)
+    exe(q, k, v, o, N, mq, mk, lse=lse,
+        varlen=exe.varlen_compact(cq, ck, mq, mk))
+    torch.cuda.synchronize()
+    # Rows belonging to real sequences were written; there are no rows
+    # belonging to the empty ones, so nothing else may have been touched.
+    written = torch.zeros(int(cq[-1]), dtype=torch.bool, device="cuda")
+    for z, lq in enumerate(lens_q):
+        written[int(cq[z]):int(cq[z]) + lq] = True
+    assert torch.isfinite(o[:, written]).all(), "live rows were not written"
+    assert torch.isfinite(lse[:, written]).all(), "live logsumexp not written"
+
+
+@pytest.mark.parametrize("ctype", [0, 1], ids=["full", "causal"])
+def test_varlen_padded_matches_dense(ctype):
+    """`PaddedVarlen`: BHSD tensors whose sequences are short.
+
+    Differs from compact in *precisely* the two decoded fields -- `batch_index`
+    becomes `z` and `row_off` becomes 0 -- so this is what catches a mix-up
+    between them (plan §7 property 2).
+    """
+    _require_env()
+    head_dim = 64
+    lens_q = [200, 40, 128]
+    lens_k = [x + 7 for x in lens_q]
+    N, mq, mk = len(lens_q), max(lens_q), max(lens_k)
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(N, mq, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    k = torch.randn(N, mk, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    v = torch.randn(N, mk, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    o = torch.zeros_like(q)
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=bool(ctype),
+        causal_type=ctype or None, dtype_str="f16",
+    )
+    exe(q, k, v, o, N, mq, mk,
+        varlen=exe.varlen_padded(_cu(lens_q), _cu(lens_k), mq, mk))
+    torch.cuda.synchronize()
+    for z, (lq, lk) in enumerate(zip(lens_q, lens_k)):
+        qz = q[z:z + 1, :lq].contiguous()
+        kz = k[z:z + 1, :lk].contiguous()
+        vz = v[z:z + 1, :lk].contiguous()
+        ref = torch.empty_like(qz)
+        exe(qz, kz, vz, ref, 1, lq, lk)
+        torch.cuda.synchronize()
+        assert torch.equal(ref, o[z:z + 1, :lq]), (
+            f"padded sequence {z} differs from its dense call"
+        )
+
+
+def test_varlen_single_sequence_reduces_to_dense():
+    """N = 1 compact must be bit-identical to the plain dense call.
+
+    The cheapest instance of the headline gate, and the first thing to make
+    pass: at N = 1 the only difference between the two is that one of them
+    went through the decoder at all.
+    """
+    _require_env()
+    head_dim, L = 64, 300
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(1, L, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    k = torch.randn(1, L, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    v = torch.randn(1, L, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda", generator=gen)
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16",
+    )
+    o_dense = torch.empty_like(q)
+    exe(q, k, v, o_dense, 1, L, L)
+    o_varlen = torch.empty_like(q)
+    exe(q, k, v, o_varlen, 1, L, L,
+        varlen=exe.varlen_compact(_cu([L]), _cu([L]), L, L))
+    torch.cuda.synchronize()
+    assert torch.equal(o_dense, o_varlen)
+
+
+def test_varlen_lse_layout_th_transposes():
+    """`VARLEN_LSE_LAYOUT_TH` must write `(T, H)`, not `(H, T)`.
+
+    Transformer Engine requires the layout, not merely the shape, so the test
+    compares against the transpose of the `_HT` result rather than against a
+    reference computation -- a kernel that ignored the bit would produce `_HT`
+    content in a `_TH` buffer and pass any shape-only check.
+    """
+    _require_env()
+    head_dim = 64
+    lens_q = [96, 40, 128]
+    lens_k = [x + 7 for x in lens_q]
+    N, mq, mk = len(lens_q), max(lens_q), max(lens_k)
+    q, k, v, cq, ck = _packed_qkv(lens_q, lens_k, head_dim)
+    Tq = int(cq[-1])
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16",
+    )
+    o = torch.empty_like(q)
+    lse_ht = torch.zeros(_NUM_HEADS, Tq, dtype=torch.float32, device="cuda")
+    exe(q, k, v, o, N, mq, mk, lse=lse_ht,
+        varlen=exe.varlen_compact(cq, ck, mq, mk))
+    lse_th = torch.zeros(Tq, _NUM_HEADS, dtype=torch.float32, device="cuda")
+    exe(q, k, v, o, N, mq, mk, lse=lse_th,
+        varlen=exe.varlen_compact(cq, ck, mq, mk, lse_tokens=Tq,
+                                  lse_layout=_LSE_LAYOUT_TH))
+    torch.cuda.synchronize()
+    assert torch.equal(lse_ht, lse_th.t().contiguous()), (
+        "TH layout is not the transpose of HT"
+    )
+
+
+def test_varlen_rejects_unimplemented_configurations():
+    """Encodable but not yet built must fail loudly, not silently misbehave."""
+    _require_env()
+    q, k, v = (
+        torch.randn(1, 64, _NUM_HEADS, 64, dtype=torch.float16, device="cuda")
+        for _ in range(3)
+    )
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16",
+    )
+    cu = _cu([64])
+    # ARRAY positions are step 2; INDIVIDUAL lengths are step 3.
+    for side in (0x13, 0x15, 0x04):
+        bad = dict(bits=exe.varlen_bits(side, side), seqinfo_q0=cu, seqinfo_q1=cu,
+                   seqinfo_k0=cu, seqinfo_k1=cu, max_seqlen_q=64, max_seqlen_k=64,
+                   lse_tokens=64)
+        with pytest.raises(NotImplementedError, match="not implemented"):
+            exe(q, k, v, torch.empty_like(q), 1, 64, 64, varlen=bad)
+    # REUSE without cumulative lengths is not encodable at all.
+    with pytest.raises(ValueError, match="REUSE requires"):
+        exe.varlen_bits(0x0D, 0x0D)

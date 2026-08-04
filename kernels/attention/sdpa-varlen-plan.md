@@ -42,9 +42,9 @@ Two consequences worth keeping in view while implementing:
   gate is equivalence against *N separate dense calls* — an oracle built out of
   the kernel's own dense path rather than borrowed from elsewhere.
 - **The design is not constrained to AOTriton's ABI.** Where the two disagree —
-  `REUSE` avoiding a load AOTriton always pays (§1.2), `lse_stride` read from
-  the tensor rather than the device (§4.2) — the divergence is deliberate and
-  recorded, not drift.
+  `REUSE` avoiding a load AOTriton always pays (§1.2), the LSE tensor carrying
+  no strides at all (§4.2) — the divergence is deliberate and recorded, not
+  drift.
 
 ---
 
@@ -230,14 +230,21 @@ def decode_side(bits8, z, max_seqlen, s0, s1):
     return seqlen, row_off, batch_index
 ```
 
-Called twice, and it never reads `[N]`: `lse_stride` comes off the LSE tensor
-on the host (§4.2), so no total has to be recovered from a `seqinfo` array.
+Called twice. The Q call additionally yields the LSE token pitch, the one
+place `[N]` is read:
+
+```python
+lse_tokens = (max_seqlen_q       if not q_stacked else
+              N * max_seqlen_q   if q_posmode == 0 else
+              s0[N]              if q_posmode == 1 else
+              s1[N])
+```
 
 ### 3.2 LSE: the *indices* are derived, the *layout* is not
 
 Plan1 resolved LSE as one branch-free offset formula, `(b*H + h)*S + s`. Under
 this decomposition the **inputs** are exactly Q's addressing applied to a
-rank-2 tensor: `b = batch_index_q`, `s = row_off_q`, `S = lse_stride`. So
+rank-2 tensor: `b = batch_index_q`, `s = row_off_q`, `S` the token pitch. So
 `(B*H, Max_seqlen_q)` and `(H, TotalS)` are not modes to select between — they
 are what the formula produces for `BATCHED` and `STACKED`, and no bits are
 needed to distinguish them.
@@ -247,7 +254,7 @@ an earlier draft of this plan claimed otherwise. Transformer Engine — which
 uses AOTriton as a backend — requires LSE in the `(T_q, H_q)` **layout**, not
 merely that shape. PyTorch's varlen documentation specifies a shape and says
 nothing about memory, but TE's requirement is real and no value of
-`lse_stride` produces the transpose.
+token pitch produces the transpose.
 
 This is plan1 §0 applying to LSE exactly as it applies to Q/K/V/O: *shape does
 not imply layout*. Having asserted that principle for the rank-4 tensors and
@@ -255,10 +262,10 @@ then quietly assuming the rank-2 one was `(H, T)` was inconsistent.
 
 Two formulas, selected by `LSE_LAYOUT`:
 
-| `LSE_LAYOUT` | constant               | shape    | offset                                 | contiguous | pitch        |
-| ------------ | ---------------------- | -------- | -------------------------------------- | ---------- | ------------ |
-| 0 (default)  | `VARLEN_LSE_LAYOUT_HT` | `(H, T)` | `(b * H + h) * lse_stride + s`         | `T`        | `lse_stride` |
-| 1            | `VARLEN_LSE_LAYOUT_TH` | `(T, H)` | `(b * lse_stride + s) * lse_pitch + h` | `H`        | `lse_pitch`  |
+| `LSE_LAYOUT` | constant               | shape    | offset                | contiguous |
+| ------------ | ---------------------- | -------- | --------------------- | ---------- |
+| 0 (default)  | `VARLEN_LSE_LAYOUT_HT` | `(H, T)` | `(b * H + h) * S + s` | `T`        |
+| 1            | `VARLEN_LSE_LAYOUT_TH` | `(T, H)` | `(b * S + s) * H + h` | `H`        |
 
 **`_HT` is what the AOTriton kernel uses** (`_lse_offset(b, h, s, H, S) =
 (b*H + h)*S + s`), and what this kernel does today. `_TH` is Transformer
@@ -281,13 +288,39 @@ after.
 `HT` also covers the non-varlen `(B*H, Max_seqlen_q)` case without a separate
 name, since that is `(B, H, S)` with `S` contiguous.
 
-`lse_stride` keeps its meaning — tokens per row-group — and continues to come
-from `lse.stride(0)` on the host (§4.2). `lse_pitch` is one new scalar, the
-head-axis pitch, which is `>= num_head_q` so that **padding for alignment is
-free in either layout**: `_HT` pads via `lse_stride`, `_TH` via `lse_pitch`.
-That is why the field is two bits and not one — a padded or blocked
-arrangement neither formula covers has somewhere to go without another ABI
-change.
+**Neither pitch is a kernel argument.** Unlike Q/K/V/O the logsumexp tensor is
+*always compact* — nothing analogous to `storage_flip` applies to it, and no
+caller hands us a strided one. Its layout is therefore fully determined by
+`LSE_LAYOUT` plus quantities the kernel already holds, and passing strides
+would be passing derivable information twice, which can only ever disagree
+with itself.
+
+Derived instead:
+
+| quantity        | value                                                       |
+| --------------- | ----------------------------------------------------------- |
+| head pitch      | `num_head_q` — compact, so exactly the head count           |
+| token pitch `S` | `Max_seqlen_q` if `BATCHED`; else the total token count `T` |
+
+and `T` comes from the Q side's own decode, which already knows where the
+positions live:
+
+```
+T = N * Max_seqlen_q     if POSITION == IMPLIED   (uniform stacking)
+    seqinfo_q0[N]        if POSITION == REUSE
+    seqinfo_q1[N]        if POSITION == ARRAY
+```
+
+The `[N]` read is the one AOTriton also performs
+(`tl.load(cu_seqlens_q + Num_seqlens)`), and it is why `N` must reach the
+kernel — V6 has it reuse `batch_size`. It sits inside a branch that has
+already touched the same pointer, and §9.4's prefix-sum assumption is exactly
+what makes it valid.
+
+That the field is two bits and not one still matters, for a sharper reason
+than before: an arrangement that is *not* compact — padded or blocked for
+alignment — becomes a new `LSE_LAYOUT` code rather than a stride argument,
+which is where such a thing belongs.
 
 `LSE_LAYOUT == 0` is `_HT`, which is AOTriton's and today's behaviour, so
 `VarlenBits == 0` remains the conventional dense case.
@@ -298,7 +331,7 @@ change.
 
 After the prologue, everything is one of:
 
-|     | `seqlen_q` | `seqlen_k` | `q_row_off` | `k_row_off` | `batch_index` | `lse_stride` |
+|     | `seqlen_q` | `seqlen_k` | `q_row_off` | `k_row_off` | `batch_index` | `lse_tokens` |
 | --- | ---------- | ---------- | ----------- | ----------- | ------------- | ------------ |
 
 and the two places that consume them are already written in the right shape.
@@ -308,8 +341,8 @@ s_head`. Adding `+ q_row_off * s_seq` covers every configuration, for all four
 tensors. Note `batch_index` is *also* now decoded rather than
 `gpu.block_idx.z` — the one existing line that changes.
 
-**LSE.** `_lse_base = (batch_idx * num_head_q + head_q) * lse_stride` becomes
-the same expression `+ q_row_off`, per §3.2.
+**LSE.** `_lse_base = (batch_idx * num_head_q + head_q) * S` becomes the same
+expression `+ q_row_off`, with `S` derived per §3.2.
 
 **Cost.** `z` is uniform per workgroup, so the `seqinfo` reads are **scalar**
 loads — at most six, once, into SGPRs. They do not touch the VGPR budget gSWA
@@ -345,19 +378,20 @@ So the orthogonality is real, but it is inherited from the per-tensor stride
 decision rather than free. Worth one test rather than none: §7's suite B
 carries a GQA row.
 
-### 4.2 `lse_stride` needs no derivation
+### 4.2 The LSE tensor carries no strides
 
-AOTriton loads it from the device (`tl.load(cu_seqlens_q + Num_seqlens)`)
-because its API only receives `Max_seqlen_q`. Ours already reads
-`lse.stride(0)` off the LSE tensor on the host, which is the same number by
-construction for every layout in §2 — `TotalS` for `(H, TotalS)`,
-`Max_seqlen_q` for `(B*H, Max_seqlen_q)`. Keep that: it removes a scalar load
-from the prologue and a host/device round trip from the caller.
+An earlier draft passed `lse_stride` (and later `lse_pitch`) from the host,
+read off `lse.stride(0)`. That is wrong in kind rather than merely wasteful.
+LSE is the one tensor whose layout is **not** a free variable: Q/K/V/O may
+arrive in any `xxxD` permutation, which is why plan1 §0 insists their strides
+be read from the tensor — but the logsumexp buffer is always compact, so its
+strides are a *function* of `LSE_LAYOUT`, `num_head_q` and the token count.
+Passing them alongside creates two sources of truth for one fact.
 
-What it does *not* supply is the head-axis pitch, which `_TH` needs:
-`lse_pitch` is a second scalar, read from `lse.stride(0)` of a `_TH` tensor
-while `lse_stride` then comes from its logical token count. The host
-resolves which is which from `LSE_LAYOUT`; the kernel does not.
+They are derived in-kernel instead (§3.2). The host's job shrinks to
+**validating** that the tensor it was handed matches the layout the bits
+declare — contiguous, and of the expected shape — a check it could not
+meaningfully perform while it was inferring strides from that same tensor.
 
 ---
 
@@ -493,7 +527,7 @@ becomes reachable.
 
 ### Step 1 — bits, decoder, and everything that reads no position array
 
-`VarlenBits`, `seqinfo_?0`, `lse_pitch`, the §3.1 decoder, the six scalars, the
+`VarlenBits`, `seqinfo_?0`, `N`, the §3.1 decoder, the six scalars, the
 empty-work path, and both LSE layouts (`_HT`, `_TH`). Implement
 `LENGTH ∈ {MAX, CUMULATIVE}`
 and `POSITION ∈ {IMPLIED, REUSE}` with both `STACKED` values.
@@ -555,12 +589,12 @@ then skip `b[z]` rows", which is unusual but well-defined and free. What falls
 3. **Differing `N` between Q and K.** The sequence count is shared by
    construction; the bits are per-side but `z` is not.
 4. **Non-cumulative position arrays.** `POSITION = ARRAY` reads `b[z]`, which
-   works for any array, cumulative or not. But `lse_stride` reads `b[N]`, which
-   assumes the array is a prefix sum with a total in the last slot. An arbitrary
-   scatter of starts would need the total supplied separately. Both TE's
-   `cu_seqlens_padded` and `cu_seqlens` satisfy this, so it costs nothing today
-   — but it is an assumption, and it should be asserted on the host rather than
-   discovered later.
+   works for any array, cumulative or not. But the LSE token pitch reads `b[N]`
+   (§3.2), which assumes the array is a prefix sum with its total in the last
+   slot. An arbitrary scatter of starts would need the total supplied
+   separately. Both TE's `cu_seqlens_padded` and `cu_seqlens` satisfy this, so
+   it costs nothing today — but it is an assumption, and the host asserts it
+   rather than leaving it to be discovered.
 5. **A sequence starting mid-slot with a length that runs past the next
    sequence's start.** Representable, and the kernel would happily read another
    sequence's tokens. Nothing validates non-overlap. Host-side check.
@@ -596,7 +630,8 @@ layout.** So it is a live requirement, not a hypothetical.
 Two bits rather than one, because efficient-attention implementations pad the
 LSE layout for alignment and the field should have room for arrangements
 neither current formula covers. Padding itself needs no new codes — §3.2's
-`lse_stride` and `lse_pitch` absorb it in either layout.
+a non-compact arrangement becomes a new code rather than a stride argument
+(§3.2).
 
 Named `VARLEN_LSE_LAYOUT_HT` (**AOTriton's**, and the `0` default) and
 `VARLEN_LSE_LAYOUT_TH` (TE's), after the axis order — not because major/minor

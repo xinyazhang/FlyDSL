@@ -823,12 +823,11 @@ def build_flash_attn_func_aiw_module_primary(
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
+        num_seqlens: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
-        lse_stride: fx.Int64,
-        lse_pitch: fx.Int32,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
@@ -1000,9 +999,15 @@ def build_flash_attn_func_aiw_module_primary(
         def _decode_side(bits_shift, max_seqlen, s0, s1):
             """One side of VarlenBits. Called twice, identically.
 
-            Returns (seqlen, row_off, batch_index). See section 3.1 of
-            sdpa-varlen-plan.md; the shapes of the three axes are STACKED (bit
-            0), LENGTH (bits 2:1) and POSITION (bits 4:3).
+            Returns (seqlen, row_off, batch_index, tokens). See section 3.1
+            of sdpa-varlen-plan.md; the axes are STACKED (bit 0), LENGTH (bits
+            2:1) and POSITION (bits 4:3).
+
+            `tokens` is the LSE token pitch, and only the Q call's is used. It
+            is derived rather than passed because the logsumexp tensor -- alone
+            among the tensors here -- is always compact, so its strides are a
+            function of the bits and would otherwise be a second source of
+            truth for one fact (plan section 4.2).
             """
             _b = fx.Int32(varlen_bits) >> fx.Int32(bits_shift)
             _stacked = _b & fx.Int32(1)
@@ -1034,12 +1039,25 @@ def build_flash_attn_func_aiw_module_primary(
                 _scmp_i32(arith.CmpIPredicate.ne, _stacked, fx.Int32(0)),
                 fx.Int32(0), _z_i32,
             )
-            return _seqlen, _row_off, _batch
 
-        _seqlen_q_i32, _q_row_off, _q_batch = _decode_side(
+            # LSE token pitch. Batched layouts pad every row-group to
+            # Max_seqlen; stacked ones run to the batch total, which lives in
+            # slot [N] of whichever array supplies positions. That `[N]` read
+            # is the prefix-sum assumption of plan section 9.4, asserted host
+            # side.
+            _tokens = fx.Int32(max_seqlen)
+            if _stacked != fx.Int32(0):
+                _tokens = fx.Int32(num_seqlens) * fx.Int32(max_seqlen)
+                if _posmode == fx.Int32(1):
+                    _tokens = _seqinfo_at(s0, fx.Int32(num_seqlens))
+                elif _posmode == fx.Int32(2):
+                    _tokens = _seqinfo_at(s1, fx.Int32(num_seqlens))
+            return _seqlen, _row_off, _batch, _tokens
+
+        _seqlen_q_i32, _q_row_off, _q_batch, _lse_tokens = _decode_side(
             0, max_seqlen_q, seqinfo_q0, seqinfo_q1
         )
-        _seqlen_k_i32, _k_row_off, _k_batch = _decode_side(
+        _seqlen_k_i32, _k_row_off, _k_batch, _ = _decode_side(
             8, max_seqlen_k, seqinfo_k0, seqinfo_k1
         )
 
@@ -1600,6 +1618,12 @@ def build_flash_attn_func_aiw_module_primary(
         # dynamic `scf.if` guard inside one loop measured much worse than no
         # guard at all, because the region boundary blocks scheduling in a
         # latency-bound loop. A static split has no such boundary.
+        # Does this workgroup own any real Q row? Under varlen the grid is
+        # sized from Max_seqlen_q, so this is false for whole workgroups.
+        _alive = ArithValue(
+            arith.cmpi(arith.CmpIPredicate.slt, _raw(q_start), _raw(seqlen_q_v))
+        )
+
         if const_expr(CAUSAL):
             # ---- gSWA: three regions over one contiguous block range ----
             #
@@ -1642,6 +1666,13 @@ def build_flash_attn_func_aiw_module_primary(
             # in this Q block, so those tiles are not walked at all.
             _v_lo = _smax_i32(_sdiv_rd(_q_start_i32 - _wl_i32), fx.Int32(0))
             _v_hi = _smin_i32(_blk_last, _sdiv_rd(_q_last_i32 + _wr_i32))
+            # Empty work, not skipped work. Varlen sizes the grid from
+            # Max_seqlen_q, so a short sequence gets workgroups whose rows are
+            # all past its end; this kernel is one single-exit trace and
+            # cannot `return` out of them (plan section 6.1). Inverting the
+            # visited range drives every region count to zero, and the
+            # existing row-bound guards already suppress both stores.
+            _v_hi = _ssel_i32(_alive, _v_hi, _v_lo - fx.Int32(1))
 
             # First tile clear of the left edge: ceil(((q_hi-1) - w_left)/BN).
             # First tile touched by the right edge: floor((q_start+w_right+1)/BN).
@@ -1702,6 +1733,13 @@ def build_flash_attn_func_aiw_module_primary(
             kv_upper = fx.Index(
                 ((seqlen_k_v + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N))
                 * fx.Index(BLOCK_N)
+            )
+            # Same empty-work clamp as the causal arm above.
+            _full_end = fx.Index(
+                ArithValue(_alive).select(_full_end, fx.Index(0))
+            )
+            kv_upper = fx.Index(
+                ArithValue(_alive).select(kv_upper, fx.Index(0))
             )
 
         # ---- Prologue: at distance 1, the first tile's K / V go to registers ----
@@ -2273,26 +2311,22 @@ def build_flash_attn_func_aiw_module_primary(
                 #   _HT  (H, T)   AOTriton's, and the default: T contiguous
                 #   _TH  (T, H)   Transformer Engine's:         H contiguous
                 _row = _q_row_off_v + q_rows[qt]
-                _lse_off = (
-                    _q_batch_v * fx.Index(num_head_q) + head_q
-                ) * fx.Index(lse_stride) + _row
-                if const_expr(True):
-                    _is_th = ArithValue(
-                        arith.cmpi(
-                            arith.CmpIPredicate.ne,
-                            _raw(
-                                (fx.Int32(varlen_bits) >> fx.Int32(16))
-                                & fx.Int32(3)
-                            ),
-                            _raw(fx.Int32(0)),
-                        )
+                _tok = fx.Index(_lse_tokens)
+                _nhq = fx.Index(num_head_q)
+                _lse_off_ht = (_q_batch_v * _nhq + head_q) * _tok + _row
+                # Compact in both layouts, so the head pitch is exactly
+                # num_head_q and the token pitch is the decode's `tokens`.
+                _lse_off_th = (_q_batch_v * _tok + _row) * _nhq + head_q
+                _is_th = ArithValue(
+                    arith.cmpi(
+                        arith.CmpIPredicate.ne,
+                        _raw((fx.Int32(varlen_bits) >> fx.Int32(16)) & fx.Int32(3)),
+                        _raw(fx.Int32(0)),
                     )
-                    _lse_off_th = (
-                        _q_batch_v * fx.Index(lse_stride) + _row
-                    ) * fx.Index(lse_pitch) + head_q
-                    _lse_off = fx.Index(
-                        _is_th.select(fx.Index(_lse_off_th), fx.Index(_lse_off))
-                    )
+                )
+                _lse_off = fx.Index(
+                    _is_th.select(fx.Index(_lse_off_th), fx.Index(_lse_off_ht))
+                )
                 _pointer_store(
                     _lse,
                     buffer_ops.get_element_ptr(
@@ -2368,8 +2402,6 @@ def build_flash_attn_func_aiw_module_primary(
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
-        lse_stride: fx.Int64,
-        lse_pitch: fx.Int32,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
@@ -2407,8 +2439,8 @@ def build_flash_attn_func_aiw_module_primary(
         launcher = flash_attn_func_aiw_kernel(
             Q, K, V, O, L,
             seqinfo_q0, seqinfo_q1, seqinfo_k0, seqinfo_k1,
-            varlen_bits, max_seqlen_q, max_seqlen_k,
-            window_left, window_right, lse_stride, lse_pitch,
+            varlen_bits, batch_size, max_seqlen_q, max_seqlen_k,
+            window_left, window_right,
             num_head_q, num_head_k,
             hdim_qk, hdim_vo,
             stride_q0, stride_q1, stride_q2,
@@ -2520,29 +2552,47 @@ def build_flash_attn_func_aiw_module_primary(
             )
         return t.stride(0), t.stride(1), t.stride(2)
 
-    def _lse_args(lse, seq_len, varlen=None):
-        """(pointer, row stride) for the logsumexp tensor; a null pointer skips it.
+    def _lse_args(lse, seq_len, varlen, num_head_q):
+        """The logsumexp pointer, and a check that its layout matches the bits.
 
-        The kernel gates on the pointer rather than on a build flag, matching
-        AOTriton, so training and inference share one binary instead of
-        doubling the functional count.
+        Returns only a pointer: unlike Q/K/V/O this tensor is always compact,
+        so the kernel derives both pitches from `LSE_LAYOUT`, `num_head_q` and
+        the token count (sdpa-varlen-plan.md section 4.2). Inferring strides
+        here as well would give one fact two sources.
+
+        What the host can do instead -- and could not while it was inferring --
+        is verify the caller's tensor actually has the declared layout.
         """
         if lse is None:
-            return _NULL_PTR, int(seq_len), 0
+            return _NULL_PTR
         if lse.dtype != torch_f32:
             raise ValueError(f"logsumexp must be float32, got {lse.dtype}")
-        if lse.dim() != 2 or lse.stride(1) != 1:
+        if lse.dim() != 2:
+            raise ValueError(f"logsumexp must be rank 2, got shape {tuple(lse.shape)}")
+        if not lse.is_contiguous():
             raise ValueError(
-                f"logsumexp must be rank 2 with a contiguous last dim, got "
-                f"shape {tuple(lse.shape)} strides {lse.stride()}"
+                "logsumexp must be contiguous: the kernel derives its pitches "
+                "from VarlenBits rather than reading strides"
             )
-        # `_HT` reads `lse.stride(0)` as the token pitch and ignores the head
-        # pitch; `_TH` reads `lse.stride(0)` as the head pitch and takes the
-        # token count from the caller. Resolved here, never in the kernel.
         _layout = 0 if varlen is None else (int(varlen["bits"]) >> 16) & 3
         if _layout == 0:
-            return _ptr_arg(lse), lse.stride(0), 0
-        return _ptr_arg(lse), int(varlen["lse_tokens"]), lse.stride(0)
+            # The token pitch the kernel will derive. Only checkable when the
+            # caller supplies it: under a stacked layout it lives in
+            # `seqinfo[N]` on the device, and reading that back would cost a
+            # sync for a validation.
+            want_last = int(seq_len) if varlen is None else varlen.get("lse_tokens")
+            if want_last is not None and lse.shape[1] != int(want_last):
+                raise ValueError(
+                    f"VARLEN_LSE_LAYOUT_HT wants (*, {int(want_last)}), got "
+                    f"{tuple(lse.shape)}"
+                )
+        else:
+            if lse.shape[1] != num_head_q:
+                raise ValueError(
+                    f"VARLEN_LSE_LAYOUT_TH wants (*, {num_head_q}), got "
+                    f"{tuple(lse.shape)}"
+                )
+        return _ptr_arg(lse)
 
     # Where causal alignment lives now that the kernel has only {0, 3}.
     #
@@ -2599,6 +2649,37 @@ def build_flash_attn_func_aiw_module_primary(
     )                                                              # 0x0B
     VARLEN_PADDED_SIDE = VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_IMPLIED
                                                                    # 0x02
+
+    _VARLEN_IMPLEMENTED_SIDE = {
+        VARLEN_DENSE, VARLEN_COMPACT_SIDE, VARLEN_PADDED_SIDE,
+    }
+
+    def varlen_compact(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                       lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT):
+        """Classical packed varlen: 1THD tensors, `cu_seqlens` for both roles.
+
+        `seqinfo_?1` is deliberately **not** passed: `POSITION = REUSE` takes
+        the position out of the cumulative length value already loaded, so
+        this configuration reads no position array at all (plan section 1.2).
+        """
+        return dict(
+            bits=varlen_bits(VARLEN_COMPACT_SIDE, VARLEN_COMPACT_SIDE, lse_layout),
+            seqinfo_q0=cu_seqlens_q, seqinfo_q1=None,
+            seqinfo_k0=cu_seqlens_k, seqinfo_k1=None,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            lse_tokens=lse_tokens,
+        )
+
+    def varlen_padded(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                      lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT):
+        """BHSD tensors whose sequences are short: lengths only, no positions."""
+        return dict(
+            bits=varlen_bits(VARLEN_PADDED_SIDE, VARLEN_PADDED_SIDE, lse_layout),
+            seqinfo_q0=cu_seqlens_q, seqinfo_q1=None,
+            seqinfo_k0=cu_seqlens_k, seqinfo_k1=None,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            lse_tokens=lse_tokens,
+        )
 
     def _resolve_window(window, seqlen_q, seqlen_k):
         """(window_left, window_right), signed, as the kernel wants them.
@@ -2658,6 +2739,24 @@ def build_flash_attn_func_aiw_module_primary(
                 "varlen invalidates; it is a dense-only diagnostic arm"
             )
         bits = int(varlen["bits"])
+        for side, shift in (("q", 0), ("k", 8)):
+            byte = (bits >> shift) & 0xFF
+            if byte not in _VARLEN_IMPLEMENTED_SIDE:
+                raise NotImplementedError(
+                    f"{side} side {byte:#04x} is encodable but not implemented "
+                    f"yet: step 1 ships MAX/CUMULATIVE lengths with "
+                    f"IMPLIED/REUSE positions. ARRAY positions are step 2 and "
+                    f"INDIVIDUAL lengths are step 3 (sdpa-varlen-plan.md 8)"
+                )
+        for side, shift in (("q", 0), ("k", 8)):
+            byte = (bits >> shift) & 0xFF
+            if byte not in _VARLEN_IMPLEMENTED_SIDE:
+                raise NotImplementedError(
+                    f"{side} side {byte:#04x} is encodable but not implemented "
+                    f"yet: step 1 ships MAX/CUMULATIVE lengths with "
+                    f"IMPLIED/REUSE positions. ARRAY positions are step 2 and "
+                    f"INDIVIDUAL lengths are step 3 (sdpa-varlen-plan.md §8)"
+                )
         got = tuple(
             _ptr_arg(varlen[k]) if varlen.get(k) is not None else _NULL_PTR
             for k in ("seqinfo_q0", "seqinfo_q1", "seqinfo_k0", "seqinfo_k1")
@@ -2694,7 +2793,7 @@ def build_flash_attn_func_aiw_module_primary(
     def _launch(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
-        _lse_p, _lse_s, _lse_pitch = _lse_args(lse, seqlen_q, varlen)
+        _lse_p = _lse_args(lse, seqlen_q, varlen, meta[0])
         _wl, _wr = _resolve_window(window, seqlen_q, seqlen_k)
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(
             varlen, seqlen_q, seqlen_k
@@ -2710,8 +2809,6 @@ def build_flash_attn_func_aiw_module_primary(
             _mk,
             _wl,
             _wr,
-            _lse_s,
-            _lse_pitch,
             *meta,
             *st,
             _resolve_scale(Q, scale),
@@ -2721,7 +2818,7 @@ def build_flash_attn_func_aiw_module_primary(
     def _compile(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
-        _lse_p, _lse_s, _lse_pitch = _lse_args(lse, seqlen_q, varlen)
+        _lse_p = _lse_args(lse, seqlen_q, varlen, meta[0])
         _wl, _wr = _resolve_window(window, seqlen_q, seqlen_k)
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(
             varlen, seqlen_q, seqlen_k
@@ -2737,8 +2834,6 @@ def build_flash_attn_func_aiw_module_primary(
             _mk,
             _wl,
             _wr,
-            _lse_s,
-            _lse_pitch,
             *meta,
             *st,
             _resolve_scale(Q, scale),
@@ -2746,6 +2841,11 @@ def build_flash_attn_func_aiw_module_primary(
         )
 
     _launch.compile = _compile
+    # Attached rather than module-level: the validation closes over
+    # STRIDES_CONSTEXPR and the shipped-configuration set.
+    _launch.varlen_bits = varlen_bits
+    _launch.varlen_compact = varlen_compact
+    _launch.varlen_padded = varlen_padded
     return _launch
 
 
