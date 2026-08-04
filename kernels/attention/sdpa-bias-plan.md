@@ -103,36 +103,72 @@ loop-carried vectors, which is the resource this kernel is shortest of.
 
 ---
 
-## 3. The interaction that needs a decision: bias under varlen
+## 3. Bias and varlen are orthogonal, and that is a property to preserve
 
-AOTriton forms the bias base as
+Checked against the source rather than assumed, because an earlier draft of
+this section got it wrong and proposed rejecting the combination.
+
+**Orthogonal in the build.** `BIAS_TYPE` is a build axis (`options=[0, 1]`)
+while varlen is entirely runtime, so one compiled kernel already serves both.
+There is no `@ati.disable` pairing them — the only bias exclusion is against
+*causal*, §3.2.
+
+**Orthogonal at runtime too, provided bias is indexed like Q.** Varlen does
+not add a mode to the body; it re-purposes `batch_index` and a row offset, and
+every tensor that consumes those two gets varlen for free. Compare:
+
+| tensor | batch selector | row index                     |
+| ------ | -------------- | ----------------------------- |
+| Q      | `batch_index`  | `cu_seqlens_q_start + offs_m` |
+| bias   | `batch_index`  | `offs_m`                      |
+
+AOTriton's bias omits the row offset. That is invisible for the `BATCHED`
+modes — dense and padded varlen both set `cu_seqlens_q_start = 0` and select
+the plane with `batch_index`, so bias behaves exactly as it does dense. It
+only bites for the `STACKED` modes, where `batch_index` is pinned to 0 and the
+row offset carries the sequence.
+
+**So the rule for this kernel is one line: index bias with the same
+`(batch_index, q_row_off)` the varlen decode already produced, and the same
+`k_row_off` on the column.** The six scalars exist precisely so that a tensor
+does not need to know which layout it is in, and bias is another consumer of
+them. That makes every varlen mode work uniformly, and it costs two extra
+terms in an address that is computed once per tile.
+
+This diverges from AOTriton for the stacked modes, deliberately: a bias laid
+out to match packed Q/K is the only thing a caller could sensibly pass there,
+and `sdpa-varlen-plan.md` §0.1 already records that AOTriton is not the oracle
+for configurations past its enum.
+
+### 3.1 Not tested, and that is a decision
+
+Bias-under-varlen gets **no test**. The combination has no caller today, and
+inventing a reference for it would cost more than the logic is worth. What is
+required instead is that the *logic* be right by construction — bias reads the
+same two scalars as Q and V, so if varlen is correct for them it is correct
+for bias, and there is no third path that could drift.
+
+Stated explicitly because "untested" and "unsupported" are different claims
+and the code should not be read as making the second one.
+
+### 3.2 AOTriton ships no causal + bias at all
+
+Worth flagging because it removes an oracle. `_common.py`:
 
 ```python
-B_ptrs = B + batch_index * stride_bz + off_h_q * stride_bh + offs_m[:, None] * stride_bm
+if causal != 0 and bias_type != 0:
+    return True          # functional disabled
 ```
 
-Note what is *absent*: `cu_seqlens_q_start`. The row index is `offs_m`, which
-is the position **within the sequence**, and the batch selector is
-`batch_index` — which compact varlen sets to **0**.
+with the comment "causal+matrix-bias unsupported". So AOTriton has **no**
+compiled kernel for that combination on any architecture.
 
-So under compact varlen every sequence would read the same bias plane, indexed
-by its own local row. That is either a deliberate restriction (bias is not
-supported with varlen) or a gap; either way we should not copy it without
-saying which. Three options:
-
-| option                      | meaning                                                  | cost                               |
-| --------------------------- | -------------------------------------------------------- | ---------------------------------- |
-| **A. reject** bias + varlen | host raises; matches what AOTriton effectively does      | none, and no semantics invented    |
-| **B. per-sequence plane**   | `stride_bz` indexes the sequence, `z` selects it         | one more term, `(N, H, Sq, Sk)`    |
-| **C. packed bias**          | bias rows follow `q_row_off`, columns follow `k_row_off` | matches packed Q/K; largest change |
-
-**Recommend A for this phase**, with B or C deferred until a caller asks:
-the varlen decomposition already gives `q_row_off` and `k_row_off`, so C is a
-two-term change later, and inventing a layout now that no caller uses risks
-getting it wrong in a way that is expensive to unpick. This is a decision for
-you, not a default I should pick silently.
-
----
+This kernel has one masking path and one bias add, and they compose without a
+special case, so there is no reason to inherit the restriction — but it means
+the causal rows of §5's matrix have no AOTriton counterpart and must be
+checked against a reference implementation instead. It also means §1's
+ordering claim (bias before the mask) cannot be validated against AOTriton
+behaviour; it has to stand on the argument.
 
 ## 4. Steps
 
@@ -187,13 +223,14 @@ Two properties beyond "matches the reference":
 
 ## 6. Risks
 
-| risk                               | why it matters                                                   | mitigation                                        |
-| ---------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------- |
-| **Register pressure**              | a new load stream in a loop already spilling at head_dim 192+    | measure before prefetching; §2.1                  |
-| `-inf` deleted by fast-math        | now arrives from user data, not just from the kernel             | `ninf` stays off; assert with an `-inf` bias      |
-| Bias masked *after* the mask       | `-inf + bias` un-masks a column that gSWA killed                 | order fixed in §1; test bias together with causal |
-| Tuning tables go stale             | fifth time; bias changes the live set                            | re-sweep only if the A/B shows a shift            |
-| Varlen semantics invented silently | §3 has no obviously right answer and AOTriton does not answer it | decide explicitly; recommend rejecting for now    |
+| risk                                 | why it matters                                                | mitigation                                                         |
+| ------------------------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------ |
+| **Register pressure**                | a new load stream in a loop already spilling at head_dim 192+ | measure before prefetching; §2.1                                   |
+| `-inf` deleted by fast-math          | now arrives from user data, not just from the kernel          | `ninf` stays off; assert with an `-inf` bias                       |
+| Bias masked *after* the mask         | `-inf + bias` un-masks a column that gSWA killed              | order fixed in §1; test bias together with causal                  |
+| Tuning tables go stale               | fifth time; bias changes the live set                         | re-sweep only if the A/B shows a shift                             |
+| Bias drifts from Q's varlen indexing | bias would silently read the wrong rows under stacked varlen  | index it from the same six scalars (§3); no separate path to drift |
+| No AOTriton oracle for causal + bias | that pair is disabled there, so parity cannot be checked      | reference implementation for those rows (§3.2)                     |
 
 ---
 
