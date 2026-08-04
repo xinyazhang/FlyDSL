@@ -2650,9 +2650,15 @@ def build_flash_attn_func_aiw_module_primary(
     VARLEN_PADDED_SIDE = VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_IMPLIED
                                                                    # 0x02
 
-    _VARLEN_IMPLEMENTED_SIDE = {
-        VARLEN_DENSE, VARLEN_COMPACT_SIDE, VARLEN_PADDED_SIDE,
-    }
+    VARLEN_STRIDED_SIDE = (
+        VARLEN_STACKED | VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_ARRAY
+    )                                                              # 0x13
+    VARLEN_SEQUSED_PACKED_SIDE = (
+        VARLEN_STACKED | VARLEN_LENGTH_INDIVIDUAL | VARLEN_POSITION_ARRAY
+    )                                                              # 0x15
+    VARLEN_SEQUSED_CACHE_SIDE = (
+        VARLEN_LENGTH_INDIVIDUAL | VARLEN_POSITION_IMPLIED
+    )                                                              # 0x04
 
     def varlen_compact(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                        lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT):
@@ -2677,6 +2683,50 @@ def build_flash_attn_func_aiw_module_primary(
             bits=varlen_bits(VARLEN_PADDED_SIDE, VARLEN_PADDED_SIDE, lse_layout),
             seqinfo_q0=cu_seqlens_q, seqinfo_q1=None,
             seqinfo_k0=cu_seqlens_k, seqinfo_k1=None,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            lse_tokens=lse_tokens,
+        )
+
+    def varlen_strided(cu_seqlens_q, cu_seqlens_k, seq_strides_q, seq_strides_k,
+                       max_seqlen_q, max_seqlen_k,
+                       lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT):
+        """Packed tensors with padding *between* sequences (TE's layout).
+
+        Differs from `varlen_compact` in one thing only: positions come from a
+        second array instead of being reused from the length array. That is
+        the whole of AOTriton's `StridedVarlen`, and the reason the two roles
+        must never be swapped -- `seq_strides` differences are *padded*
+        extents, not lengths.
+        """
+        return dict(
+            bits=varlen_bits(VARLEN_STRIDED_SIDE, VARLEN_STRIDED_SIDE, lse_layout),
+            seqinfo_q0=cu_seqlens_q, seqinfo_q1=seq_strides_q,
+            seqinfo_k0=cu_seqlens_k, seqinfo_k1=seq_strides_k,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            lse_tokens=lse_tokens,
+        )
+
+    def varlen_seqused_k(cu_seqlens_q, cu_seqlens_k, seqused_k,
+                         max_seqlen_q, max_seqlen_k, k_is_cache=False,
+                         lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT):
+        """Packed Q against a KV cache with per-sequence *used* lengths.
+
+        `torch.nn.attention.varlen`'s `seqused_k`, and the configuration no
+        `VarlenType` can express: the K side takes its **length** from an
+        individual array and its **position** from a cumulative one, so the
+        two axes read different tensors.
+
+        `k_is_cache=True` is the rectangular variant -- a BHSD cache with no
+        `cu_seqlens_k` at all, where the position is implied by the batch
+        index.
+        """
+        k_side = (VARLEN_SEQUSED_CACHE_SIDE if k_is_cache
+                  else VARLEN_SEQUSED_PACKED_SIDE)
+        return dict(
+            bits=varlen_bits(VARLEN_COMPACT_SIDE, k_side, lse_layout),
+            seqinfo_q0=cu_seqlens_q, seqinfo_q1=None,
+            seqinfo_k0=seqused_k,
+            seqinfo_k1=None if k_is_cache else cu_seqlens_k,
             max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
             lse_tokens=lse_tokens,
         )
@@ -2738,25 +2788,11 @@ def build_flash_attn_func_aiw_module_primary(
                 "strides_constexpr derives the layout from the shape, which "
                 "varlen invalidates; it is a dense-only diagnostic arm"
             )
+        # No implemented-subset gate: every encodable side byte now decodes,
+        # since the decoder is one function covering all three axis values.
+        # `varlen_bits` rejects the combinations that are not *meaningful*
+        # (reserved codes, REUSE without cumulative lengths).
         bits = int(varlen["bits"])
-        for side, shift in (("q", 0), ("k", 8)):
-            byte = (bits >> shift) & 0xFF
-            if byte not in _VARLEN_IMPLEMENTED_SIDE:
-                raise NotImplementedError(
-                    f"{side} side {byte:#04x} is encodable but not implemented "
-                    f"yet: step 1 ships MAX/CUMULATIVE lengths with "
-                    f"IMPLIED/REUSE positions. ARRAY positions are step 2 and "
-                    f"INDIVIDUAL lengths are step 3 (sdpa-varlen-plan.md 8)"
-                )
-        for side, shift in (("q", 0), ("k", 8)):
-            byte = (bits >> shift) & 0xFF
-            if byte not in _VARLEN_IMPLEMENTED_SIDE:
-                raise NotImplementedError(
-                    f"{side} side {byte:#04x} is encodable but not implemented "
-                    f"yet: step 1 ships MAX/CUMULATIVE lengths with "
-                    f"IMPLIED/REUSE positions. ARRAY positions are step 2 and "
-                    f"INDIVIDUAL lengths are step 3 (sdpa-varlen-plan.md §8)"
-                )
         got = tuple(
             _ptr_arg(varlen[k]) if varlen.get(k) is not None else _NULL_PTR
             for k in ("seqinfo_q0", "seqinfo_q1", "seqinfo_k0", "seqinfo_k1")
@@ -2846,6 +2882,8 @@ def build_flash_attn_func_aiw_module_primary(
     _launch.varlen_bits = varlen_bits
     _launch.varlen_compact = varlen_compact
     _launch.varlen_padded = varlen_padded
+    _launch.varlen_strided = varlen_strided
+    _launch.varlen_seqused_k = varlen_seqused_k
     return _launch
 
 

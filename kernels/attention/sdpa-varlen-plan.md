@@ -551,6 +551,13 @@ different code, and this is the step that writes the second one.
 step introduces the only path that reads `seqinfo_?1`, so its coverage is
 exactly that test plus step 3's.
 
+**Outcome — met, and the step was smaller than written.** The decoder is one
+function covering all three axis values, so `ARRAY` was already written in
+step 1; what steps 2 and 3 actually delivered is the host builders, the
+removal of the not-implemented gate, and the tests. That is worth recording
+rather than smoothing over: "the code was already there" is exactly the
+situation in which an untested path ships looking finished.
+
 ### Step 3 — `LENGTH == INDIVIDUAL`
 
 One decoder case, giving the PyTorch `seqused_k` pair: `0x150B` on packed KV
@@ -558,6 +565,10 @@ and `0x040B` on a rectangular cache. `0x150B` needs `ARRAY` and so depends on
 step 2; `0x040B` does not.
 
 **Gate:** §7 property 3.
+
+**Outcome — met.** Both `seqused_k` shapes work, each asserted twice: equal to
+a dense call on the *truncated* K, and *unequal* to one on the full K. Only
+the second fails if the used length is ignored.
 
 ### Step 4 — the window sentinels (P6 step 4)
 `parse_window` moves into the kernel: `0x80000001 → (seqlen_q, 0)` and

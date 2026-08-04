@@ -1185,24 +1185,328 @@ def test_varlen_lse_layout_th_transposes():
     )
 
 
-def test_varlen_rejects_unimplemented_configurations():
-    """Encodable but not yet built must fail loudly, not silently misbehave."""
+def _strided_layout(lens, gaps):
+    """(positions, cu_seqlens, padded_total) for sequences with gaps between.
+
+    `gaps` varies per sequence deliberately: a uniform gap is indistinguishable
+    from a longer uniform stride, so an implementation that mishandles the
+    position array can still pass a uniform-gap test.
+    """
+    pos, at = [], 0
+    for ln, gap in zip(lens, gaps):
+        pos.append(at)
+        at += ln + gap
+    return (torch.tensor(pos + [at], dtype=torch.int32, device="cuda"),
+            _cu(lens), at)
+
+
+@pytest.mark.parametrize("ctype", [0, 1], ids=["full", "causal"])
+def test_varlen_strided_reads_the_position_array(ctype):
+    """`StridedVarlen`: positions from `seqinfo_?1`, lengths from `?0`.
+
+    Two assertions, and the second is the one with teeth. Matching the dense
+    calls shows the gaps are honoured; *differing* from the gapless reading of
+    the same buffer shows `seqinfo_?1` is read at all. Without it, an
+    implementation that ignored the position array and fell back to `REUSE`
+    would pass everything above.
+
+    This is also the only path besides `seqused_k` that touches `seqinfo_?1`,
+    so it carries that code's entire coverage (plan §7 property 2).
+    """
     _require_env()
-    q, k, v = (
-        torch.randn(1, 64, _NUM_HEADS, 64, dtype=torch.float16, device="cuda")
-        for _ in range(3)
+    head_dim = 64
+    lens_q = [96, 40, 133]
+    lens_k = [x + 7 for x in lens_q]
+    gaps_q = [11, 64, 3]          # per-sequence, not uniform
+    gaps_k = [5, 32, 17]
+    N = len(lens_q)
+    sst_q, cq, Tq_pad = _strided_layout(lens_q, gaps_q)
+    sst_k, ck, Tk_pad = _strided_layout(lens_k, gaps_k)
+    gen = torch.Generator(device="cuda").manual_seed(0)
+
+    def _t(n):
+        return torch.randn(1, n, _NUM_HEADS, head_dim, dtype=torch.float16,
+                           device="cuda", generator=gen)
+
+    q, k, v = _t(Tq_pad), _t(Tk_pad), _t(Tk_pad)
+    o = torch.zeros_like(q)
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=bool(ctype),
+        causal_type=ctype or None, dtype_str="f16",
     )
+    mq, mk = max(lens_q), max(lens_k)
+    exe(q, k, v, o, N, mq, mk,
+        varlen=exe.varlen_strided(cq, ck, sst_q, sst_k, mq, mk))
+    torch.cuda.synchronize()
+
+    for z, (lq, lk) in enumerate(zip(lens_q, lens_k)):
+        qs, ks = int(sst_q[z]), int(sst_k[z])
+        ref = torch.empty(1, lq, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda")
+        exe(q[:, qs:qs + lq].contiguous(), k[:, ks:ks + lk].contiguous(),
+            v[:, ks:ks + lk].contiguous(), ref, 1, lq, lk)
+        torch.cuda.synchronize()
+        assert torch.equal(ref, o[:, qs:qs + lq]), (
+            f"strided sequence {z} differs from its dense call"
+        )
+
+    # Negative control: the same buffer read as if it were gapless.
+    o_compact = torch.zeros_like(q)
+    exe(q, k, v, o_compact, N, mq, mk,
+        varlen=exe.varlen_compact(cq, ck, mq, mk))
+    torch.cuda.synchronize()
+    assert not torch.equal(o, o_compact), (
+        "strided produced the same result as the gapless reading of the same "
+        "buffer -- seqinfo_?1 is not being read"
+    )
+
+
+@pytest.mark.parametrize("k_is_cache", [False, True], ids=["packed_kv", "bhsd_cache"])
+def test_varlen_seqused_k_shortens_only_k(k_is_cache):
+    """The configuration no `VarlenType` can express (plan §1.4).
+
+    The K side takes its **length** from an individual array (`seqused_k`) and
+    its **position** from a cumulative one, so axes B and C read different
+    tensors. Two assertions again: the result must equal a dense call on the
+    *truncated* K, and must differ from one on the full K -- only the second
+    fails if `seqused_k` is ignored.
+    """
+    _require_env()
+    head_dim = 64
+    lens_q = [96, 40, 128]
+    alloc_k = [x + 64 for x in lens_q]      # cache slots, larger than used
+    used_k = [x + 7 for x in lens_q]        # what actually participates
+    N, mq = len(lens_q), max(lens_q)
+    mk = max(alloc_k)
+    cq = _cu(lens_q)
+    ck = _cu(alloc_k)
+    su = torch.tensor(used_k, dtype=torch.int32, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(1, int(cq[-1]), _NUM_HEADS, head_dim, dtype=torch.float16,
+                    device="cuda", generator=gen)
+    if k_is_cache:
+        kv_shape = (N, mk, _NUM_HEADS, head_dim)
+    else:
+        kv_shape = (1, int(ck[-1]), _NUM_HEADS, head_dim)
+    k = torch.randn(*kv_shape, dtype=torch.float16, device="cuda", generator=gen)
+    v = torch.randn(*kv_shape, dtype=torch.float16, device="cuda", generator=gen)
+    o = torch.zeros_like(q)
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16",
+    )
+    exe(q, k, v, o, N, mq, mk,
+        varlen=exe.varlen_seqused_k(cq, ck, su, mq, mk, k_is_cache=k_is_cache))
+    torch.cuda.synchronize()
+
+    for z, lq in enumerate(lens_q):
+        qs = int(cq[z])
+        qz = q[:, qs:qs + lq].contiguous()
+        if k_is_cache:
+            kz_full, vz_full = k[z:z + 1], v[z:z + 1]
+        else:
+            ks = int(ck[z])
+            kz_full = k[:, ks:ks + alloc_k[z]]
+            vz_full = v[:, ks:ks + alloc_k[z]]
+        ref = torch.empty_like(qz)
+        exe(qz, kz_full[:, :used_k[z]].contiguous(),
+            vz_full[:, :used_k[z]].contiguous(), ref, 1, lq, used_k[z])
+        torch.cuda.synchronize()
+        assert torch.equal(ref, o[:, qs:qs + lq]), (
+            f"seqused_k sequence {z} differs from a dense call on the "
+            f"truncated K"
+        )
+        # Negative control: the untruncated cache must give something else.
+        ref_full = torch.empty_like(qz)
+        exe(qz, kz_full[:, :alloc_k[z]].contiguous(),
+            vz_full[:, :alloc_k[z]].contiguous(), ref_full, 1, lq, alloc_k[z])
+        torch.cuda.synchronize()
+        assert not torch.equal(ref_full, o[:, qs:qs + lq]), (
+            f"seqused_k sequence {z} matched the *full* cache -- the used "
+            f"length is being ignored"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Suite B: one awkward length set, every configuration
+# ---------------------------------------------------------------------------
+#
+# The full product of lengths x modes is far too large, and it factors: the
+# mode decides how a sequence is *located*, the lengths decide what is *in*
+# it. Suite A projects onto lengths with the mode fixed; this projects onto
+# modes with the lengths fixed.
+#
+# What the factorisation gives up is an interaction needing both an unusual
+# length pattern and an unusual mode. That is bounded because the mode is
+# consumed entirely in the prologue -- it becomes three scalars and every
+# length pattern then flows through identical code -- so such an interaction
+# would have to be a prologue bug. The length set below is chosen to be
+# awkward enough to provoke one: ragged, N = 7, containing a zero, a
+# length-1 sequence and one much longer than the rest, with seqlen_k above
+# seqlen_q throughout.
+
+_SUITE_B_Q = [200, 0, 37, 1, 128, 3, 96]
+_SUITE_B_K = [x + 13 if x else 0 for x in _SUITE_B_Q]
+
+
+def _suite_b_case(mode, head_dim, n_head_k):
+    """Build (q, k, v, varlen, slicers) for one configuration.
+
+    `slicers[z]` returns the (q, k, v) views a plain dense call would receive
+    for sequence z, which is what the result must match bit for bit.
+    """
+    lq, lk = _SUITE_B_Q, _SUITE_B_K
+    N, mq, mk = len(lq), max(lq), max(lk)
+    cq, ck = _cu(lq), _cu(lk)
+    gen = torch.Generator(device="cuda").manual_seed(7)
+
+    def rnd(*shape):
+        return torch.randn(*shape, dtype=torch.float16, device="cuda", generator=gen)
+
+    def packed_slicer(q, k, v, qpos, kpos, klens):
+        def _s(z):
+            return (q[:, qpos[z]:qpos[z] + lq[z]].contiguous(),
+                    k[:, kpos[z]:kpos[z] + klens[z]].contiguous(),
+                    v[:, kpos[z]:kpos[z] + klens[z]].contiguous(), klens[z])
+        return _s
+
+    if mode == "dense_k":
+        # Packed Q against a rectangular K: the Q byte is compact, the K byte 0.
+        q = rnd(1, int(cq[-1]), _NUM_HEADS, head_dim)
+        k = rnd(N, mk, n_head_k, head_dim)
+        v = rnd(N, mk, n_head_k, head_dim)
+        bits = None  # assembled by the caller below
+        return q, k, v, ("mixed", cq, ck, mq, mk), (
+            lambda z: (q[:, int(cq[z]):int(cq[z]) + lq[z]].contiguous(),
+                       k[z:z + 1].contiguous(), v[z:z + 1].contiguous(), mk))
+
+    if mode == "padded":
+        q = rnd(N, mq, _NUM_HEADS, head_dim)
+        k = rnd(N, mk, n_head_k, head_dim)
+        v = rnd(N, mk, n_head_k, head_dim)
+        return q, k, v, ("padded", cq, ck, mq, mk), (
+            lambda z: (q[z:z + 1, :lq[z]].contiguous(),
+                       k[z:z + 1, :lk[z]].contiguous(),
+                       v[z:z + 1, :lk[z]].contiguous(), lk[z]))
+
+    if mode == "strided":
+        gq = [7, 3, 64, 1, 40, 5, 11][:N]
+        gk = [5, 17, 2, 32, 9, 3, 21][:N]
+        sst_q, _, Tq = _strided_layout(lq, gq)
+        sst_k, _, Tk = _strided_layout(lk, gk)
+        q, k, v = rnd(1, Tq, _NUM_HEADS, head_dim), rnd(1, Tk, n_head_k, head_dim), rnd(1, Tk, n_head_k, head_dim)
+        return q, k, v, ("strided", cq, ck, sst_q, sst_k, mq, mk), packed_slicer(
+            q, k, v, [int(x) for x in sst_q], [int(x) for x in sst_k], lk)
+
+    if mode in ("seqused_packed", "seqused_cache"):
+        alloc = [x + 48 if x else 0 for x in lq]
+        used = lk
+        ca = _cu(alloc)
+        q = rnd(1, int(cq[-1]), _NUM_HEADS, head_dim)
+        cache = mode == "seqused_cache"
+        shape = (N, max(alloc), n_head_k, head_dim) if cache else (1, int(ca[-1]), n_head_k, head_dim)
+        k, v = rnd(*shape), rnd(*shape)
+        su = torch.tensor(used, dtype=torch.int32, device="cuda")
+        tag = ("seqused", cq, ca, su, mq, max(alloc), cache)
+        if cache:
+            sl = lambda z: (q[:, int(cq[z]):int(cq[z]) + lq[z]].contiguous(),
+                            k[z:z + 1, :used[z]].contiguous(),
+                            v[z:z + 1, :used[z]].contiguous(), used[z])
+        else:
+            sl = packed_slicer(q, k, v, [int(x) for x in cq], [int(x) for x in ca], used)
+        return q, k, v, tag, sl
+
+    # compact
+    q = rnd(1, int(cq[-1]), _NUM_HEADS, head_dim)
+    k, v = rnd(1, int(ck[-1]), n_head_k, head_dim), rnd(1, int(ck[-1]), n_head_k, head_dim)
+    return q, k, v, ("compact", cq, ck, mq, mk), packed_slicer(
+        q, k, v, [int(x) for x in cq], [int(x) for x in ck], lk)
+
+
+_SUITE_B_MODES = ["compact", "strided", "padded", "seqused_packed",
+                  "seqused_cache", "dense_k"]
+
+
+@pytest.mark.parametrize("gqa", [False, True], ids=["mha", "gqa"])
+@pytest.mark.parametrize("mode", _SUITE_B_MODES)
+def test_varlen_suite_b_all_modes(mode, gqa):
+    """Every configuration against the same awkward length set, bitwise.
+
+    The GQA axis is here rather than in suite A because varlen and GQA touch
+    the same address expression on different axes -- varlen picks the batch
+    slice and the row, GQA the head. They are orthogonal only because strides
+    are per-tensor: for a 1THD tensor the per-token stride is `H * D`, which
+    differs between Q and K under GQA, so `q_row_off` and `k_row_off` are
+    scaled by different multipliers. A shared token stride would be silently
+    wrong for every packed GQA call, and nothing else here would catch it.
+    """
+    _require_env()
+    head_dim = 64
+    n_head_k = 1 if gqa else _NUM_HEADS
+    q, k, v, tag, slicer = _suite_b_case(mode, head_dim, n_head_k)
+    N, mq = len(_SUITE_B_Q), max(_SUITE_B_Q)
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16",
+    )
+    if tag[0] == "compact":
+        _, cq, ck, _mq, mk = tag
+        varlen = exe.varlen_compact(cq, ck, mq, mk)
+    elif tag[0] == "padded":
+        _, cq, ck, _mq, mk = tag
+        varlen = exe.varlen_padded(cq, ck, mq, mk)
+    elif tag[0] == "strided":
+        _, cq, ck, sq, sk, _mq, mk = tag
+        varlen = exe.varlen_strided(cq, ck, sq, sk, mq, mk)
+    elif tag[0] == "seqused":
+        _, cq, ca, su, _mq, mk, cache = tag
+        varlen = exe.varlen_seqused_k(cq, ca, su, mq, mk, k_is_cache=cache)
+    else:  # packed Q, rectangular K with full lengths
+        _, cq, ck, _mq, mk = tag
+        varlen = dict(
+            bits=exe.varlen_bits(0x0B, 0x00),
+            seqinfo_q0=cq, seqinfo_q1=None, seqinfo_k0=None, seqinfo_k1=None,
+            max_seqlen_q=mq, max_seqlen_k=mk, lse_tokens=int(cq[-1]),
+        )
+    o = torch.zeros_like(q)
+    exe(q, k, v, o, N, mq, mk, varlen=varlen)
+    torch.cuda.synchronize()
+
+    for z, lq_z in enumerate(_SUITE_B_Q):
+        if lq_z == 0:
+            continue
+        qz, kz, vz, lk_z = slicer(z)
+        ref = torch.empty_like(qz)
+        exe(qz, kz, vz, ref, 1, lq_z, lk_z)
+        torch.cuda.synchronize()
+        if tag[0] == "padded":
+            got = o[z:z + 1, :lq_z]
+        elif tag[0] == "strided":
+            base = int(tag[3][z])
+            got = o[:, base:base + lq_z]
+        else:
+            got = o[:, int(tag[1][z]):int(tag[1][z]) + lq_z]
+        assert torch.equal(ref, got), (
+            f"{mode}{'/gqa' if gqa else ''} sequence {z} (Lq={lq_z}, "
+            f"Lk={lk_z}) differs from its dense call"
+        )
+
+
+def test_varlen_rejects_meaningless_configurations():
+    """Every encodable byte now decodes, so what is left is the *meaningless*.
+
+    `REUSE` takes a position out of the length array, which is only a position
+    when the lengths are cumulative; and two codes per field are reserved.
+    Both are rejected when the bits are assembled, before any launch.
+    """
+    _require_env()
     exe = build_flash_attn_func_aiw_module(
         num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16",
     )
-    cu = _cu([64])
-    # ARRAY positions are step 2; INDIVIDUAL lengths are step 3.
-    for side in (0x13, 0x15, 0x04):
-        bad = dict(bits=exe.varlen_bits(side, side), seqinfo_q0=cu, seqinfo_q1=cu,
-                   seqinfo_k0=cu, seqinfo_k1=cu, max_seqlen_q=64, max_seqlen_k=64,
-                   lse_tokens=64)
-        with pytest.raises(NotImplementedError, match="not implemented"):
-            exe(q, k, v, torch.empty_like(q), 1, 64, 64, varlen=bad)
-    # REUSE without cumulative lengths is not encodable at all.
     with pytest.raises(ValueError, match="REUSE requires"):
-        exe.varlen_bits(0x0D, 0x0D)
+        exe.varlen_bits(0x0D, 0x0D)          # INDIVIDUAL length + REUSE position
+    with pytest.raises(ValueError, match="REUSE requires"):
+        exe.varlen_bits(0x09, 0x09)          # MAX length + REUSE position
+    with pytest.raises(ValueError, match="reserved"):
+        exe.varlen_bits(0x06, 0x00)          # LENGTH == 3
+    with pytest.raises(ValueError, match="reserved"):
+        exe.varlen_bits(0x18, 0x00)          # POSITION == 3
+    with pytest.raises(ValueError, match="fit in a byte"):
+        exe.varlen_bits(0x100, 0x00)
