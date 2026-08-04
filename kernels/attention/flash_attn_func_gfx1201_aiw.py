@@ -818,11 +818,17 @@ def build_flash_attn_func_aiw_module_primary(
         V: fx.Pointer,
         O: fx.Pointer,  # noqa: E741
         L: fx.Pointer,
-        seqlen_q: fx.Int32,
-        seqlen_k: fx.Int32,
+        seqinfo_q0: fx.Pointer,
+        seqinfo_q1: fx.Pointer,
+        seqinfo_k0: fx.Pointer,
+        seqinfo_k1: fx.Pointer,
+        varlen_bits: fx.Int32,
+        max_seqlen_q: fx.Int32,
+        max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
         lse_stride: fx.Int64,
+        lse_pitch: fx.Int32,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
@@ -931,8 +937,114 @@ def build_flash_attn_func_aiw_module_primary(
                 ).result
             return rocdl.wmma_f32_16x16x16_f16(v8f32_type, a_v8, b_v8, c_v8).result
 
-        seqlen_q_v = fx.Index(seqlen_q)
-        seqlen_k_v = fx.Index(seqlen_k)
+        def _scmp_i32(pred, a, b):
+            """A *signed* integer compare. The `<` and `>` overloads on
+            fx.Int32 pick unsigned, which on a negative window silently
+            compares against something enormous -- plan section 2.4 rule 2."""
+            return ArithValue(
+                arith.cmpi(pred, _raw(fx.Int32(a)), _raw(fx.Int32(b)))
+            )
+
+        def _ssel_i32(pred, a, b):
+            return fx.Int32(ArithValue(pred).select(fx.Int32(a), fx.Int32(b)))
+
+        def _smin_i32(a, b):
+            return _ssel_i32(_scmp_i32(arith.CmpIPredicate.slt, a, b), a, b)
+
+        def _smax_i32(a, b):
+            return _ssel_i32(_scmp_i32(arith.CmpIPredicate.sgt, a, b), a, b)
+
+        def _sdiv_rd(x):
+            """floor(x / BLOCK_N), signed -- plan section 2.4 rule 4.
+
+            BLOCK_N is a power of two, so an arithmetic right shift *is* the
+            round-toward-negative-infinity division. `arith.divsi` truncates
+            toward zero instead, which is wrong for every window that reaches
+            past the start of the sequence: at BLOCK_N 32, floor(-1/32) is -1
+            but truncation gives 0, and the left run would then start one tile
+            too late and silently drop live columns.
+            """
+            return fx.Int32(
+                ArithValue(
+                    arith.shrsi(_raw(fx.Int32(x)), _raw(fx.Int32(_BLOCK_N_LOG2)))
+                )
+            )
+
+        # ---- Varlen prologue: VarlenBits -> six scalars ----
+        #
+        # The *only* place the layout is examined. Everything downstream reads
+        # the scalars and cannot tell which of the configurations in
+        # sdpa-varlen-plan.md section 2 it is running under -- which is that
+        # plan's objective 3, and why there is no `if varlen_mode` in the body.
+        #
+        # `z` is uniform across the workgroup, so every load here is scalar:
+        # at most four, once, into SGPRs. They do not touch the VGPR budget.
+        #
+        # Real branches, not selects. A select-based decode would issue the
+        # loads unconditionally and fault on the null `seqinfo` pointers that
+        # the dense case passes; the branch also keeps `VarlenBits == 0` free
+        # rather than merely correct.
+        _z_i32 = fx.Int32(gpu.block_idx.z)
+
+        def _seqinfo_at(ptr, idx_i32):
+            return fx.Int32(
+                _pointer_load(
+                    T.i32,
+                    buffer_ops.get_element_ptr(
+                        _pointer_to_llvm_ptr(ptr), fx.Int64(idx_i32),
+                        elem_type=T.i32,
+                    ),
+                )
+            )
+
+        def _decode_side(bits_shift, max_seqlen, s0, s1):
+            """One side of VarlenBits. Called twice, identically.
+
+            Returns (seqlen, row_off, batch_index). See section 3.1 of
+            sdpa-varlen-plan.md; the shapes of the three axes are STACKED (bit
+            0), LENGTH (bits 2:1) and POSITION (bits 4:3).
+            """
+            _b = fx.Int32(varlen_bits) >> fx.Int32(bits_shift)
+            _stacked = _b & fx.Int32(1)
+            _lenmode = (_b >> fx.Int32(1)) & fx.Int32(3)
+            _posmode = (_b >> fx.Int32(3)) & fx.Int32(3)
+
+            # LENGTH. `_s0_z` is the cumulative *position* that REUSE then
+            # reuses -- the whole point of that mode is that this load has
+            # already happened (plan section 1.2).
+            _seqlen = fx.Int32(max_seqlen)
+            _s0_z = fx.Int32(0)
+            if _lenmode == fx.Int32(1):          # CUMULATIVE
+                _s0_z = _seqinfo_at(s0, _z_i32)
+                _seqlen = _seqinfo_at(s0, _z_i32 + fx.Int32(1)) - _s0_z
+            elif _lenmode == fx.Int32(2):        # INDIVIDUAL
+                _seqlen = _seqinfo_at(s0, _z_i32)
+
+            # POSITION.
+            _row_off = _ssel_i32(
+                _scmp_i32(arith.CmpIPredicate.ne, _stacked, fx.Int32(0)),
+                _z_i32 * fx.Int32(max_seqlen), fx.Int32(0),
+            )
+            if _posmode == fx.Int32(1):          # REUSE: already in a register
+                _row_off = _s0_z
+            elif _posmode == fx.Int32(2):        # ARRAY
+                _row_off = _seqinfo_at(s1, _z_i32)
+
+            _batch = _ssel_i32(
+                _scmp_i32(arith.CmpIPredicate.ne, _stacked, fx.Int32(0)),
+                fx.Int32(0), _z_i32,
+            )
+            return _seqlen, _row_off, _batch
+
+        _seqlen_q_i32, _q_row_off, _q_batch = _decode_side(
+            0, max_seqlen_q, seqinfo_q0, seqinfo_q1
+        )
+        _seqlen_k_i32, _k_row_off, _k_batch = _decode_side(
+            8, max_seqlen_k, seqinfo_k0, seqinfo_k1
+        )
+
+        seqlen_q_v = fx.Index(_seqlen_q_i32)
+        seqlen_k_v = fx.Index(_seqlen_k_i32)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_kv = lds.kv.ptr
@@ -996,11 +1108,13 @@ def build_flash_attn_func_aiw_module_primary(
             # Longest-processing-time-first: under causal, cost grows with
             # q_tile, so dispatching the expensive tiles first leaves only
             # cheap ones to fill the tail.
-            _ntiles = (seqlen_q_v + (BLOCK_M - 1)) // BLOCK_M
+            # Max_seqlen_q, not this sequence's length: the reversal has to
+            # be a permutation of the *grid*, whose y extent the host sized
+            # from Max_seqlen_q.
+            _ntiles = (fx.Index(max_seqlen_q) + (BLOCK_M - 1)) // BLOCK_M
             q_tile_idx = _ntiles - fx.Index(1) - fx.Index(gpu.block_idx.y)
         else:
             q_tile_idx = fx.Index(gpu.block_idx.y)
-        batch_idx = fx.Index(gpu.block_idx.z)
         q_start = q_tile_idx * BLOCK_M
 
         # MQA/GQA: Num_head_q / Num_head_k query heads share each KV head.
@@ -1039,8 +1153,10 @@ def build_flash_attn_func_aiw_module_primary(
             # Axis 0 (batch) still depends on the runtime seq_len, so it is
             # never a compile-time constant even here; only 1 and 2 fold.
             # Diagnostic arm only, and valid solely when seqlen_q == seqlen_k.
-            _stq = (seqlen_q_v * STRIDE_TOKEN, STRIDE_TOKEN, HEAD_DIM)
-            _stk = (seqlen_k_v * STRIDE_TOKEN, STRIDE_TOKEN, HEAD_DIM)
+            # Dense-only: it derives the layout from the shape, which varlen
+            # invalidates outright. The host rejects the combination.
+            _stq = (fx.Index(max_seqlen_q) * STRIDE_TOKEN, STRIDE_TOKEN, HEAD_DIM)
+            _stk = (fx.Index(max_seqlen_k) * STRIDE_TOKEN, STRIDE_TOKEN, HEAD_DIM)
             q_st = o_st = _stq
             k_st = v_st = _stk
             sm_log2e = fx.Float32(sm_scale * _LOG2E)
@@ -1056,9 +1172,13 @@ def build_flash_attn_func_aiw_module_primary(
         # untouched), and under MQA/GQA they carry Num_head_k rather than
         # Num_head_q, so their head stride differs from Q's by construction.
         # Assuming one shared layout is not a simplification, it is wrong.
-        def _addr_pair(st, head):
+        def _addr_pair(st, head, batch_index, row_off):
+            # `row_off` is the varlen row offset, and it belongs in the
+            # **64-bit base** rather than the 32-bit per-lane offset: on a
+            # packed tensor it is a whole-batch quantity and overflows 32 bits
+            # at realistic token counts (sdpa-varlen-plan.md section 5).
             s_batch, s_seq, s_head = st
-            bh = batch_idx * s_batch + head * s_head
+            bh = batch_index * s_batch + head * s_head + row_off * s_seq
 
             def tbase(tile_start):
                 """Uniform 64-bit element base for (batch, head, tile_start)."""
@@ -1072,10 +1192,14 @@ def build_flash_attn_func_aiw_module_primary(
 
         # Q and O are indexed by the query head; K and V by the KV head they
         # share. At num_head_q == num_head_k these coincide.
-        q_tbase, q_toff = _addr_pair(q_st, head_q)
-        k_tbase, k_toff = _addr_pair(k_st, head_k)
-        v_tbase, v_toff = _addr_pair(v_st, head_k)
-        o_tbase, o_toff = _addr_pair(o_st, head_q)
+        _q_batch_v = fx.Index(_q_batch)
+        _k_batch_v = fx.Index(_k_batch)
+        _q_row_off_v = fx.Index(_q_row_off)
+        _k_row_off_v = fx.Index(_k_row_off)
+        q_tbase, q_toff = _addr_pair(q_st, head_q, _q_batch_v, _q_row_off_v)
+        k_tbase, k_toff = _addr_pair(k_st, head_k, _k_batch_v, _k_row_off_v)
+        v_tbase, v_toff = _addr_pair(v_st, head_k, _k_batch_v, _k_row_off_v)
+        o_tbase, o_toff = _addr_pair(o_st, head_q, _q_batch_v, _q_row_off_v)
 
         def _kv_addr(tbase, toff, tile_start, row_in_tile, col):
             """(uniform base, divergent offset) for a KV row, clamped in bounds.
@@ -1460,39 +1584,6 @@ def build_flash_attn_func_aiw_module_primary(
         # Everything derived from a window stays fx.Int32 with explicit signed
         # predicates, per sdpa-gswa-plan.md section 2.4. fx.Index is unsigned,
         # so a negative window reaching it silently becomes enormous.
-        def _scmp_i32(pred, a, b):
-            """A *signed* integer compare. The `<` and `>` overloads on
-            fx.Int32 pick unsigned, which on a negative window silently
-            compares against something enormous -- plan section 2.4 rule 2."""
-            return ArithValue(
-                arith.cmpi(pred, _raw(fx.Int32(a)), _raw(fx.Int32(b)))
-            )
-
-        def _ssel_i32(pred, a, b):
-            return fx.Int32(ArithValue(pred).select(fx.Int32(a), fx.Int32(b)))
-
-        def _smin_i32(a, b):
-            return _ssel_i32(_scmp_i32(arith.CmpIPredicate.slt, a, b), a, b)
-
-        def _smax_i32(a, b):
-            return _ssel_i32(_scmp_i32(arith.CmpIPredicate.sgt, a, b), a, b)
-
-        def _sdiv_rd(x):
-            """floor(x / BLOCK_N), signed -- plan section 2.4 rule 4.
-
-            BLOCK_N is a power of two, so an arithmetic right shift *is* the
-            round-toward-negative-infinity division. `arith.divsi` truncates
-            toward zero instead, which is wrong for every window that reaches
-            past the start of the sequence: at BLOCK_N 32, floor(-1/32) is -1
-            but truncation gives 0, and the left run would then start one tile
-            too late and silently drop live columns.
-            """
-            return fx.Int32(
-                ArithValue(
-                    arith.shrsi(_raw(fx.Int32(x)), _raw(fx.Int32(_BLOCK_N_LOG2)))
-                )
-            )
-
         if const_expr(CAUSAL):
             _wr_i32 = fx.Int32(window_right)
             _wl_i32 = fx.Int32(window_left)
@@ -1535,7 +1626,7 @@ def build_flash_attn_func_aiw_module_primary(
             # smallest on the right.
             _q_start_i32 = fx.Int32(q_start)
             _q_hi_i32 = _smin_i32(
-                _q_start_i32 + fx.Int32(BLOCK_M), fx.Int32(seqlen_q)
+                _q_start_i32 + fx.Int32(BLOCK_M), _seqlen_q_i32
             )
             _q_last_i32 = _q_hi_i32 - fx.Int32(1)
 
@@ -1544,8 +1635,8 @@ def build_flash_attn_func_aiw_module_primary(
             # leaves a partial final tile, which must be masked rather than
             # counted as full. The old code spelled the same thing
             # `_full_seq`.
-            _blk_last = _sdiv_rd(fx.Int32(seqlen_k) - fx.Int32(1))
-            _blk_last_whole = _sdiv_rd(fx.Int32(seqlen_k)) - fx.Int32(1)
+            _blk_last = _sdiv_rd(_seqlen_k_i32 - fx.Int32(1))
+            _blk_last_whole = _sdiv_rd(_seqlen_k_i32) - fx.Int32(1)
 
             # The visited range: outside it every column is dead for every row
             # in this Q block, so those tiles are not walked at all.
@@ -2174,14 +2265,39 @@ def build_flash_attn_func_aiw_module_primary(
                         _raw(fx.Int32(0)),
                     )
                 ).select(fx.Float32(_lse), fx.Float32(float("inf")))
-                _lse_base = (
-                    batch_idx * fx.Index(num_head_q) + head_q
-                ) * fx.Index(lse_stride)
+                # LSE_LAYOUT, VarlenBits bits 17:16. The *inputs* are Q's
+                # decode -- batch, row offset, length -- so the two layouts
+                # are the same indices arranged two ways, not two features
+                # (sdpa-varlen-plan.md section 3.2).
+                #
+                #   _HT  (H, T)   AOTriton's, and the default: T contiguous
+                #   _TH  (T, H)   Transformer Engine's:         H contiguous
+                _row = _q_row_off_v + q_rows[qt]
+                _lse_off = (
+                    _q_batch_v * fx.Index(num_head_q) + head_q
+                ) * fx.Index(lse_stride) + _row
+                if const_expr(True):
+                    _is_th = ArithValue(
+                        arith.cmpi(
+                            arith.CmpIPredicate.ne,
+                            _raw(
+                                (fx.Int32(varlen_bits) >> fx.Int32(16))
+                                & fx.Int32(3)
+                            ),
+                            _raw(fx.Int32(0)),
+                        )
+                    )
+                    _lse_off_th = (
+                        _q_batch_v * fx.Index(lse_stride) + _row
+                    ) * fx.Index(lse_pitch) + head_q
+                    _lse_off = fx.Index(
+                        _is_th.select(fx.Index(_lse_off_th), fx.Index(_lse_off))
+                    )
                 _pointer_store(
                     _lse,
                     buffer_ops.get_element_ptr(
                         _pointer_to_llvm_ptr(L),
-                        fx.Int64(_lse_base + q_rows[qt]),
+                        fx.Int64(_lse_off),
                         elem_type=_f32_ty,
                     ),
                 )
@@ -2242,12 +2358,18 @@ def build_flash_attn_func_aiw_module_primary(
         V: fx.Pointer,
         O: fx.Pointer,  # noqa: E741
         L: fx.Pointer,
+        seqinfo_q0: fx.Pointer,
+        seqinfo_q1: fx.Pointer,
+        seqinfo_k0: fx.Pointer,
+        seqinfo_k1: fx.Pointer,
         batch_size: fx.Int32,
-        seqlen_q: fx.Int32,
-        seqlen_k: fx.Int32,
+        varlen_bits: fx.Int32,
+        max_seqlen_q: fx.Int32,
+        max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
         lse_stride: fx.Int64,
+        lse_pitch: fx.Int32,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
@@ -2270,7 +2392,10 @@ def build_flash_attn_func_aiw_module_primary(
         ctx = CompilationContext.get_current()
 
         bs_idx = fx.Index(batch_size)
-        sl_idx = fx.Index(seqlen_q)
+        # Grid Q extent keys on Max_seqlen_q: under varlen there is no single
+        # seqlen_q, so every sequence gets the longest one's worth of
+        # workgroups and the short ones exit empty (plan section 6).
+        sl_idx = fx.Index(max_seqlen_q)
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
 
         # Strides come from the caller, read off the real tensors -- never
@@ -2280,8 +2405,10 @@ def build_flash_attn_func_aiw_module_primary(
         # Always forwarded: with STRIDES_CONSTEXPR the kernel simply does not
         # read them, which is what keeps the two arms directly comparable.
         launcher = flash_attn_func_aiw_kernel(
-            Q, K, V, O, L, seqlen_q, seqlen_k,
-            window_left, window_right, lse_stride,
+            Q, K, V, O, L,
+            seqinfo_q0, seqinfo_q1, seqinfo_k0, seqinfo_k1,
+            varlen_bits, max_seqlen_q, max_seqlen_k,
+            window_left, window_right, lse_stride, lse_pitch,
             num_head_q, num_head_k,
             hdim_qk, hdim_vo,
             stride_q0, stride_q1, stride_q2,
@@ -2358,6 +2485,8 @@ def build_flash_attn_func_aiw_module_primary(
         "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
     }
 
+    _NULL_PTR = flyc.from_c_void_p(fx.Uint8, 0)
+
     def _ptr_arg(t):
         if hasattr(t, "data_ptr"):
             type_name = type(t).__name__
@@ -2391,7 +2520,7 @@ def build_flash_attn_func_aiw_module_primary(
             )
         return t.stride(0), t.stride(1), t.stride(2)
 
-    def _lse_args(lse, seq_len):
+    def _lse_args(lse, seq_len, varlen=None):
         """(pointer, row stride) for the logsumexp tensor; a null pointer skips it.
 
         The kernel gates on the pointer rather than on a build flag, matching
@@ -2399,7 +2528,7 @@ def build_flash_attn_func_aiw_module_primary(
         doubling the functional count.
         """
         if lse is None:
-            return flyc.from_c_void_p(fx.Uint8, 0), int(seq_len)
+            return _NULL_PTR, int(seq_len), 0
         if lse.dtype != torch_f32:
             raise ValueError(f"logsumexp must be float32, got {lse.dtype}")
         if lse.dim() != 2 or lse.stride(1) != 1:
@@ -2407,7 +2536,13 @@ def build_flash_attn_func_aiw_module_primary(
                 f"logsumexp must be rank 2 with a contiguous last dim, got "
                 f"shape {tuple(lse.shape)} strides {lse.stride()}"
             )
-        return _ptr_arg(lse), lse.stride(0)
+        # `_HT` reads `lse.stride(0)` as the token pitch and ignores the head
+        # pitch; `_TH` reads `lse.stride(0)` as the head pitch and takes the
+        # token count from the caller. Resolved here, never in the kernel.
+        _layout = 0 if varlen is None else (int(varlen["bits"]) >> 16) & 3
+        if _layout == 0:
+            return _ptr_arg(lse), lse.stride(0), 0
+        return _ptr_arg(lse), int(varlen["lse_tokens"]), lse.stride(0)
 
     # Where causal alignment lives now that the kernel has only {0, 3}.
     #
@@ -2424,6 +2559,46 @@ def build_flash_attn_func_aiw_module_primary(
         1: lambda sq, sk: (sq, 0),           # top-left
         2: lambda sq, sk: (sq, sk - sq),     # bottom-right
     }
+
+    # ---- VarlenBits, sdpa-varlen-plan.md section 2 ----
+    #
+    # One byte per side, decoded by the same kernel-side function twice, plus
+    # the LSE layout in byte 2. `0` is BHSD / MAX / IMPLIED on both sides with
+    # an (H, T) logsumexp -- the conventional dense case, and the default.
+    VARLEN_STACKED = 1
+    VARLEN_LENGTH_MAX = 0 << 1
+    VARLEN_LENGTH_CUMULATIVE = 1 << 1
+    VARLEN_LENGTH_INDIVIDUAL = 2 << 1
+    VARLEN_POSITION_IMPLIED = 0 << 3
+    VARLEN_POSITION_REUSE = 1 << 3
+    VARLEN_POSITION_ARRAY = 2 << 3
+    # `_HT` is AOTriton's and this kernel's default: shape (H, T), T
+    # contiguous. `_TH` is Transformer Engine's (T, H).
+    VARLEN_LSE_LAYOUT_HT = 0 << 16
+    VARLEN_LSE_LAYOUT_TH = 1 << 16
+
+    def varlen_bits(q_side=0, k_side=0, lse_layout=VARLEN_LSE_LAYOUT_HT):
+        """Assemble VarlenBits from per-side bytes."""
+        for name, b in (("q_side", q_side), ("k_side", k_side)):
+            if not 0 <= b <= 0xFF:
+                raise ValueError(f"{name} must fit in a byte, got {b:#x}")
+            if (b >> 3) & 3 == 1 and (b >> 1) & 3 != 1:
+                # REUSE takes a *position* out of the length array, which is
+                # only a position when the lengths are cumulative.
+                raise ValueError(
+                    f"{name}={b:#04x}: POSITION=REUSE requires "
+                    f"LENGTH=CUMULATIVE (plan section 1, axis C)"
+                )
+            if (b >> 1) & 3 == 3 or (b >> 3) & 3 == 3:
+                raise ValueError(f"{name}={b:#04x} uses a reserved code")
+        return q_side | (k_side << 8) | lse_layout
+
+    VARLEN_DENSE = 0
+    VARLEN_COMPACT_SIDE = (
+        VARLEN_STACKED | VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_REUSE
+    )                                                              # 0x0B
+    VARLEN_PADDED_SIDE = VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_IMPLIED
+                                                                   # 0x02
 
     def _resolve_window(window, seqlen_q, seqlen_k):
         """(window_left, window_right), signed, as the kernel wants them.
@@ -2466,6 +2641,30 @@ def build_flash_attn_func_aiw_module_primary(
             return 1.0 / host_math.sqrt(Q.shape[3])
         return float(sm_scale)
 
+    def _varlen_args(varlen, seqlen_q, seqlen_k):
+        """(bits, q0, q1, k0, k1, max_q, max_k) in launch order.
+
+        `varlen` is None for the dense case, else a dict with `bits` and
+        whichever `seqinfo_*` tensors that configuration reads. Unread slots
+        stay **null**, which is safe because the kernel's decode branches
+        rather than selects -- see the prologue.
+        """
+        if varlen is None:
+            return (0, _NULL_PTR, _NULL_PTR, _NULL_PTR, _NULL_PTR,
+                    int(seqlen_q), int(seqlen_k))
+        if STRIDES_CONSTEXPR:
+            raise ValueError(
+                "strides_constexpr derives the layout from the shape, which "
+                "varlen invalidates; it is a dense-only diagnostic arm"
+            )
+        bits = int(varlen["bits"])
+        got = tuple(
+            _ptr_arg(varlen[k]) if varlen.get(k) is not None else _NULL_PTR
+            for k in ("seqinfo_q0", "seqinfo_q1", "seqinfo_k0", "seqinfo_k1")
+        )
+        return (bits,) + got + (int(varlen["max_seqlen_q"]),
+                                int(varlen["max_seqlen_k"]))
+
     def _prep(Q, K, V, O):  # noqa: E741
         """Pointers, head counts and the twelve strides, in launch order.
 
@@ -2492,42 +2691,54 @@ def build_flash_attn_func_aiw_module_primary(
 
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
-    def _launch(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None):  # noqa: E741
+    def _launch(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
-        _lse_p, _lse_s = _lse_args(lse, seqlen_q)
+        _lse_p, _lse_s, _lse_pitch = _lse_args(lse, seqlen_q, varlen)
         _wl, _wr = _resolve_window(window, seqlen_q, seqlen_k)
+        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(
+            varlen, seqlen_q, seqlen_k
+        )
         _run_compiled(
             launch_flash_attn_aiw,
             *ptrs,
             _lse_p,
+            _sq0, _sq1, _sk0, _sk1,
             batch_size,
-            seqlen_q,
-            seqlen_k,
+            _vb,
+            _mq,
+            _mk,
             _wl,
             _wr,
             _lse_s,
+            _lse_pitch,
             *meta,
             *st,
             _resolve_scale(Q, scale),
             stream if stream is not None else fx.Stream(None),
         )
 
-    def _compile(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None):  # noqa: E741
+    def _compile(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
-        _lse_p, _lse_s = _lse_args(lse, seqlen_q)
+        _lse_p, _lse_s, _lse_pitch = _lse_args(lse, seqlen_q, varlen)
         _wl, _wr = _resolve_window(window, seqlen_q, seqlen_k)
+        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(
+            varlen, seqlen_q, seqlen_k
+        )
         return flyc.compile(
             launch_flash_attn_aiw,
             *ptrs,
             _lse_p,
+            _sq0, _sq1, _sk0, _sk1,
             batch_size,
-            seqlen_q,
-            seqlen_k,
+            _vb,
+            _mq,
+            _mk,
             _wl,
             _wr,
             _lse_s,
+            _lse_pitch,
             *meta,
             *st,
             _resolve_scale(Q, scale),
