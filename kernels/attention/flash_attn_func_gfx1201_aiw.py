@@ -170,6 +170,13 @@ def _pointer_store(value: ir.Value, ptr: ir.Value):
     return _llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
 
 
+# Causal alignment as a *window* sentinel, AOTriton's `WindowValue`. These
+# occupy two values a real bound never takes, so `Window_left`/`Window_right`
+# stay plain signed integers rather than gaining a discriminant.
+_WINDOW_TOPLEFT = -2147483647    # 0x80000001
+_WINDOW_BOTRIGHT = -2147483646   # 0x80000002
+
+
 # ---------------------------------------------------------------------------
 # Tuning policy
 #
@@ -1613,8 +1620,43 @@ def build_flash_attn_func_aiw_module_primary(
         # predicates, per sdpa-gswa-plan.md section 2.4. fx.Index is unsigned,
         # so a negative window reaching it silently becomes enormous.
         if const_expr(CAUSAL):
-            _wr_i32 = fx.Int32(window_right)
+            # ---- parse_window: resolve the causal sentinels per sequence ----
+            #
+            # `Window_left`/`Window_right` may carry 0x80000001 (top-left) or
+            # 0x80000002 (bottom-right) instead of a literal bound, and the
+            # kernel resolves them against *this sequence's* lengths.
+            #
+            # That is the whole reason the sentinels exist. Resolving on the
+            # host works only when there is one length to resolve against:
+            # under varlen, bottom-right needs `seqlen_k[z] - seqlen_q[z]`,
+            # and the batch-wide `Max_seqlen_k - Max_seqlen_q` is a different
+            # number for every sequence whose difference is not the maximum.
+            #
+            # Both sentinels give an unbounded left edge -- no row reaches
+            # further back than the start of its own sequence -- so they
+            # differ only in the right one. Matches AOTriton's `parse_window`.
             _wl_i32 = fx.Int32(window_left)
+            _wr_i32 = fx.Int32(window_right)
+            _is_tl_l = _scmp_i32(
+                arith.CmpIPredicate.eq, _wl_i32, fx.Int32(_WINDOW_TOPLEFT)
+            )
+            _is_br_l = _scmp_i32(
+                arith.CmpIPredicate.eq, _wl_i32, fx.Int32(_WINDOW_BOTRIGHT)
+            )
+            _wl_i32 = _ssel_i32(
+                ArithValue(arith.ori(_raw(_is_tl_l), _raw(_is_br_l))),
+                _seqlen_q_i32, _wl_i32,
+            )
+            _wr_i32 = _ssel_i32(
+                _scmp_i32(arith.CmpIPredicate.eq, _wr_i32,
+                          fx.Int32(_WINDOW_TOPLEFT)),
+                fx.Int32(0), _wr_i32,
+            )
+            _wr_i32 = _ssel_i32(
+                _scmp_i32(arith.CmpIPredicate.eq, fx.Int32(window_right),
+                          fx.Int32(_WINDOW_BOTRIGHT)),
+                _seqlen_k_i32 - _seqlen_q_i32, _wr_i32,
+            )
 
         # ---- Split the KV range into full and masked regions ----
         #
@@ -2604,20 +2646,23 @@ def build_flash_attn_func_aiw_module_primary(
                 )
         return _ptr_arg(lse)
 
-    # Where causal alignment lives now that the kernel has only {0, 3}.
+    # Causal alignment is expressed as a *sentinel* window, resolved in the
+    # kernel against each sequence's own lengths (`parse_window` in the
+    # prologue). The host does not resolve it.
     #
-    # `window_left = seqlen_q` is "unbounded": no row can reach further back
-    # than the start of its own sequence, so the left edge of the band never
-    # binds and the mask degenerates to a diagonal. This is `calculate_swa` in
-    # AOTriton's `mha_fwd_aot`.
+    # It used to: `_CAUSAL_WINDOW` mapped causal_type 1/2 to literal bounds
+    # using the single (seqlen_q, seqlen_k) pair passed to the launcher. That
+    # is correct only when there is one such pair. Under varlen it silently
+    # gave bottom-right the batch-wide `Max_seqlen_k - Max_seqlen_q` for every
+    # sequence, which is wrong for all but the longest -- and invisible to any
+    # test whose sequences share a uniform k-q difference, since then the two
+    # numbers coincide.
     #
-    # It has to be resolved *here* rather than at build time because both
-    # entries depend on the runtime lengths -- which is also why the varlen
-    # sentinels of step 4 exist: with per-sequence lengths there is no single
-    # seqlen_q to compute a uniform window from.
-    _CAUSAL_WINDOW = {
-        1: lambda sq, sk: (sq, 0),           # top-left
-        2: lambda sq, sk: (sq, sk - sq),     # bottom-right
+    # Resolving in one place removes the class of bug rather than the
+    # instance.
+    _CAUSAL_SENTINEL = {
+        1: _WINDOW_TOPLEFT,      # j <= i
+        2: _WINDOW_BOTRIGHT,     # j <= i + (seqlen_k - seqlen_q)
     }
 
     # ---- VarlenBits, sdpa-varlen-plan.md section 2 ----
@@ -2747,16 +2792,21 @@ def build_flash_attn_func_aiw_module_primary(
         Non-causal still forwards a pair so both arms share one ABI and stay
         directly comparable -- the same reason the strides are always passed
         even under STRIDES_CONSTEXPR.
+
+        Causal alignments forward a *sentinel*, not a bound: the kernel
+        resolves it per sequence, which is the only correct thing to do once
+        there is more than one sequence.
         """
         if CAUSAL_TYPE == 0:
             return 0, 0
-        if HOST_CAUSAL_TYPE in _CAUSAL_WINDOW:
+        if HOST_CAUSAL_TYPE in _CAUSAL_SENTINEL:
             if window is not None:
                 raise ValueError(
                     f"causal_type={HOST_CAUSAL_TYPE} already fixes the window; "
                     "pass causal_type=3 to choose one"
                 )
-            wl, wr = _CAUSAL_WINDOW[HOST_CAUSAL_TYPE](seqlen_q, seqlen_k)
+            _s = _CAUSAL_SENTINEL[HOST_CAUSAL_TYPE]
+            wl, wr = _s, _s
         else:
             if window is None:
                 raise ValueError(

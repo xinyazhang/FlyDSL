@@ -1042,7 +1042,12 @@ def test_varlen_compact_lengths(lens_q, label, ctype):
     """
     _require_env()
     head_dim = 64
-    lens_k = [x + 7 if x else 0 for x in lens_q]
+    # The k-q difference **varies per sequence**, deliberately. A uniform
+    # difference makes `seqlen_k[z] - seqlen_q[z]` equal the batch-wide
+    # `Max_seqlen_k - Max_seqlen_q`, which hides any bottom-right
+    # implementation that resolves the diagonal per batch instead of per
+    # sequence -- it did exactly that, and every uniform test passed.
+    lens_k = [x + 3 + 17 * i if x else 0 for i, x in enumerate(lens_q)]
     N = len(lens_q)
     q, k, v, cq, ck = _packed_qkv(lens_q, lens_k, head_dim)
     o = torch.zeros_like(q)
@@ -1056,6 +1061,38 @@ def test_varlen_compact_lengths(lens_q, label, ctype):
     torch.cuda.synchronize()
     _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck,
                                  f"compact/{label}/ctype={ctype}")
+
+
+def test_varlen_bottom_right_diagonal_is_per_sequence():
+    """Bottom-right causal must use *this sequence's* `seqlen_k - seqlen_q`.
+
+    The reason `Window_left`/`Window_right` carry sentinels (`0x80000001`,
+    `0x80000002`) rather than resolved bounds: the alignment can only be
+    turned into a number once the lengths are known, and under varlen there
+    is one pair per sequence. Resolving on the host gave every sequence the
+    batch-wide difference.
+
+    The length set below has a k-q difference that varies per sequence *and*
+    is not the maximum for most of them, which is what makes the two
+    resolutions disagree. With a uniform difference they coincide and this
+    test cannot fail.
+    """
+    _require_env()
+    head_dim = 64
+    lens_q = [64, 96, 40]
+    lens_k = [64 + 5, 96 + 40, 40 + 3]   # differences 5, 40, 3; batch-wide 40
+    N = len(lens_q)
+    q, k, v, cq, ck = _packed_qkv(lens_q, lens_k, head_dim)
+    o = torch.zeros_like(q)
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, causal_type=2,
+        dtype_str="f16",
+    )
+    mq, mk = max(lens_q), max(lens_k)
+    exe(q, k, v, o, N, mq, mk, varlen=exe.varlen_compact(cq, ck, mq, mk))
+    torch.cuda.synchronize()
+    _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck,
+                                 "bottom-right/varlen")
 
 
 def test_varlen_zero_length_writes_nothing():
@@ -1344,7 +1381,8 @@ def test_varlen_seqused_k_shortens_only_k(k_is_cache):
 # seqlen_q throughout.
 
 _SUITE_B_Q = [200, 0, 37, 1, 128, 3, 96]
-_SUITE_B_K = [x + 13 if x else 0 for x in _SUITE_B_Q]
+# Non-uniform k-q differences, per the note in suite A.
+_SUITE_B_K = [x + 5 + 11 * i if x else 0 for i, x in enumerate(_SUITE_B_Q)]
 
 
 def _suite_b_case(mode, head_dim, n_head_k):

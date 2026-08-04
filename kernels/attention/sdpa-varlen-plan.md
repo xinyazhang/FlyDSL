@@ -571,10 +571,33 @@ a dense call on the *truncated* K, and *unequal* to one on the full K. Only
 the second fails if the used length is ignored.
 
 ### Step 4 — the window sentinels (P6 step 4)
+
 `parse_window` moves into the kernel: `0x80000001 → (seqlen_q, 0)` and
-`0x80000002 → (seqlen_q, seqlen_k - seqlen_q)`, per sequence. The host-side
-`_CAUSAL_WINDOW` stays for the dense path — it costs nothing there and keeps
-the sentinel off the hot path — but the two must agree, which §7 tests.
+`0x80000002 → (seqlen_q, seqlen_k - seqlen_q)`, per sequence.
+
+~~The host-side `_CAUSAL_WINDOW` stays for the dense path.~~ **It does not.**
+Keeping two resolutions that "must agree" was the wrong call, and not
+hypothetically: the host one was already wrong. It mapped `causal_type=2` to a
+bound from the single `(seqlen_q, seqlen_k)` pair handed to the launcher,
+which under varlen is `(Max_seqlen_q, Max_seqlen_k)` — so every sequence got
+the *batch-wide* difference rather than its own.
+
+**Nothing caught it**, because every length set in §7 used a uniform `k - q`
+difference, which makes `seqlen_k[z] - seqlen_q[z]` identical to
+`Max_seqlen_k - Max_seqlen_q`. A bitwise gate proves nothing when the two
+quantities being compared coincide by construction.
+
+So the sentinel resolves in the kernel for *every* configuration, dense
+included, and the host resolves nothing. One source of truth removes the class
+rather than the instance. Cost is two scalar compares in the prologue, and
+dense output stays bit-identical.
+
+**Outcome — met, plus that bug.** Reproduced with differences 5, 40, 3 against
+a batch-wide 40: two of three sequences wrong, and the one that passed was the
+one where the numbers happened to agree. §7's length sets now vary `k - q` per
+sequence, and a dedicated regression test uses differences that are *not* the
+maximum for most sequences — the condition under which the two resolutions
+disagree.
 
 ---
 
