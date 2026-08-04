@@ -120,14 +120,22 @@ One byte per side, identically decoded, so the kernel has **one** decoder
 called twice.
 
 ```
-  bits  0      STACKED     0 = BHSD              1 = 1THD
+  per-side byte:
+  bit   0      STACKED     0 = BHSD              1 = 1THD
   bits  2:1    LENGTH      0 = MAX               1 = CUMULATIVE   2 = INDIVIDUAL
-  bits  3      POSITION    0 = IMPLIED           1 = ARRAY
+  bit   3      POSITION    0 = IMPLIED           1 = ARRAY
   bits  7:4    reserved
 
-  VarlenBits = q_byte | (k_byte << 8)
-  bits 31:16   reserved   (paged KV, §8)
+  bits  7:0    Q side
+  bits 15:8    K side
+  bits 17:16   LSE_LAYOUT  0 = HEAD_MAJOR        1 = TOKEN_MAJOR  2,3 reserved
+  bits 23:18   reserved
+  bits 31:24   reserved    (paged KV, §9.1)
 ```
+
+Byte 2 holds the LSE layout (§3.2); two bits rather than one, deliberately, so
+that padded and blocked LSE arrangements have somewhere to go without another
+ABI change.
 
 `VarlenBits == 0` is BHSD / MAX / IMPLIED on both sides — the conventional
 dense case, and the default, exactly as required.
@@ -186,17 +194,43 @@ lse_stride = s1_q[N] if q_posmode else (N * max_seqlen_q if q_stacked
                                         else max_seqlen_q)
 ```
 
-### 3.2 LSE is not a fourth choice
+### 3.2 LSE: the *indices* are derived, the *layout* is not
 
 Plan1 resolved LSE as one branch-free offset formula, `(b*H + h)*S + s`. Under
-this decomposition that is **exactly Q's addressing applied to a rank-2
-tensor**: `b = batch_index_q`, `s = row_off_q`, `S = lse_stride`. So the
-`(B*H, Max_seqlen_q)` and `(H, TotalS)` layouts are not modes to select
-between — they are what the formula produces for `BATCHED` and `STACKED`. No
-LSE bits, and nothing to keep in sync.
+this decomposition the **inputs** are exactly Q's addressing applied to a
+rank-2 tensor: `b = batch_index_q`, `s = row_off_q`, `S = lse_stride`. So
+`(B*H, Max_seqlen_q)` and `(H, TotalS)` are not modes to select between — they
+are what the formula produces for `BATCHED` and `STACKED`, and no bits are
+needed to distinguish them.
 
-This is the strongest evidence that the decomposition is the right one: a
-choice that looked independent turns out to be derived.
+**But the arrangement of those indices in memory is a separate choice**, and
+an earlier draft of this plan claimed otherwise. Transformer Engine — which
+uses AOTriton as a backend — requires LSE in the `(T_q, H_q)` **layout**, not
+merely that shape. PyTorch's varlen documentation specifies a shape and says
+nothing about memory, but TE's requirement is real and no value of
+`lse_stride` produces the transpose.
+
+This is plan1 §0 applying to LSE exactly as it applies to Q/K/V/O: *shape does
+not imply layout*. Having asserted that principle for the rank-4 tensors and
+then quietly assumed the rank-2 one was head-major was inconsistent.
+
+Two formulas, selected by `LSE_LAYOUT`:
+
+| `LSE_LAYOUT`    | offset                                 | contiguous axis | pitch        |
+| --------------- | -------------------------------------- | --------------- | ------------ |
+| 0 `HEAD_MAJOR`  | `(b * H + h) * lse_stride + s`         | token           | `lse_stride` |
+| 1 `TOKEN_MAJOR` | `(b * lse_stride + s) * lse_pitch + h` | head            | `lse_pitch`  |
+
+`lse_stride` keeps its meaning — tokens per row-group — and continues to come
+from `lse.stride(0)` on the host (§4.2). `lse_pitch` is one new scalar, the
+head-axis pitch, which is `>= num_head_q` so that **padding for alignment is
+free in either layout**: head-major pads via `lse_stride`, token-major via
+`lse_pitch`. That is why the field is two bits and not one — a padded or
+blocked arrangement that neither formula covers has somewhere to go without
+another ABI change.
+
+`LSE_LAYOUT == 0` is the default and today's behaviour, so `VarlenBits == 0`
+remains the conventional dense case.
 
 ---
 
@@ -260,7 +294,10 @@ construction for every layout in §2 — `TotalS` for `(H, TotalS)`,
 `Max_seqlen_q` for `(B*H, Max_seqlen_q)`. Keep that: it removes a scalar load
 from the prologue and a host/device round trip from the caller.
 
-This does leave one thing unexpressible; see item V2 in §11.
+What it does *not* supply is the head-axis pitch, which `TOKEN_MAJOR` needs:
+`lse_pitch` is a second scalar, read from `lse.stride(0)` of a token-major
+tensor while `lse_stride` then comes from its logical token count. The host
+resolves which is which from `LSE_LAYOUT`; the kernel does not.
 
 ---
 
@@ -391,9 +428,10 @@ rows — not to build the full product now.
 ## 8. Steps
 
 ### Step 1 — bits, decoder, and the stacked/cumulative path
-`VarlenBits`, the four `seqinfo` pointers, the §3.1 decoder, the six scalars,
-the empty-work path, LSE via §3.2. Enable `0x0000` and `0x0B0B` only; reject
-other bytes with a clear error.
+`VarlenBits`, the four `seqinfo` pointers, `lse_pitch`, the §3.1 decoder, the
+six scalars, the empty-work path, and both LSE layouts (§3.2 — `TOKEN_MAJOR`
+is two lines here and a migration later). Enable `0x0000` and `0x0B0B` only;
+reject other bytes with a clear error.
 
 **Gate:** §7 property 1, then the headline gate for compact. Dense must be
 **bit-identical to today** — it will be if the decoder folds at `bits == 0`.
@@ -408,7 +446,9 @@ Enables `0x0D0B` and `0x040B` — the PyTorch `seqused_k` cases. Two lines in th
 decoder plus §7 property 4.
 
 Strided varlen needs **no step**: it is `0x0B0B` with a different pointer
-(§1.2). Add it to the test matrix, not to the kernel.
+(§1.2). Add it to the test matrix, not to the kernel — and add the role
+invariant of V5 as a comment where the two pointers are read, since that is the
+line a future shortcut would break.
 
 ### Step 4 — the window sentinels (P6 step 4)
 `parse_window` moves into the kernel: `0x80000001 → (seqlen_q, 0)` and
@@ -431,7 +471,7 @@ then skip `b[z]` rows", which is unusual but well-defined and free. What falls
    `(total_pages, page_size, H, D)`. A sequence is then a *list* of physical
    pages, so position is per-page, not per-sequence, and no scalar `row_off`
    can express it. This needs an indirection load inside the KV loop — a real
-   feature, not an encoding gap. Bits 31:16 are reserved for it.
+   feature, not an encoding gap. Byte 3 (bits 31:24) is reserved for it.
 2. **Per-sequence head counts or head dims.** Not expressible, and not a thing
    any API asks for.
 3. **Differing `N` between Q and K.** The sequence count is shared by
@@ -452,89 +492,106 @@ semantics, and both are cheap to guard on the host.
 
 ---
 
-## 10. Items to resolve
+## 10. Resolved
 
-Recommendations given, but these are yours to settle before step 1.
+All eight settled; recorded with the reasoning, not just the verdict.
 
-### V1 — `VarlenBits` runtime or constexpr?
+### [V1 — RESOLVED] `VarlenBits` is a runtime argument
 
-**Recommend runtime.** A build axis multiplies the functional count by the
-number of shipped configurations, against a tuning key that is currently
-`BLOCK_DMODEL` alone (N3). The decode is ~10 scalar ops and at most six scalar
-loads, once per workgroup, entirely in SGPRs — and D2 already priced runtime
-scalars at ~0.2%. The prologue branch is uniform and outside every loop.
+Not a build axis: the combinations cannot be afforded. The tuning key stays
+`BLOCK_DMODEL` alone (N3), and a build axis would multiply the functional count
+by the number of shipped configurations — of which there are already seven in
+§7's suite B, before bias and dropout add theirs.
 
-Cost of being wrong: if it measures badly at small head_dim, `bits == 0` can be
-promoted to a constexpr *specialisation* later without changing the ABI.
+The decode is ~10 scalar ops and at most six scalar loads, once per workgroup,
+entirely in SGPRs; D2 priced runtime scalars at ~0.2%. If `bits == 0` ever
+measures badly it can be promoted to a *specialisation* later without an ABI
+change.
 
-### V2 — LSE layout: is `(T_q, H_q)` in scope?
+### [V2 — RESOLVED] `LSE_LAYOUT`, two bits, in byte 2
 
-`torch.nn.attention.varlen` returns LSE with shape **`(T_q, H_q)`** —
-token-major. Our formula is `(b*H + h) * lse_stride + s`, which is head-major,
-and **no value of `lse_stride` produces the transpose**. AOTriton is head-major
-too, so this is a PyTorch-shim question, not an AOTriton-parity one.
+The concern was real and my framing of it was not: I had called the LSE layout
+"derived". **PyTorch specifies a shape and says nothing about memory, but
+Transformer Engine — an AOTriton backend — requires the `(T_q, H_q)`
+layout.** So it is a live requirement, not a hypothetical.
 
-Three options:
+Two bits rather than one, because efficient-attention implementations pad the
+LSE layout for alignment and the field should have room for arrangements
+neither current formula covers. Padding itself needs no new codes — §3.2's
+`lse_stride` and `lse_pitch` absorb it in either layout.
 
-|                                               |                                                 |
-| --------------------------------------------- | ----------------------------------------------- |
-| head-major only, shim transposes              | zero kernel cost, one copy per call in the shim |
-| add a head stride: `b*s_lb + h*s_lh + s*s_ls` | covers both, stays branch-free, +2 scalar args  |
-| defer                                         | fine if no caller needs `(T_q, H_q)` yet        |
+### [V3 — RESOLVED] Ship Q-side `INDIVIDUAL`
 
-**Recommend the second.** It is two extra arguments and no branch, it makes the
-LSE tensor as layout-agnostic as Q/K/V/O already are (plan1 §0), and it removes
-a special case the backward pass would otherwise inherit.
+PyTorch exposes only `seqused_k`; others may want the Q side. Symmetry is free
+— the decoder is one function called twice — whereas rejecting it would cost a
+validation branch and an asymmetry to explain.
 
-### V3 — Q-side `INDIVIDUAL` lengths: ship or reject?
+### [V4 — RESOLVED] Host assertions as *documentation*
 
-PyTorch only exposes `seqused_k`, never `seqused_q`. The bits make the Q side
-symmetric for free.
+The §9.4 and §9.5 assumptions — `seqinfo_?1` is a prefix sum with its total in
+slot `[N]`, and sequences do not overlap — are written as documented
+preconditions on the launch shim, with the assertion spelled out in the
+docstring so a reader can see exactly what is assumed.
 
-**Recommend shipping it**, because rejecting it costs a validation branch and
-an asymmetry to explain, while accepting it costs nothing — the decoder is
-called twice with the same code either way. Leave it untested beyond one smoke
-case.
+Not enforced on every call: checking them means reading the `seqinfo` tensors
+back to the host, which is a device sync on the hot path. The document is the
+contract; the check is available to anyone debugging.
 
-### V4 — where do the §9 host-side guards live?
+### [V5 — RESOLVED] Strided ships without a kernel step — the risk, stated precisely
 
-Two assumptions the encoding does not enforce: `seqinfo_?1` is a prefix sum
-with the total in slot `[N]` (§9.4), and sequences do not overlap (§9.5).
+My original flag was too vague to act on. The concern is not that strided is
+wrong today. It is that §1.2's equivalence rests on an invariant that **nothing
+in the kernel enforces**:
 
-**Recommend host-side asserts in the launch shim**, cheap and off the device.
-But they cost a device→host read of the `seqinfo` tensors, which is a sync.
-So: **debug-only**, behind the same switch the existing shape validation uses,
-not on every call.
+> every read of a *position* goes to `seqinfo_?1`, and every read of a *length*
+> goes to `seqinfo_?0`.
 
-### V5 — strided varlen ships with no kernel step
+Compact varlen passes the *same pointer* as both, which makes the two roles
+indistinguishable in the common case. So a future edit that takes a length
+from `?1` — say `?1[z+1] - ?1[z]`, which is a natural-looking shortcut —
+**passes every compact test and silently breaks strided**, because for strided
+that difference is the *padded* extent, not the real length. The bug would be
+invisible in exactly the configuration everyone runs.
 
-Per §1.2 it is compact with a different `seqinfo_?1`. That means **nothing in
-the kernel is written for it** and its correctness rests entirely on suite B
-plus §7 property 2.
+Three mitigations, all cheap:
 
-Flagging it because "we support strided varlen" and "we never wrote any code
-for strided varlen" are both true, and the second is the surprising one.
+1. §7 property 2 is the load-bearing test — a strided case with non-zero gaps.
+   It must exist before strided is claimed, not after.
+2. The decoder comments the invariant at the point where the two pointers are
+   read, since that is where a shortcut would be introduced.
+3. Suite B's strided row uses gaps that differ *per sequence*, so a uniform-gap
+   implementation does not accidentally pass.
 
-### V6 — does `N` reuse `batch_size`?
+Noted alongside: AOTriton's strided path is deployed but incompatible with
+`torch.nn.attention.varlen`, which supplies `cu_seq_k` rather than
+`cu_seqlens_padded`, so a **shim cumsum kernel** builds the position array.
+That cumsum belongs on the host side of our shim too — the kernel takes
+whatever array it is handed and does not know which it is, which is the point.
 
-AOTriton sets `.Batch = num_seqlens == 0 ? batch : num_seqlens`, i.e. reuses
-the slot. **Recommend the same** — the grid's z extent is the sequence count in
-both readings, and a second argument would only be able to disagree.
+### [V6 — RESOLVED] `N` reuses `batch_size`
 
-### V7 — `Max_seqlen_q/k` stay as arguments
+As AOTriton does (`.Batch = num_seqlens == 0 ? batch : num_seqlens`). The grid's
+z extent is the sequence count under both readings, and a second argument could
+only ever disagree with the first.
 
-Needed even in varlen: `Max_seqlen_q` sizes the grid, and both appear in
-`IMPLIED` positions and `MAX` lengths. **Recommend keeping them unconditional**
-rather than overloading them per mode. Noting it only because objective 3's
-grep criterion names `Max_seqlen_*` — they may appear in the *prologue* and the
-*launcher*, nowhere else.
+### [V7 — RESOLVED] `Max_seqlen_q/k` stay unconditional
 
-### V8 — is the §6.2 grid-waste measurement in scope?
+Kept as plain arguments even where a mode never reads them, so the shim may
+pass anything in those cases. Precisely, the kernel reads them only when:
 
-It is a benchmark, not a feature, and it belongs to persistent-dynamic.
-**Recommend doing it here anyway**: it is ~20 lines against a skewed length
-distribution, and the alternative is that persistent-dynamic starts with an
-intuition. Say so now if you would rather defer it.
+| argument       | read when                                                |
+| -------------- | -------------------------------------------------------- |
+| `Max_seqlen_q` | Q `LENGTH == MAX`, or Q `POSITION == IMPLIED && STACKED` |
+| `Max_seqlen_k` | K `LENGTH == MAX`, or K `POSITION == IMPLIED && STACKED` |
+
+The host needs `Max_seqlen_q` unconditionally regardless, to size the grid.
+
+### [V8 — RESOLVED] Collect the grid-waste measurement here
+
+No harm, and persistent-dynamic then starts from a number rather than an
+intuition. ~20 lines against a skewed length distribution, reported as the
+idle-workgroup fraction `1 - mean(seqlen)/max(seqlen)` alongside measured
+throughput.
 
 ---
 
