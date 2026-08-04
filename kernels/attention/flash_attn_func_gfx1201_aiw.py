@@ -985,15 +985,20 @@ def build_flash_attn_func_aiw_module_primary(
         # rather than merely correct.
         _z_i32 = fx.Int32(gpu.block_idx.z)
 
+        # The `seqinfo` arguments arrive as untyped byte pointers, so type
+        # them once and index in elements. `fx.recast_iter` + `fx.ptr_load` is
+        # the DSL idiom (see `kernels/moe/moe_a8w4_mxscale_gfx1250.py`); going
+        # through a raw LLVM GEP works but hand-rolls what the pointer type
+        # already knows, and gets the element scaling wrong by default.
+        _i32_gptr = fx.PointerType.get(
+            elem_ty=fx.Int32.ir_type,
+            address_space=fx.AddressSpace.Global,
+            alignment=4,
+        )
+
         def _seqinfo_at(ptr, idx_i32):
             return fx.Int32(
-                _pointer_load(
-                    T.i32,
-                    buffer_ops.get_element_ptr(
-                        _pointer_to_llvm_ptr(ptr), fx.Int64(idx_i32),
-                        elem_type=T.i32,
-                    ),
-                )
+                fx.ptr_load(fx.recast_iter(_i32_gptr, ptr) + fx.Int64(idx_i32))
             )
 
         def _decode_side(bits_shift, max_seqlen, s0, s1):
