@@ -78,6 +78,10 @@ Written arch-agnostic from the start, which is cheaper than retrofitting:
 - **No wave-size or layout assumptions.** The module maps
   `(seed, offset) -> N randoms`. How a caller assigns offsets to elements is
   the caller's business — that is §3, and it lives in the attention kernel.
+- **Two entry points over one core**, §4.2: a *block* form that returns an
+  `M x N` tile and a *streamed* form that returns one row, for callers that
+  cannot afford the tile in registers. Both call the same round function, and
+  §4.2 requires them to agree bit for bit.
 - **Width is a parameter, not a constant.** `PHILOX_WIDTH ∈ {32, 64}` selects
   the variant; the round constants and lane type follow from it. A caller that
   does not care takes the per-arch default.
@@ -255,6 +259,85 @@ elements is **eight contiguous columns** — one 64-bit call, or two 32-bit
 calls. That halves the offset arithmetic and the registers holding results,
 and doubles the headroom before §3.2's overflow.
 
+### 4.1 Register pressure is the second axis, and the benchmark must report it
+
+Throughput is not the only difference. Philox's state is `c0..c3` plus
+`k0, k1` — **six registers at 32-bit lanes, twelve at 64-bit**, since each
+`u64` occupies a register pair. Outputs differ the same way: 4 x u32 against
+8 x u32, held until consumed. So the 64-bit variant costs roughly ten more
+VGPRs in a kernel that already spills at head_dim 192 and above (plan1 §6.2).
+
+Two things bound that, and they are worth stating because they say where to
+look:
+
+- **Dropout extends nothing's lifetime.** It sits between the row sum and the
+  `exp2(m_i - m_new)` correction — in Triton's shape, between `l_ij` and
+  `alpha`. Everything live across that window (`p`, the O accumulators, `m`,
+  `l`) is live with or without dropout. The added pressure is Philox's own
+  state and the randoms, both of which die inside the window.
+- **Randoms are consumed per group.** Applying eight columns at a time keeps
+  at most one call's output live rather than a whole tile's — and §4.2 takes
+  that further.
+
+Bounded is not zero at head_dim 192+, where ten registers is the difference
+between spilling and not. So the microbenchmark reports **VGPR count alongside
+randoms/second**, and step 3 re-checks spills after integration: a PRNG
+measured in isolation has the whole register file to itself, which is not the
+situation it will be in.
+
+### 4.2 Experimental: streamed generation, one row at a time
+
+`PHILOX_WIDTH` trades ALU against registers. This trades *shape* against
+registers, and is the lever to reach for when the width choice is not enough.
+
+**The block form** — AOTriton's `fast_philox` — generates an `M x N` tile of
+randoms and then applies dropout to it. The tile is live all at once, so the
+register cost is `M*N / threads` per thread on top of everything the softmax
+already holds.
+
+**The streamed form** generates and applies one row at a time:
+
+```
+for m in rows_this_lane_owns:
+    r = philox_row(seed, offset_of(m), N)     # N randoms, this row only
+    apply(p[m], r)                            # consumed immediately
+```
+
+so at most one row of randoms is ever live. For the attention kernel that is
+`N` values instead of `M*N`, and `N` is `BLOCK_N` — at BLOCK_N 32 with the
+32-bit variant, eight offsets' worth rather than a whole tile's.
+
+**Why this is worth having rather than always doing the obvious thing.** The
+block form is not wasteful in general: it amortises the offset arithmetic
+across the tile and gives the scheduler a wide window of independent loads.
+Under low register pressure it should win. The streamed form pays a little
+more address arithmetic per row to keep the live set flat. Which is better is
+therefore a function of the *caller*, not of the PRNG:
+
+| caller                      | pressure                      | form     |
+| --------------------------- | ----------------------------- | -------- |
+| §7's mask kernel            | none — it does nothing else   | block    |
+| attention at small head_dim | comfortable                   | block    |
+| attention at head_dim 192+  | already spilling (plan1 §6.2) | streamed |
+
+So both ship, and the attention kernel picks by head_dim exactly as it picks
+`Q_TILES_PER_BLOCK`.
+
+**The two forms must agree bitwise, and that is a test rather than a
+deduction.** Philox is a pure function of `(seed, offset)`, so *if* both forms
+derive the same offset for element `(m, n)` they cannot disagree. The risk is
+entirely in that "if": the streamed form is the one that invites an
+incremental derivation — `offset += stride` as the row loop advances, instead
+of recomputing `base + m*stride + n//RN` from coordinates. Incremental is
+cheaper and agrees with the block form right up until it does not, because the
+two wrap differently at §3.2's overflow. A row-major walk that never revisits
+a row also hides the disagreement from any test that checks one row at a time.
+
+So: **`philox_row(seed, offset_of(m), N)` takes an absolute offset**, computed
+from coordinates by the caller, and the module never advances a counter across
+calls. The gate is a direct comparison of the whole tile, both forms, both
+widths.
+
 **So gfx1201's default is measured, not argued.** A microbenchmark under
 `kernels/microbench/`, timing both at the shapes the attention loop uses and
 reporting randoms/second *and* VGPR count, because the register cost is what
@@ -339,20 +422,21 @@ the raw keep/drop for comparison.
 
 The statistical tests are the weak ones. Put the weight on the exact ones.
 
-| test                                | what it catches                                                             |
-| ----------------------------------- | --------------------------------------------------------------------------- |
-| **Philox vs a CPU reference**       | the PRNG itself, bit for bit, before attention is involved                  |
-| **Philox vs `torch`/Triton stream** | that we match the stream callers expect                                     |
-| **tiling invariance**               | the §3 contract: same mask at BLOCK_M/N 64/32, 128/32, 256/64               |
-| **mask kernel vs attention**        | that the kernel actually applies the mask it claims                         |
-| `ENABLE_DROPOUT=0` bit-identical    | objective 4                                                                 |
-| `p = 0`                             | must be bit-identical to dropout off, not merely close                      |
-| `p = 1`                             | every element dropped; `O = 0`                                              |
-| mean/variance at p = 0.1, 0.5, 0.9  | the weak test, kept because it catches a wrong threshold                    |
-| seed/offset are 64-bit              | pass values above 2^32 and check the mask changes                           |
-| **both `PHILOX_WIDTH` values**      | every row above, run twice -- the module is a library, not a gfx1201 detail |
-| the two widths *differ*             | that `PHILOX_WIDTH` reaches the stream rather than being ignored            |
-| large `B*H*Sq*Sk`                   | §3.2: the offset product overflowing `int32` and aliasing heads             |
+| test                                | what it catches                                                                             |
+| ----------------------------------- | ------------------------------------------------------------------------------------------- |
+| **Philox vs a CPU reference**       | the PRNG itself, bit for bit, before attention is involved                                  |
+| **Philox vs `torch`/Triton stream** | that we match the stream callers expect                                                     |
+| **tiling invariance**               | the §3 contract: same mask at BLOCK_M/N 64/32, 128/32, 256/64                               |
+| **mask kernel vs attention**        | that the kernel actually applies the mask it claims                                         |
+| `ENABLE_DROPOUT=0` bit-identical    | objective 4                                                                                 |
+| `p = 0`                             | must be bit-identical to dropout off, not merely close                                      |
+| `p = 1`                             | every element dropped; `O = 0`                                                              |
+| mean/variance at p = 0.1, 0.5, 0.9  | the weak test, kept because it catches a wrong threshold                                    |
+| seed/offset are 64-bit              | pass values above 2^32 and check the mask changes                                           |
+| **both `PHILOX_WIDTH` values**      | every row above, run twice -- the module is a library, not a gfx1201 detail                 |
+| the two widths *differ*             | that `PHILOX_WIDTH` reaches the stream rather than being ignored                            |
+| **block vs streamed, whole tile**   | §4.2 — compared as a tile, not row by row: a row-major walk hides an incremental-offset bug |
+| large `B*H*Sq*Sk`                   | §3.2: the offset product overflowing `int32` and aliasing heads                             |
 
 The 64-bit row matters: a 32-bit truncation of the seed passes every other
 test in this table, because any consistent stream looks random.
@@ -379,25 +463,39 @@ touch it needs to see why it is what it is.
 ### Step 3 — `ENABLE_DROPOUT` in the attention kernel
 The offset scheme, the threshold compare, the `l`-before-dropout ordering.
 
-**Gate:** `ENABLE_DROPOUT=0` bit-identical; `p=0` bit-identical to off.
+**Gate:** `ENABLE_DROPOUT=0` bit-identical; `p=0` bit-identical to off; and
+**a spill check at head_dim 192 and 256**, at both widths and both generation
+forms (§4.1, §4.2) — the microbenchmark measures Philox with the register file
+to itself, which is not the situation it will be in here.
 
-### Step 4 — the mask kernel, and the invariance test
+### Step 4 — streamed generation, and whether it is worth it
+§4.2. Add `philox_row` beside the block form, gate on the whole-tile bitwise
+comparison, then measure spills and throughput at head_dim 192 and 256 against
+the block form.
+
+**Gate:** bitwise identical to the block form at both widths, *and* a number
+saying whether it helps. It is an experiment — if it does not reduce spills it
+still ships in the module, since §7's mask kernel and low-pressure callers
+keep using the block form, but the attention kernel keeps whichever won.
+
+### Step 5 — the mask kernel, and the invariance test
 §7 and the tiling-invariance row of §8, which is the phase's real gate.
 
 ---
 
 ## 10. Risks
 
-| risk                                    | why it matters                                                            | mitigation                                                                   |
-| --------------------------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| **Mask depends on tiling**              | silently breaks reproducibility on any future re-tune                     | §3; the invariance test is the phase's gate                                  |
-| `PHILOX_WIDTH` changed after shipping   | every mask changes (§3.1); unlike `BLOCK_M` this is observable            | versioned, documented table; not re-swept with tuning                        |
-| Producer and consumer disagree on width | backward regenerates a different mask; gradients stay plausible           | width is a parameter of the *op*, not of each kernel                         |
-| `l` accumulated after dropout           | plausible output, wrong by a per-row factor, no shape check               | §6; assert LSE against the undropped reference                               |
-| 64-bit seed silently truncated          | every statistical test still passes                                       | the >2^32 row of §8                                                          |
-| Offset product overflows `int32`        | two heads share a stream; every statistical test still passes             | §3.2 -- widen before multiplying; assert the peak offset                     |
-| Register pressure from Philox state     | ~6 vs ~12 registers by width, in a loop already spilling at head_dim 192+ | §4.1; VGPR count in the microbenchmark *and* a spill check after integration |
-| Diverging from Triton's stream          | callers compare against seeded `torch` runs                               | step 1 gates on bit-exactness, not distribution                              |
+| risk                                    | why it matters                                                                         | mitigation                                                                   |
+| --------------------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| **Mask depends on tiling**              | silently breaks reproducibility on any future re-tune                                  | §3; the invariance test is the phase's gate                                  |
+| `PHILOX_WIDTH` changed after shipping   | every mask changes (§3.1); unlike `BLOCK_M` this is observable                         | versioned, documented table; not re-swept with tuning                        |
+| Producer and consumer disagree on width | backward regenerates a different mask; gradients stay plausible                        | width is a parameter of the *op*, not of each kernel                         |
+| `l` accumulated after dropout           | plausible output, wrong by a per-row factor, no shape check                            | §6; assert LSE against the undropped reference                               |
+| 64-bit seed silently truncated          | every statistical test still passes                                                    | the >2^32 row of §8                                                          |
+| Offset product overflows `int32`        | two heads share a stream; every statistical test still passes                          | §3.2 -- widen before multiplying; assert the peak offset                     |
+| Register pressure from Philox state     | ~6 vs ~12 registers by width, in a loop already spilling at head_dim 192+              | §4.1; VGPR count in the microbenchmark *and* a spill check after integration |
+| Streamed form drifts from block form    | an incremental offset agrees until it wraps (§3.2), and a row-major walk never notices | §4.2 — `philox_row` takes an *absolute* offset; compare whole tiles          |
+| Diverging from Triton's stream          | callers compare against seeded `torch` runs                                            | step 1 gates on bit-exactness, not distribution                              |
 
 ---
 
