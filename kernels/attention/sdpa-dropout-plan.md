@@ -118,6 +118,51 @@ Two consequences:
   what callers already expect, but it means the mask kernel of §7 must be
   handed the same `Max_seqlen_k`, not the sequence's own length.
 
+### 3.1 The offset is 64-bit; the arithmetic that builds it must be too
+
+Two different things could wrap, and only one of them is safe by
+construction.
+
+**The counter does not alias.** A 64-bit offset is split across `c0` (low) and
+`c1` (high), and the seed across `k0`/`k1`, so Philox sees a 128-bit counter of
+which we use 64 bits. Offsets `0` and `2^32` land on genuinely different
+counter states, and so do seeds `1` and `1 + 2^32`. Verified against a CPU
+reference rather than assumed — putting the offset in `c0` alone *would* alias,
+which is presumably why Triton splits it.
+
+**The arithmetic that computes the offset can overflow, and it is int32.**
+
+```
+offset(m, n) = base + off_zh * Max_seqlen_q * stride + m * stride + n // RN
+                      \_______ this product _______/
+```
+
+`off_zh`, `Max_seqlen_q` and `stride` are all `int32` in AOTriton, and the
+peak offset is about `B * H * Sq * Sk / RN`:
+
+| B   | H   | Sq   | Sk   | RN  | peak offset    | fits `i32` |
+| --- | --- | ---- | ---- | --- | -------------- | ---------- |
+| 1   | 8   | 4096 | 4096 | 4   | 33,554,432     | yes        |
+| 8   | 32  | 4096 | 4096 | 4   | 1,073,741,824  | yes        |
+| 8   | 32  | 8192 | 8192 | 4   | 4,294,967,296  | **no**     |
+| 32  | 64  | 8192 | 8192 | 4   | 34,359,738,368 | **no**     |
+
+So it overflows at large-but-real shapes — a 64-batch 8K-context model is not
+exotic. And the failure mode is the bad one: the offset wraps into a range
+already used by another `(z, h)` pair, so two heads silently share a dropout
+stream. Every statistical test still passes, because a shared stream is just
+as random as an unshared one.
+
+**Rule: build the offset in 64-bit from the start.** `base` is already `u64`;
+the product must be widened *before* multiplying, not after — widening the
+result of an `int32` multiply preserves the wrap. This is the same width
+hazard as `sdpa-varlen-plan.md` §5, in a place where nothing faults to
+announce it.
+
+Choosing `RN = 8` (§4) halves the offset space and buys one more doubling of
+head count or context before the wrap — a small point in its favour, and not
+a substitute for 64-bit arithmetic.
+
 ---
 
 ## 4. Which variant: 32-bit or 64-bit lanes
@@ -217,17 +262,18 @@ the raw keep/drop for comparison.
 
 The statistical tests are the weak ones. Put the weight on the exact ones.
 
-| test                                | what it catches                                               |
-| ----------------------------------- | ------------------------------------------------------------- |
-| **Philox vs a CPU reference**       | the PRNG itself, bit for bit, before attention is involved    |
-| **Philox vs `torch`/Triton stream** | that we match the stream callers expect                       |
-| **tiling invariance**               | the §3 contract: same mask at BLOCK_M/N 64/32, 128/32, 256/64 |
-| **mask kernel vs attention**        | that the kernel actually applies the mask it claims           |
-| `ENABLE_DROPOUT=0` bit-identical    | objective 4                                                   |
-| `p = 0`                             | must be bit-identical to dropout off, not merely close        |
-| `p = 1`                             | every element dropped; `O = 0`                                |
-| mean/variance at p = 0.1, 0.5, 0.9  | the weak test, kept because it catches a wrong threshold      |
-| seed/offset are 64-bit              | pass values above 2^32 and check the mask changes             |
+| test                                | what it catches                                                 |
+| ----------------------------------- | --------------------------------------------------------------- |
+| **Philox vs a CPU reference**       | the PRNG itself, bit for bit, before attention is involved      |
+| **Philox vs `torch`/Triton stream** | that we match the stream callers expect                         |
+| **tiling invariance**               | the §3 contract: same mask at BLOCK_M/N 64/32, 128/32, 256/64   |
+| **mask kernel vs attention**        | that the kernel actually applies the mask it claims             |
+| `ENABLE_DROPOUT=0` bit-identical    | objective 4                                                     |
+| `p = 0`                             | must be bit-identical to dropout off, not merely close          |
+| `p = 1`                             | every element dropped; `O = 0`                                  |
+| mean/variance at p = 0.1, 0.5, 0.9  | the weak test, kept because it catches a wrong threshold        |
+| seed/offset are 64-bit              | pass values above 2^32 and check the mask changes               |
+| large `B*H*Sq*Sk`                   | §3.1: the offset product overflowing `int32` and aliasing heads |
 
 The 64-bit row matters: a 32-bit truncation of the seed passes every other
 test in this table, because any consistent stream looks random.
@@ -261,14 +307,15 @@ The offset scheme, the threshold compare, the `l`-before-dropout ordering.
 
 ## 10. Risks
 
-| risk                                   | why it matters                                              | mitigation                                          |
-| -------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------- |
-| **Mask depends on tiling**             | silently breaks reproducibility on any future re-tune       | §3; the invariance test is the phase's gate         |
-| `RN_PER_OFFSET` changed after shipping | every mask changes; it is in the offset arithmetic          | freeze in step 2, before integration                |
-| `l` accumulated after dropout          | plausible output, wrong by a per-row factor, no shape check | §6; assert LSE against the undropped reference      |
-| 64-bit seed silently truncated         | every statistical test still passes                         | the >2^32 row of §8                                 |
-| Register pressure from held randoms    | a loop already spilling at head_dim 192+                    | measure as in P4; the scale folds into the epilogue |
-| Diverging from Triton's stream         | callers compare against seeded `torch` runs                 | step 1 gates on bit-exactness, not distribution     |
+| risk                                   | why it matters                                                | mitigation                                               |
+| -------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------- |
+| **Mask depends on tiling**             | silently breaks reproducibility on any future re-tune         | §3; the invariance test is the phase's gate              |
+| `RN_PER_OFFSET` changed after shipping | every mask changes; it is in the offset arithmetic            | freeze in step 2, before integration                     |
+| `l` accumulated after dropout          | plausible output, wrong by a per-row factor, no shape check   | §6; assert LSE against the undropped reference           |
+| 64-bit seed silently truncated         | every statistical test still passes                           | the >2^32 row of §8                                      |
+| Offset product overflows `int32`       | two heads share a stream; every statistical test still passes | §3.1 -- widen before multiplying; assert the peak offset |
+| Register pressure from held randoms    | a loop already spilling at head_dim 192+                      | measure as in P4; the scale folds into the epilogue      |
+| Diverging from Triton's stream         | callers compare against seeded `torch` runs                   | step 1 gates on bit-exactness, not distribution          |
 
 ---
 
