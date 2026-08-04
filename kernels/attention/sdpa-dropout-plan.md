@@ -142,41 +142,35 @@ configurable.
 - **`RN_PER_OFFSET` is part of it too**, because it appears in the offset
   arithmetic: `n // RN` and `cdiv(Max_seqlen_k, RN)`.
 
-### 3.1 `PHILOX_WIDTH` is in the contract, so the mask is per-build
+### 3.1 `PHILOX_WIDTH` is in the contract, and that is unremarkable
 
-The two variants are **different functions** — different round constants,
-different lane width, 4 randoms per offset against 8. They do not produce the
-same stream and cannot be made to. Making the width configurable therefore
-weakens the contract from
+The two variants are different functions — different round constants,
+different lane width, 4 randoms per offset against 8 — so they produce
+different streams. That is not a defect to weigh: no two PRNGs agree, and
+philox32 and philox64 are simply two PRNGs. The contract is
 
-> the mask is a function of `(seed, base, z, h, m, n)`
+> the mask is a function of `(seed, base, z, h, m, n)` **and `PHILOX_WIDTH`**
 
-to
+and a mask is reproducible within a build, not across builds that chose
+different widths. Cross-architecture bit-exact runs are not achievable anyway.
 
-> ... **and of `PHILOX_WIDTH`**.
+**The invariant that actually matters is forward/backward, and it is the whole
+reason this is a shared module.** Since FAv1 the design has been that the two
+passes run a *bitwise identical* PRNG, so the mask never has to be stored or
+passed — only `(seed, offset)` crosses the boundary, and the backward pass
+regenerates the same numbers from the same coordinates. A dropout mask for a
+4K x 4K attention is 268 MB per head; regenerating it is free by comparison.
 
-That is a real loss and worth being explicit about rather than discovering it
-later. What it costs: a dropout mask is not reproducible across two builds
-that chose different widths, and therefore not across two architectures whose
-defaults differ.
+That places three requirements, all on us rather than on the caller:
 
-What it does *not* cost, and what must be held instead:
-
-- **Forward, backward and the mask kernel must agree.** They share `philox.py`
-  and must be given the same `PHILOX_WIDTH`; it is a parameter of the *op*,
-  not of each kernel. A mismatch is silent — a backward pass that regenerates
-  the wrong mask still produces plausible gradients.
-- **A given build is still exactly reproducible**, which is what dropout
-  actually needs. Bit-exact cross-architecture training runs are not
-  achievable anyway.
-- **The width must be recorded, not inferred.** The value the op used has to
-  be queryable, so a caller can tell whether two runs are comparable.
-
-This is the same shape as the tuning tables — a per-arch default chosen by
-measurement — with one difference that matters: retuning `BLOCK_M` changes
-nothing observable, and changing `PHILOX_WIDTH` changes every mask. So it
-belongs in a table that is *versioned and documented*, not in one that is
-re-swept whenever the register budget moves.
+- **One module, both passes.** `philox.py` is what keeps them from drifting.
+  A copy-paste would drift on the first constant anyone re-derived.
+- **`PHILOX_WIDTH` is a parameter of the op, not of a kernel.** Forward,
+  backward and the mask kernel take the same value. A mismatch is silent: the
+  backward pass regenerates a *different* valid mask and produces plausible
+  gradients.
+- **The width must be recorded, not inferred**, so a caller can tell whether
+  two runs are comparable — and so the backward pass cannot guess wrong.
 
 ### 3.2 The offset is 64-bit; the arithmetic that builds it must be too
 
@@ -394,16 +388,16 @@ The offset scheme, the threshold compare, the `l`-before-dropout ordering.
 
 ## 10. Risks
 
-| risk                                    | why it matters                                                  | mitigation                                               |
-| --------------------------------------- | --------------------------------------------------------------- | -------------------------------------------------------- |
-| **Mask depends on tiling**              | silently breaks reproducibility on any future re-tune           | §3; the invariance test is the phase's gate              |
-| `PHILOX_WIDTH` changed after shipping   | every mask changes (§3.1); unlike `BLOCK_M` this is observable  | versioned, documented table; not re-swept with tuning    |
-| Producer and consumer disagree on width | backward regenerates a different mask; gradients stay plausible | width is a parameter of the *op*, not of each kernel     |
-| `l` accumulated after dropout           | plausible output, wrong by a per-row factor, no shape check     | §6; assert LSE against the undropped reference           |
-| 64-bit seed silently truncated          | every statistical test still passes                             | the >2^32 row of §8                                      |
-| Offset product overflows `int32`        | two heads share a stream; every statistical test still passes   | §3.2 -- widen before multiplying; assert the peak offset |
-| Register pressure from held randoms     | a loop already spilling at head_dim 192+                        | measure as in P4; the scale folds into the epilogue      |
-| Diverging from Triton's stream          | callers compare against seeded `torch` runs                     | step 1 gates on bit-exactness, not distribution          |
+| risk                                    | why it matters                                                            | mitigation                                                                   |
+| --------------------------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| **Mask depends on tiling**              | silently breaks reproducibility on any future re-tune                     | §3; the invariance test is the phase's gate                                  |
+| `PHILOX_WIDTH` changed after shipping   | every mask changes (§3.1); unlike `BLOCK_M` this is observable            | versioned, documented table; not re-swept with tuning                        |
+| Producer and consumer disagree on width | backward regenerates a different mask; gradients stay plausible           | width is a parameter of the *op*, not of each kernel                         |
+| `l` accumulated after dropout           | plausible output, wrong by a per-row factor, no shape check               | §6; assert LSE against the undropped reference                               |
+| 64-bit seed silently truncated          | every statistical test still passes                                       | the >2^32 row of §8                                                          |
+| Offset product overflows `int32`        | two heads share a stream; every statistical test still passes             | §3.2 -- widen before multiplying; assert the peak offset                     |
+| Register pressure from Philox state     | ~6 vs ~12 registers by width, in a loop already spilling at head_dim 192+ | §4.1; VGPR count in the microbenchmark *and* a spill check after integration |
+| Diverging from Triton's stream          | callers compare against seeded `torch` runs                               | step 1 gates on bit-exactness, not distribution                              |
 
 ---
 
