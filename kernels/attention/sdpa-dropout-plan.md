@@ -287,6 +287,17 @@ situation it will be in.
 
 ### 4.2 Experimental: streamed generation, one row at a time
 
+> **Measured, and the answer is that this section's premise does not hold in
+> this stack.** The two shapes compile to *byte-identical ISA* at head_dim 192
+> and at head_dim 256, including the 140 bytes of scratch at 256 — same VGPR
+> count, same spill instructions, throughput within 0.1%. The reasoning below
+> is imported from Triton, where `tl.rand` over a tile is a single tile-shaped
+> op and the tile really is materialised. Here `range_constexpr` unrolls the
+> group loop, so every random is an individual SSA value in one basic block
+> with no control flow between the calls. The order they appear in the source
+> is not information the backend has to respect: how many are live at once is
+> the scheduler's decision, not the author's. No knob shipped — see step 4.
+
 `PHILOX_WIDTH` trades ALU against registers. This trades *shape* against
 registers, and is the lever to reach for when the width choice is not enough.
 
@@ -527,6 +538,42 @@ the block form.
 saying whether it helps. It is an experiment — if it does not reduce spills it
 still ships in the module, since §7's mask kernel and low-pressure callers
 keep using the block form, but the attention kernel keeps whichever won.
+
+**Done — the experiment ran and nothing shipped, which is the correct
+outcome.** Two findings, in the order they were reached:
+
+1. **`philox_row` was already there under another name.** §4.2 specifies
+   "takes an absolute offset, and the module never advances a counter across
+   calls". That is exactly the contract of `Philox.span_u32` / `keep_span`
+   from step 3, which take a first offset and a count. Adding `philox_row`
+   would have been a second name for one helper.
+
+2. **The block/streamed distinction does not survive the compiler.** Both
+   shapes were built behind a temporary knob and compared:
+
+   | head_dim | form      | VGPR | scratch | spill insts | TFLOPS |
+   | -------- | --------- | ---- | ------- | ----------- | ------ |
+   | 128      | per-group | 226  | 0       | 0           | 58.86  |
+   | 128      | block     | 226  | 0       | 0           | 58.82  |
+   | 192      | per-group | 250  | 0       | 0           | 63.98  |
+   | 192      | block     | 250  | 0       | 0           | 64.03  |
+   | 256      | per-group | 256  | 140     | 66          | 71.15  |
+   | 256      | block     | 256  | 140     | 66          | 71.20  |
+
+   Not merely equal — the emitted ISA is byte-identical at 192 (3346 lines)
+   and at 256 (3629 lines). The bitwise mask gate passed at both widths and
+   both head_dims before the knob was removed, but it was testing two spellings
+   of one program.
+
+The knob was reverted rather than shipped: a build parameter that provably
+cannot change the output or the code is configurability with a maintenance
+cost and no lever attached. What the attention kernel does — generate and
+consume 8 columns of one row per accumulator group — is what it already did in
+step 3, and is finer-grained than §4.2's row anyway, since a row is `BLOCK_N`
+columns.
+
+The register-pressure lever that *does* exist is `PHILOX_WIDTH`, measured in
+step 2 and re-measured under integration in step 3.
 
 ### Step 5 — the mask kernel, and the invariance test
 §7 and the tiling-invariance row of §8, which is the phase's real gate.

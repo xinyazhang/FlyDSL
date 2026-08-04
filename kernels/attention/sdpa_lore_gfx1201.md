@@ -447,3 +447,25 @@ The cost of dropout proper is the 128 and 256 rows: +3 VGPRs where there is
 headroom, +24 bytes of scratch where there is not. Width 64 is worse on
 registers as well as throughput (+2 VGPRs at 128, +36 bytes at 256), which is
 the second, independent reason `_WIDTH_BY_ARCH["gfx1201"]` is 32.
+
+## Source-level "generation shape" is not a lever under `range_constexpr`
+
+The dropout plan carried a section (§4.2) proposing that generating PRNG values
+a row at a time, instead of a tile at a time, would cut register pressure at
+head_dim 192+ — the live set being `N` values rather than `M*N`. Both shapes
+were built and compared. They emit **byte-identical ISA**: 3346 lines at
+head_dim 192, 3629 at 256, same VGPR count, same 140 bytes of scratch, and
+throughput within 0.1%.
+
+The premise is a Triton import. There `tl.rand` over a tile is a single
+tile-shaped operation and the tile is genuinely materialised, so the author's
+choice of shape is the liveness. Here `range_constexpr` unrolls the loop and
+every random becomes an individual SSA value in one basic block with no control
+flow between the calls — at which point the textual order of independent
+operations carries no information the backend must respect. How many values are
+live at once is the scheduler's decision.
+
+**The general rule: restructuring a fully-unrolled constexpr loop to "hold less
+at once" is a no-op.** To force liveness you need something the backend cannot
+reorder across — a runtime `scf.for`, or a barrier. Reaching for a real lever
+(`PHILOX_WIDTH` here, or tiling) beats rewriting straight-line code.
