@@ -78,6 +78,9 @@ __all__ = [
     "randoms_per_offset",
     "philox_4x",
     "philox_u32",
+    "dropout_threshold",
+    "keep_mask",
+    "to_uniform_f32",
 ]
 
 # --- types -----------------------------------------------------------------
@@ -265,6 +268,74 @@ def philox_u32(
     return out
 
 
+# --- dropout helpers -------------------------------------------------------
+#
+# These are not attention: they are "a block of consecutive randoms" and "an
+# f32 probability compared as an i32", which is what AOTriton's dropout.py and
+# dropout_rng.py are made of. They live here so the attention kernel does not
+# grow a PRNG, and so the debug mask kernel can reach them without importing
+# the attention builder.
+#
+# What stays with the caller is the *offset scheme* -- which element gets which
+# offset. That is layout-specific and belongs where the layout is.
+
+_U32_SCALE = 2.3283064365386963e-10   # 2**-32, exact
+
+
+def dropout_threshold(p: float) -> int:
+    """The i32 threshold for a drop probability `p`.
+
+    A uniform u32 reinterpreted as i32 is uniform on `[-2**31, 2**31)`, so
+    comparing against `(p - 0.5) * 2**32` keeps a `1 - p` fraction and needs no
+    float conversion per element -- one compare instead of a convert and a
+    float compare, on a path that runs once per score.
+
+    `p = 0` gives `-2**31` (keep everything) and `p -> 1` gives `+2**31`
+    (keep nothing). AOTriton computes the same value as
+    `((dropout_p - 0.5) * 0xFFFFFFFF).to(tl.int32)`.
+    """
+    if not 0.0 <= p <= 1.0:
+        raise ValueError(f"dropout p must be in [0, 1], got {p}")
+    t = int((p - 0.5) * 0xFFFFFFFF)
+    return max(-(2 ** 31), min(2 ** 31 - 1, t))
+
+
+def keep_mask(vals: list[fx.Int32], threshold: int | fx.Int32) -> list[ArithValue]:
+    """`vals > threshold` as **signed** compares -- one predicate per value.
+
+    The signedness is the whole reason this is here rather than at the call
+    site. `fx.Int32`'s `>` overload is *unsigned*, and the threshold is
+    negative for every `p < 0.5` -- the common case -- so the natural spelling
+    silently keeps everything. This module owns the compare so that trap is
+    written once.
+    """
+    thr = fx.Int32(threshold)
+    return [
+        ArithValue(
+            arith.cmpi(arith.CmpIPredicate.sgt, _raw(fx.Int32(v)), _raw(thr))
+        )
+        for v in vals
+    ]
+
+
+def to_uniform_f32(v: fx.Int32) -> fx.Float32:
+    """A u32 random as a float in `[0, 1)`, for inspection rather than dropout.
+
+    The dropout path never calls this -- that is the point of
+    `dropout_threshold`. The debug mask kernel does, because a float mask is
+    what a human reads.
+    """
+    f = fx.Float32(ArithValue(arith.sitofp(fx.Float32.ir_type, _raw(fx.Int32(v)))))
+    return fx.Float32(
+        ArithValue(arith.addf(_raw(_fmul32(f, fx.Float32(_U32_SCALE))),
+                              _raw(fx.Float32(0.5))))
+    )
+
+
+def _fmul32(a: fx.Float32, b: fx.Float32) -> fx.Float32:
+    return fx.Float32(ArithValue(arith.mulf(_raw(a), _raw(b))))
+
+
 @dataclass(frozen=True, slots=True)
 class Philox:
     """A *configured* PRNG: the width and round count that define a stream.
@@ -316,6 +387,36 @@ class Philox:
     ) -> tuple[Word, Word, Word, Word]:
         """The raw round function, for callers packing the counter themselves."""
         return philox_4x(c0, c1, c2, c3, k0, k1, self.width, self.n_rounds)
+
+    def span_u32(self, seed: U64, first_offset: U64, count: int) -> list[fx.Int32]:
+        """`count` consecutive randoms, starting at `first_offset`'s slot 0.
+
+        The blocked form: a run of adjacent stream elements, which is what a
+        tile of a dropout mask is. `count` must be a multiple of
+        `randoms_per_offset`, because a partial call would still cost a full
+        Philox and callers who cannot arrange that should say so explicitly.
+
+        `first_offset` is an **absolute** offset. This function never advances
+        a counter across calls -- see `sdpa-dropout-plan.md` §4.2 for why an
+        incremental version agrees with the blocked one right up until it
+        wraps.
+        """
+        rn = self.randoms_per_offset
+        if count % rn:
+            raise ValueError(
+                f"count must be a multiple of randoms_per_offset ({rn}), got {count}"
+            )
+        out: list[fx.Int32] = []
+        base = fx.Int64(first_offset)
+        for k in range(count // rn):
+            out.extend(self.u32(seed, base + fx.Int64(k)))
+        return out
+
+    def keep_span(
+        self, seed: U64, first_offset: U64, count: int, threshold: int | fx.Int32
+    ) -> list[ArithValue]:
+        """`span_u32` and `keep_mask` together: the dropout mask for a run."""
+        return keep_mask(self.span_u32(seed, first_offset, count), threshold)
 
 
 def _split64(v: U64) -> tuple[fx.Int32, fx.Int32]:

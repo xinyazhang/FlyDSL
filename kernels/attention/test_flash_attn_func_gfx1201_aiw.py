@@ -1697,3 +1697,157 @@ def test_bias_requires_contiguous_last_dim():
                       device="cuda").transpose(2, 3)
     with pytest.raises(ValueError, match="contiguous"):
         _bias_build(head_dim)(q, k, v, torch.empty_like(q), 1, seq, bias=bad)
+
+# ---------------------------------------------------------------------------
+# Dropout (ENABLE_DROPOUT)
+# ---------------------------------------------------------------------------
+
+
+def _drop_build(head_dim, **kw):
+    return build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False,
+        dtype_str="f16", dropout=True, **kw
+    )
+
+
+def test_dropout_p0_is_bit_identical_to_no_dropout():
+    """`p = 0` must be *identical*, not merely close.
+
+    The PRNG still runs, the threshold still compares, and `1/(1-0)` is
+    exactly 1 -- so every element is kept and every arithmetic step is a
+    no-op. Anything less than bitwise here means a scale or a select is
+    perturbing values it should not touch.
+    """
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    o_off = torch.empty_like(q)
+    build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16"
+    )(q, k, v, o_off, 1, seq)
+    o_p0 = torch.empty_like(q)
+    _drop_build(head_dim)(q, k, v, o_p0, 1, seq, dropout_p=0.0, philox_seed=7)
+    torch.cuda.synchronize()
+    assert torch.equal(o_off, o_p0)
+
+
+def test_dropout_p1_drops_everything():
+    """`p -> 1` keeps nothing, so the output is exactly zero."""
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    o = torch.empty_like(q)
+    _drop_build(head_dim)(q, k, v, o, 1, seq, dropout_p=0.999999, philox_seed=7)
+    torch.cuda.synchronize()
+    assert o.abs().max().item() == 0.0
+
+
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+def test_dropout_leaves_logsumexp_undropped(p):
+    """`l` accumulates the *pre-dropout* sum, so LSE is unchanged by dropout.
+
+    This is the ordering that produces plausible-but-wrong output if reversed:
+    scaling the softmax denominator by the surviving fraction makes the result
+    stop being an expectation of the undropped attention, and makes the LSE the
+    backward pass reads wrong by a per-row factor. No shape or finiteness check
+    notices, which is why it is asserted directly.
+    """
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    o = torch.empty_like(q)
+    lse_drop = torch.zeros(_NUM_HEADS, seq, dtype=torch.float32, device="cuda")
+    _drop_build(head_dim)(q, k, v, o, 1, seq, dropout_p=p, philox_seed=1234,
+                          lse=lse_drop)
+    lse_ref = torch.zeros(_NUM_HEADS, seq, dtype=torch.float32, device="cuda")
+    build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16"
+    )(q, k, v, torch.empty_like(q), 1, seq, lse=lse_ref)
+    torch.cuda.synchronize()
+    assert torch.allclose(lse_drop, lse_ref, atol=1e-5), (
+        "logsumexp moved with dropout -- l was accumulated after the mask"
+    )
+
+
+def test_dropout_is_reproducible_from_seed_alone():
+    """Same seed, same mask; different seed, different mask.
+
+    The property the backward pass depends on: it is handed `(seed, offset)`
+    and regenerates the mask rather than being given it, so a stream that did
+    not depend only on those would make gradients silently wrong.
+    """
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    exe = _drop_build(head_dim)
+    a, b, c = (torch.empty_like(q) for _ in range(3))
+    exe(q, k, v, a, 1, seq, dropout_p=0.5, philox_seed=11)
+    exe(q, k, v, b, 1, seq, dropout_p=0.5, philox_seed=11)
+    exe(q, k, v, c, 1, seq, dropout_p=0.5, philox_seed=12)
+    torch.cuda.synchronize()
+    assert torch.equal(a, b), "same seed gave a different mask"
+    assert not torch.equal(a, c), "different seeds gave the same mask"
+
+
+def test_dropout_offset_shifts_the_mask():
+    """`philox_offset` must reach the stream too, not just the seed.
+
+    PyTorch's RNG state is a (seed, offset) pair and advances the offset
+    between calls; a build that ignored it would repeat the same mask for
+    every call in a training step.
+    """
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    exe = _drop_build(head_dim)
+    a, b = torch.empty_like(q), torch.empty_like(q)
+    exe(q, k, v, a, 1, seq, dropout_p=0.5, philox_seed=11, philox_offset=0)
+    exe(q, k, v, b, 1, seq, dropout_p=0.5, philox_seed=11, philox_offset=1 << 20)
+    torch.cuda.synchronize()
+    assert not torch.equal(a, b)
+
+
+@pytest.mark.parametrize("p", [0.25, 0.5])
+def test_dropout_expectation_is_preserved(p):
+    """Dropout must be unbiased: `E[O]` stays at the undropped output.
+
+    This is the only test that sees the `1/(1-p)` scale at all -- the
+    exactness tests use `p = 0` and `p -> 1`, where the scale is respectively
+    1 and irrelevant. A dropped or mis-signed scale biases the mean by a
+    factor of `1-p`, far outside the tolerance below.
+
+    `V` is made non-negative on purpose. With signed random `V` the attention
+    output is a near-cancelling weighted sum, so `|O_ref|` lands at the same
+    magnitude as the dropout noise itself and the estimator's relative error
+    is `sqrt(p/(1-p)/n)` -- 0.35 at `p = 0.5, n = 8`, which forces a tolerance
+    so loose it would no longer catch the bias it exists to catch. Positive
+    `V` makes the signal `O(1)` instead of `O(1/sqrt(seq))` and buys back the
+    ~sqrt(seq) of headroom.
+    """
+    _require_env()
+    head_dim, seq = 64, 512
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    v = v.abs()
+    o_ref = torch.empty_like(q)
+    build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16"
+    )(q, k, v, o_ref, 1, seq)
+    exe = _drop_build(head_dim)
+    acc = torch.zeros_like(q, dtype=torch.float32)
+    n = 8
+    for i in range(n):
+        o = torch.empty_like(q)
+        exe(q, k, v, o, 1, seq, dropout_p=p, philox_seed=1000 + i)
+        torch.cuda.synchronize()
+        acc += o.float()
+    mean = acc / n
+    rel = (mean - o_ref.float()).abs().mean() / o_ref.float().abs().mean()
+    assert rel < 0.05, f"E[O] drifted from the undropped output: rel={rel:.3f}"
+
+
+def test_dropout_requires_p():
+    """A dropout build with no probability is a caller error, not p=0."""
+    _require_env()
+    q, k, v = _qkv(1, 256, 64, torch.float16)
+    with pytest.raises(ValueError, match="requires dropout_p"):
+        _drop_build(64)(q, k, v, torch.empty_like(q), 1, 256)

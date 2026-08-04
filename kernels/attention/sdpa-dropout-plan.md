@@ -504,6 +504,20 @@ The offset scheme, the threshold compare, the `l`-before-dropout ordering.
 forms (§4.1, §4.2) — the microbenchmark measures Philox with the register file
 to itself, which is not the situation it will be in here.
 
+**Done.** `ENABLE_DROPOUT=0` is bit-identical to HEAD and `p=0` is
+bit-identical to dropout off; `p -> 1` gives exactly zero; LSE matches the
+undropped reference; the mask depends only on `(seed, offset)`. The spill
+check ran at both widths and is recorded in `sdpa_lore_gfx1201.md` — the cost
+is +3 VGPRs at head_dim 128 and +24 bytes of scratch at 256, and width 64 is
+worse on registers as well as throughput.
+
+Only the block form exists so far, so "both generation forms" carries into
+step 4. What the attention kernel does today is already finer-grained than
+§4.1's whole-tile form: it generates and consumes 8 randoms per accumulator
+group, so at most one group is live. Step 4's comparison is therefore that
+per-group form against the whole-tile one, not against a not-yet-written
+streamed one.
+
 ### Step 4 — streamed generation, and whether it is worth it
 §4.2. Add `philox_row` beside the block form, gate on the whole-tile bitwise
 comparison, then measure spills and throughput at head_dim 192 and 256 against

@@ -108,6 +108,7 @@ from flydsl.expr import (
     rocdl,
 )
 from flydsl.expr.typing import T, Vector as Vec
+from philox import Philox, dropout_threshold
 from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
 
 KERNEL_NAME = "flash_attn_func_gfx1201_aiw_kernel"
@@ -394,6 +395,8 @@ def build_flash_attn_func_aiw_module_primary(
     strides_constexpr=False,
     padded_head=False,
     bias=False,
+    dropout=False,
+    philox_width=None,
     causal_type=None,
     q_row_tiles=1,
     shards=None,
@@ -760,6 +763,18 @@ def build_flash_attn_func_aiw_module_primary(
             "or drop the bias"
         )
 
+    # Dropout, AOTriton's ENABLE_DROPOUT. A build axis, so a build without it
+    # emits no PRNG at all -- the loop is latency-bound and a caller who does
+    # not want dropout should not pay for the option.
+    #
+    # The PRNG itself lives in `philox.py`: it is not attention, the backward
+    # pass and the debug mask kernel need the identical stream, and this file
+    # is long enough. What stays here is the *offset scheme* -- which element
+    # gets which offset -- because that is layout-specific.
+    ENABLE_DROPOUT = bool(dropout)
+    PHILOX = Philox.for_arch() if philox_width is None else Philox(width=philox_width)
+    RN_PER_OFFSET = PHILOX.randoms_per_offset
+
     # Mask KV columns past seqlen_k. Required whenever seqlen need not divide
     # BLOCK_N -- i.e. always, now that the interface no longer pads. The guard
     # inside is dynamic, so interior tiles cost one scalar compare.
@@ -882,6 +897,10 @@ def build_flash_attn_func_aiw_module_primary(
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
+        philox_seed: fx.Int64,
+        philox_offset_base: fx.Int64,
+        idropout_p: fx.Int32,
+        dropout_scale: fx.Float32,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
@@ -1327,6 +1346,37 @@ def build_flash_attn_func_aiw_module_primary(
                 _q_batch_v * fx.Index(stride_b0)
                 + head_q * fx.Index(stride_b1)
                 + _q_row_off_v * fx.Index(stride_b2)
+            )
+
+        if const_expr(ENABLE_DROPOUT):
+            # The offset scheme, and the *only* dropout-specific arithmetic in
+            # this file -- everything else is `philox.py`.
+            #
+            #   stride = cdiv(Max_seqlen_k, RN)
+            #   base   = philox_offset_base + off_zh * Max_seqlen_q * stride
+            #   offset(m, n) = base + m * stride + n // RN
+            #
+            # `BLOCK_M` and `BLOCK_N` appear nowhere: `m` and `n` are global
+            # element coordinates, so the mask does not move when the kernel is
+            # re-tuned. That is the reproducibility contract of
+            # sdpa-dropout-plan.md §3, and it is invisible in any test that
+            # uses one tile size.
+            #
+            # **Built in 64-bit.** `off_zh * Max_seqlen_q * stride` reaches
+            # 2**32 at B*H = 256 with 8K sequences, and an i32 wrap there does
+            # not fault -- it aliases two heads onto one stream, which every
+            # statistical test still passes (§3.2). `fx.Int64` first, then
+            # multiply.
+            _ph_stride = fx.Int64(
+                (fx.Int32(max_seqlen_k) + fx.Int32(RN_PER_OFFSET - 1))
+                // fx.Int32(RN_PER_OFFSET)
+            )
+            _off_zh = fx.Int64(
+                fx.Int32(_z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
+            )
+            _ph_base = (
+                fx.Int64(philox_offset_base)
+                + _off_zh * fx.Int64(max_seqlen_q) * _ph_stride
             )
 
         q_tbase, q_toff = _addr_pair(q_st, head_q, _q_batch_v, _q_row_off_v)
@@ -2275,6 +2325,41 @@ def build_flash_attn_func_aiw_module_primary(
                 for dc in range_constexpr(O_ACCS):
                     o_accs_all[qt][dc] = _fmul(o_accs_all[qt][dc], corr_vec)
 
+                if const_expr(ENABLE_DROPOUT):
+                    # **After `l_new`, before the O accumulation.** The softmax
+                    # denominator must be the *undropped* sum, or the result
+                    # stops being an expectation of the undropped attention and
+                    # the logsumexp the backward pass reads is wrong. Reversing
+                    # these two lines produces plausible output that is wrong by
+                    # a per-row factor, and no shape check notices
+                    # (sdpa-dropout-plan.md §6).
+                    #
+                    # A group of eight consecutive elements is eight contiguous
+                    # KV columns (§2 of the bias plan has the same identity), so
+                    # each group is one span of the stream.
+                    _row_off64 = fx.Int64(q_rows[qt]) * _ph_stride
+                    for _st in range_constexpr(NUM_S_ACCS):
+                        _c0 = (_st // 2) * 32 + (_st % 2) * 16
+                        _bcol = (
+                            fx.Int64(kv_block_start)
+                            + fx.Int64(_c0)
+                            + fx.Int64(fx.Int32(klane) * fx.Int32(8))
+                        )
+                        _first = (
+                            _ph_base + _row_off64
+                            + _bcol // fx.Int64(RN_PER_OFFSET)
+                        )
+                        _keep = PHILOX.keep_span(
+                            philox_seed, _first, 8, idropout_p
+                        )
+                        for _r in range_constexpr(8):
+                            _i = _st * 8 + _r
+                            p_vals[_i] = _raw(
+                                _keep[_r].select(
+                                    fx.Float32(p_vals[_i]), fx.Float32(0.0)
+                                )
+                            )
+
                 m_new_all.append(m_new_raw)
                 l_new_all.append(l_new)
                 p_vals_all.append(p_vals)
@@ -2586,6 +2671,16 @@ def build_flash_attn_func_aiw_module_primary(
             # there.
             _l_safe = _fmax(l_final, fx.Float32(1e-30))
             inv_l = arith.divf(_raw(c_one_f), _raw(_l_safe), fastmath=fm_fast)
+            if const_expr(ENABLE_DROPOUT):
+                # `1/(1-p)` folds into the existing `1/l` rather than becoming
+                # a per-element multiply: it is uniform across the tile, and
+                # the dropped entries are already zero, so scaling the whole
+                # accumulator is equivalent and costs one scalar.
+                #
+                # `l` is deliberately *not* scaled -- it is the undropped sum,
+                # and the logsumexp written below is the undropped one, which
+                # is what the backward pass needs.
+                inv_l = _raw(_fmul(fx.Float32(inv_l), dropout_scale))
             inv_l_vec = (
                 Vec.from_elements([inv_l], fx.Float32).broadcast_to(8).ir_value()
             )
@@ -2639,6 +2734,10 @@ def build_flash_attn_func_aiw_module_primary(
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
+        philox_seed: fx.Int64,
+        philox_offset_base: fx.Int64,
+        idropout_p: fx.Int32,
+        dropout_scale: fx.Float32,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
@@ -2681,6 +2780,7 @@ def build_flash_attn_func_aiw_module_primary(
             seqinfo_q0, seqinfo_q1, seqinfo_k0, seqinfo_k1,
             varlen_bits, batch_size, max_seqlen_q, max_seqlen_k,
             window_left, window_right,
+            philox_seed, philox_offset_base, idropout_p, dropout_scale,
             num_head_q, num_head_k,
             hdim_qk, hdim_vo,
             stride_q0, stride_q1, stride_q2,
@@ -3007,6 +3107,23 @@ def build_flash_attn_func_aiw_module_primary(
             wl, wr = window
         return int(wl), int(wr)
 
+    def _dropout_args(dropout_p, seed, offset_base):
+        """(seed, offset_base, threshold, 1/(1-p)) in launch order.
+
+        The threshold and the scale are computed here, once per call, rather
+        than per element in the kernel -- `philox.dropout_threshold` turns the
+        probability into an i32 the raw random can be compared against, so the
+        hot path never converts a random to a float.
+        """
+        if not ENABLE_DROPOUT:
+            return 0, 0, 0, 1.0
+        if dropout_p is None:
+            raise ValueError("this build has dropout=True and requires dropout_p=")
+        p = float(dropout_p)
+        if not 0.0 <= p < 1.0:
+            raise ValueError(f"dropout_p must be in [0, 1), got {p}")
+        return (int(seed), int(offset_base), dropout_threshold(p), 1.0 / (1.0 - p))
+
     def _bias_args(bias):
         """(pointer, stride_b0, stride_b1, stride_b2) for a (B, H, Sq, Sk) bias.
 
@@ -3095,7 +3212,7 @@ def build_flash_attn_func_aiw_module_primary(
 
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
-    def _launch(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None, bias=None):  # noqa: E741
+    def _launch(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None, bias=None, dropout_p=None, philox_seed=0, philox_offset=0):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
         _lse_p = _lse_args(lse, seqlen_q, varlen, meta[0])
@@ -3104,6 +3221,7 @@ def build_flash_attn_func_aiw_module_primary(
             varlen, seqlen_q, seqlen_k
         )
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
+        _ps, _po, _ip, _dsc = _dropout_args(dropout_p, philox_seed, philox_offset)
         _run_compiled(
             launch_flash_attn_aiw,
             *ptrs,
@@ -3116,6 +3234,7 @@ def build_flash_attn_func_aiw_module_primary(
             _mk,
             _wl,
             _wr,
+            _ps, _po, _ip, _dsc,
             *meta,
             *st,
             _sb0, _sb1, _sb2,
@@ -3123,7 +3242,7 @@ def build_flash_attn_func_aiw_module_primary(
             stream if stream is not None else fx.Stream(None),
         )
 
-    def _compile(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None, bias=None):  # noqa: E741
+    def _compile(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None, bias=None, dropout_p=None, philox_seed=0, philox_offset=0):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
         _lse_p = _lse_args(lse, seqlen_q, varlen, meta[0])
@@ -3132,6 +3251,7 @@ def build_flash_attn_func_aiw_module_primary(
             varlen, seqlen_q, seqlen_k
         )
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
+        _ps, _po, _ip, _dsc = _dropout_args(dropout_p, philox_seed, philox_offset)
         return flyc.compile(
             launch_flash_attn_aiw,
             *ptrs,
@@ -3144,6 +3264,7 @@ def build_flash_attn_func_aiw_module_primary(
             _mk,
             _wl,
             _wr,
+            _ps, _po, _ip, _dsc,
             *meta,
             *st,
             _sb0, _sb1, _sb2,

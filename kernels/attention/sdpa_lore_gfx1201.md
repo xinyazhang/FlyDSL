@@ -414,3 +414,36 @@ confident-looking -8% in either direction.
 least three alternating runs agree.** The point is plausibly bistable in a
 clock or allocation state rather than in the kernel; nobody has chased it
 down. head_dim 16 non-causal, measured alongside, is stable to 0.5%.
+
+## head_dim 192 non-dropout spills 164 bytes that it does not have to
+
+The step-3 dropout spill check produced a result that reads backwards:
+
+| head_dim | dropout | philox width | VGPRs | scratch | spill insts |
+| -------- | ------- | ------------ | ----- | ------- | ----------- |
+| 128      | off     | —            | 223   | 0       | 0           |
+| 128      | on      | 32           | 226   | 0       | 0           |
+| 128      | on      | 64           | 228   | 0       | 0           |
+| 192      | off     | —            | 256   | **164** | **39**      |
+| 192      | on      | 32           | 250   | 0       | 0           |
+| 192      | on      | 64           | 246   | 0       | 0           |
+| 256      | off     | —            | 256   | 116     | 57          |
+| 256      | on      | 32           | 256   | 140     | 66          |
+| 256      | on      | 64           | 256   | 176     | 94          |
+
+At head_dim 192, *adding* the PRNG removes all spilling — at both widths, so
+it is not a one-off. This is not dropout helping. Register allocation is not
+monotone in code size: the non-dropout schedule at 192 lands exactly on the
+256-VGPR cap and spills, and lengthening live ranges pushes the scheduler onto
+a different, less aggressive schedule whose peak pressure fits.
+
+The useful reading is the other direction: **head_dim 192 without dropout is
+leaving 164 bytes of scratch and 39 spill instructions on the table**, and some
+scheduling nudge unrelated to dropout would recover them. Nobody has chased
+this; it is recorded because the measurement fell out of an unrelated gate and
+would otherwise be re-discovered as a dropout mystery.
+
+The cost of dropout proper is the 128 and 256 rows: +3 VGPRs where there is
+headroom, +24 bytes of scratch where there is not. Width 64 is worse on
+registers as well as throughput (+2 VGPRs at 128, +36 bytes at 256), which is
+the second, independent reason `_WIDTH_BY_ARCH["gfx1201"]` is 32.
