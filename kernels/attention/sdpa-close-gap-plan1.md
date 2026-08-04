@@ -333,11 +333,12 @@ tensors. Hence `seqinfo_?0` (length) and `seqinfo_?1` (position), named by
 role. And `varlen_mode` as an enum samples the space rather than describing it
 — varlen is a product of three orthogonal choices, so it becomes
 `VarlenBits : u32`, one identically-decoded byte per side, `0` meaning the
-conventional dense case. A third byte carries the **LSE layout** in two bits:
+conventional dense case. A third byte carries the **LSE layout** in two bits
+(`VARLEN_LSE_LAYOUT_HT`, which is AOTriton's and the default, against `_TH`):
 the offset *inputs* are derived from Q's addressing, but the arrangement in
 memory is a genuine choice, because Transformer Engine requires `(T_q, H_q)`
-and plan1 §0's "shape does not imply layout" applies to the rank-2 tensor
-exactly as it does to the rank-4 ones.
+and §0's "shape does not imply layout" applies to the rank-2 tensor exactly as
+it does to the rank-4 ones.
 
 ### [D4 — RESOLVED] ALIBI out of scope
 

@@ -139,7 +139,8 @@ called twice.
 
   bits  7:0    Q side
   bits 15:8    K side
-  bits 17:16   LSE_LAYOUT  0 = HEAD_MAJOR        1 = TOKEN_MAJOR  2,3 reserved
+  bits 17:16   LSE_LAYOUT  0 = ..._HT            1 = ..._TH       2,3 reserved
+                           (VARLEN_LSE_LAYOUT_HT is AOTriton's; see 3.2)
   bits 23:18   reserved
   bits 31:24   reserved    (paged KV, §9.1)
 ```
@@ -228,25 +229,46 @@ nothing about memory, but TE's requirement is real and no value of
 
 This is plan1 §0 applying to LSE exactly as it applies to Q/K/V/O: *shape does
 not imply layout*. Having asserted that principle for the rank-4 tensors and
-then quietly assumed the rank-2 one was head-major was inconsistent.
+then quietly assuming the rank-2 one was `(H, T)` was inconsistent.
 
 Two formulas, selected by `LSE_LAYOUT`:
 
-| `LSE_LAYOUT`    | offset                                 | contiguous axis | pitch        |
-| --------------- | -------------------------------------- | --------------- | ------------ |
-| 0 `HEAD_MAJOR`  | `(b * H + h) * lse_stride + s`         | token           | `lse_stride` |
-| 1 `TOKEN_MAJOR` | `(b * lse_stride + s) * lse_pitch + h` | head            | `lse_pitch`  |
+| `LSE_LAYOUT` | constant               | shape    | offset                                 | contiguous | pitch        |
+| ------------ | ---------------------- | -------- | -------------------------------------- | ---------- | ------------ |
+| 0 (default)  | `VARLEN_LSE_LAYOUT_HT` | `(H, T)` | `(b * H + h) * lse_stride + s`         | `T`        | `lse_stride` |
+| 1            | `VARLEN_LSE_LAYOUT_TH` | `(T, H)` | `(b * lse_stride + s) * lse_pitch + h` | `H`        | `lse_pitch`  |
+
+**`_HT` is what the AOTriton kernel uses** (`_lse_offset(b, h, s, H, S) =
+(b*H + h)*S + s`), and what this kernel does today. `_TH` is Transformer
+Engine's requirement.
+
+Named by **axis order**, and the reason is shared context rather than
+precision. Row-major `(T, H)` and column-major `(H, T)` are exact duals, so
+"major" is not ambiguous — it is merely indirect, costing the reader a
+conversion step on every read.
+
+What makes `HT`/`TH` better is that **PyTorch is the common background**. A
+contiguous PyTorch tensor has one fixed layout, so a shape alone determines the
+memory arrangement and every reader takes it off immediately, without recalling
+which convention is in play. The names also map straight onto the code that
+decides the layout in the first place — `torch.empty(H, T)` against
+`torch.empty(T, H)`. This is not a Fortran-versus-C argument; it is that one
+framework's convention is now universal enough in this domain to name things
+after.
+
+`HT` also covers the non-varlen `(B*H, Max_seqlen_q)` case without a separate
+name, since that is `(B, H, S)` with `S` contiguous.
 
 `lse_stride` keeps its meaning — tokens per row-group — and continues to come
 from `lse.stride(0)` on the host (§4.2). `lse_pitch` is one new scalar, the
 head-axis pitch, which is `>= num_head_q` so that **padding for alignment is
-free in either layout**: head-major pads via `lse_stride`, token-major via
-`lse_pitch`. That is why the field is two bits and not one — a padded or
-blocked arrangement that neither formula covers has somewhere to go without
-another ABI change.
+free in either layout**: `_HT` pads via `lse_stride`, `_TH` via `lse_pitch`.
+That is why the field is two bits and not one — a padded or blocked
+arrangement neither formula covers has somewhere to go without another ABI
+change.
 
-`LSE_LAYOUT == 0` is the default and today's behaviour, so `VarlenBits == 0`
-remains the conventional dense case.
+`LSE_LAYOUT == 0` is `_HT`, which is AOTriton's and today's behaviour, so
+`VarlenBits == 0` remains the conventional dense case.
 
 ---
 
@@ -310,9 +332,9 @@ construction for every layout in §2 — `TotalS` for `(H, TotalS)`,
 `Max_seqlen_q` for `(B*H, Max_seqlen_q)`. Keep that: it removes a scalar load
 from the prologue and a host/device round trip from the caller.
 
-What it does *not* supply is the head-axis pitch, which `TOKEN_MAJOR` needs:
-`lse_pitch` is a second scalar, read from `lse.stride(0)` of a token-major
-tensor while `lse_stride` then comes from its logical token count. The host
+What it does *not* supply is the head-axis pitch, which `_TH` needs:
+`lse_pitch` is a second scalar, read from `lse.stride(0)` of a `_TH` tensor
+while `lse_stride` then comes from its logical token count. The host
 resolves which is which from `LSE_LAYOUT`; the kernel does not.
 
 ---
@@ -450,7 +472,8 @@ becomes reachable.
 ### Step 1 — bits, decoder, and everything that reads no position array
 
 `VarlenBits`, `seqinfo_?0`, `lse_pitch`, the §3.1 decoder, the six scalars, the
-empty-work path, and both LSE layouts. Implement `LENGTH ∈ {MAX, CUMULATIVE}`
+empty-work path, and both LSE layouts (`_HT`, `_TH`). Implement
+`LENGTH ∈ {MAX, CUMULATIVE}`
 and `POSITION ∈ {IMPLIED, REUSE}` with both `STACKED` values.
 
 That is three named modes at once — **dense `0x0000`, compact `0x0B0B`, padded
@@ -552,6 +575,12 @@ Two bits rather than one, because efficient-attention implementations pad the
 LSE layout for alignment and the field should have room for arrangements
 neither current formula covers. Padding itself needs no new codes — §3.2's
 `lse_stride` and `lse_pitch` absorb it in either layout.
+
+Named `VARLEN_LSE_LAYOUT_HT` (**AOTriton's**, and the `0` default) and
+`VARLEN_LSE_LAYOUT_TH` (TE's), after the axis order — not because major/minor
+is imprecise, since it is exact, but because a PyTorch shape already fixes the
+layout for every reader and maps onto the `torch.empty(...)` that creates it
+(§3.2).
 
 ### [V3 — RESOLVED] Ship Q-side `INDIVIDUAL`
 
