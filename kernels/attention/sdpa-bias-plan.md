@@ -151,24 +151,51 @@ for bias, and there is no third path that could drift.
 Stated explicitly because "untested" and "unsupported" are different claims
 and the code should not be read as making the second one.
 
-### 3.2 AOTriton ships no causal + bias at all
+### 3.2 Causal + bias is rejected, because it is undefined
 
-Worth flagging because it removes an oracle. `_common.py`:
+AOTriton disables the functional outright — `_common.py`:
 
 ```python
 if causal != 0 and bias_type != 0:
     return True          # functional disabled
 ```
 
-with the comment "causal+matrix-bias unsupported". So AOTriton has **no**
-compiled kernel for that combination on any architecture.
+An earlier draft read that as a capability gap and proposed *not* inheriting
+it, since this kernel has one masking path and one bias add and composes them
+without a special case. That was the wrong reading. **The restriction is
+semantic, not technical.**
 
-This kernel has one masking path and one bias add, and they compose without a
-special case, so there is no reason to inherit the restriction — but it means
-the causal rows of §5's matrix have no AOTriton counterpart and must be
-checked against a reference implementation instead. It also means §1's
-ordering claim (bias before the mask) cannot be validated against AOTriton
-behaviour; it has to stand on the argument.
+Causal is an attention mask with a fixed pattern. Bias *is* an attention mask,
+supplied directly — a large negative or `-inf` entry is how callers spell "do
+not attend here". Passing both asks which one wins where they disagree, and
+there is no defined answer: the caller has specified the same thing twice, in
+two vocabularies, with no rule for reconciling them.
+
+PyTorch takes the same position, and more explicitly than AOTriton:
+
+| backend   | `attn_mask` together with `is_causal=True`                               |
+| --------- | ------------------------------------------------------------------------ |
+| math      | `RuntimeError: Explicit attn_mask should not be set when is_causal=True` |
+| flash     | `No available kernel` — none is compiled for the pair                    |
+| efficient | accepted, silently                                                       |
+
+Two of three refuse, one of them by name. The third is the outlier, not the
+precedent.
+
+**So this kernel rejects it too**, on the host, with a message that says why
+rather than "unsupported". `BIAS_TYPE == 1` together with `CAUSAL_TYPE != 0`
+is a caller error.
+
+### 3.3 The KV tail mask is not an attention mask, and still orders after bias
+
+The rejection removes the *semantic* mask from the picture but not the bounds
+one. Columns past `seqlen_k` are not keys the caller chose to hide; they do not
+exist, and their bias entries do not exist either. So the tail mask must still
+win, which it does because §1 puts the bias add before it.
+
+This is why §1's ordering claim survives §3.2: the mask it orders against is
+the one masking *non-existent* keys, which composes with bias in the only way
+it can.
 
 ## 4. Steps
 
@@ -207,7 +234,7 @@ so a flat profile means something is wrong.
 | bias values   | zeros, random, large negative, `-inf`            | `-inf` is objective 2 and the `ninf` check     |
 | `-inf` extent | one column, one whole KV tile, a whole row       | a whole row is "this query attends to nothing" |
 | shape         | `(B, H, Sq, Sk)`, and broadcast-ish strides of 0 | stride 0 is how callers share one plane        |
-| with causal   | off, top-left, bottom-right, window              | bias and mask must compose, not fight          |
+| with causal   | **rejected** -- assert the error                 | undefined semantics, §3.2                      |
 | ragged seqlen | primes                                           | the tail tile loads bias out of range too      |
 
 Two properties beyond "matches the reference":
@@ -227,17 +254,20 @@ Two properties beyond "matches the reference":
 | ------------------------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------ |
 | **Register pressure**                | a new load stream in a loop already spilling at head_dim 192+ | measure before prefetching; §2.1                                   |
 | `-inf` deleted by fast-math          | now arrives from user data, not just from the kernel          | `ninf` stays off; assert with an `-inf` bias                       |
-| Bias masked *after* the mask         | `-inf + bias` un-masks a column that gSWA killed              | order fixed in §1; test bias together with causal                  |
+| Bias added *after* the tail mask     | `-inf + bias` revives a column past seqlen_k                  | order fixed in §1; the ragged-seqlen row of §5                     |
 | Tuning tables go stale               | fifth time; bias changes the live set                         | re-sweep only if the A/B shows a shift                             |
 | Bias drifts from Q's varlen indexing | bias would silently read the wrong rows under stacked varlen  | index it from the same six scalars (§3); no separate path to drift |
-| No AOTriton oracle for causal + bias | that pair is disabled there, so parity cannot be checked      | reference implementation for those rows (§3.2)                     |
+| Causal + bias accepted by accident   | it is undefined, and a silent answer is worse than an error   | host-side rejection with a reason (§3.2); assert it                |
 
 ---
 
 ## 7. What this phase does *not* do
 
+- **Causal + bias**, §3.2 — rejected rather than deferred.
 - **ALIBI** — D4, out of scope, and it is a *computed* bias rather than a
-  loaded one, so it shares the add but not the load.
+  loaded one, so it shares the add but not the load. It is *not* subject to
+  §3.2: ALiBi is a positional prior rather than a mask, so composing it with
+  causal is well defined.
 - **Bias gradients.** The backward pass needs `db`, which is a reduction over
   the same tile. Out of scope, but the load geometry in §2 is what it will
   reuse, so keep it addressable rather than inlined.
