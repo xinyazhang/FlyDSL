@@ -1539,3 +1539,161 @@ def test_varlen_rejects_meaningless_configurations():
         exe.varlen_bits(0x18, 0x00)          # POSITION == 3
     with pytest.raises(ValueError, match="fit in a byte"):
         exe.varlen_bits(0x100, 0x00)
+
+# ---------------------------------------------------------------------------
+# Bias tensor (BIAS_TYPE)
+# ---------------------------------------------------------------------------
+
+
+def _bias_build(head_dim, causal=False, **kw):
+    return build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal,
+        dtype_str="f16", bias=True, **kw
+    )
+
+
+def _bias_ref(q, k, v, bias):
+    qb, kb, vb = (x.transpose(1, 2).float() for x in (q, k, v))
+    return F.scaled_dot_product_attention(
+        qb, kb, vb, attn_mask=bias.float()
+    ).transpose(1, 2)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("seq", [256, 200], ids=["aligned", "ragged"])
+def test_bias_matches_reference(head_dim, seq):
+    """A random bias must reproduce SDPA with the same additive mask.
+
+    The ragged length matters on its own: the tail tile loads bias columns
+    past `seqlen_k`, and those must be killed by the tail mask rather than
+    added -- which is why the bias add is ordered before it.
+    """
+    _require_env()
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    bias = torch.randn(1, _NUM_HEADS, seq, seq, dtype=torch.float16,
+                       device="cuda", generator=gen)
+    o = torch.empty_like(q)
+    _bias_build(head_dim)(q, k, v, o, 1, seq, bias=bias)
+    torch.cuda.synchronize()
+    rel = _rel(o, _bias_ref(q, k, v, bias))
+    assert rel < 5e-3, f"hd={head_dim} seq={seq} rel={rel:.3e}"
+
+
+def test_zero_bias_matches_no_bias():
+    """An all-zero bias must change nothing measurable.
+
+    **Not bitwise**, and the reason is the one gSWA already taught: adding a
+    floating-point operation changes the emitted code even when the operation
+    is mathematically a no-op, and under `reassoc`/`contract` the compiler may
+    then contract differently. Measured here: 33 of 32768 elements differ, by
+    at most ~1 f16 ULP.
+
+    What this still checks is that bias is added rather than, say, multiplied
+    or dropped -- a bias that was ignored entirely would also pass, which is
+    why `test_bias_matches_reference` exists alongside it.
+    """
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    o_none = torch.empty_like(q)
+    build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16"
+    )(q, k, v, o_none, 1, seq)
+    o_zero = torch.empty_like(q)
+    zeros = torch.zeros(1, _NUM_HEADS, seq, seq, dtype=torch.float16, device="cuda")
+    _bias_build(head_dim)(q, k, v, o_zero, 1, seq, bias=zeros)
+    torch.cuda.synchronize()
+    rel = _rel(o_zero, o_none.float())
+    assert rel < 1e-3, f"zero bias moved the result by rel={rel:.3e}"
+
+
+def test_bias_minus_inf_row_is_a_dead_row():
+    """`-inf` across a whole row is how a caller says "attend to nothing".
+
+    Same contract dead rows already have under gSWA -- `O = 0`, `LSE = +inf`
+    -- but reached through a different path, so it is asserted separately.
+    """
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    bias = torch.zeros(1, _NUM_HEADS, seq, seq, dtype=torch.float16, device="cuda")
+    bias[:, :, 3, :] = float("-inf")
+    o = torch.empty_like(q)
+    lse = torch.zeros(_NUM_HEADS, seq, dtype=torch.float32, device="cuda")
+    _bias_build(head_dim)(q, k, v, o, 1, seq, bias=bias, lse=lse)
+    torch.cuda.synchronize()
+    assert (o[:, 3] == 0).all(), "a row with no visible key must be zero"
+    assert torch.isinf(lse[:, 3]).all() and (lse[:, 3] > 0).all(), "LSE must be +inf"
+
+
+def test_bias_minus_inf_first_tile_does_not_produce_nan():
+    """The `m_i` floor, finally reachable -- and verified to fail without it.
+
+    P1 initialised `m_i` at -3.40282e+38 rather than `-inf` and recorded the
+    fix as *preventative*: under causal masking alone the first KV tile always
+    contains a live column, so `-inf - -inf` could not happen. A bias covering
+    that whole tile with `-inf` is the first configuration that reaches it.
+    With an `-inf` floor the correction term is `exp2(-inf - -inf) = NaN`;
+    with the real floor it is `exp2(-inf + 3.4e38) = 0`.
+
+    This was checked against a deliberately reverted floor rather than assumed:
+    reverting `c_m_init` to `-inf` turns **every one** of the 32768 output
+    elements into NaN, and restoring it gives none. A regression test that has
+    never been seen to fail is not yet a regression test.
+
+    It also keeps `ninf` honest. The `-inf` here comes from *user data*, so a
+    build that enabled `no-infs-fp-math` would be licensed to delete it, and
+    the reference comparison would drift rather than fault.
+    """
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    bias = torch.zeros(1, _NUM_HEADS, seq, seq, dtype=torch.float16, device="cuda")
+    bias[:, :, :, :32] = float("-inf")      # the whole first KV tile
+    o = torch.empty_like(q)
+    _bias_build(head_dim)(q, k, v, o, 1, seq, bias=bias)
+    torch.cuda.synchronize()
+    assert not torch.isnan(o).any(), "m_i floor: -inf - -inf produced NaN"
+    rel = _rel(o, _bias_ref(q, k, v, bias))
+    assert rel < 5e-3, f"rel={rel:.3e}"
+
+
+def test_bias_shared_plane_via_zero_stride():
+    """Stride 0 on the batch axis is how a caller shares one bias plane."""
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(2, seq, head_dim, torch.float16)
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    plane = torch.randn(1, _NUM_HEADS, seq, seq, dtype=torch.float16,
+                        device="cuda", generator=gen)
+    shared = plane.expand(2, _NUM_HEADS, seq, seq)      # stride(0) == 0
+    assert shared.stride(0) == 0
+    o = torch.empty_like(q)
+    _bias_build(head_dim)(q, k, v, o, 2, seq, bias=shared)
+    torch.cuda.synchronize()
+    rel = _rel(o, _bias_ref(q, k, v, shared))
+    assert rel < 5e-3, f"rel={rel:.3e}"
+
+
+def test_bias_and_causal_are_mutually_exclusive():
+    """Undefined, not unimplemented -- so it must be an error, not an answer.
+
+    Causal is an attention mask with a fixed pattern; bias *is* an attention
+    mask supplied directly. Asking for both asks which wins where they
+    disagree, and there is no defined answer. AOTriton disables the functional
+    and PyTorch's math backend raises; see sdpa-bias-plan.md 3.2.
+    """
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _bias_build(64, causal=True)
+
+
+def test_bias_requires_contiguous_last_dim():
+    """The KV axis is loaded eight columns at a time; it must be contiguous."""
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    bad = torch.zeros(1, _NUM_HEADS, seq, seq, dtype=torch.float16,
+                      device="cuda").transpose(2, 3)
+    with pytest.raises(ValueError, match="contiguous"):
+        _bias_build(head_dim)(q, k, v, torch.empty_like(q), 1, seq, bias=bad)

@@ -85,21 +85,63 @@ So bias costs `NUM_S_ACCS` vector loads per KV tile per Q row-tile, on a row
 index that is uniform per lane (`lane16`) and a column base that is uniform
 per `klane`. No gather, no scalarisation.
 
-### 2.1 What it does cost
+### 2.1 What it does cost — measured
 
-A new global load stream in a loop that is **already latency-bound and already
-spilling at head_dim 192 and above** (plan1 §6.2, §2.6). This is the phase's
-main risk and it is a performance risk, not a correctness one. Two mitigations
-are available and should be measured in this order:
+A bias tensor is `(B, H, Sq, Sk)`, so reading it is **O(N²) traffic against
+O(N·D) for everything else**. At B=1 H=8 N=4096 head_dim 64 that is 268 MB of
+bias against 16.8 MB for Q, K, V and O combined — sixteen times the rest of
+the kernel's memory.
 
-1. **Nothing.** The loop has spare memory-level parallelism precisely because
-   it is latency- rather than bandwidth-bound; the bias load may hide behind
-   the existing K/V waits.
-2. **Prefetch it with K and V**, at the same distance, so it joins the
-   existing pipeline rather than adding a serial dependency.
+Measured, non-causal, interleaved:
 
-Do not reach for (2) before measuring (1): it adds `NUM_S_ACCS` more
-loop-carried vectors, which is the resource this kernel is shortest of.
+| head_dim | `NUM_S_ACCS` | no bias | bias | ratio |
+| -------- | ------------ | ------- | ---- | ----- |
+| 16       | 16           | 40.6    | 10.6 | 3.82x |
+| 32       | 8            | 58.9    | 16.2 | 3.64x |
+| 64       | 4            | 88.2    | 28.4 | 3.11x |
+| 128      | 4            | 93.6    | 56.1 | 1.68x |
+| 192      | 4            | 75.8    | 60.5 | 1.26x |
+| 256      | 4            | 95.4    | 72.4 | 1.32x |
+
+**This is the cost of the feature, not a regression to fix.** `BIAS_TYPE` is a
+build axis, and `BIAS_TYPE == 0` is bit-identical to the pre-bias kernel — a
+caller who does not want bias pays nothing, not even an argument read.
+
+The shape of the cost falls out of the ratio above:
+
+```
+bias bytes      = 2·B·H·N²
+attention flops = 4·B·H·N²·D      ->   bytes/flop = 1 / (2·head_dim)
+```
+
+so **the relative cost depends on head_dim alone and not on sequence length**
+— the same 268 MB serves sixteen times the arithmetic at head_dim 256 as at
+16. It does not get worse as models grow their context.
+
+### 2.2 Prefetching does not help, and the measurement says why
+
+The plan originally proposed prefetching bias with K and V. It was tested and
+it does not work, for a reason worth recording rather than re-deriving.
+
+The bias stream runs at **327 GB/s**, and the R9700 peaks near 645. That looks
+like half the machine left on the table until the access pattern is counted:
+lanes 0-15 and lanes 16-31 read the *same* sixteen Q rows, contributing 16
+bytes each, so a wave touches sixteen rows at **32 contiguous bytes** apiece.
+Each of those lands in a 64-byte cache line, giving a hard ceiling of 50% of
+peak. 327/645 is 50.7%.
+
+**We are already at the ceiling the layout allows**, so there is no latency
+left to hide. Confirmed directly as well: hoisting the loads from after GEMM1
+(where they were issued and immediately waited on) to before it gives a whole
+GEMM1 and cross-shard reduction of free overlap, and moved nothing — 3.11x
+stayed 3.11x at head_dim 64. A distance-1 prefetch would buy more overlap and
+the same bandwidth, at the cost of `NUM_S_ACCS` loop-carried vectors.
+
+The only real lever would be cache-line utilisation, which the WMMA
+accumulator layout dictates: a lane's eight elements are eight columns of one
+row, and two lanes cover sixteen. Changing that means changing how S is held.
+Out of scope, and recorded here so the next person does not re-run the
+prefetch experiment.
 
 ---
 
@@ -218,6 +260,10 @@ max to `-inf`. With an `-inf`-initialised `m_i` the correction term is
 it. A regression test that has never been seen to fail is not yet a regression
 test.
 
+**Outcome — met, and emphatically.** With the floor, 0 NaNs. With `c_m_init`
+reverted to `-inf`, **32768 of 32768** output elements are NaN. The P1 fix has
+been unverifiable for three phases and is now demonstrably load-bearing.
+
 ### Step 3 — measure, then decide about prefetching
 
 §2.1. Ladder A/B with bias on and off, and the on/off gap reported per
@@ -239,9 +285,13 @@ so a flat profile means something is wrong.
 
 Two properties beyond "matches the reference":
 
-1. **Zero bias is a no-op.** `BIAS_TYPE == 1` with an all-zero tensor must
-   match `BIAS_TYPE == 0` — bitwise if the add is the only difference, which
-   it should be at zero.
+1. **Zero bias is a no-op**, to tolerance. `BIAS_TYPE == 1` with an all-zero
+   tensor must match `BIAS_TYPE == 0`. An earlier draft said "bitwise, since
+   the add is the only difference" — wrong, and wrong the same way gSWA step 1
+   was: adding a floating-point operation changes the emitted code even when
+   the operation is a mathematical no-op, and `reassoc`/`contract` may then
+   contract differently. Measured: 33 of 32768 elements differ, by at most
+   ~1 f16 ULP.
 2. **A whole-row `-inf` bias gives `O = 0` and `LSE = +inf`**, the same
    contract dead rows already have under gSWA. Bias reaches that state through
    a different path, so it is worth asserting separately.
@@ -250,14 +300,14 @@ Two properties beyond "matches the reference":
 
 ## 6. Risks
 
-| risk                                 | why it matters                                                | mitigation                                                         |
-| ------------------------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------ |
-| **Register pressure**                | a new load stream in a loop already spilling at head_dim 192+ | measure before prefetching; §2.1                                   |
-| `-inf` deleted by fast-math          | now arrives from user data, not just from the kernel          | `ninf` stays off; assert with an `-inf` bias                       |
-| Bias added *after* the tail mask     | `-inf + bias` revives a column past seqlen_k                  | order fixed in §1; the ragged-seqlen row of §5                     |
-| Tuning tables go stale               | fifth time; bias changes the live set                         | re-sweep only if the A/B shows a shift                             |
-| Bias drifts from Q's varlen indexing | bias would silently read the wrong rows under stacked varlen  | index it from the same six scalars (§3); no separate path to drift |
-| Causal + bias accepted by accident   | it is undefined, and a silent answer is worse than an error   | host-side rejection with a reason (§3.2); assert it                |
+| risk                                 | why it matters                                                              | mitigation                                                             |
+| ------------------------------------ | --------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| ~~Register pressure~~                | not the binding cost -- the stream is bandwidth-bound at the layout ceiling | measured, §2.2; prefetching rejected                                   |
+| `-inf` deleted by fast-math          | now arrives from user data, not just from the kernel                        | `ninf` stays off; assert with an `-inf` bias                           |
+| Bias added *after* the tail mask     | `-inf + bias` revives a column past seqlen_k                                | order fixed in §1; the ragged-seqlen row of §5                         |
+| Tuning tables go stale               | bias changes the live set                                                   | `BIAS_TYPE == 0` is bit-identical, so the shipped tables are untouched |
+| Bias drifts from Q's varlen indexing | bias would silently read the wrong rows under stacked varlen                | index it from the same six scalars (§3); no separate path to drift     |
+| Causal + bias accepted by accident   | it is undefined, and a silent answer is worse than an error                 | host-side rejection with a reason (§3.2); assert it                    |
 
 ---
 

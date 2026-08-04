@@ -393,6 +393,7 @@ def build_flash_attn_func_aiw_module_primary(
     v_lds_layout=None,
     strides_constexpr=False,
     padded_head=False,
+    bias=False,
     causal_type=None,
     q_row_tiles=1,
     shards=None,
@@ -736,6 +737,29 @@ def build_flash_attn_func_aiw_module_primary(
     # what licensed removing them; see sdpa-gswa-plan.md section 0.
     CAUSAL_TYPE = 0 if HOST_CAUSAL_TYPE == 0 else 3
 
+    # Bias tensor, AOTriton's BIAS_TYPE. 0 = none, 1 = a (B, H, Sq, Sk) matrix
+    # added to the scores before the softmax. A build axis, so BIAS_TYPE == 0
+    # emits nothing at all -- the loop is latency-bound and a bias that costs
+    # anything when unused would be paid by every caller who does not want it.
+    BIAS_TYPE = 1 if bias else 0
+    if BIAS_TYPE and CAUSAL_TYPE:
+        # Undefined, not unimplemented. Causal is an attention mask with a
+        # fixed pattern; bias *is* an attention mask supplied directly, since
+        # a large negative or -inf entry is how callers spell "do not attend
+        # here". Asking for both asks which wins where they disagree, and
+        # there is no answer -- the same thing has been specified twice in two
+        # vocabularies with no rule for reconciling them.
+        #
+        # AOTriton disables the functional; PyTorch's math backend raises
+        # "Explicit attn_mask should not be set when is_causal=True" and its
+        # flash backend has no kernel for the pair. See sdpa-bias-plan.md 3.2.
+        raise ValueError(
+            "bias and causal masking are mutually exclusive: bias already is "
+            "an attention mask, so combining it with a causal one has no "
+            "defined meaning. Fold the causal pattern into the bias tensor, "
+            "or drop the bias"
+        )
+
     # Mask KV columns past seqlen_k. Required whenever seqlen need not divide
     # BLOCK_N -- i.e. always, now that the interface no longer pads. The guard
     # inside is dynamic, so interior tiles cost one scalar compare.
@@ -847,6 +871,7 @@ def build_flash_attn_func_aiw_module_primary(
         V: fx.Pointer,
         O: fx.Pointer,  # noqa: E741
         L: fx.Pointer,
+        Bias: fx.Pointer,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
@@ -873,6 +898,9 @@ def build_flash_attn_func_aiw_module_primary(
         stride_o0: fx.Int64,
         stride_o1: fx.Int64,
         stride_o2: fx.Int64,
+        stride_b0: fx.Int64,
+        stride_b1: fx.Int64,
+        stride_b2: fx.Int64,
         sm_scale_arg: fx.Float32,
     ):
         elem_type = elem_numeric_cls.ir_type
@@ -1288,6 +1316,19 @@ def build_flash_attn_func_aiw_module_primary(
         _k_batch_v = fx.Index(_k_batch)
         _q_row_off_v = fx.Index(_q_row_off)
         _k_row_off_v = fx.Index(_k_row_off)
+        # Bias is (B, H, Sq, Sk): the last axis is the KV column, so unlike
+        # Q/K/V/O its "row" stride is stride_b2 and the contiguous axis is the
+        # one the KV tile walks. Indexed with the *same* (batch_index,
+        # q_row_off) the varlen decode produced, so it inherits every layout
+        # for free rather than needing its own -- sdpa-bias-plan.md 3.
+        if const_expr(BIAS_TYPE):
+            _b_ptr = _pointer_to_llvm_ptr(Bias)
+            _b_base = (
+                _q_batch_v * fx.Index(stride_b0)
+                + head_q * fx.Index(stride_b1)
+                + _q_row_off_v * fx.Index(stride_b2)
+            )
+
         q_tbase, q_toff = _addr_pair(q_st, head_q, _q_batch_v, _q_row_off_v)
         k_tbase, k_toff = _addr_pair(k_st, head_k, _k_batch_v, _k_row_off_v)
         v_tbase, v_toff = _addr_pair(v_st, head_k, _k_batch_v, _k_row_off_v)
@@ -2107,6 +2148,41 @@ def build_flash_attn_func_aiw_module_primary(
                 # domain and the exponent is a plain subtract.
                 s_raw = [_fmul(v, c_sm_scale_log2e) for v in s_raw]
 
+                if const_expr(BIAS_TYPE):
+                    # ---- Bias, after the scale and before the mask ----
+                    #
+                    # After the scale because m_i and the exponent live in the
+                    # base-2 scaled domain, so a bias in natural units has to
+                    # be multiplied by log2(e) first -- which is what
+                    # AOTriton's `qk += bias * 1.44269504089` is doing.
+                    #
+                    # Before the mask so a column past seqlen_k stays -inf
+                    # rather than becoming -inf + bias. Those columns are not
+                    # keys the caller hid; they do not exist, and neither do
+                    # their bias entries.
+                    #
+                    # Not a gather. Element i of the flattened accumulators is
+                    # KV column (i//16)*32 + ((i//8)%2)*16 + klane*8 + i%8, so
+                    # within each group of eight only i%8 varies: those eight
+                    # are eight *contiguous* columns starting at klane*8, and
+                    # one v8 load covers them -- the same shape as the K and V
+                    # loads.
+                    _b_row = _b_base + q_rows[qt] * fx.Index(stride_b2)
+                    for _st in range_constexpr(NUM_S_ACCS):
+                        _c0 = (_st // 2) * 32 + (_st % 2) * 16
+                        _bv = load_global_v8f16(
+                            _b_ptr,
+                            _b_row + fx.Index(kv_block_start) + fx.Index(_c0)
+                            + klane * fx.Index(8),
+                            fx.Index(0),
+                        )
+                        for _r in range_constexpr(8):
+                            _bs = fx.Float32(Vec(_bv)[_r].to(fx.Float32))
+                            s_raw[_st * 8 + _r] = _fadd(
+                                s_raw[_st * 8 + _r],
+                                _fmul(_bs, fx.Float32(_LOG2E)),
+                            )
+
                 if const_expr(_MASK_STEPS):
                     # ---- Masked region: KV tail and causal, fused ----
                     #
@@ -2552,6 +2628,7 @@ def build_flash_attn_func_aiw_module_primary(
         V: fx.Pointer,
         O: fx.Pointer,  # noqa: E741
         L: fx.Pointer,
+        Bias: fx.Pointer,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
@@ -2578,6 +2655,9 @@ def build_flash_attn_func_aiw_module_primary(
         stride_o0: fx.Int64,
         stride_o1: fx.Int64,
         stride_o2: fx.Int64,
+        stride_b0: fx.Int64,
+        stride_b1: fx.Int64,
+        stride_b2: fx.Int64,
         sm_scale_v: fx.Float32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -2597,7 +2677,7 @@ def build_flash_attn_func_aiw_module_primary(
         # Always forwarded: with STRIDES_CONSTEXPR the kernel simply does not
         # read them, which is what keeps the two arms directly comparable.
         launcher = flash_attn_func_aiw_kernel(
-            Q, K, V, O, L,
+            Q, K, V, O, L, Bias,
             seqinfo_q0, seqinfo_q1, seqinfo_k0, seqinfo_k1,
             varlen_bits, batch_size, max_seqlen_q, max_seqlen_k,
             window_left, window_right,
@@ -2607,6 +2687,7 @@ def build_flash_attn_func_aiw_module_primary(
             stride_k0, stride_k1, stride_k2,
             stride_v0, stride_v1, stride_v2,
             stride_o0, stride_o1, stride_o2,
+            stride_b0, stride_b1, stride_b2,
             sm_scale_v,
         )
 
@@ -2926,6 +3007,26 @@ def build_flash_attn_func_aiw_module_primary(
             wl, wr = window
         return int(wl), int(wr)
 
+    def _bias_args(bias):
+        """(pointer, stride_b0, stride_b1, stride_b2) for a (B, H, Sq, Sk) bias.
+
+        The last axis is the KV column and must be contiguous, exactly as the
+        D axis is for Q/K/V/O -- the kernel loads eight adjacent columns per
+        accumulator group in one v8.
+        """
+        if not BIAS_TYPE:
+            return _NULL_PTR, 0, 0, 0
+        if bias is None:
+            raise ValueError("this build has BIAS_TYPE=1 and requires bias=")
+        if bias.dim() != 4:
+            raise ValueError(f"bias must be rank 4 (B, H, Sq, Sk), got {tuple(bias.shape)}")
+        if bias.stride(3) != 1:
+            raise ValueError(
+                f"bias must have a contiguous last (Sk) dimension, got "
+                f"stride(3)={bias.stride(3)}"
+            )
+        return (_ptr_arg(bias), bias.stride(0), bias.stride(1), bias.stride(2))
+
     def _resolve_scale(Q, scale):
         """Default sm_scale from the tensor's *real* head dim, not the tile.
 
@@ -2994,7 +3095,7 @@ def build_flash_attn_func_aiw_module_primary(
 
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
-    def _launch(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None):  # noqa: E741
+    def _launch(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None, bias=None):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
         _lse_p = _lse_args(lse, seqlen_q, varlen, meta[0])
@@ -3002,10 +3103,12 @@ def build_flash_attn_func_aiw_module_primary(
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(
             varlen, seqlen_q, seqlen_k
         )
+        _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
         _run_compiled(
             launch_flash_attn_aiw,
             *ptrs,
             _lse_p,
+            _bp,
             _sq0, _sq1, _sk0, _sk1,
             batch_size,
             _vb,
@@ -3015,11 +3118,12 @@ def build_flash_attn_func_aiw_module_primary(
             _wr,
             *meta,
             *st,
+            _sb0, _sb1, _sb2,
             _resolve_scale(Q, scale),
             stream if stream is not None else fx.Stream(None),
         )
 
-    def _compile(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None):  # noqa: E741
+    def _compile(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None, bias=None):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
         _lse_p = _lse_args(lse, seqlen_q, varlen, meta[0])
@@ -3027,10 +3131,12 @@ def build_flash_attn_func_aiw_module_primary(
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(
             varlen, seqlen_q, seqlen_k
         )
+        _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
         return flyc.compile(
             launch_flash_attn_aiw,
             *ptrs,
             _lse_p,
+            _bp,
             _sq0, _sq1, _sk0, _sk1,
             batch_size,
             _vb,
@@ -3040,6 +3146,7 @@ def build_flash_attn_func_aiw_module_primary(
             _wr,
             *meta,
             *st,
+            _sb0, _sb1, _sb2,
             _resolve_scale(Q, scale),
             fx.Stream(stream),
         )
