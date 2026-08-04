@@ -1016,11 +1016,16 @@ computed once in the prologue, and the kernel's addressing and LSE offset are
 already written in the shape that needs — the LSE layout turns out not to be an
 independent choice at all, but Q's addressing applied to a rank-2 tensor.
 
-**P4 bias · P5 dropout.** Unchanged in content, and each is now simpler than
-plan 0 scoped it: there is one masking path to extend, not two. P4 still
-carries the `m_i` floor regression test, which is only *reachable* with bias.
-Both gain a varlen dimension once P3 lands — bias is indexed per sequence, and
-dropout's Philox offset must be per-sequence to stay reproducible.
+**P4 bias.** Detailed separately in `sdpa-bias-plan.md`. Simpler than plan 0
+scoped it -- one masking path to extend, not two -- but it carries the `m_i`
+floor regression test, which is only *reachable* with bias and is therefore
+the phase's second objective rather than a footnote. One decision needs
+resolving before code: AOTriton's bias base omits `cu_seqlens_q_start` and
+uses a `batch_index` that compact varlen pins to 0, so bias under varlen has
+no defined semantics there to copy.
+
+**P5 dropout.** Unchanged, and independent of P4. Its Philox offset must be
+per-sequence under varlen to stay reproducible.
 
 **All owed items are now closed:** the tuning re-sweep (two entries moved,
 head_dim 224 by 27%), the legacy oracles' retirement (N2, numbers recorded
