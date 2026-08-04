@@ -78,9 +78,14 @@ that the PRNG do 64-bit *arithmetic*. Triton's 32-bit path already takes both:
 | `c2`, `c3`   | 0, 0                                  |
 
 So a 64-bit seed occupies the whole 64-bit key and a 64-bit offset the low
-half of the counter, with 32-bit lanes throughout. The split is two shifts on
-a value that is uniform per workgroup — it happens once in the prologue, not
-per element.
+half of the counter, with 32-bit lanes throughout.
+
+**And the split is free, not two shifts.** A 64-bit value lives in two
+consecutive 32-bit registers, so its halves are addressable directly — the
+compiler lowers `trunc` and `lshr 32; trunc` to register naming. Confirmed on
+gfx1201: the whole hi/lo extraction of a `u64` kernarg emits **zero**
+instructions between the `s_load_b128` and the store. There is no cost to
+carrying 64-bit seed and offset through a 32-bit PRNG, not even a cheap one.
 
 The 64-bit variant instead puts the whole seed in `k0` and the whole offset in
 `c0`, with `u64` lanes and the wider constants. It yields 4 x u64 = 8 usable
@@ -159,6 +164,11 @@ result of an `int32` multiply preserves the wrap. This is the same width
 hazard as `sdpa-varlen-plan.md` §5, in a place where nothing faults to
 announce it.
 
+The rule is close to free on this target, which removes the usual reason to
+skip it. A `32 x 32 -> 64` widening product is **one instruction** in both
+paths: `s_mul_u64` when the operands are uniform, `v_mad_co_u64_u32` when they
+are per-lane. Measured from the emitted ISA, not assumed.
+
 Choosing `RN = 8` (§4) halves the offset space and buys one more doubling of
 head count or context before the wrap — a small point in its favour, and not
 a substitute for 64-bit arithmetic.
@@ -169,24 +179,35 @@ a substitute for 64-bit arithmetic.
 
 The interesting question, and the one the plan cannot answer from a desk.
 
-**The case for 32-bit.** RDNA4 has `v_mul_lo_u32` and `v_mul_hi_u32` as single
-instructions. It has no 64-bit integer multiply: a `u64 * u64` low product is
-three 32-bit multiplies plus adds, and a 64-bit `umulhi` is worse. Per round
-the 32-bit variant costs 2 `mul_hi` + 2 `mul_lo` + 4 xor + 2 add; the 64-bit
-one costs perhaps 7x that for 2x the output — call it 3.5x worse per random
-bit.
+**The case for 32-bit, now with ISA counts.** Philox's inner loop needs
+`umulhi` and a low product on the *counter*, which is per-lane and therefore
+VALU. Measured on gfx1201:
 
-**The case for 64-bit.** It maps onto our accumulator layout exactly. Element
-`i` of the flattened accumulators is KV column
+| operation                      | emitted                                                         | VALU ops |
+| ------------------------------ | --------------------------------------------------------------- | -------- |
+| `32 x 32 -> 64` widening       | `v_mad_co_u64_u32`                                              | **1**    |
+| `64 x 64 -> 64`, low half only | `2x v_mul_lo_u32` + `v_mad_co_u64_u32` + `v_add3_u32` + carries | **~6**   |
+
+`v_mul_hi_u32` gives the 32-bit variant's `umulhi` in one instruction. The
+64-bit variant needs the *high* 64 bits of a 64x64 product, which is worse
+than the low half measured above. Per round that is roughly 10 VALU ops for
+4 x u32 of output against ~42 for 8 x u32 — about **2x more work per random
+bit**, not the 3.5x guessed before the measurement.
+
+**The case for 64-bit** is unchanged and is about call count, not arithmetic.
+Element `i` of the flattened accumulators is KV column
 `(i//16)*32 + ((i//8)%2)*16 + klane*8 + i%8`, so a group of eight consecutive
-elements is **eight contiguous columns** — which is one 64-bit Philox call
-(8 x u32) and two 32-bit calls. Halving the call count also halves the offset
-arithmetic and the register pressure of holding results.
+elements is **eight contiguous columns** — one 64-bit Philox call, or two
+32-bit calls. Halving the call count halves the offset arithmetic and the
+registers holding results, and doubles the headroom before §3.1's overflow.
 
-**So it is not obvious, and §0.3 asks for a measurement.** A microbenchmark
-under `kernels/microbench/` — the repo already has that directory — timing
-both variants at the shapes the attention loop actually uses, reporting
-randoms per second and VGPR count. Decide from that, then freeze it (§3).
+**The ISA counts predict 32-bit, but the microbenchmark still runs**, because
+what matters is randoms per second in the attention loop's register budget,
+not ops per round on paper — and the 64-bit variant halves the call count,
+which the op counts above do not capture. A microbenchmark under
+`kernels/microbench/`, timing both at the shapes the loop actually uses and
+reporting randoms/second *and* VGPR count. Decide from that, then freeze it
+(§3).
 
 Write the benchmark before either integration, because the answer changes the
 offset arithmetic in §3 and therefore every mask.
