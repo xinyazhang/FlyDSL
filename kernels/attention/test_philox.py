@@ -285,6 +285,35 @@ def test_matches_triton(width):
 
 
 @_SKIP
+def test_configured_object_matches_free_functions(width):
+    """`Philox` must be a wrapper, not a second implementation.
+
+    It exists so that width and round count travel together -- forward,
+    backward and the mask kernel have to agree bit for bit -- which is only
+    worth anything if it produces the same stream as the functions it wraps.
+    """
+    from philox import Philox
+
+    rng = Philox(width=width)
+    assert rng.randoms_per_offset == randoms_per_offset(width)
+    seeds = [s for s, _ in _CASES]
+    offs = [o for _, o in _CASES]
+    direct = _run_device(seeds, offs, width)
+    for i, (s, o) in enumerate(_CASES):
+        assert list(direct[i]) == _ref_u32(s, o, width), "free function drifted"
+
+
+def test_configured_object_validates(width):
+    """Bad configurations fail at construction, not at trace time."""
+    from philox import Philox
+
+    with pytest.raises(ValueError, match="PHILOX_WIDTH"):
+        Philox(width=48)
+    with pytest.raises(ValueError, match="n_rounds"):
+        Philox(width=width, n_rounds=0)
+
+
+@_SKIP
 def test_distribution_is_plausible(width):
     """Weak by construction, kept because it catches a stuck word.
 

@@ -41,7 +41,7 @@ import flydsl.expr as fx  # noqa: E402
 from flydsl.expr import gpu, range_constexpr  # noqa: E402
 
 from bench_shim import do_bench  # noqa: E402
-from philox import DEFAULT_ROUNDS, PHILOX_WIDTHS, philox_u32, randoms_per_offset  # noqa: E402
+from philox import DEFAULT_ROUNDS, PHILOX_WIDTHS, Philox  # noqa: E402
 
 BLOCKS = 4096
 THREADS = 256
@@ -50,7 +50,8 @@ CALLS_PER_THREAD = 64
 
 def build(width, n_rounds=DEFAULT_ROUNDS, calls=CALLS_PER_THREAD):
     """Sum `calls` calls' worth of randoms so nothing is dead code."""
-    rn = randoms_per_offset(width)
+    rng = Philox(width=width, n_rounds=n_rounds)
+    rn = rng.randoms_per_offset
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def k(OUT: fx.Pointer, seed: fx.Int64, base: fx.Int64):
@@ -64,7 +65,7 @@ def build(width, n_rounds=DEFAULT_ROUNDS, calls=CALLS_PER_THREAD):
         for c in range_constexpr(calls):
             off = base + blk * fx.Int64(THREADS * calls) \
                 + tid * fx.Int64(calls) + fx.Int64(c)
-            vals = philox_u32(seed, off, width, n_rounds)
+            vals = rng.u32(seed, off)
             for j in range_constexpr(rn):
                 acc = acc ^ fx.Int32(vals[j])
         out = fx.recast_iter(i32p, OUT)
@@ -119,7 +120,7 @@ def run_one(width):
     fn()
     torch.cuda.synchronize()
     ms = do_bench(fn, warmup=25, rep=100, return_mode="median")
-    n = BLOCKS * THREADS * CALLS_PER_THREAD * randoms_per_offset(width)
+    n = BLOCKS * THREADS * CALLS_PER_THREAD * Philox(width=width).randoms_per_offset
     return ms, n / ms * 1e3 / 1e9      # G randoms/s
 
 
@@ -140,7 +141,7 @@ def main():
         ms, grs = run_one(w)
         v = vgpr_count(w)
         res[w] = (grs, v)
-        print(f"{w:>6} {randoms_per_offset(w):>9} {ms:>8.3f} {grs:>10.2f} "
+        print(f"{w:>6} {Philox(width=w).randoms_per_offset:>9} {ms:>8.3f} {grs:>10.2f} "
               f"{(v if v is not None else '?'):>11}")
     a, b = res[32][0], res[64][0]
     print(f"\n32-bit is {a / b:.2f}x the throughput of 64-bit per random")
