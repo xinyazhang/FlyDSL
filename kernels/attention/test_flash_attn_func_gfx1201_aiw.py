@@ -900,12 +900,17 @@ def test_logsumexp_is_plus_inf_for_rows_with_no_keys():
 def test_shard_resolution_respects_narrow_window():
     """A narrow V window must not inherit a shard count it cannot divide.
 
-    head_dim 384 prefers 3 shards, which splits a 128-column window into
-    42-column slices -- not a multiple of WMMA_N. The resolver walks down
-    instead of failing the build.
+    At a preference of 3, head_dim 384 splits a 128-column window into
+    42-column slices -- not a multiple of WMMA_N. The resolver must walk down
+    to something valid instead of failing the build.
+
+    The preference is passed explicitly rather than taken from the tuning
+    table. It used to be read from the table, which coupled a test of the
+    *resolver* to a tuning value and duly broke when head_dim 384 was retuned
+    from 3 shards to 2 -- while the property under test had not changed at all.
     """
-    assert resolve_shards(384, 384, 32) == 3
-    assert resolve_shards(384, 128, 32) < 3
+    assert resolve_shards(384, 384, 32, want=3) == 3
+    assert resolve_shards(384, 128, 32, want=3) < 3
     for head_dim in _LADDER:
         for vo in (head_dim, 128, 64):
             if vo > head_dim:

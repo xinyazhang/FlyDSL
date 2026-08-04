@@ -233,14 +233,36 @@ _ROWS_PER_Q_TILE = 16
 # (384: 61.4/60.9 at (3,4), best alternative 54.2; 512: 52.2/44.6 at (4,2),
 # best alternative 36.7). Only 256 was mistuned.
 #
+# Re-swept in full after gSWA and varlen, both of which moved register
+# pressure. Nine of eleven entries were confirmed unchanged. Two were not, and
+# **both were mistuned the same way head_dim 256 had been**: a configuration
+# rejected on spills or LDS was never retried after the surrounding budget
+# changed, so the table kept a choice whose reason had expired.
+#
+#   head_dim  was      now      non-causal  causal   (interleaved, 5 reps)
+#   224       (2, 8)   (1, 16)     1.269     1.230
+#   384       (3, 4)   (2, 4)      1.089     1.062
+#
+# head_dim 224's old note reads "1 shard spills at any count" -- true, and
+# irrelevant: unsharded 16 waves is 27% faster despite the spills. That is the
+# third time this file has recorded that spill count is not a proxy for speed,
+# and the second time the lesson was written down and then not applied to a
+# neighbouring entry.
+#
+# head_dim 160 screened as a win for (1, 8) and is *not* one: interleaved it
+# is 0.948 non-causal and 1.000 causal. Kept at (1, 16). Recorded because the
+# screen and the confirmation disagreed by more than the effect being measured
+# -- a single undrifted measurement cannot resolve a 1% difference on this
+# board, and two of the three candidates it produced were real.
+#
 # head_dim 128 re-swept after the P2 region split, which duplicates the loop
 # body and pushed its VGPR count 149 -> 212. 16 q_tiles (BLOCK_M 256, 16 waves)
 # no longer fits; 8 is 92.5/92.0 against 84.4/81.2 TFLOPS non-causal/causal.
 # 48/80/96/160 were swept at the same time and are unchanged; 192 is already
 # at its optimum.
-_SHARDS_BY_HEAD_DIM = {224: 2, 256: 1}
+_SHARDS_BY_HEAD_DIM = {224: 1, 256: 1, 384: 2}
 _Q_TILES_BY_HEAD_DIM = {48: 8, 64: 16, 80: 16, 96: 16, 128: 8, 160: 16,
-                        192: 8, 224: 8, 256: 16, 384: 4, 512: 2}
+                        192: 8, 224: 16, 256: 16, 384: 4, 512: 2}
 
 # BLOCK_M for the distance-0 schedule. Per-wave register use is dominated by
 # two head_dim-proportional terms -- o_accs = VO_WIDTH/2 VGPRs and
