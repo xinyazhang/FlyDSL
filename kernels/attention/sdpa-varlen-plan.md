@@ -43,7 +43,7 @@ and PyTorch already ships a case outside it — see §1.4. The three axes:
 
 |              | array shape | `seqlen(z)`                            |
 | ------------ | ----------- | -------------------------------------- |
-| `MAX`        | —           | `Max_seqlen` (every sequence the same) |
+| `MAX`        | -           | `Max_seqlen` (every sequence the same) |
 | `CUMULATIVE` | `(N+1,)`    | `a[z+1] - a[z]`                        |
 | `INDIVIDUAL` | `(N,)`      | `a[z]`                                 |
 
@@ -221,6 +221,47 @@ the same expression `+ q_row_off`, per §3.2.
 loads — at most six, once, into SGPRs. They do not touch the VGPR budget gSWA
 just raised.
 
+### 4.1 Orthogonal with MQA/GQA, and not by accident
+
+Checked rather than assumed, because the two features touch the same address
+expression:
+
+```
+base = batch_index * s_batch  +  head * s_head  +  row_off * s_seq
+         \________ varlen ________/   \_ GQA _/   \___ varlen ___/
+```
+
+They act on **three different axes of a rank-4 tensor**. Varlen decides which
+batch slice and which row; GQA decides which head, via
+`head_k = head_q // (num_head_q // num_head_k)` — pure head arithmetic that
+reads no sequence or batch quantity. LSE is indexed by `num_head_q` and the Q
+side's decode, so it inherits both without a special case.
+
+**The coupling that would have broken it is already closed.** For a 1THD
+tensor, `stride(1)` — the per-token stride — is `H * D`, and under GQA that is
+`num_head_q * D` for Q but `num_head_k * D` for K. So `q_row_off` and
+`k_row_off` are scaled by *different* multipliers. That works only because
+strides are per-tensor, which plan1 §2.1 already established for exactly this
+reason ("K and V ... carry Num_head_k rather than Num_head_q, so their head
+stride differs from Q's by construction"). A kernel still deriving one shared
+`STRIDE_TOKEN` from the shape would be silently wrong for every packed GQA
+call — the tokens of K would be strided as if K had Q's head count.
+
+So the orthogonality is real, but it is inherited from the per-tensor stride
+decision rather than free. Worth one test rather than none: §7's suite B
+carries a GQA row.
+
+### 4.2 `lse_stride` needs no derivation
+
+AOTriton loads it from the device (`tl.load(cu_seqlens_q + Num_seqlens)`)
+because its API only receives `Max_seqlen_q`. Ours already reads
+`lse.stride(0)` off the LSE tensor on the host, which is the same number by
+construction for every layout in §2 — `TotalS` for `(H, TotalS)`,
+`Max_seqlen_q` for `(B*H, Max_seqlen_q)`. Keep that: it removes a scalar load
+from the prologue and a host/device round trip from the caller.
+
+This does leave one thing unexpressible; see item V2 in §11.
+
 ---
 
 ## 5. Row offsets are 64-bit; the hazard is width, not sign
@@ -288,33 +329,61 @@ so does the tile-to-workgroup mapping), which changes nothing any surviving
 workgroup computes; and LSE lives in a different layout, so compare
 per-sequence slices rather than buffers.
 
-### Axes
+### Two suites, not one product
 
-| axis                           | values                                  | why                                    |
-| ------------------------------ | --------------------------------------- | -------------------------------------- |
-| Q byte × K byte                | the six rows of §2, plus mixed Q/K      | the point of the decomposition         |
-| length distribution            | uniform; one-long-many-short; all-equal | all-equal hides position bugs          |
-| `N`                            | 1, 2, 7, 22                             | `N = 1` must reduce to dense exactly   |
-| `seqlen = 0`                   | leading, middle, trailing               | must write nothing at all              |
-| `seqlen_k = 0`, `seqlen_q > 0` |                                         | every row dead: `O = 0`, `LSE = +inf`  |
-| ragged lengths                 | primes                                  | tiles ending mid-sequence              |
-| causal                         | off, top-left, bottom-right, window     | `window_right` is per-sequence now     |
-| sentinels                      | `0x80000001`, `0x80000002`              | objective 2; must match the host table |
+The full product — lengths × modes × causal × GQA — is far too large. It
+factors cleanly because the two interesting axes are independent (§1): the
+*mode* decides how a sequence is located, the *lengths* decide what is in it.
+So project onto each axis in turn.
 
-### Properties beyond "matches the reference"
+**Suite A — one mode, many length patterns.** `CompactVarlen` (`0x0B0B`) only,
+since it is the mode every caller uses, against a spread of length sets:
+
+| axis                           | values                                                     |
+| ------------------------------ | ---------------------------------------------------------- |
+| `N`                            | 1, 2, 7, 22                                                |
+| length distribution            | uniform; one-long-many-short; all-equal; all-ragged primes |
+| zero-length                    | leading, middle, trailing                                  |
+| `seqlen_k = 0`, `seqlen_q > 0` | every row dead                                             |
+| causal                         | off, top-left, bottom-right, explicit window               |
+
+**Suite B — one length pattern, every mode.** A single deliberately awkward
+length set — ragged, `N = 7`, including one zero and one much-longer sequence,
+`seqlen_q != seqlen_k` — run through every configuration:
+
+| configuration                         | bits                                    |
+| ------------------------------------- | --------------------------------------- |
+| dense                                 | `0x0000`                                |
+| compact                               | `0x0B0B`                                |
+| strided (gaps between sequences)      | `0x0B0B`, different `?1`                |
+| padded                                | `0x0202`                                |
+| packed Q, `seqused_k` on packed KV    | `0x0D0B`                                |
+| packed Q, `seqused_k` on a BHSD cache | `0x040B`                                |
+| mixed: packed Q, dense K              | `0x000B`                                |
+| GQA (§4.1), on compact                | `0x0B0B`, `num_head_q = 4 * num_head_k` |
+
+**What the factorisation gives up, and why that is acceptable.** It cannot see
+an interaction that needs *both* an unusual length pattern and an unusual mode
+— a zero-length sequence in the middle of a `seqused_k` batch, say. That risk
+is bounded by §1: the mode is consumed entirely in the prologue, which turns it
+into three scalars, and every length pattern then flows through identical code.
+An interaction would have to be a prologue bug, and suite B's length set is
+chosen to be awkward enough to expose one. If a mode-specific bug is ever found
+in the field, that assumption is what failed, and the fix is to cross those two
+rows — not to build the full product now.
+
+### Properties neither suite covers
 
 1. **Single-sequence reduction.** `N = 1` compact must be bitwise identical to
    the dense call. Cheapest instance of the headline gate; make it pass first.
-2. **Padded vs compact agreement.** The same logical batch both ways. Catches a
-   `batch_index` / `row_off` mix-up, because those two configurations differ in
-   *precisely* those fields.
-3. **Position array actually read.** Build a case whose gaps are non-zero and
-   assert it differs from the gapless interpretation of the same buffer —
-   otherwise an implementation that ignores `seqinfo_?1` passes everything.
-4. **`seqused_k` shortens, and only K.** With `seqused_k[z] < cu_k[z+1]-cu_k[z]`
-   the result must equal a dense call on the truncated K, and must *differ*
-   from one on the full K. This is the §1.4 case; nothing else covers it.
-5. **One large case**, `T` big enough that `q_row_off * stride` exceeds 2^32,
+2. **Position array actually read.** A strided case with non-zero gaps must
+   differ from the gapless reading of the same buffer — otherwise an
+   implementation that ignores `seqinfo_?1` passes everything above.
+3. **`seqused_k` shortens, and only K.** With
+   `seqused_k[z] < cu_k[z+1] - cu_k[z]`, the result must equal a dense call on
+   the truncated K *and* differ from one on the full K. Two assertions, because
+   only the second one fails if `seqused_k` is ignored.
+4. **One large case**, `T` big enough that `q_row_off * stride` exceeds 2^32,
    marked `large_shape`. §5 is unreachable at normal test scale.
 
 ---
@@ -383,7 +452,93 @@ semantics, and both are cheap to guard on the host.
 
 ---
 
-## 10. What this phase does *not* do
+## 10. Items to resolve
+
+Recommendations given, but these are yours to settle before step 1.
+
+### V1 — `VarlenBits` runtime or constexpr?
+
+**Recommend runtime.** A build axis multiplies the functional count by the
+number of shipped configurations, against a tuning key that is currently
+`BLOCK_DMODEL` alone (N3). The decode is ~10 scalar ops and at most six scalar
+loads, once per workgroup, entirely in SGPRs — and D2 already priced runtime
+scalars at ~0.2%. The prologue branch is uniform and outside every loop.
+
+Cost of being wrong: if it measures badly at small head_dim, `bits == 0` can be
+promoted to a constexpr *specialisation* later without changing the ABI.
+
+### V2 — LSE layout: is `(T_q, H_q)` in scope?
+
+`torch.nn.attention.varlen` returns LSE with shape **`(T_q, H_q)`** —
+token-major. Our formula is `(b*H + h) * lse_stride + s`, which is head-major,
+and **no value of `lse_stride` produces the transpose**. AOTriton is head-major
+too, so this is a PyTorch-shim question, not an AOTriton-parity one.
+
+Three options:
+
+|                                               |                                                 |
+| --------------------------------------------- | ----------------------------------------------- |
+| head-major only, shim transposes              | zero kernel cost, one copy per call in the shim |
+| add a head stride: `b*s_lb + h*s_lh + s*s_ls` | covers both, stays branch-free, +2 scalar args  |
+| defer                                         | fine if no caller needs `(T_q, H_q)` yet        |
+
+**Recommend the second.** It is two extra arguments and no branch, it makes the
+LSE tensor as layout-agnostic as Q/K/V/O already are (plan1 §0), and it removes
+a special case the backward pass would otherwise inherit.
+
+### V3 — Q-side `INDIVIDUAL` lengths: ship or reject?
+
+PyTorch only exposes `seqused_k`, never `seqused_q`. The bits make the Q side
+symmetric for free.
+
+**Recommend shipping it**, because rejecting it costs a validation branch and
+an asymmetry to explain, while accepting it costs nothing — the decoder is
+called twice with the same code either way. Leave it untested beyond one smoke
+case.
+
+### V4 — where do the §9 host-side guards live?
+
+Two assumptions the encoding does not enforce: `seqinfo_?1` is a prefix sum
+with the total in slot `[N]` (§9.4), and sequences do not overlap (§9.5).
+
+**Recommend host-side asserts in the launch shim**, cheap and off the device.
+But they cost a device→host read of the `seqinfo` tensors, which is a sync.
+So: **debug-only**, behind the same switch the existing shape validation uses,
+not on every call.
+
+### V5 — strided varlen ships with no kernel step
+
+Per §1.2 it is compact with a different `seqinfo_?1`. That means **nothing in
+the kernel is written for it** and its correctness rests entirely on suite B
+plus §7 property 2.
+
+Flagging it because "we support strided varlen" and "we never wrote any code
+for strided varlen" are both true, and the second is the surprising one.
+
+### V6 — does `N` reuse `batch_size`?
+
+AOTriton sets `.Batch = num_seqlens == 0 ? batch : num_seqlens`, i.e. reuses
+the slot. **Recommend the same** — the grid's z extent is the sequence count in
+both readings, and a second argument would only be able to disagree.
+
+### V7 — `Max_seqlen_q/k` stay as arguments
+
+Needed even in varlen: `Max_seqlen_q` sizes the grid, and both appear in
+`IMPLIED` positions and `MAX` lengths. **Recommend keeping them unconditional**
+rather than overloading them per mode. Noting it only because objective 3's
+grep criterion names `Max_seqlen_*` — they may appear in the *prologue* and the
+*launcher*, nowhere else.
+
+### V8 — is the §6.2 grid-waste measurement in scope?
+
+It is a benchmark, not a feature, and it belongs to persistent-dynamic.
+**Recommend doing it here anyway**: it is ~20 lines against a skewed length
+distribution, and the alternative is that persistent-dynamic starts with an
+intuition. Say so now if you would rather defer it.
+
+---
+
+## 11. What this phase does *not* do
 
 - **Paged KV** (§9.1) and **persistent-dynamic** (§6.2).
 - **Backward.** The dk/dv kernel needs the same six scalars and the sentinels
