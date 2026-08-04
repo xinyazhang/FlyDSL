@@ -1174,6 +1174,29 @@ def build_flash_attn_func_aiw_module_primary(
             q_tile_idx = fx.Index(gpu.block_idx.y)
         q_start = q_tile_idx * BLOCK_M
 
+        # Does this workgroup own any real Q row? Under varlen the grid's Q
+        # extent is sized from Max_seqlen_q, so whole workgroups land past the
+        # end of a shorter sequence and this is false for them.
+        _alive = ArithValue(
+            arith.cmpi(arith.CmpIPredicate.slt, _raw(q_start), _raw(seqlen_q_v))
+        )
+
+        # **The Q base must be clamped, not just the row within the tile.**
+        # `q_tbase(q_start)` folds q_start into the 64-bit base, and the
+        # in-bounds guard below only clamps the row *inside* the tile -- so a
+        # dead workgroup still addresses `row_off + q_start` rows in, which
+        # for a packed tensor runs past the end of the whole allocation, not
+        # merely past this sequence. Dense never reached it: there the grid is
+        # exactly ceil(seqlen_q / BLOCK_M), so q_start < seqlen_q always.
+        #
+        # Faults for real -- a 1.3 MB overshoot on a 16-sequence batch hits an
+        # unmapped page. It is a *read*, and one whose result is discarded, so
+        # smaller overshoots land inside the allocation and are silently
+        # harmless, which is exactly why the varlen tests did not catch it.
+        _q_start_addr = fx.Index(
+            ArithValue(_alive).select(q_start, fx.Index(0))
+        )
+
         # MQA/GQA: Num_head_q / Num_head_k query heads share each KV head.
         # The ratio is uniform and computed once, so the scalar divide is
         # immaterial; the per-head division below is by that ratio.
@@ -1590,7 +1613,7 @@ def build_flash_attn_func_aiw_module_primary(
             wave_q_offset + fx.Index(qt * WMMA_M) + lane16
             for qt in range_constexpr(Q_ROW_TILES)
         ]
-        q_tile_base = q_tbase(q_start)
+        q_tile_base = q_tbase(_q_start_addr)
         c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
 
         q_in_bounds_all = []
@@ -1692,12 +1715,6 @@ def build_flash_attn_func_aiw_module_primary(
         # dynamic `scf.if` guard inside one loop measured much worse than no
         # guard at all, because the region boundary blocks scheduling in a
         # latency-bound loop. A static split has no such boundary.
-        # Does this workgroup own any real Q row? Under varlen the grid is
-        # sized from Max_seqlen_q, so this is false for whole workgroups.
-        _alive = ArithValue(
-            arith.cmpi(arith.CmpIPredicate.slt, _raw(q_start), _raw(seqlen_q_v))
-        )
-
         if const_expr(CAUSAL):
             # ---- gSWA: three regions over one contiguous block range ----
             #

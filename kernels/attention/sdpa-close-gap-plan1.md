@@ -228,13 +228,33 @@ with the **backward** kernels too, so design it for that rather than as a
 forward-only dedup. (Speculative — the backward kernels do not exist here yet;
 do not over-fit the interface to forward's needs in the meantime.)
 
-### [N2 — RESOLVED] Oracles retire at the end of P2, with their numbers recorded
+### [N2 — RESOLVED] Oracles retire at the end of P2, with their numbers recorded — DONE
 
-Accepted. **Record the legacy performance numbers before deleting them** —
-once the files are gone the A/B in `bench_aiw_ab.py` has no comparison arm, and
-the pre-unification ladder becomes unreproducible. Capture the full
-head_dim × causal ladder with VGPR/spill counts into `sdpa_lore_gfx1201.md` as
-a frozen reference table at the point of retirement.
+Retired. Final numbers, B=1 H=8 N=4096 f16, interleaved 3 reps, aiw against
+the three pre-unification kernels it replaced (`legacy` below 48, `legacy_bp`
+at and above):
+
+| | median | min | max |
+| ---------- | ------ | ------------------- | -------------------- |
+| causal     | 1.179  | 0.988 (head_dim 32) | 1.371 (head_dim 192) |
+| non-causal | 0.994  | 0.812 (head_dim 32) | 1.257 (head_dim 224) |
+| all        | 1.124  | 0.812               | 1.371                |
+
+Causal is ahead everywhere and by 12-37% from head_dim 48 up, which is where
+the region split and the head-fastest grid pay. Non-causal is a wash by
+design: the same shapes, one extra masking term, and the tuning tables
+re-swept to the same ladder.
+
+The two remaining non-causal deficits are known and logged, not new: head_dim
+16 (0.836) and 32 (0.812) are the `safe_softmax` cost of §6.1, which the
+oracles do not pay because they predate the correction. Head_dim 32
+non-causal is also the bimodal point recorded in `sdpa_lore_gfx1201.md`, so
+treat 0.812 as one draw rather than a number.
+
+Against this, aiw carries what the oracles cannot express at all: MQA/GQA,
+`PADDED_HEAD`, logsumexp, per-tensor strides, `seqlen_q != seqlen_k`, sliding
+windows, and varlen. The comparison is retained here because after this commit
+there is nothing left to re-run it against.
 
 ### [N3 — RESOLVED] Key on `BLOCK_DMODEL`; seqlen binning later; asymmetric hdim is not a goal
 
@@ -1002,10 +1022,9 @@ carries the `m_i` floor regression test, which is only *reachable* with bias.
 Both gain a varlen dimension once P3 lands — bias is indexed per sequence, and
 dropout's Philox offset must be per-sequence to stay reproducible.
 
-**Still owed before the phase set is clean:** the tuning re-sweep (§5 of the
-gSWA plan -- the tables have now gone stale a fourth time, and gSWA moved
-register pressure again), and the legacy oracles' retirement (N2), which P2
-was supposed to carry and did not.
+**All owed items are now closed:** the tuning re-sweep (two entries moved,
+head_dim 224 by 27%), the legacy oracles' retirement (N2, numbers recorded
+above), and the varlen grid-waste measurement (`sdpa-varlen-plan.md` §6.2).
 
 **Deferred:** persistent-dynamic (own task, wants P1's 3D grid), `NUM_XCDS`,
 INT8, fused `RETURN_ENCODED_SOFTMAX`, `PRE_LOAD_V`, mxfp8. Dynamic VGPR

@@ -30,8 +30,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flash_attn_func_gfx1201_bp import build_flash_attn_func_bp_module
-from flash_attn_func_gfx1201_m32 import build_flash_attn_func_m32_module
+from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module
 from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
 
 # Relative-error tolerance against an fp32 reference. The kernel accumulates in
@@ -194,29 +193,19 @@ def test_irregular_seqlen_does_not_copy():
     assert (q.data_ptr(), k.data_ptr(), v.data_ptr()) == before
 
 
-def test_legacy_variant_still_rejects_noncausal_padding():
-    """The pre-unification kernels have no KV mask and still need the padding."""
-    _require_env()
-    q, k, v = _qkv(1, 200, _NUM_HEADS, 128, torch.float16)
-    with pytest.raises(ValueError, match="no in-kernel KV mask"):
-        flydsl_flash_attn_func_gfx1201(q, k, v, causal=False, variant="legacy_bp")
+def test_builder_rejects_unsupported_head_dim():
+    """head_dim must be a multiple of 16 within 16..512.
 
-
-@pytest.mark.parametrize(
-    "kwargs, match",
-    [
-        (dict(num_heads=_NUM_HEADS, head_dim=100), "head_dim"),
-        (dict(num_heads=_NUM_HEADS, head_dim=128, block_n=64), "BLOCK_N"),
-    ],
-    ids=["head_dim_100", "block_n_64"],
-)
-def test_binding_prefetch_rejects_unsupported_config(kwargs, match):
-    """The binding-prefetch variant guards its supported config set.
-
-    head_dim must be a multiple of 16 within 16..512; BLOCK_N must be 32.
+    Was a binding-prefetch test; retargeted when that kernel retired. Its
+    companion case -- BLOCK_N must be 32 -- retired with it rather than moving,
+    because that constraint was specific to the binding-prefetch schedule and
+    the unified kernel deliberately runs BLOCK_N 64 and 128 on the distance-0
+    path at small head_dim.
     """
-    with pytest.raises(ValueError, match=match):
-        build_flash_attn_func_bp_module(causal=False, dtype_str="f16", **kwargs)
+    with pytest.raises(ValueError, match="head_dim"):
+        build_flash_attn_func_aiw_module(
+            num_heads=_NUM_HEADS, head_dim=100, causal=False, dtype_str="f16"
+        )
 
 
 # The m32 variant gives each wave two Q row-tiles (BLOCK_M=256) so one K/V
@@ -249,9 +238,11 @@ def test_m32_matches_sdpa(shape):
 
 
 def test_m32_rejects_head_dim_128():
-    """head_dim 128 would spill; the builder must refuse rather than regress."""
+    """head_dim 128 would spill; the interface must refuse rather than regress."""
+    _require_env()
+    q, k, v = _qkv(1, 256, _NUM_HEADS, 128, torch.float16)
     with pytest.raises(ValueError, match="head_dim 64"):
-        build_flash_attn_func_m32_module(num_heads=_NUM_HEADS, head_dim=128, causal=False, dtype_str="f16")
+        flydsl_flash_attn_func_gfx1201(q, k, v, causal=False, variant="m32")
 
 
 def test_shape_and_dtype_validation():

@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Parity tests for the unified gfx1201 kernel (``..._aiw``) against its oracles.
+"""Correctness tests for the unified gfx1201 kernel (``..._aiw``).
 
-``flash_attn_func_gfx1201_aiw`` replaced three separate kernels. Those three are
-kept on disk unchanged precisely so that they can be used as correctness
-oracles here: for every knob setting that reproduces one of them, aiw must
-match it **bitwise**.
+This kernel replaced three earlier ones, which were kept on disk as bitwise
+oracles until the features outgrew them -- they predate MQA/GQA, PADDED_HEAD,
+logsumexp, per-tensor strides, sliding windows and varlen, so most of what is
+tested below has no oracle to compare against. They are retired; their final
+performance numbers are recorded under N2 in ``sdpa-close-gap-plan1.md``.
 
-Bitwise is the right bar because none of the unified knobs change the order of
-floating-point operations -- they change *scheduling* (prefetch distance), *LDS
-layout* (row vs transposed V), or *tiling* (Q row-tiles per wave). The one knob
-that genuinely does change the arithmetic is ``QK_SHARDS > 1``, which splits the
-QK dot product across waves and sums the partials; those configs are compared
-against an fp32 reference at tolerance instead.
+What replaced them as the sharpest bar is *self*-equivalence: a configuration
+that should reduce to a simpler one must do so **bitwise**. A window equal to
+the causal diagonal, varlen with N sequences against N dense calls. Those
+compare two paths through the same kernel rather than two kernels, and they
+catch what a tolerance cannot -- see the window and varlen sections below.
 
 Two things this bar does **not** catch, both learned the hard way while
 building aiw and both worth remembering before trusting a green run here:
@@ -39,14 +39,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flash_attn_func_gfx1201 import build_flash_attn_func_module
 from flash_attn_func_gfx1201_aiw import (
     build_flash_attn_func_aiw_module,
     default_block_m as aiw_block_m,
     resolve_shards,
 )
-from flash_attn_func_gfx1201_bp import build_flash_attn_func_bp_module, bp_block_m
-from flash_attn_func_gfx1201_m32 import build_flash_attn_func_m32_module
 
 _NUM_HEADS = 2
 
@@ -74,17 +71,10 @@ def _qkv(batch, seq, head_dim, dtype, seed=0):
     )
 
 
-def _run(exe, q, k, v, batch, seq, out=None, legacy=False):
-    """Launch a builder's executable.
-
-    aiw takes the rank-4 tensors whole and reads their strides; the legacy
-    builders take flat pointers and derive the layout from num_heads/head_dim.
-    """
+def _run(exe, q, k, v, batch, seq, out=None):
+    """Launch and return the output tensor."""
     o = torch.empty_like(q) if out is None else out
-    if legacy:
-        exe(q.reshape(-1), k.reshape(-1), v.reshape(-1), o.reshape(-1), batch, seq)
-    else:
-        exe(q, k, v, o, batch, seq)
+    exe(q, k, v, o, batch, seq)
     torch.cuda.synchronize()
     return o
 
@@ -96,90 +86,6 @@ def _reference(q, k, v, causal):
 
 def _rel(got, ref):
     return (got.float() - ref).abs().max().item() / ref.abs().max().item()
-
-
-def _parity(head_dim, causal, dtype, batch, seq, oracle, aiw_kwargs):
-    """aiw at `aiw_kwargs` must match `oracle` to tolerance."""
-    q, k, v = _qkv(batch, seq, head_dim, dtype)
-    common = dict(
-        num_heads=_NUM_HEADS,
-        head_dim=head_dim,
-        causal=causal,
-        dtype_str="f16" if dtype == torch.float16 else "bf16",
-    )
-    got = _run(
-        build_flash_attn_func_aiw_module(**common, **aiw_kwargs),
-        q, k, v, batch, seq,
-    )
-    want = _run(oracle(**common), q, k, v, batch, seq, legacy=True)
-    assert torch.isfinite(got).all(), "aiw produced non-finite output"
-    # Tolerance, not bitwise. The oracles predate the softmax correction
-    # -- they scale inside the exponent via FMA -- and that correction is
-    # now unconditional, so exact agreement is no longer the right bar.
-    # What this still checks is that the *scheduling* knobs (prefetch
-    # distance, V LDS layout, Q row-tiles) do not change the answer,
-    # which is what they were introduced to verify.
-    # bf16 carries an 8-bit mantissa, so the two softmax formulations
-    # diverge about an order of magnitude further than in f16.
-    tol = 2e-3 if dtype == torch.float16 else 1e-2
-    rel = ((got.float() - want.float()).abs().max().item()
-           / want.float().abs().max().item())
-    assert rel < tol, f"aiw vs oracle rel = {rel:.3e} (tol {tol:.0e})"
-
-
-_BITWISE_DTYPES = [torch.float16, torch.bfloat16]
-
-
-@pytest.mark.parametrize("dtype", _BITWISE_DTYPES, ids=["f16", "bf16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-@pytest.mark.parametrize("head_dim", [64, 128])
-def test_matches_bp(head_dim, causal, dtype):
-    """Distance-1 + transposed-V reproduces the binding-prefetch kernel."""
-    _require_env()
-    _parity(
-        head_dim,
-        causal,
-        dtype,
-        1,
-        bp_block_m(head_dim) * 2,
-        build_flash_attn_func_bp_module,
-        dict(k_prefetch_dist=1, v_prefetch_dist=1, v_lds_layout="transposed"),
-    )
-
-
-@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-@pytest.mark.parametrize("head_dim", [16, 32, 64, 128])
-def test_matches_baseline(head_dim, causal):
-    """K distance 0 + V distance 1 + row-major V reproduces the baseline kernel.
-
-    Note the asymmetric distances: the baseline pre-issues V one tile ahead and
-    carries it in registers, and only K is staged at distance 0.
-    """
-    _require_env()
-    _parity(
-        head_dim,
-        causal,
-        torch.float16,
-        1,
-        256,
-        build_flash_attn_func_module,
-        dict(k_prefetch_dist=0, v_prefetch_dist=1, v_lds_layout="row"),
-    )
-
-
-@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-def test_matches_m32(causal):
-    """Two Q row-tiles per wave reproduces the m32 kernel."""
-    _require_env()
-    _parity(
-        64,
-        causal,
-        torch.float16,
-        1,
-        512,
-        build_flash_attn_func_m32_module,
-        dict(k_prefetch_dist=1, v_prefetch_dist=1, v_lds_layout="transposed", q_row_tiles=2),
-    )
 
 
 _LADDER = [16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 384, 512]
@@ -1098,6 +1004,52 @@ def test_varlen_bottom_right_diagonal_is_per_sequence():
     torch.cuda.synchronize()
     _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck,
                                  "bottom-right/varlen")
+
+
+_GRID_WASTE_LENGTHS = [
+    ([1365] * 4 + [683] * 4, "mild_skew"),
+    ([4096] + [820] * 5, "one_long"),
+    ([4096, 2048, 1024] + [700] * 3, "heavy_tail"),
+]
+
+
+@pytest.mark.parametrize("lens,label", _GRID_WASTE_LENGTHS, ids=[x[1] for x in _GRID_WASTE_LENGTHS])
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_varlen_dead_workgroups_do_not_read_past_the_tensor(lens, label, causal):
+    """A workgroup past a sequence's end must not *address* past it either.
+
+    Varlen sizes the Q grid from `Max_seqlen_q`, so short sequences get
+    workgroups whose rows are all out of range. Those exit without storing --
+    but the Q base folds `q_start` into the 64-bit address before any guard
+    applies, and the in-bounds check only clamps the row *within* the tile. So
+    the load still reached `row_off + q_start` rows in, which on a packed
+    tensor is past the end of the whole allocation rather than merely past the
+    sequence.
+
+    It faulted for real: a 16-sequence batch overshoots by ~1.3 MB and hits an
+    unmapped page. Smaller overshoots land inside the allocation, read garbage
+    that is then discarded, and pass -- which is precisely why every varlen
+    test already in this file missed it. The lengths here are chosen to make
+    the overshoot large: several sequences much shorter than the longest, and
+    lengths that are *not* multiples of BLOCK_M so the tail tiles are real.
+
+    A correctness assertion cannot express "did not read out of bounds", so
+    this test relies on the fault being fatal. That is a weaker guarantee than
+    the rest of the suite offers and is worth knowing when reading it.
+    """
+    _require_env()
+    head_dim = 64
+    N, mq = len(lens), max(lens)
+    q, k, v, cq, ck = _packed_qkv(lens, lens, head_dim)
+    o = torch.empty_like(q)
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16",
+    )
+    exe(q, k, v, o, N, mq, mq, varlen=exe.varlen_compact(cq, ck, mq, mq))
+    torch.cuda.synchronize()
+    assert torch.isfinite(o).all()
+    _assert_varlen_matches_dense(exe, q, k, v, o, lens, lens, cq, ck,
+                                 f"grid-waste/{label}")
 
 
 def test_varlen_zero_length_writes_nothing():

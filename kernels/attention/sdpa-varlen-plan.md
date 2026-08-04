@@ -441,6 +441,28 @@ batches. AOTriton excludes varlen from persistent
 it is persistent-dynamic's job, not this phase's — but **produce the number
 here** so that task starts with a measurement instead of an intuition.
 
+**Measured** at head_dim 64, `BLOCK_M` 256, 16 sequences, total tokens held
+constant. "tiles idle" is the dispatched-but-dead fraction; "cost/useful tile"
+is time normalised to the uniform batch's cost per *live* tile, so it isolates
+the waste from the change in real work:
+
+| distribution       | mean/max | tiles idle | cost/useful tile |
+| ------------------ | -------- | ---------- | ---------------- |
+| uniform            | 1.00     | 0.0%       | 1.00x            |
+| mild skew (2:1)    | 0.75     | 25.0%      | 1.03x            |
+| one long (8:1)     | 0.25     | 70.3%      | 1.44x            |
+| heavy tail         | 0.25     | 73.8%      | 1.64x            |
+| decode-like (64:1) | 0.08     | 87.9%      | 1.97x            |
+
+**The tile count badly overstates the cost** — 88% of dispatches idle costs
+1.97x, not 8x — because an empty workgroup exits without walking a single KV
+tile. So the ceiling persistent-dynamic can claw back on a skewed batch is
+roughly **2x**, not the order of magnitude the dispatch count suggests. Worth
+knowing before that task is scoped from the idle fraction alone.
+
+Mild skew is essentially free (1.03x), so this only matters for genuinely
+long-tailed batches — decode being the obvious one.
+
 ---
 
 ## 7. Test matrix, and the oracle that makes it cheap
