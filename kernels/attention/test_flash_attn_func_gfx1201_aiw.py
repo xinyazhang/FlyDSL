@@ -1052,6 +1052,40 @@ def test_varlen_dead_workgroups_do_not_read_past_the_tensor(lens, label, causal)
                                  f"grid-waste/{label}")
 
 
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_varlen_sequence_with_no_keys(causal):
+    """A sequence with queries but no keys: every row dead, no memory touched.
+
+    `seqlen_k == 0` with `seqlen_q > 0` is a legitimate varlen configuration
+    and the plan's matrix asks for it, but it was never written. It faulted:
+    the distance-1 prefetch is issued before any loop bound is consulted, and
+    `seq_last = seqlen_k - 1` underflows an *unsigned* index to 2**64-1, so
+    the KV clamp pinned every address to that row.
+
+    The fix is not to clamp the address but to skip the load -- at
+    `seqlen_k == 0` there is no in-range address to clamp *to*, since row 0 of
+    an empty sequence is already one past its end.
+    """
+    _require_env()
+    head_dim = 64
+    lens_q = [64, 96, 40]
+    lens_k = [64, 0, 40]          # sequence 1 has queries and no keys
+    N = len(lens_q)
+    q, k, v, cq, ck = _packed_qkv(lens_q, lens_k, head_dim)
+    o = torch.full_like(q, float("nan"))
+    exe = build_flash_attn_func_aiw_module(
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16",
+    )
+    exe(q, k, v, o, N, max(lens_q), max(lens_k),
+        varlen=exe.varlen_compact(cq, ck, max(lens_q), max(lens_k)))
+    torch.cuda.synchronize()
+    s0, e0 = int(cq[1]), int(cq[1]) + lens_q[1]
+    assert (o[:, s0:e0] == 0).all(), "rows with no keys must be exactly zero"
+    # The sequences that do have keys are unaffected by their neighbour.
+    _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck,
+                                 "no-keys neighbour")
+
+
 def test_varlen_zero_length_writes_nothing():
     """A zero-length sequence must not be written at all.
 

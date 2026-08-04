@@ -1209,7 +1209,19 @@ def build_flash_attn_func_aiw_module_primary(
         v_row_in_batch = tid // V_TPR_LOAD
         v_col_base = (tid % V_TPR_LOAD) * VEC_WIDTH
 
-        seq_last = seqlen_k_v - fx.Index(1)
+        # `max(seqlen_k - 1, 0)`. `fx.Index` is **unsigned**, so a bare
+        # `seqlen_k - 1` wraps to 2**64-1 at seqlen_k == 0 and the KV clamp
+        # below then pins every address to that row -- the fault lands at
+        # 0xfffffffff000, which is that value truncated to the virtual address
+        # width.
+        #
+        # Now unreachable: the only caller that could arrive here with
+        # seqlen_k == 0 was the prologue prefetch, and that is skipped when
+        # there are no KV tiles. Kept because the hazard is an unsigned wrap,
+        # which produces a plausible address rather than an obvious failure,
+        # and it costs one scalar op to pin.
+        _slast_i32 = _smax_i32(_seqlen_k_i32 - fx.Int32(1), fx.Int32(0))
+        seq_last = fx.Index(_slast_i32)
 
         # ---- Address split: 64-bit uniform base + 32-bit divergent offset ----
         #
@@ -1833,6 +1845,14 @@ def build_flash_attn_func_aiw_module_primary(
                 ArithValue(_alive).select(kv_upper, fx.Index(0))
             )
 
+        # Tiles this workgroup will actually walk. Zero for a sequence with no
+        # keys and for every workgroup the varlen grid dispatches past the end
+        # of a short one.
+        if const_expr(CAUSAL):
+            _kv_tiles_i32 = _n_f + _n_l + _n_r
+        else:
+            _kv_tiles_i32 = fx.Int32(kv_upper)
+
         # ---- Prologue: at distance 1, the first tile's K / V go to registers ----
         #
         # "First" is tile 0 for everything except gSWA, where a left window
@@ -1854,10 +1874,59 @@ def build_flash_attn_func_aiw_module_primary(
             )
         else:
             _first_col = fx.Index(0)
+        # **Issued only if a KV tile will actually be walked.**
+        #
+        # The prefetch runs before any loop bound is consulted, so a workgroup
+        # with nothing to do -- a sequence with no keys, or one of the dead
+        # workgroups varlen's Max_seqlen_q-sized grid dispatches past the end
+        # of a short sequence -- would otherwise still issue a K and a V tile
+        # load and throw the result away.
+        #
+        # Clamping the address instead would make that load land somewhere
+        # harmless, which fixes the symptom: the load should not happen. And
+        # at seqlen_k == 0 there is no harmless address to clamp *to* -- row 0
+        # of an empty sequence is one past its end.
+        #
+        # A 0-or-1-trip `range(..., init=...)` is how this kernel already
+        # expresses predicated state: FlyDSL's dynamic `if` merges named
+        # scalars only and rejects the list of vectors a prefetch produces,
+        # while a loop carries exactly that list. The trip count is uniform
+        # across the workgroup, so no divergence is introduced.
+        _pf_n = fx.Index(
+            _ssel_i32(
+                _scmp_i32(arith.CmpIPredicate.sgt, _kv_tiles_i32, fx.Int32(0)),
+                fx.Int32(1), fx.Int32(0),
+            )
+        )
+        _pf_init = []
         if const_expr(K_PREFETCH_DIST):
-            _k_vecs_init = coop_load_k_global(_first_col)
+            for _ in range_constexpr(NUM_BATCHES_KV):
+                _pf_init.append(Vec.filled(VEC_WIDTH, 0.0, elem_dtype).ir_value())
         if const_expr(V_PREFETCH_DIST):
-            _v_vecs_init = coop_load_v_global(_first_col)
+            for _ in range_constexpr(V_LOADS):
+                _pf_init.append(Vec.filled(VEC_WIDTH, 0.0, elem_dtype).ir_value())
+        _pf = _pf_init
+        if const_expr(K_PREFETCH_DIST or V_PREFETCH_DIST):
+            for _pfi, _pf_args in range(fx.Index(0), _pf_n, 1, init=_pf_init):
+                _y = []
+                if const_expr(K_PREFETCH_DIST):
+                    _y.extend(coop_load_k_global(_first_col))
+                if const_expr(V_PREFETCH_DIST):
+                    _y.extend(coop_load_v_global(_first_col))
+                _pf = yield _y
+            # `scf_yield_` returns a bare value, not a list, when the loop
+            # carries exactly one -- which happens at head_dim 16, where the K
+            # prefetch is off and V is a single load. Indexing that bare value
+            # extracts a vector *element*, so the next use sees an f16 scalar
+            # where it wants a vector, and the failure surfaces far away in
+            # the LDS store.
+            if const_expr(len(_pf_init) == 1):
+                _pf = [_pf]
+        if const_expr(K_PREFETCH_DIST):
+            _k_vecs_init = [_pf[_i] for _i in range_constexpr(NUM_BATCHES_KV)]
+        if const_expr(V_PREFETCH_DIST):
+            _off = NUM_BATCHES_KV if K_PREFETCH_DIST else 0
+            _v_vecs_init = [_pf[_off + _i] for _i in range_constexpr(V_LOADS)]
 
         # Loop-carried state layout:
         #   [0 .. 2*Q_ROW_TILES)             m/l per Q row-tile, interleaved
