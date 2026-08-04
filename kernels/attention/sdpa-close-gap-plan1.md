@@ -1024,8 +1024,13 @@ resolving before code: AOTriton's bias base omits `cu_seqlens_q_start` and
 uses a `batch_index` that compact varlen pins to 0, so bias under varlen has
 no defined semantics there to copy.
 
-**P5 dropout.** Unchanged, and independent of P4. Its Philox offset must be
-per-sequence under varlen to stay reproducible.
+**P5 dropout.** Detailed separately in `sdpa-dropout-plan.md`. The largest
+phase by code: a Philox PRNG in its own module, a second kernel that returns
+the mask, and -- the part that is easy to satisfy incorrectly -- a
+reproducibility contract stating that the mask must not depend on the tiling.
+Every earlier phase was free to change BLOCK_M/BLOCK_N; from here on that
+freedom is constrained, which is why the contract is written down rather than
+left implicit in the offset arithmetic.
 
 **All owed items are now closed:** the tuning re-sweep (two entries moved,
 head_dim 224 by 27%), the legacy oracles' retirement (N2, numbers recorded
