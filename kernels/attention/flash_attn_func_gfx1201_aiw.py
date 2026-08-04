@@ -987,9 +987,14 @@ def build_flash_attn_func_aiw_module_primary(
 
         # The `seqinfo` arguments arrive as untyped byte pointers, so type
         # them once and index in elements. `fx.recast_iter` + `fx.ptr_load` is
-        # the DSL idiom (see `kernels/moe/moe_a8w4_mxscale_gfx1250.py`); going
-        # through a raw LLVM GEP works but hand-rolls what the pointer type
-        # already knows, and gets the element scaling wrong by default.
+        # the DSL idiom (see `kernels/moe/moe_a8w4_mxscale_gfx1250.py` and
+        # `kernels/gemm/mxfp4_preshuffle.py`, which build the same type).
+        #
+        # The shorthand `fx.recast_iter(fx.Int32, ptr)` does *not* work here:
+        # it inherits the source pointer's alignment, and a kernel argument
+        # arrives as `u8` with alignment 1, so it raises "alignment must be a
+        # positive multiple of element byte size (4), got 1". The type has to
+        # be spelled out.
         _i32_gptr = fx.PointerType.get(
             elem_ty=fx.Int32.ir_type,
             address_space=fx.AddressSpace.Global,
