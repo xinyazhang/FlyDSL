@@ -452,6 +452,20 @@ reference and against Triton's stream. No attention, no target intrinsics.
 **Gate:** bit-exact agreement with the reference **at both widths**, for a
 spread of seeds and offsets including values above 2^32.
 
+**Outcome — met.** `philox.py` and `test_philox.py`; 9 pass, 3 skip. The
+reference turned out to be three rather than two: **Random123's published
+known-answer vectors** for Philox-4x32-10 pin the round function against the
+algorithm's own specification, which is the only check here that does not
+depend on someone's reading of someone's source. The numpy model then extends
+that to the 64-bit-seed/offset packing and to width 64.
+
+The Triton cross-check is written but **skips in this environment** — Triton's
+HIP backend compiles a utility module at import and the Python dev headers are
+absent. What that costs is narrow: the KAT vectors cover the algorithm and the
+numpy model covers the packing, so only a *misreading of Triton specifically*
+would slip through, and the constants and word order are shared with the
+vectors.
+
 ### Step 2 — the microbenchmark, and gfx1201's default
 §4. Measure randoms/second and VGPR cost at both widths, and set the
 `_PHILOX_WIDTH_BY_ARCH` entry for gfx1201.
@@ -459,6 +473,28 @@ spread of seeds and offsets including values above 2^32.
 **Gate:** a number and a recorded rationale, in the table rather than in a
 commit message — §3.1 makes this entry mask-visible, so the next person to
 touch it needs to see why it is what it is.
+
+**Outcome — 32-bit, by a wider margin than predicted.**
+
+| width | u32/call | G randoms/s | VGPRs (one call) |
+| ----- | -------- | ----------- | ---------------- |
+| 32    | 4        | **284.5**   | **8**            |
+| 64    | 8        | 65.7        | 26               |
+
+**4.3x** the throughput per random and 18 fewer registers. Both margins beat
+§4's instruction-count estimate of ~2x, and the reason is that the estimate
+counted the *low* half of a 64x64 product: Philox needs the **high** half,
+whose expansion is worse. So the 64-bit variant's one advantage — eight
+randoms per call, matching an eight-column accumulator group exactly — does
+not come close to paying for itself on this target.
+
+Recorded in `philox.py`'s `_WIDTH_BY_ARCH` with the numbers and the reasoning,
+not in this file, since that is where someone changing it will be.
+
+A note on the benchmark itself: VGPRs are measured at a **one-call** unroll.
+The throughput run unrolls 64 calls to saturate the pipeline, which also
+saturates the register file and made both widths report the 256 cap — an
+artifact that would have hidden the entire register difference.
 
 ### Step 3 — `ENABLE_DROPOUT` in the attention kernel
 The offset scheme, the threshold compare, the `l`-before-dropout ordering.
