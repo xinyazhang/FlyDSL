@@ -986,8 +986,9 @@ per-sequence, which is meaningless without per-sequence lengths. The host-side
 enum but a product of **three orthogonal choices** — is the token axis stacked,
 how is length given, where does a sequence start — encoded as `VarlenBits :
 u32` with one identically-decoded byte per side. That subsumes AOTriton's four
-`VarlenType` values, collapses two of them (compact and strided differ only in
-a pointer, not in code), and covers a case the enum cannot express at all:
+`VarlenType` values, gives classical varlen a position mode that reads no
+position array at all — it reuses the cumulative length value already in a
+register — and covers a case the enum cannot express:
 PyTorch's `seqused_k`, which takes lengths from an individual array and
 positions from a cumulative one. All of it still reduces to six scalars
 computed once in the prologue, and the kernel's addressing and LSE offset are

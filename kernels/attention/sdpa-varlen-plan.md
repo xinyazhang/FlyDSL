@@ -49,10 +49,14 @@ and PyTorch already ships a case outside it — see §1.4. The three axes:
 
 ### C. Where does sequence `z` *start* along the token axis?
 
-|           | `row_off(z)`                             |
-| --------- | ---------------------------------------- |
-| `IMPLIED` | `0` if `BATCHED`, else `z * Max_seqlen`  |
-| `ARRAY`   | `b[z]`, from a cumulative position array |
+|           | `row_off(z)`                            | reads            |
+| --------- | --------------------------------------- | ---------------- |
+| `IMPLIED` | `0` if `BATCHED`, else `z * Max_seqlen` | nothing          |
+| `REUSE`   | `seqinfo_?0[z]` — the length array      | *already loaded* |
+| `ARRAY`   | `seqinfo_?1[z]`                         | one scalar load  |
+
+`REUSE` requires `LENGTH == CUMULATIVE`: only then is `seqinfo_?0[z]` a
+position. It exists so that classical varlen costs nothing extra — §1.2.
 
 **All three are per-side.** Q and K may differ, and the case that forces this
 is ordinary: packed queries against a rectangular KV cache.
@@ -66,31 +70,38 @@ not imply layout**. `storage_flip` alone breaks it. The batch stride is an
 independent number the kernel reads off the tensor, so selecting a batch slice
 and offsetting within one are two different operations.
 
-### 1.2 Why C has two states, not the three you might expect
+### 1.2 Why `REUSE` is a state and not a host-side convenience
 
-The natural reading is three: *reuse `cu_seqlens`*, *use `seq_strides`*, or
-*regular*. But the first two are **the same kernel code with a different
-pointer** — both compute `row_off = b[z]` from a cumulative array; `cu_seqlens`
-and TE's `cu_seqlens_padded` differ only in whether the sequences have gaps
-between them, which the kernel never needs to know.
+It is tempting to drop `REUSE` and have compact varlen pass `cu_seqlens` as
+*both* `seqinfo_?0` and `seqinfo_?1`. The kernel would have one fewer case, and
+compact and strided would become the same code with a different pointer.
 
-So `CompactVarlen` and `StridedVarlen` are not two modes. They are one mode
-called with two different arrays. That collapse is the main return on
-decomposing at all, and it is worth stating as a result rather than hiding as
-an implementation detail.
+**That costs a memory access on the mode everyone uses.** Under
+`LENGTH == CUMULATIVE` the prologue has already loaded `seqinfo_?0[z]` and
+`seqinfo_?0[z+1]` to compute the length — and for compact varlen the position
+*is* `seqinfo_?0[z]`, already sitting in a register. Reading it again through a
+second pointer is a scalar load that buys nothing, plus a live pointer pair.
 
-(A third state `REUSE`, meaning "position array == length array", would save
-one live pointer. It is representable in the reserved bits if a measurement
-ever justifies it. Not now.)
+So `REUSE` is not redundancy; it is the *absence* of a redundant load.
+Classical varlen — by far the most common configuration — reads **no position
+array at all**, and `seqinfo_?1` is not passed.
+
+The price is that compact and strided are genuinely different codes rather than
+one code with two pointers: one extra line in the decoder, against a scalar
+load saved on every workgroup of the common path. It also removes a hazard —
+with the same pointer in both slots the two *roles* are indistinguishable in
+the configuration everyone runs (V5).
 
 ### 1.3 AOTriton's four types, decomposed
 
 | `VarlenType`    | Q side                              | K side                              |
 | --------------- | ----------------------------------- | ----------------------------------- |
 | `None`          | BATCHED, MAX, IMPLIED               | BATCHED, MAX, IMPLIED               |
-| `CompactVarlen` | STACKED, CUMULATIVE, ARRAY(`cu_q`)  | STACKED, CUMULATIVE, ARRAY(`cu_k`)  |
+| `CompactVarlen` | STACKED, CUMULATIVE, REUSE          | STACKED, CUMULATIVE, REUSE          |
 | `PaddedVarlen`  | BATCHED, CUMULATIVE, IMPLIED        | BATCHED, CUMULATIVE, IMPLIED        |
 | `StridedVarlen` | STACKED, CUMULATIVE, ARRAY(`sst_q`) | STACKED, CUMULATIVE, ARRAY(`sst_k`) |
+
+Only `StridedVarlen` passes `seqinfo_?1` at all.
 
 ### 1.4 The case the enum cannot express
 
@@ -123,8 +134,8 @@ called twice.
   per-side byte:
   bit   0      STACKED     0 = BHSD              1 = 1THD
   bits  2:1    LENGTH      0 = MAX               1 = CUMULATIVE   2 = INDIVIDUAL
-  bit   3      POSITION    0 = IMPLIED           1 = ARRAY
-  bits  7:4    reserved
+  bits  4:3    POSITION    0 = IMPLIED           1 = REUSE        2 = ARRAY
+  bits  7:5    reserved
 
   bits  7:0    Q side
   bits 15:8    K side
@@ -140,16 +151,18 @@ ABI change.
 `VarlenBits == 0` is BHSD / MAX / IMPLIED on both sides — the conventional
 dense case, and the default, exactly as required.
 
-| configuration                         | bits                                         |
-| ------------------------------------- | -------------------------------------------- |
-| dense                                 | `0x0000`                                     |
-| compact varlen                        | `0x0B0B`                                     |
-| padded varlen                         | `0x0202`                                     |
-| strided varlen                        | `0x0B0B` *(same code; `seqinfo_?1` differs)* |
-| packed Q, `seqused_k` on packed KV    | `0x0D0B`                                     |
-| packed Q, `seqused_k` on a BHSD cache | `0x040B`                                     |
+| configuration                         | bits     | passes `seqinfo_?1` |
+| ------------------------------------- | -------- | ------------------- |
+| dense                                 | `0x0000` | neither side        |
+| compact varlen                        | `0x0B0B` | neither side        |
+| padded varlen                         | `0x0202` | neither side        |
+| strided varlen                        | `0x1313` | both                |
+| packed Q, `seqused_k` on packed KV    | `0x150B` | K only              |
+| packed Q, `seqused_k` on a BHSD cache | `0x040B` | neither side        |
 
-That two AOTriton types share `0x0B0B` is the §1.2 collapse showing up in the
+Only one of the six reads a position array on both sides. `seqused_k` on
+packed KV must use `ARRAY` rather than `REUSE`, because its `seqinfo_k0` holds
+individual lengths and so is not a position array — §1.4 showing up in the
 encoding.
 
 ---
@@ -161,38 +174,41 @@ needed because B and C can read different tensors (§1.4). They are named by
 **role**, so the bits say only how to *interpret* them, never which slot to
 look in:
 
-|              | role                | read when           | indexed                        |
-| ------------ | ------------------- | ------------------- | ------------------------------ |
-| `seqinfo_?0` | **length** source   | `LENGTH != MAX`     | `[z]`, `[z+1]`                 |
-| `seqinfo_?1` | **position** source | `POSITION == ARRAY` | `[z]`, and `[N]` for the total |
+|              | role                | read when           | indexed        |
+| ------------ | ------------------- | ------------------- | -------------- |
+| `seqinfo_?0` | **length** source   | `LENGTH != MAX`     | `[z]`, `[z+1]` |
+| `seqinfo_?1` | **position** source | `POSITION == ARRAY` | `[z]`          |
 
-Compact varlen passes the same pointer as both `?0` and `?1`. That redundancy
-is deliberate: fixing the roles keeps the decoder branch-free on *which*
-pointer, at the cost of one duplicated argument.
+The roles are fixed and never swapped. `POSITION == REUSE` takes a *position*
+out of the length array, which is sound only because `CUMULATIVE` makes that
+array hold positions as well — and it reuses the value already loaded rather
+than issuing a second access (§1.2).
 
 ### 3.1 The decoder
 
 ```python
-def decode_side(bits8, z, N, max_seqlen, s0, s1):
+def decode_side(bits8, z, max_seqlen, s0, s1):
     stacked = bits8 & 1
     lenmode = (bits8 >> 1) & 3
-    posmode = (bits8 >> 3) & 1
+    posmode = (bits8 >> 3) & 3
 
-    seqlen = (max_seqlen        if lenmode == 0 else
-              s0[z + 1] - s0[z] if lenmode == 1 else
-              s0[z])
+    if lenmode == 0:                       # MAX
+        s0_z, seqlen = None, max_seqlen
+    elif lenmode == 1:                     # CUMULATIVE
+        s0_z = s0[z]                       # the load REUSE then reuses
+        seqlen = s0[z + 1] - s0_z
+    else:                                  # INDIVIDUAL
+        s0_z, seqlen = None, s0[z]
 
-    row_off = s1[z] if posmode else (z * max_seqlen if stacked else 0)
+    row_off = (s0_z  if posmode == 1 else  # REUSE: already in a register
+               s1[z] if posmode == 2 else  # ARRAY
+               (z * max_seqlen if stacked else 0))
     batch_index = 0 if stacked else z
     return seqlen, row_off, batch_index
 ```
 
-Called twice. The Q call additionally yields the LSE stride:
-
-```python
-lse_stride = s1_q[N] if q_posmode else (N * max_seqlen_q if q_stacked
-                                        else max_seqlen_q)
-```
+Called twice, and it never reads `[N]`: `lse_stride` comes off the LSE tensor
+on the host (§4.2), so no total has to be recovered from a `seqinfo` array.
 
 ### 3.2 LSE: the *indices* are derived, the *layout* is not
 
@@ -392,9 +408,9 @@ length set — ragged, `N = 7`, including one zero and one much-longer sequence,
 | ------------------------------------- | --------------------------------------- |
 | dense                                 | `0x0000`                                |
 | compact                               | `0x0B0B`                                |
-| strided (gaps between sequences)      | `0x0B0B`, different `?1`                |
+| strided (gaps between sequences)      | `0x1313`                                |
 | padded                                | `0x0202`                                |
-| packed Q, `seqused_k` on packed KV    | `0x0D0B`                                |
+| packed Q, `seqused_k` on packed KV    | `0x150B`                                |
 | packed Q, `seqused_k` on a BHSD cache | `0x040B`                                |
 | mixed: packed Q, dense K              | `0x000B`                                |
 | GQA (§4.1), on compact                | `0x0B0B`, `num_head_q = 4 * num_head_k` |
@@ -427,28 +443,42 @@ rows — not to build the full product now.
 
 ## 8. Steps
 
-### Step 1 — bits, decoder, and the stacked/cumulative path
-`VarlenBits`, the four `seqinfo` pointers, `lse_pitch`, the §3.1 decoder, the
-six scalars, the empty-work path, and both LSE layouts (§3.2 — `TOKEN_MAJOR`
-is two lines here and a migration later). Enable `0x0000` and `0x0B0B` only;
-reject other bytes with a clear error.
+The steps implement *axis values*, not named modes — the decomposition paying
+off again, since each named mode then appears the moment its combination
+becomes reachable.
 
-**Gate:** §7 property 1, then the headline gate for compact. Dense must be
-**bit-identical to today** — it will be if the decoder folds at `bits == 0`.
+### Step 1 — bits, decoder, and everything that reads no position array
 
-### Step 2 — `IMPLIED` positions and `BATCHED` stacking
-Enables `0x0202` (padded varlen) and, for free, THD-with-uniform-stride.
-Should be small if step 1 factored the decoder properly; if it is not, that is
-the signal to refactor before continuing.
+`VarlenBits`, `seqinfo_?0`, `lse_pitch`, the §3.1 decoder, the six scalars, the
+empty-work path, and both LSE layouts. Implement `LENGTH ∈ {MAX, CUMULATIVE}`
+and `POSITION ∈ {IMPLIED, REUSE}` with both `STACKED` values.
 
-### Step 3 — `INDIVIDUAL` lengths
-Enables `0x0D0B` and `0x040B` — the PyTorch `seqused_k` cases. Two lines in the
-decoder plus §7 property 4.
+That is three named modes at once — **dense `0x0000`, compact `0x0B0B`, padded
+`0x0202`** — because all three are combinations of those axis values.
+`seqinfo_?1` is not passed by any of them, so the second pointer pair need not
+exist yet.
 
-Strided varlen needs **no step**: it is `0x0B0B` with a different pointer
-(§1.2). Add it to the test matrix, not to the kernel — and add the role
-invariant of V5 as a comment where the two pointers are read, since that is the
-line a future shortcut would break.
+**Gate:** §7 property 1, then the headline gate for compact and padded. Dense
+must be **bit-identical to today** — it will be if the decoder folds at
+`bits == 0`.
+
+### Step 2 — `POSITION == ARRAY`
+
+Adds `seqinfo_?1` and one decoder case, which is strided varlen (`0x1313`).
+Small, but *not free* as an earlier draft claimed: `REUSE` and `ARRAY` are
+different code, and this is the step that writes the second one.
+
+**Gate:** §7 property 2 — a strided case whose gaps differ per sequence. This
+step introduces the only path that reads `seqinfo_?1`, so its coverage is
+exactly that test plus step 3's.
+
+### Step 3 — `LENGTH == INDIVIDUAL`
+
+One decoder case, giving the PyTorch `seqused_k` pair: `0x150B` on packed KV
+and `0x040B` on a rectangular cache. `0x150B` needs `ARRAY` and so depends on
+step 2; `0x040B` does not.
+
+**Gate:** §7 property 3.
 
 ### Step 4 — the window sentinels (P6 step 4)
 `parse_window` moves into the kernel: `0x80000001 → (seqlen_q, 0)` and
@@ -461,7 +491,10 @@ the sentinel off the hot path — but the two must agree, which §7 tests.
 ## 9. Coverage: what these bits cannot say
 
 Asked for explicitly, so stated explicitly. The encoding spans
-`2 × 3 × 2 = 12` configurations per side, 144 pairs. Every one is either
+`2 × 3 × 3 = 18` configurations per side, of which **`REUSE` with a
+non-`CUMULATIVE` length is invalid** — `seqinfo_?0[z]` is not a position there
+— leaving 14 valid per side and 196 pairs. That constraint is host-validated
+(V4). Every one is either
 meaningful or harmless — `BATCHED + ARRAY`, for instance, means "slice `z`,
 then skip `b[z]` rows", which is unusual but well-defined and free. What falls
 *outside*:
@@ -537,36 +570,31 @@ Not enforced on every call: checking them means reading the `seqinfo` tensors
 back to the host, which is a device sync on the hot path. The document is the
 contract; the check is available to anyone debugging.
 
-### [V5 — RESOLVED] Strided ships without a kernel step — the risk, stated precisely
+### [V5 — RESOLVED] `REUSE` dissolves the hazard
 
-My original flag was too vague to act on. The concern is not that strided is
-wrong today. It is that §1.2's equivalence rests on an invariant that **nothing
-in the kernel enforces**:
+The concern was that §1.2's original formulation rested on an invariant nothing
+enforced — every *position* read going to `seqinfo_?1`, every *length* read to
+`seqinfo_?0` — while compact varlen passed the **same pointer** as both, making
+the two roles indistinguishable in the configuration everyone runs. A later
+shortcut taking a length from `?1` (say `?1[z+1] - ?1[z]`, which looks natural)
+would have passed every compact test and silently broken strided, where that
+difference is the *padded* extent rather than the real length.
 
-> every read of a *position* goes to `seqinfo_?1`, and every read of a *length*
-> goes to `seqinfo_?0`.
+**`REUSE` removes it.** Compact no longer passes `seqinfo_?1` at all, so the
+same shortcut faults on a null pointer instead of quietly returning a wrong
+answer — silent-and-common becomes loud-and-immediate.
 
-Compact varlen passes the *same pointer* as both, which makes the two roles
-indistinguishable in the common case. So a future edit that takes a length
-from `?1` — say `?1[z+1] - ?1[z]`, which is a natural-looking shortcut —
-**passes every compact test and silently breaks strided**, because for strided
-that difference is the *padded* extent, not the real length. The bug would be
-invisible in exactly the configuration everyone runs.
-
-Three mitigations, all cheap:
-
-1. §7 property 2 is the load-bearing test — a strided case with non-zero gaps.
-   It must exist before strided is claimed, not after.
-2. The decoder comments the invariant at the point where the two pointers are
-   read, since that is where a shortcut would be introduced.
-3. Suite B's strided row uses gaps that differ *per sequence*, so a uniform-gap
-   implementation does not accidentally pass.
+What remains is narrower and honest: `seqinfo_?1` is read only by strided
+(`0x1313`) and by `seqused_k` on packed KV (`0x150B`), so that path's entire
+coverage is §7 properties 2 and 3. Both must exist before either configuration
+is claimed, and property 2's gaps must vary *per sequence* so a uniform-gap
+implementation cannot pass by accident.
 
 Noted alongside: AOTriton's strided path is deployed but incompatible with
 `torch.nn.attention.varlen`, which supplies `cu_seq_k` rather than
 `cu_seqlens_padded`, so a **shim cumsum kernel** builds the position array.
 That cumsum belongs on the host side of our shim too — the kernel takes
-whatever array it is handed and does not know which it is, which is the point.
+whatever array it is handed and cannot tell which it is, which is the point.
 
 ### [V6 — RESOLVED] `N` reuses `batch_size`
 
