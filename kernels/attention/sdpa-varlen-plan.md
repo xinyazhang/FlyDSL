@@ -34,25 +34,25 @@ and PyTorch already ships a case outside it — see §1.4. The three axes:
 
 ### A. Is the token axis stacked?
 
-| | shape | how sequence `z` is selected |
-|---|---|---|
-| `BATCHED` | BHSD | the batch index: `batch_index = z` |
-| `STACKED` | 1THD (rank 4, `B` fixed at 1) | a row offset along `T` |
+|           | shape                         | how sequence `z` is selected       |
+| --------- | ----------------------------- | ---------------------------------- |
+| `BATCHED` | BHSD                          | the batch index: `batch_index = z` |
+| `STACKED` | 1THD (rank 4, `B` fixed at 1) | a row offset along `T`             |
 
 ### B. How is the *length* of sequence `z` given?
 
-| | array shape | `seqlen(z)` |
-|---|---|---|
-| `MAX` | — | `Max_seqlen` (every sequence the same) |
-| `CUMULATIVE` | `(N+1,)` | `a[z+1] - a[z]` |
-| `INDIVIDUAL` | `(N,)` | `a[z]` |
+|              | array shape | `seqlen(z)`                            |
+| ------------ | ----------- | -------------------------------------- |
+| `MAX`        | —           | `Max_seqlen` (every sequence the same) |
+| `CUMULATIVE` | `(N+1,)`    | `a[z+1] - a[z]`                        |
+| `INDIVIDUAL` | `(N,)`      | `a[z]`                                 |
 
 ### C. Where does sequence `z` *start* along the token axis?
 
-| | `row_off(z)` |
-|---|---|
-| `IMPLIED` | `0` if `BATCHED`, else `z * Max_seqlen` |
-| `ARRAY` | `b[z]`, from a cumulative position array |
+|           | `row_off(z)`                             |
+| --------- | ---------------------------------------- |
+| `IMPLIED` | `0` if `BATCHED`, else `z * Max_seqlen`  |
+| `ARRAY`   | `b[z]`, from a cumulative position array |
 
 **All three are per-side.** Q and K may differ, and the case that forces this
 is ordinary: packed queries against a rectangular KV cache.
@@ -85,11 +85,11 @@ ever justifies it. Not now.)
 
 ### 1.3 AOTriton's four types, decomposed
 
-| `VarlenType` | Q side | K side |
-|---|---|---|
-| `None` | BATCHED, MAX, IMPLIED | BATCHED, MAX, IMPLIED |
-| `CompactVarlen` | STACKED, CUMULATIVE, ARRAY(`cu_q`) | STACKED, CUMULATIVE, ARRAY(`cu_k`) |
-| `PaddedVarlen` | BATCHED, CUMULATIVE, IMPLIED | BATCHED, CUMULATIVE, IMPLIED |
+| `VarlenType`    | Q side                              | K side                              |
+| --------------- | ----------------------------------- | ----------------------------------- |
+| `None`          | BATCHED, MAX, IMPLIED               | BATCHED, MAX, IMPLIED               |
+| `CompactVarlen` | STACKED, CUMULATIVE, ARRAY(`cu_q`)  | STACKED, CUMULATIVE, ARRAY(`cu_k`)  |
+| `PaddedVarlen`  | BATCHED, CUMULATIVE, IMPLIED        | BATCHED, CUMULATIVE, IMPLIED        |
 | `StridedVarlen` | STACKED, CUMULATIVE, ARRAY(`sst_q`) | STACKED, CUMULATIVE, ARRAY(`sst_k`) |
 
 ### 1.4 The case the enum cannot express
@@ -132,14 +132,14 @@ called twice.
 `VarlenBits == 0` is BHSD / MAX / IMPLIED on both sides — the conventional
 dense case, and the default, exactly as required.
 
-| configuration | bits |
-|---|---|
-| dense | `0x0000` |
-| compact varlen | `0x0B0B` |
-| padded varlen | `0x0202` |
-| strided varlen | `0x0B0B` *(same code; `seqinfo_?1` differs)* |
-| packed Q, `seqused_k` on packed KV | `0x0D0B` |
-| packed Q, `seqused_k` on a BHSD cache | `0x040B` |
+| configuration                         | bits                                         |
+| ------------------------------------- | -------------------------------------------- |
+| dense                                 | `0x0000`                                     |
+| compact varlen                        | `0x0B0B`                                     |
+| padded varlen                         | `0x0202`                                     |
+| strided varlen                        | `0x0B0B` *(same code; `seqinfo_?1` differs)* |
+| packed Q, `seqused_k` on packed KV    | `0x0D0B`                                     |
+| packed Q, `seqused_k` on a BHSD cache | `0x040B`                                     |
 
 That two AOTriton types share `0x0B0B` is the §1.2 collapse showing up in the
 encoding.
@@ -153,9 +153,9 @@ needed because B and C can read different tensors (§1.4). They are named by
 **role**, so the bits say only how to *interpret* them, never which slot to
 look in:
 
-| | role | read when | indexed |
-|---|---|---|---|
-| `seqinfo_?0` | **length** source | `LENGTH != MAX` | `[z]`, `[z+1]` |
+|              | role                | read when           | indexed                        |
+| ------------ | ------------------- | ------------------- | ------------------------------ |
+| `seqinfo_?0` | **length** source   | `LENGTH != MAX`     | `[z]`, `[z+1]`                 |
 | `seqinfo_?1` | **position** source | `POSITION == ARRAY` | `[z]`, and `[N]` for the total |
 
 Compact varlen passes the same pointer as both `?0` and `?1`. That redundancy
@@ -204,8 +204,8 @@ choice that looked independent turns out to be derived.
 
 After the prologue, everything is one of:
 
-| | `seqlen_q` | `seqlen_k` | `q_row_off` | `k_row_off` | `batch_index` | `lse_stride` |
-|---|---|---|---|---|---|---|
+|     | `seqlen_q` | `seqlen_k` | `q_row_off` | `k_row_off` | `batch_index` | `lse_stride` |
+| --- | ---------- | ---------- | ----------- | ----------- | ------------- | ------------ |
 
 and the two places that consume them are already written in the right shape.
 
@@ -290,16 +290,16 @@ per-sequence slices rather than buffers.
 
 ### Axes
 
-| axis | values | why |
-|---|---|---|
-| Q byte × K byte | the six rows of §2, plus mixed Q/K | the point of the decomposition |
-| length distribution | uniform; one-long-many-short; all-equal | all-equal hides position bugs |
-| `N` | 1, 2, 7, 22 | `N = 1` must reduce to dense exactly |
-| `seqlen = 0` | leading, middle, trailing | must write nothing at all |
-| `seqlen_k = 0`, `seqlen_q > 0` | | every row dead: `O = 0`, `LSE = +inf` |
-| ragged lengths | primes | tiles ending mid-sequence |
-| causal | off, top-left, bottom-right, window | `window_right` is per-sequence now |
-| sentinels | `0x80000001`, `0x80000002` | objective 2; must match the host table |
+| axis                           | values                                  | why                                    |
+| ------------------------------ | --------------------------------------- | -------------------------------------- |
+| Q byte × K byte                | the six rows of §2, plus mixed Q/K      | the point of the decomposition         |
+| length distribution            | uniform; one-long-many-short; all-equal | all-equal hides position bugs          |
+| `N`                            | 1, 2, 7, 22                             | `N = 1` must reduce to dense exactly   |
+| `seqlen = 0`                   | leading, middle, trailing               | must write nothing at all              |
+| `seqlen_k = 0`, `seqlen_q > 0` |                                         | every row dead: `O = 0`, `LSE = +inf`  |
+| ragged lengths                 | primes                                  | tiles ending mid-sequence              |
+| causal                         | off, top-left, bottom-right, window     | `window_right` is per-sequence now     |
+| sentinels                      | `0x80000001`, `0x80000002`              | objective 2; must match the host table |
 
 ### Properties beyond "matches the reference"
 
