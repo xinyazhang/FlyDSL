@@ -90,7 +90,6 @@ Grid:   (batch * num_q_tiles * num_heads,)
 """
 
 import math as host_math
-import os
 
 from torch import float32 as torch_f32
 
@@ -222,6 +221,7 @@ def build_flash_attn_func_aiw_module_primary(
     sched_strategy=None,
     lpt_tile_order=True,
     unsafe_no_kv_clamp=False,
+    fp_mode="noninf",
     path_tag="auto",
 ):
     """Build the unified gfx1201 flash-attention kernel.
@@ -525,7 +525,7 @@ def build_flash_attn_func_aiw_module_primary(
     #
     # "fast" restores the old behaviour for A/B; "safe" additionally drops
     # `nnan` (~0.6%).
-    _FP_MODE = os.environ.get("FMHA_FP_MODE", "noninf")
+    _FP_MODE = fp_mode
     STRIDES_CONSTEXPR = strides_constexpr
 
     # Two softmax corrections, unconditional. Both come from AOTriton's
