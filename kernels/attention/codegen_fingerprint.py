@@ -42,10 +42,36 @@ def fingerprint(hd, causal):
     return {"error": "no isa"}
 
 
+def main() -> int:
+    """`--expect <baseline.json>` makes this a `git bisect run` predicate.
+
+    Exit 0 when the emitted code matches the baseline, 1 when it differs. It is
+    a sound predicate precisely because it is deterministic -- unlike a
+    benchmark, which at this kernel's noise floor flips good/bad near the
+    threshold and converges on the wrong commit (plan section 0.5).
+    """
+    out = {f"hd{hd}_{'c' if c else 'f'}": fingerprint(hd, c) for hd, c in CONFIGS}
+
+    if "--expect" in sys.argv:
+        base = json.load(open(sys.argv[sys.argv.index("--expect") + 1]))
+        diffs = [k for k in base if base[k] != out.get(k)]
+        for k in diffs:
+            b, a = base[k], out.get(k, {})
+            print(f"{k}: vgpr {b.get('vgpr')}->{a.get('vgpr')} "
+                  f"scratch {b.get('scratch')}->{a.get('scratch')} "
+                  f"insts {b.get('insts')}->{a.get('insts')} "
+                  f"sha {b.get('isa_sha')}->{a.get('isa_sha')}")
+        print("UNCHANGED" if not diffs else f"CHANGED ({len(diffs)}/{len(base)})")
+        return 1 if diffs else 0
+
+    print(json.dumps(out, indent=1))
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if args:
+        json.dump(out, open(args[0], "w"), indent=1)
+    return 0
+
+
 if __name__ == "__main__":
     if "--child" in sys.argv:
         sys.exit(child(int(sys.argv[-2]), bool(int(sys.argv[-1]))))
-    out = {f"hd{hd}_{'c' if c else 'f'}": fingerprint(hd, c) for hd, c in CONFIGS}
-    print(json.dumps(out, indent=1))
-    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
-        json.dump(out, open(sys.argv[1], "w"), indent=1)
+    sys.exit(main())

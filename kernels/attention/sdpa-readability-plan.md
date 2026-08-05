@@ -81,6 +81,96 @@ baseline. Tier 3 runs once, after P5.5.
 **Critical path:** `P3.1 -> P3.2 -> P3.3 -> P5.4/P5.5`. Everything in P1 and P4
 is independent and can land at any time; P2 gates only on itself.
 
+### 0.3 Commit granularity: one function per commit
+
+**A commit refactors exactly one function, whatever its size.** Not one module,
+not one "area", and explicitly not a bundle assembled to make the diffs
+comparable. A 400-line change to one function is easier to reason about than a
+40-line change spread over six unrelated ones, and only the first is a useful
+bisect point.
+
+The reason this is a rule rather than a preference is §2.3.2: the perf harness
+resolves about 1% typically and 5% at the short-kernel configs. A regression
+smaller than a wide commit's blast radius cannot be attributed by reading the
+diff, so the commit boundary *is* the attribution mechanism. Wide commits do
+not get harder to bisect -- they make bisect useless, because the answer it
+returns is "one of these forty changes".
+
+Three consequences worth stating, because each changes the task list:
+
+**Thin wrappers still get their own commit.** `_split_ptr`,
+`_load_global_half_vec`, `load_global_f16xN` are five lines each. Moving one and
+leaving its caller pointing at the new location is a valid, complete, testable
+change, so it is a commit. Tiny commits are the cheap case, not the wasteful
+one -- tier 1 costs 12 s and most of these will not move the fingerprint at all.
+
+**Code that is not yet a function needs two commits, not one.** The gSWA region
+split (line 1821), the Q preload (1696) and the cross-shard S reduction (2121)
+are *inline blocks*. Each becomes:
+
+1. **extract in place** -- lift the block into a local function, same file, no
+   import changes. This is the commit with the sharpest gate: pure code motion,
+   bitwise-identical output, and the fingerprint should not move.
+2. **move** -- relocate the now-existing function to its shared module.
+
+Splitting these is not bureaucracy. Extraction is where a scoping mistake
+happens (a captured variable that should have been a parameter), and relocation
+is where an inlining change happens. They fail differently and should be
+bisectable apart.
+
+**Phase 3 has no function to refactor, so its unit is one *quantity*.** Narrowing
+`seqlen_q_v` from `fx.Index` to `fx.Int32` is a change to a value's type that
+propagates to every consumer; there is no single function that owns it. The
+same principle applies -- one logical change per commit, regardless of how many
+lines it touches -- with the quantity standing in for the function. P3.2 is
+therefore one commit per quantity: `seqlen_q_v`/`seqlen_k_v`, then the tile and
+row origins, then the shard offsets, then the window bounds, then whatever
+P3.1's classification turns up.
+
+### 0.4 The commit list, derived
+
+The groups in §0.2 expand as follows. Each bullet is one commit.
+
+| group | commits | one per                                                                                     |
+| ----- | ------- | --------------------------------------------------------------------------------------------- |
+| P3.2  | ~5      | quantity: `seqlen_?_v`; tile/row origins; shard offsets; window bounds; P3.1 remainder      |
+| P3.3  | 4       | `_scmp_i32`, `_ssel_i32`, `_smin_i32`, `_smax_i32`                                          |
+| P5.2  | 8       | `_pointer_to_llvm_ptr`, `_pointer_load`, `_pointer_store`, `_global_load_tr_v8`, `_split_ptr`, `_load_global_half_vec`, `_store_global_half`, `load_global_f16xN` + `load_global_v8f16` |
+| P5.3  | 2       | `_lds_load_v8`, `_lds_store_vx`                                                             |
+| P5.4  | 3       | `_sdiv_rd`, `_smin_i32`, `_smax_i32` (post-P3.3 survivors)                                  |
+| P5.5  | ~12     | gSWA extract + move; Q preload extract + move; cross-shard extract + move; `_decode_side` split into 3; `_decode_side` move; `_seqinfo_at` move; LSE addressing extract + move |
+
+That takes the plan from 21 tasks to roughly **50 commits**. That is the
+intended outcome: at 12 s of tier-1 gate each, the whole sequence costs about
+ten minutes of verification, and every one of them is a bisect point.
+
+### 0.5 Bisecting a regression, when one appears
+
+**Do not `git bisect run` the benchmark.** With a 5% floor at the short-kernel
+configs, a noisy predicate flips good/bad near the threshold and binary search
+converges on the wrong commit with total confidence. The repository's
+`/bisect-perf-regression` skill drives a benchmark command, which is the right
+tool for a large regression and the wrong one for a 3% drift.
+
+Bisect the **fingerprint** instead. It is deterministic (verified), so it is a
+sound predicate:
+
+```
+git bisect start <bad> <good>
+git bisect run python3 kernels/attention/codegen_fingerprint.py --expect <baseline.json>
+```
+
+That localises the commit where the *emitted code* changed, in
+`log2(n) x 12 s` -- under a minute across fifty commits. Then run tier 2.9 on
+that one commit to confirm it is also where the *time* changed. Two-stage,
+because the deterministic question and the noisy question deserve different
+tools.
+
+The failure mode to know about: if several commits change the fingerprint and
+only one changes the timing, the fingerprint bisect returns the first of them.
+That is why the `fp?` column exists -- the twelve tasks expected not to move it
+narrow the search before it starts.
+
 ### 0.3 Definition of done, per phase
 
 | phase | done when                                                                                          |
@@ -712,9 +802,16 @@ Three ordering constraints, all real:
    tractable, and Phase 3 touches many of the same lines. Doing them in the
    other order means resolving the same conflicts twice.
 
-Phase 1 is safe to land immediately and independently. Phases 2, 3 and 5 should
-each be a single commit -- they are wide, and a bisect across a half-applied
-refactor is worse than the refactor.
+Phase 1 is safe to land immediately and independently.
+
+An earlier draft of this plan said Phases 2, 3 and 5 should each be a *single*
+commit, on the grounds that bisecting a half-applied refactor is worse than the
+refactor. That was wrong, and §0.3 replaces it. The objection conflates two
+different intermediate states: a **broken** tree (does not compile, fails the
+suite) genuinely is worse to bisect through, but an **inconsistent** one --
+half the file narrowed to `i32`, half not -- compiles, passes, and is a
+perfectly good bisect point. Requiring every commit to be independently valid
+gets the safety; requiring them to be large does not.
 
 ---
 
