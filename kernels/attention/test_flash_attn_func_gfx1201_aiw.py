@@ -864,15 +864,15 @@ def test_block_m_is_invariant_to_q_row_tiles():
 @pytest.mark.parametrize(
     "kwargs, match",
     [
-        (dict(head_dim=100), "head_dim"),
+        (dict(head_dim=100), "BLOCK_DMODEL"),
         (dict(head_dim=128, block_n=64, causal=True), "BLOCK_N"),
         (dict(head_dim=128, v_lds_layout="row", shards=2), "cross-shard"),
         (dict(head_dim=64, q_row_tiles=2, shards=2), "untested"),
-        (dict(head_dim=64, q_row_tiles=3), "q_row_tiles"),
-        (dict(head_dim=128, k_prefetch_dist=2), "k_prefetch_dist"),
-        (dict(head_dim=128, v_prefetch_dist=2), "v_prefetch_dist"),
-        (dict(head_dim=128, head_dim_v=24), "head_dim_v"),
-        (dict(head_dim=128, head_dim_v=64, d_offset=96), "d_offset"),
+        (dict(head_dim=64, q_row_tiles=3), "Q_ROW_TILES"),
+        (dict(head_dim=128, k_prefetch_dist=2), "K_PREFETCH_DIST"),
+        (dict(head_dim=128, v_prefetch_dist=2), "V_PREFETCH_DIST"),
+        (dict(head_dim=128, head_dim_v=24), "BLOCK_DMODEL_V"),
+        (dict(head_dim=128, head_dim_v=64, d_offset=96), "D_OFFSET"),
     ],
 )
 def test_knob_validity_predicate(kwargs, match):

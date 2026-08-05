@@ -974,3 +974,23 @@ with outliers to +19%** -- established on 48 points whose kernel selection was
 provably identical. Same-process interleaved A/B separates cleanly at 1%. Any
 perf gate in this plan means the second thing.
 
+
+---
+
+## 12. Deferred to Phase 3: move `_primary`'s validation into the tuning module
+
+`build_flash_attn_func_aiw_module_primary` still opens with ~10 `raise
+ValueError` checks over its resolved knobs -- BLOCK_DMODEL divisibility,
+BLOCK_DMODEL_V fitting inside it, D_OFFSET alignment, prefetch distances,
+q_row_tiles, shard divisibility, BLOCK_N against K_SUB_N.
+
+They belong with the knobs, for the same reason the policy did: they are
+statements about which combinations are *legal*, which is the same knowledge
+`resolve_shards` and `vo_chunks` already encode there. Validating in the
+builder means an invalid combination is only caught once someone tries to
+compile it, and `resolve_knobs` can hand back a knob set it knows is
+unbuildable.
+
+Not done here because the checks are interleaved with derivation -- VO_WIDTH is
+computed between two of them -- so untangling them is a real refactor rather
+than a move, and Phase 2 was already long. It is a Phase 3 task.

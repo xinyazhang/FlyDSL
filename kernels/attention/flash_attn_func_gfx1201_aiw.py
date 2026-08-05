@@ -195,7 +195,6 @@ _WINDOW_BOTRIGHT = -2147483646   # 0x80000002
 
 
 
-
 def build_flash_attn_func_aiw_module_primary(meta, knobs):
     """Build the unified gfx1201 flash-attention kernel.
 
@@ -214,9 +213,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # Unpacked to locals so the body below reads unchanged. Anything not
     # resolved is a caller error, not a default to be invented here.
     num_heads = meta.num_heads
-    head_dim = meta.head_dim
-    head_dim_v = meta.head_dim_v
-    d_offset = meta.d_offset
     causal = meta.causal
     dtype_str = meta.dtype_str
     sm_scale = meta.sm_scale
@@ -225,25 +221,28 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     dropout = meta.dropout
     philox_width = meta.philox_width
 
-    waves_per_eu = knobs.waves_per_eu
-    flat_work_group_size = knobs.flat_work_group_size
-    block_m = knobs.block_m
-    block_n = knobs.block_n
-    k_prefetch_dist = knobs.k_prefetch_dist
-    v_prefetch_dist = knobs.v_prefetch_dist
-    v_lds_layout = knobs.v_lds_layout
-    strides_constexpr = knobs.strides_constexpr
-    padded_head = knobs.padded_head
-    q_row_tiles = knobs.q_row_tiles
-    shards = knobs.shards
-    unsafe_fp_math = knobs.unsafe_fp_math
-    fast_fp_math = knobs.fast_fp_math
-    denormals_are_zero = knobs.denormals_are_zero
-    sched_strategy = knobs.sched_strategy
-    lpt_tile_order = knobs.lpt_tile_order
-    unsafe_no_kv_clamp = knobs.unsafe_no_kv_clamp
-    fp_mode = knobs.fp_mode
-    path_tag = knobs.path_tag
+    WAVES_PER_EU = knobs.waves_per_eu
+    FLAT_WORK_GROUP_SIZE = knobs.flat_work_group_size
+    BLOCK_M_KNOB = knobs.block_m
+    BLOCK_N_KNOB = knobs.block_n
+    BLOCK_DMODEL = knobs.block_dmodel
+    BLOCK_DMODEL_V = knobs.block_dmodel_v
+    D_OFFSET = knobs.d_offset
+    K_PREFETCH_DIST_KNOB = knobs.k_prefetch_dist
+    V_PREFETCH_DIST = knobs.v_prefetch_dist
+    V_LDS_LAYOUT = knobs.v_lds_layout
+    STRIDES_CONSTEXPR = knobs.strides_constexpr
+    PADDED_HEAD = knobs.padded_head
+    Q_ROW_TILES = knobs.q_row_tiles
+    SHARDS = knobs.shards
+    UNSAFE_FP_MATH = knobs.unsafe_fp_math
+    FAST_FP_MATH = knobs.fast_fp_math
+    DENORMALS_ARE_ZERO = knobs.denormals_are_zero
+    SCHED_STRATEGY_KNOB = knobs.sched_strategy
+    LPT_TILE_ORDER_KNOB = knobs.lpt_tile_order
+    UNSAFE_NO_KV_CLAMP = knobs.unsafe_no_kv_clamp
+    FP_MODE = knobs.fp_mode
+    PATH_TAG = knobs.path_tag
     """Build the unified gfx1201 flash-attention kernel.
 
     See the module docstring for what each knob selects and which of the three
@@ -283,39 +282,37 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # See the operand-layout note in the module docstring.
     WMMA_LANE_K = WMMA_K // (WARP_SIZE // WMMA_M)
 
-    if head_dim % 16 or not (16 <= head_dim <= 512):
-        raise ValueError(f"aiw needs 16 <= head_dim <= 512 and head_dim % 16 == 0, got {head_dim}")
+    if BLOCK_DMODEL % 16 or not (16 <= BLOCK_DMODEL <= 512):
+        raise ValueError(f"aiw needs 16 <= BLOCK_DMODEL <= 512 and BLOCK_DMODEL % 16 == 0, got {BLOCK_DMODEL}")
     if dtype_str not in ("f16", "bf16"):
         raise ValueError(f"aiw supports f16/bf16, got {dtype_str!r}")
 
     # ---- Knob resolution ----
     K_PREFETCH_DIST = (
-        default_prefetch_dist(head_dim) if k_prefetch_dist is None else k_prefetch_dist
+        default_prefetch_dist(BLOCK_DMODEL) if K_PREFETCH_DIST_KNOB is None else K_PREFETCH_DIST_KNOB
     )
     if K_PREFETCH_DIST not in (0, 1):
-        raise ValueError(f"k_prefetch_dist must be 0 or 1, got {K_PREFETCH_DIST}")
+        raise ValueError(f"K_PREFETCH_DIST_KNOB must be 0 or 1, got {K_PREFETCH_DIST}")
     # K and V prefetch distances are INDEPENDENT. The baseline kernel is
     # (K=0, V=1) -- its "pre-issue first V global load before loop" carries V in
     # registers exactly as bp does, and only K is staged at distance 0. Folding
     # the two into one knob produces a (K=0, V=0) schedule that exists in none
-    # of the originals and costs 9.6% at head_dim 32 non-causal.
-    V_PREFETCH_DIST = v_prefetch_dist
+    # of the originals and costs 9.6% at BLOCK_DMODEL 32 non-causal.
     if V_PREFETCH_DIST not in (0, 1):
-        raise ValueError(f"v_prefetch_dist must be 0 or 1, got {V_PREFETCH_DIST}")
+        raise ValueError(f"V_PREFETCH_DIST must be 0 or 1, got {V_PREFETCH_DIST}")
     V_LDS_LAYOUT = (
         ("transposed" if K_PREFETCH_DIST else "row")
-        if v_lds_layout is None
-        else v_lds_layout
+        if V_LDS_LAYOUT is None
+        else V_LDS_LAYOUT
     )
     if V_LDS_LAYOUT not in ("row", "transposed"):
-        raise ValueError(f"v_lds_layout must be 'row' or 'transposed', got {V_LDS_LAYOUT!r}")
+        raise ValueError(f"V_LDS_LAYOUT must be 'row' or 'transposed', got {V_LDS_LAYOUT!r}")
     V_TRANSPOSED = V_LDS_LAYOUT == "transposed"
-    Q_ROW_TILES = q_row_tiles
 
     ROWS_PER_WAVE = WMMA_M * Q_ROW_TILES
 
-    BLOCK_N = block_n if block_n is not None else default_block_n(
-        head_dim, causal, K_PREFETCH_DIST
+    BLOCK_N = BLOCK_N_KNOB if BLOCK_N_KNOB is not None else default_block_n(
+        BLOCK_DMODEL, causal, K_PREFETCH_DIST
     )
     if BLOCK_N % K_SUB_N:
         raise ValueError(f"BLOCK_N ({BLOCK_N}) must be a multiple of K_SUB_N ({K_SUB_N})")
@@ -343,37 +340,36 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # V/O column *window*: the slice of the output width this build computes.
     # Distinct from VO_SLICE (a wave's share of a window) and from VO_CHUNK_COLS
     # (a staging pass's share of a window).
-    VO_WIDTH = head_dim if head_dim_v is None else head_dim_v
-    D_OFFSET = d_offset
-    if VO_WIDTH % 16 or not (0 < VO_WIDTH <= head_dim):
-        raise ValueError(f"head_dim_v must be a positive multiple of 16 and <= head_dim, got {VO_WIDTH}")
-    if D_OFFSET % 16 or D_OFFSET + VO_WIDTH > head_dim:
-        raise ValueError(f"d_offset {D_OFFSET} + head_dim_v {VO_WIDTH} must fit in head_dim {head_dim}")
+    VO_WIDTH = BLOCK_DMODEL if BLOCK_DMODEL_V is None else BLOCK_DMODEL_V
+    if VO_WIDTH % 16 or not (0 < VO_WIDTH <= BLOCK_DMODEL):
+        raise ValueError(f"BLOCK_DMODEL_V must be a positive multiple of 16 and <= BLOCK_DMODEL, got {VO_WIDTH}")
+    if D_OFFSET % 16 or D_OFFSET + VO_WIDTH > BLOCK_DMODEL:
+        raise ValueError(f"D_OFFSET {D_OFFSET} + BLOCK_DMODEL_V {VO_WIDTH} must fit in BLOCK_DMODEL {BLOCK_DMODEL}")
 
     # Head-dimension sharding. QK_SHARDS waves cooperate on one Q row-tile,
-    # each reducing over its own head_dim slice in GEMM1 and owning the matching
+    # each reducing over its own BLOCK_DMODEL slice in GEMM1 and owning the matching
     # V/O column slice in GEMM2. QK_SHARDS == 1 is the unsharded kernel: every
     # sharded construct below is behind `const_expr(QK_SHARDS > 1)`.
-    # Resolved against the V/O *window*, not head_dim, so a narrow window does
+    # Resolved against the V/O *window*, not BLOCK_DMODEL, so a narrow window does
     # not inherit a shard count it cannot divide.
-    if shards is not None:
-        QK_SHARDS = shards
+    if SHARDS is not None:
+        QK_SHARDS = SHARDS
     elif K_PREFETCH_DIST == 0 or Q_ROW_TILES > 1:
         QK_SHARDS = 1
     else:
-        QK_SHARDS = resolve_shards(head_dim, VO_WIDTH, BLOCK_N)
-    QK_SLICE = head_dim // QK_SHARDS      # head-dim columns per wave in GEMM1
+        QK_SHARDS = resolve_shards(BLOCK_DMODEL, VO_WIDTH, BLOCK_N)
+    QK_SLICE = BLOCK_DMODEL // QK_SHARDS      # head-dim columns per wave in GEMM1
 
     VO_CHUNKS = vo_chunks(VO_WIDTH, BLOCK_N, QK_SHARDS) if V_TRANSPOSED else 1
     VO_CHUNK_COLS = VO_WIDTH // VO_CHUNKS   # V columns resident per pass
     VO_SLICE = VO_CHUNK_COLS // QK_SHARDS   # V/O columns per wave per pass
 
-    if head_dim % QK_SHARDS or QK_SLICE % WMMA_K:
+    if BLOCK_DMODEL % QK_SHARDS or QK_SLICE % WMMA_K:
         # K_STEPS_QK = QK_SLICE // WMMA_K truncates otherwise, silently dropping
-        # part of the reduction: head_dim 224 with 4 shards gives a 56-wide
+        # part of the reduction: BLOCK_DMODEL 224 with 4 SHARDS gives a 56-wide
         # slice, of which only 48 would be reduced (measured rel err 0.97).
         raise ValueError(
-            f"head_dim {head_dim} with {QK_SHARDS} shards gives a {QK_SLICE}-wide "
+            f"BLOCK_DMODEL {BLOCK_DMODEL} with {QK_SHARDS} SHARDS gives a {QK_SLICE}-wide "
             f"slice, which must be a multiple of WMMA_K={WMMA_K}"
         )
     if VO_SLICE % WMMA_N:
@@ -384,25 +380,25 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # at build time; do not emit a kernel that silently computes the wrong
     # thing.
     if not V_TRANSPOSED and QK_SHARDS > 1:
-        raise ValueError("v_lds_layout='row' does not implement cross-shard reduction; use 'transposed'")
+        raise ValueError("V_LDS_LAYOUT='row' does not implement cross-shard reduction; use 'transposed'")
     if not V_TRANSPOSED and VO_CHUNKS > 1:
-        raise ValueError("v_lds_layout='row' does not implement chunked V staging; use 'transposed'")
+        raise ValueError("V_LDS_LAYOUT='row' does not implement chunked V staging; use 'transposed'")
     if VO_CHUNKS > 1 and not V_PREFETCH_DIST:
-        raise ValueError("chunked V staging requires v_prefetch_dist=1")
+        raise ValueError("chunked V staging requires V_PREFETCH_DIST=1")
     if Q_ROW_TILES > 1 and QK_SHARDS > 1:
-        raise ValueError("q_row_tiles > 1 with qk_shards > 1 is untested; pick one")
+        raise ValueError("Q_ROW_TILES > 1 with qk_shards > 1 is untested; pick one")
     if Q_ROW_TILES not in (1, 2):
-        raise ValueError(f"q_row_tiles must be 1 or 2, got {Q_ROW_TILES}")
+        raise ValueError(f"Q_ROW_TILES must be 1 or 2, got {Q_ROW_TILES}")
 
     # ---- Workgroup geometry ----
     if K_PREFETCH_DIST == 0:
-        BLOCK_M = block_m if block_m is not None else default_block_m(head_dim, 0)
+        BLOCK_M = BLOCK_M_KNOB if BLOCK_M_KNOB is not None else default_block_m(BLOCK_DMODEL, 0)
         if BLOCK_M % ROWS_PER_WAVE:
             raise ValueError(f"BLOCK_M ({BLOCK_M}) must be a multiple of {ROWS_PER_WAVE}")
         Q_TILES_PER_BLOCK = BLOCK_M // ROWS_PER_WAVE
         NUM_WAVES = Q_TILES_PER_BLOCK
     else:
-        # Keep the workgroup at TARGET_WAVES by trading Q row-tiles for shards,
+        # Keep the workgroup at TARGET_WAVES by trading Q row-tiles for SHARDS,
         # so BLOCK_M shrinks as QK_SHARDS grows.
         #
         # Divide by Q_ROW_TILES so BLOCK_M is *invariant* to that knob and only
@@ -416,14 +412,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # arithmetic is identical however rows are grouped into blocks -- so
         # only the benchmark catches it.
         Q_TILES_PER_BLOCK = max(
-            1, q_tiles_per_block(head_dim, QK_SHARDS) // Q_ROW_TILES
+            1, q_tiles_per_block(BLOCK_DMODEL, QK_SHARDS) // Q_ROW_TILES
         )
         BLOCK_M = ROWS_PER_WAVE * Q_TILES_PER_BLOCK
         NUM_WAVES = Q_TILES_PER_BLOCK * QK_SHARDS
 
-    if flat_work_group_size is None:
-        flat_work_group_size = NUM_WAVES * WARP_SIZE
-    BLOCK_SIZE = flat_work_group_size
+    if FLAT_WORK_GROUP_SIZE is None:
+        FLAT_WORK_GROUP_SIZE = NUM_WAVES * WARP_SIZE
+    BLOCK_SIZE = FLAT_WORK_GROUP_SIZE
 
     BLOCK_N_OUT = BLOCK_N
 
@@ -435,8 +431,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # `None` means the policy below; pass `""` for the stock GCN scheduler.
     SCHED_STRATEGY = (
         ("max-memory-clause" if (K_PREFETCH_DIST or causal) else "")
-        if sched_strategy is None
-        else sched_strategy
+        if SCHED_STRATEGY_KNOB is None
+        else SCHED_STRATEGY_KNOB
     )
 
     K_STEP_QK = WMMA_K
@@ -450,10 +446,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     PV_K_STEPS = K_SUB_N // PV_K_STEP
 
     if sm_scale is None:
-        sm_scale = 1.0 / host_math.sqrt(head_dim)
+        sm_scale = 1.0 / host_math.sqrt(BLOCK_DMODEL)
 
     NUM_HEADS = num_heads
-    HEAD_DIM = head_dim
+    HEAD_DIM = BLOCK_DMODEL
     CAUSAL = causal
     STRIDE_TOKEN = NUM_HEADS * HEAD_DIM
 
@@ -462,11 +458,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # every shape.
     #
     # Measured price (B=1 H=8 N=4096 f16, interleaved 3-rep A/B over the full
-    # head_dim ladder x causal): **median ratio 0.996**, worst 0.967 (head_dim
-    # 16 causal), best 1.041 (head_dim 192 causal). Several configs come out
+    # BLOCK_DMODEL ladder x causal): **median ratio 0.996**, worst 0.967 (BLOCK_DMODEL
+    # 16 causal), best 1.041 (BLOCK_DMODEL 192 causal). Several configs come out
     # *faster* and the spread is symmetric about 1.0, so this is the board's
     # noise floor rather than a measurable cost. Registers: +0 to +4 VGPRs,
-    # +22 SGPRs, no new spills at any head_dim. Output is bitwise identical to
+    # +22 SGPRs, no new spills at any BLOCK_DMODEL. Output is bitwise identical to
     # the folded form, sm_scale included.
     #
     # Each tensor carries its own triple, and they are not interchangeable: K
@@ -476,7 +472,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # SGPRs and zero VGPRs -- strides are uniform scalars, so they only change
     # which value an address multiplies.
     #
-    # `strides_constexpr=True` keeps them folded. It is retained only as an A/B
+    # `STRIDES_CONSTEXPR=True` keeps them folded. It is retained only as an A/B
     # arm for future phases -- if addressing ever becomes expensive we want to
     # be able to measure against the folded form -- and is not a shipping
     # configuration.
@@ -494,7 +490,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # blocks first and leaves only cheap ones to fill the tail.
     #
     # Measured B=1 H=8 N=4096 f16 causal, TFLOPS forward -> reversed:
-    #   head_dim  16   31.8 -> 35.7  (+12%)
+    #   BLOCK_DMODEL  16   31.8 -> 35.7  (+12%)
     #             32   51.2 -> 59.5  (+16%)
     #             64   67.1 -> 77.8  (+16%)
     #            128   74.8 -> 87.0  (+16%)
@@ -516,11 +512,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # is part of the knob's *definition* and is resolved here rather than
     # re-tested at the use site, where it read as an arbitrary restriction on
     # an unrelated flag.
-    _LPT_TILE_ORDER = CAUSAL and lpt_tile_order
+    _LPT_TILE_ORDER = CAUSAL and LPT_TILE_ORDER_KNOB
     # Measurement-only: drops the KV row clamp. UNSAFE in general -- it is
     # what buffer bounds checking would replace -- but valid for a benchmark
     # where seq_len is an exact multiple of BLOCK_M.
-    _NO_KV_CLAMP = unsafe_no_kv_clamp
+    _NO_KV_CLAMP = UNSAFE_NO_KV_CLAMP
     # Floating-point latitude granted to the compiler.
     #
     # "noninf" (default) is `fast` minus `ninf`, and drops the function-level
@@ -535,8 +531,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # attention mask cast to float is exactly a matrix of -inf.
     #
     # Cost of giving it up, measured with DAZ held constant (B=1 H=8 N=4096
-    # f16, head_dim 16/64/128/256/512 x causal): **within noise everywhere** --
-    # 91.5 vs 91.9 TFLOPS at head_dim 128 non-causal, 45.5 vs 45.4 at 512. The
+    # f16, BLOCK_DMODEL 16/64/128/256/512 x causal): **within noise everywhere** --
+    # 91.5 vs 91.9 TFLOPS at BLOCK_DMODEL 128 non-causal, 45.5 vs 45.4 at 512. The
     # permission bought nothing and cost a silent miscompile.
     #
     # `nnan` is retained. NaN can only arise here from -inf minus -inf, which
@@ -545,8 +541,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     #
     # "fast" restores the old behaviour for A/B; "safe" additionally drops
     # `nnan` (~0.6%).
-    _FP_MODE = fp_mode
-    STRIDES_CONSTEXPR = strides_constexpr
+    _FP_MODE = FP_MODE
 
     # Two softmax corrections, unconditional. Both come from AOTriton's
     # hard-won list and there is no reason to keep the un-corrected form
@@ -563,11 +558,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     #     `m_i` lives in the scaled domain and the exponent is a plain
     #     subtract. The alternative -- `exp2(fma(s, qk_scale, -qk_scale*m))` --
     #     is exactly the FMA pattern AOTriton flags in ROCm/aotriton#54, and it
-    #     measurably loses accuracy at large input magnitudes: at head_dim 128
+    #     measurably loses accuracy at large input magnitudes: at BLOCK_DMODEL 128
     #     causal the corrected form is *exact* against an fp64 reference from
     #     magnitude 300 up, where the FMA form sits at 4-7e-4.
 
-    # `head_dim` is BLOCK_DMODEL: the compile-time tile width, drawn from the
+    # `BLOCK_DMODEL` is BLOCK_DMODEL: the compile-time tile width, drawn from the
     # ladder. The *real* extents are the runtime `hdim_qk` / `hdim_vo`
     # arguments, and PADDED_HEAD says whether they differ from the tile.
     # AOTriton derives exactly this (`attn_fwd.cc`):
@@ -575,8 +570,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     #     PADDED_HEAD  = (hdim_rounded != hdim_qk || hdim_rounded != hdim_vo)
     # With PADDED_HEAD false the two are equal to the tile and no masking is
     # emitted at all -- that is the common case and the one the ladder measures.
-    PADDED_HEAD = padded_head
-    BLOCK_DMODEL = head_dim
 
     # Causal masking. `causal_type` is the *caller's* vocabulary, AOTriton's
     # CAUSAL_TYPE: 0 = none, 1 = top-left aligned, 2 = bottom-right aligned,
@@ -682,7 +675,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     #
     # It is also not a win. Measured 8 against 16 (B=1 H=8 N=4096 f16, TFLOPS):
     #
-    #   head_dim   non-causal        causal
+    #   BLOCK_DMODEL   non-causal        causal
     #       16    37.4 -> 40.2   28.2 -> 35.7
     #       32    64.0 -> 61.4   47.0 -> 47.2
     #       64    81.0 -> 81.4   74.3 -> 70.2
@@ -691,7 +684,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     #      256    89.1 -> 90.1   72.6 -> 73.7
     #      512    45.7 -> 55.1   43.1 -> 51.6
     #
-    # Median +0.8%, best +27% (head_dim 16 causal), worst -5.5%. So the wider
+    # Median +0.8%, best +27% (BLOCK_DMODEL 16 causal), worst -5.5%. So the wider
     # load was buying nothing on average while carrying an alignment hazard
     # that no test would catch -- it would fault or corrupt only on layouts we
     # do not currently generate. Removed rather than tuned: tuning an unsound
@@ -707,7 +700,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
     # Cover BLOCK_N rows with ceil() batches, not floor(). Flooring silently
     # dropped rows whenever ROWS_PER_BATCH_LOAD neither reached BLOCK_N nor
-    # divided it: head_dim 160/192/224 give 25/21/18, so BLOCK_N // that == 1
+    # divided it: BLOCK_DMODEL 160/192/224 give 25/21/18, so BLOCK_N // that == 1
     # and only 25/21/18 of the 32 KV rows reached LDS. The rest was stale LDS,
     # which surfaced as NaN.
     THREADS_PER_ROW_LOAD, ROWS_PER_BATCH_LOAD, NUM_BATCHES_KV, KV_NEEDS_GUARD = _load_geom(HEAD_DIM)
@@ -718,7 +711,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     V_TR_D_BLOCKS = VO_CHUNK_COLS // WMMA_N
     _V_TR_TILES = V_TR_D_BLOCKS * (BLOCK_N // WMMA_K)
     # The V TR tiling need not divide evenly across the waves: tail tiles are
-    # guarded at the LDS store. Requiring divisibility used to force head_dim
+    # guarded at the LDS store. Requiring divisibility used to force BLOCK_DMODEL
     # 160 down to 4 waves, which cost it 89.1 -> 70.0 TFLOPS.
     V_TR_LOADS = (_V_TR_TILES + NUM_WAVES - 1) // NUM_WAVES
     V_TR_NEEDS_GUARD = V_TR_LOADS * NUM_WAVES != _V_TR_TILES
@@ -1070,7 +1063,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         wave_q_offset = q_tile_in_block * ROWS_PER_WAVE
 
         # Column origins of this wave's slices. Both are 0 at QK_SHARDS == 1.
-        shard_qk_off = shard_id * fx.Index(QK_SLICE)   # into Q/K head_dim
+        shard_qk_off = shard_id * fx.Index(QK_SLICE)   # into Q/K BLOCK_DMODEL
         shard_vo_off = shard_id * fx.Index(VO_SLICE)   # into the V/O window
 
         # 3D grid: (head_q, q_tile, batch). A flat grid would need two integer
@@ -1083,7 +1076,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # there spreads durations 1..N across every scheduling group, while
         # putting head there gives each group a uniform duration. Measured at
         # B=1 H=8 N=4096 f16 causal, q_tile-fastest against head-fastest:
-        # head_dim 16 0.587, 32 0.612, 64 0.715, 128 0.769. Non-causal is
+        # BLOCK_DMODEL 16 0.587, 32 0.612, 64 0.715, 128 0.769. Non-causal is
         # indifferent (all within 1%), which is what identifies the cause.
         #
         # Note AOTriton uses dim3{S,H,B} -- q_tile fastest -- for NUM_XCDS == 1.
@@ -1155,11 +1148,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # ---- Address split: 64-bit uniform base + 32-bit divergent offset ----
         #
         # The full linear element index is
-        #     ((batch * seq_len) + token) * nheads * head_dim + head * head_dim + d
+        #     ((batch * seq_len) + token) * nheads * BLOCK_DMODEL + head * BLOCK_DMODEL + d
         # i.e. it spans all of B, S, H and D, and overflows i32 at 2G elements
         # (2 GB at f16, which real shapes reach). Only the *intra-tile* part is
         # safely 32-bit: it is bounded by
-        #     max(BLOCK_M, BLOCK_N) * nheads * head_dim + head_dim
+        #     max(BLOCK_M, BLOCK_N) * nheads * BLOCK_DMODEL + BLOCK_DMODEL
         # because the row index is relative to the tile.
         #
         # So the batch/head/tile origin stays in 64 bits, and it is uniform
@@ -1455,7 +1448,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
             The guard has to cover the *load*, not just the store. When
             ROWS_PER_BATCH_LOAD overshoots BLOCK_N some cooperative-load lanes
-            have no row -- at head_dim 32 with BLOCK_N 64 that is exactly half
+            have no row -- at BLOCK_DMODEL 32 with BLOCK_N 64 that is exactly half
             of them -- and issuing their (clamped, redundant) global loads
             anyway measured -9.6% against the baseline kernel. Distance 1
             cannot do this: there the loaded value is loop-carried, so it has
@@ -1894,7 +1887,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     _y.extend(coop_load_v_global(_first_col))
                 _pf = yield _y
             # `scf_yield_` returns a bare value, not a list, when the loop
-            # carries exactly one -- which happens at head_dim 16, where the K
+            # carries exactly one -- which happens at BLOCK_DMODEL 16, where the K
             # prefetch is off and V is a single load. Indexing that bare value
             # extracts a vector *element*, so the next use sees an f16 scalar
             # where it wants a vector, and the failure surfaces far away in
@@ -2008,7 +2001,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         )
 
             # ==== Cross-shard S reduction ====
-            # Each shard-wave holds a partial sum over its own head_dim slice;
+            # Each shard-wave holds a partial sum over its own BLOCK_DMODEL slice;
             # the full S is their sum. Explicit partials, not ds_add_f32:
             # measured 54 vs 1055 WMMA-equivalents, see
             # kernels/microbench/lds_reduce.py.
@@ -2146,7 +2139,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     #
                     # No `scf.if` guard: a runtime "does this tile need it"
                     # branch measured far worse than just doing the selects
-                    # (head_dim 192 non-causal 78.0 against 98.3 TFLOPS), the
+                    # (BLOCK_DMODEL 192 non-causal 78.0 against 98.3 TFLOPS), the
                     # region boundary blocking scheduling in a latency-bound
                     # loop. The region split gives the same benefit statically.
                     _kv_i32 = fx.Int32(kv_block_start)
@@ -2341,7 +2334,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # Unchunked: keep the original shape exactly. Wrapping this in a
                 # 1-trip chunk loop cost 4 VGPRs (190 -> 194), which crosses an
                 # allocation-granularity boundary and drops occupancy 8 -> 7
-                # waves/SIMD, measured at -4% on head_dim 128.
+                # waves/SIMD, measured at -4% on BLOCK_DMODEL 128.
                 if const_expr(V_PREFETCH_DIST):
                     coop_store_v_lds(_v_vecs_cur, 0)
                     gpu.barrier()
@@ -2388,7 +2381,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         loop_results = init_args
         if const_expr(CAUSAL):
             # Still **two** emitted bodies, not three. The body already costs
-            # 63 VGPRs at head_dim 128 and spills head_dim 192 at two copies
+            # 63 VGPRs at BLOCK_DMODEL 128 and spills BLOCK_DMODEL 192 at two copies
             # (plan1 sections 6.2, 2.6), so the two masked runs share one loop
             # walked over a piecewise index -- one select per masked iteration,
             # paid only in the masked region.
@@ -2464,7 +2457,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         #
         # One value per (batch, head, q_row). A lane's m/l belong to its own
         # q_row (lane16), replicated across the klane halves by the shuffle_xor
-        # reduction and across shards by the cross-shard reduction, so exactly
+        # reduction and across SHARDS by the cross-shard reduction, so exactly
         # one lane per row must store: klane 0 of shard 0.
         #
         # Layout is AOTriton's single branch-free formula
@@ -2486,7 +2479,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             ),
         )
         # Everything -- the log2, the scale, the address -- lives inside the
-        # guard. Hoisting it out cost 8% at head_dim 256 non-causal even though
+        # guard. Hoisting it out cost 8% at BLOCK_DMODEL 256 non-causal even though
         # the store itself was still predicated: the values stay live across
         # the epilogue and lengthen it for every wave, including the ones that
         # never store and the whole kernel when L is null.
@@ -2656,7 +2649,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
 
         # Strides come from the caller, read off the real tensors -- never
-        # derived here from num_heads/head_dim. The shape does not determine
+        # derived here from num_heads/BLOCK_DMODEL. The shape does not determine
         # the layout (plan1 section 0), and K/V need not share Q's layout at
         # all. Axis 3 is D, contiguous by contract, so it is not passed.
         # Always forwarded: with STRIDES_CONSTEXPR the kernel simply does not
@@ -2677,21 +2670,21 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             sm_scale_v,
         )
 
-        if const_expr(waves_per_eu is not None):
-            _wpe = int(waves_per_eu)
+        if const_expr(WAVES_PER_EU is not None):
+            _wpe = int(WAVES_PER_EU)
             if const_expr(_wpe >= 1):
                 for op in ctx.gpu_module_body.operations:
                     if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                        op.attributes["rocdl.WAVES_PER_EU"] = ir.IntegerAttr.get(
                             T.i32, _wpe
                         )
-        if const_expr(flat_work_group_size is not None):
-            _fwgs = int(flat_work_group_size)
+        if const_expr(FLAT_WORK_GROUP_SIZE is not None):
+            _fwgs = int(FLAT_WORK_GROUP_SIZE)
             if const_expr(_fwgs >= 1):
                 flat_wg_attr = ir.StringAttr.get(f"{_fwgs},{_fwgs}")
                 for op in ctx.gpu_module_body.operations:
                     if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                        op.attributes["rocdl.flat_work_group_size"] = flat_wg_attr
+                        op.attributes["rocdl.FLAT_WORK_GROUP_SIZE"] = flat_wg_attr
 
         passthrough_entries = []
         # The default GCN scheduler sinks every LDS load next to its consuming
@@ -2708,7 +2701,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     ]
                 )
             )
-        if const_expr(denormals_are_zero):
+        if const_expr(DENORMALS_ARE_ZERO):
             passthrough_entries.append(
                 ir.ArrayAttr.get(
                     [
@@ -2739,8 +2732,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         )
 
     _fmha_compile_hints = {
-        "fast_fp_math": fast_fp_math,
-        "unsafe_fp_math": unsafe_fp_math,
+        "FAST_FP_MATH": FAST_FP_MATH,
+        "UNSAFE_FP_MATH": UNSAFE_FP_MATH,
         "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
     }
 
@@ -3068,7 +3061,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     int(seqlen_q), int(seqlen_k))
         if STRIDES_CONSTEXPR:
             raise ValueError(
-                "strides_constexpr derives the layout from the shape, which "
+                "STRIDES_CONSTEXPR derives the layout from the shape, which "
                 "varlen invalidates; it is a dense-only diagnostic arm"
             )
         # No implemented-subset gate: every encodable side byte now decodes,
@@ -3178,7 +3171,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     _launch.varlen_strided = varlen_strided
     _launch.varlen_seqused_k = varlen_seqused_k
     return _launch
-
 
 def build_flash_attn_func_aiw_module(**kwargs):
     """Keyword front end: name a problem, get the policy's schedule.

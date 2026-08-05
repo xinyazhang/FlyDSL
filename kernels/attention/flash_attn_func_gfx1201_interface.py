@@ -155,9 +155,9 @@ def flydsl_flash_attn_func_gfx1201(
         ),
         knobs,
     )
-    block_dmodel = _plan.meta.head_dim
+    block_dmodel = _plan.knobs.block_dmodel
     padded_head = _plan.knobs.padded_head
-    block_m = _plan.block_m
+    block_m = _plan.knobs.block_m
     if padded_head:
         # The D-axis pitch must be a multiple of 16 bytes -- 8 elements at
         # f16/bf16. This is the alignment contract (see sdpa-close-gap-plan1.md
