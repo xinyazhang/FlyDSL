@@ -25,7 +25,7 @@ repeatedly and gate each touch separately.
 | phase                      | state       | commit     |
 | -------------------------- | ----------- | ---------- |
 | P5 groundwork              | **landed**  | `49764d29` |
-| P1 free corrections        | not started | --         |
+| P1 free corrections        | **done**    | `a4d9c3f6` .. `cfbf8696` |
 | P2 policy extraction       | not started | --         |
 | P3 type discipline         | not started | --         |
 | P4 investigations          | not started | --         |
@@ -58,10 +58,11 @@ baseline. Tier 3 runs once, after P5.5.
 | P1.1   | Document `K_SUB_N`, `WMMA_LANE_K`; audit every other bare constant | aiw                                            | none (comments)          | S   | none | no  | --      |
 | P1.2   | Fix `_scmp_i32`'s false docstring (§1.4)                          | aiw                                            | none (comment)           | S   | none | no  | --      |
 | ~~P1.3~~ | ~~Drop the `Vec` alias~~ **dropped** -- `Vec` is the majority spelling (17 files vs 9), see §1.1 | -- | -- | -- | -- | -- | -- |
-| P1.4   | Delete `_ssel_i32`; use `cond.select(a, b)` (§1.2)                | aiw                                            | bitwise                  | S   | low  | yes | --      |
-| P1.5   | Drop `fx.Index(<const>)` casts; sweep for siblings (§1.3)         | aiw                                            | bitwise                  | S   | none | no  | --      |
+| ~~P1.4~~ | **moved to the P3.3 group** -- `_smin_i32`/`_smax_i32` are defined in terms of `_ssel_i32`, and its `fx.Int32` coercion is only redundant after P3.2 | -- | -- | -- | -- | -- | -- |
+| ~~P1.5~~ | **folded into P3.2** -- of ~30 sites, most are sequence-space expressions P3.2 rewrites anyway (`fx.Index(BLOCK_N)` in the KV bounds, the shard offsets, `fx.Index(D_OFFSET)`) | -- | -- | -- | -- | -- | -- |
 | P1.6   | Rename `_REVERSE_Q_TILES` -> `_LPT_TILE_ORDER` (§1.5)             | aiw                                            | bitwise                  | S   | none | no  | --      |
-| P1.7   | Rename `tile_start` -> `start_k`, `q_start` -> `start_q` (21 + n sites) | aiw                                       | bitwise                  | S   | low  | no  | --      |
+| P1.7a  | Rename `tile_start` -> `start_k`; `tbase`'s param -> `seq_start`  | aiw                                            | bitwise                  | S   | low  | no  | --      |
+| P1.7b  | Rename `q_start` -> `start_q`                                     | aiw                                            | bitwise                  | S   | low  | no  | --      |
 | P2.1   | Move 6 tuning functions/constants to the interface (§4.1)         | aiw, interface                                 | schedule-diff + bitwise  | M   | low  | no  | --      |
 | P2.2   | Env vars -> build knobs, incl. `fp_mode` (§4.2)                   | aiw, interface                                 | schedule-diff + bitwise  | M   | med  | no  | P2.1    |
 | P2.3   | Introduce `FmhaProblem` / `FmhaSchedule` dataclasses (§4.3)       | aiw, interface, tests                          | schedule-diff + bitwise  | M   | low  | no  | P2.2    |
