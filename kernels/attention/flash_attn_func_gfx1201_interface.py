@@ -33,9 +33,10 @@ from functools import lru_cache
 
 import torch
 
-from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module
+from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module_primary
+from fmha_tuning_gfx1201 import FmhaProblem, FmhaSchedule, resolve_schedule
 from fmha_tuning_gfx1201 import MAX_HEAD_DIM as _MAX_HEAD_DIM
-from fmha_tuning_gfx1201 import _aiw_knobs, _round_to_ladder, _use_bp
+from fmha_tuning_gfx1201 import _round_to_ladder
 from fmha_tuning_gfx1201 import default_block_m as aiw_block_m
 from fmha_tuning_gfx1201 import default_prefetch_dist as aiw_prefetch_dist
 
@@ -61,34 +62,15 @@ def _torch_dtype_to_str(dtype: torch.dtype) -> str:
 
 
 @lru_cache(maxsize=32)
-def _get_kernel(
-    num_heads: int,
-    head_dim: int,
-    causal: bool,
-    dtype_str: str,
-    waves_per_eu: int,
-    daz: bool,
-    use_bp: bool,
-    variant: str = "",
-    head_dim_v: int | None = None,
-    d_offset: int = 0,
-    padded_head: bool = False,
-):
-    kwargs = {}
-    if head_dim_v is not None:
-        # The V/output column window.
-        kwargs = {"head_dim_v": head_dim_v, "d_offset": d_offset}
-    kwargs.update(_aiw_knobs(head_dim, use_bp, variant))
-    kwargs["padded_head"] = padded_head
-    return build_flash_attn_func_aiw_module(
-        num_heads=num_heads,
-        head_dim=head_dim,
-        causal=causal,
-        dtype_str=dtype_str,
-        waves_per_eu=waves_per_eu,
-        daz=daz,
-        **kwargs,
-    )
+def _get_kernel(problem: FmhaProblem, schedule: FmhaSchedule):
+    """Build cache. Both arguments are frozen dataclasses, so both hash.
+
+    That is the reason they are frozen: the pair *is* the cache key, and every
+    knob that reaches the builder is inside it. The previous signature listed
+    the knobs it happened to key on, which is how the env vars managed to
+    change the emitted kernel without changing the key.
+    """
+    return build_flash_attn_func_aiw_module_primary(problem, schedule)
 
 
 def flydsl_flash_attn_func_gfx1201(
@@ -99,8 +81,7 @@ def flydsl_flash_attn_func_gfx1201(
     waves_per_eu: int = 2,
     daz: bool = True,
     stream: torch.cuda.Stream | None = None,
-    use_binding_prefetch: bool = False,
-    variant: str = "",
+    schedule: FmhaSchedule | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor:
     """Run FlyDSL Flash Attention on RDNA4 (gfx1201).
@@ -116,18 +97,19 @@ def flydsl_flash_attn_func_gfx1201(
         daz: enable denormals-are-zero on the kernel.
         stream: optional CUDA/HIP stream to launch on. Defaults to the current
             stream for ``q.device``.
-        use_binding_prefetch: force K prefetch distance 1 below the head_dim
-            where the tuning policy would pick 0 (48). K and V prefetch
-            distances are independent -- V is always staged one tile ahead --
-            so this only moves K. Above the threshold it is already the default
-            and the flag is a no-op.
-        variant: ``""`` follows the tuning policy, which already selects two Q
-            row-tiles at the head_dim where that wins at every measured shape.
-            ``"m32"`` forces two row-tiles, so one K/V operand feeds two WMMAs;
-            allowed up to head_dim 80, above which the doubled per-wave state
-            spills. Whether it helps is strongly shape-dependent (see the
-            `_Q_ROW_TILES_2_HEAD_DIMS` table) -- it is a knob for callers who
-            have measured their own shape, not a generally better schedule.
+        schedule: ``None`` uses the measured tuning policy for this shape. An
+            ``FmhaSchedule`` with some fields set pins those and lets policy
+            resolve the rest -- and a pinned knob participates in deriving the
+            ones downstream of it, so ``FmhaSchedule(q_row_tiles=2)`` also
+            forces the prefetch distance two row-tiles require.
+
+            This replaces the former ``use_binding_prefetch`` and
+            ``variant="m32"`` flags, which were the same idea spelled twice:
+            ``use_binding_prefetch=True`` is ``FmhaSchedule(k_prefetch_dist=1)``
+            and ``variant="m32"`` is ``FmhaSchedule(q_row_tiles=2)``. Both now
+            say what they do rather than naming a historical kernel variant.
+            Whether either helps is strongly shape-dependent -- see the
+            ``_Q_ROW_TILES_2_HEAD_DIMS`` table in ``fmha_tuning_gfx1201``.
 
     Returns:
         Output tensor with the same shape and dtype as ``q``.
@@ -168,10 +150,6 @@ def flydsl_flash_attn_func_gfx1201(
         raise ValueError(f"q/k/v dtype must match: {q.dtype}/{k.dtype}/{v.dtype}")
     if q.dim() != 4:
         raise ValueError(f"expected 4D BSHD tensor, got rank {q.dim()} ({tuple(q.shape)})")
-    if variant not in ("", "m32"):
-        raise ValueError(
-            f"unknown variant {variant!r}; expected '' (unified kernel) or 'm32'"
-        )
 
     batch, seq_len_real, num_heads, head_dim = q.shape
     if head_dim < 1 or head_dim > _MAX_HEAD_DIM:
@@ -206,13 +184,23 @@ def flydsl_flash_attn_func_gfx1201(
 
     # Everything below keys on the *tile* width, per N3: BLOCK_DMODEL is the
     # single tuning key, and hdim rides along as a runtime argument.
-    use_bp = _use_bp(block_dmodel, use_binding_prefetch, variant)
+    _problem = FmhaProblem(
+        num_heads=num_heads,
+        head_dim=block_dmodel,
+        causal=causal,
+        dtype_str=dtype_str,
+        padded_head=padded_head,
+    )
+    # `waves_per_eu` and `daz` stay as named arguments for now, so they form
+    # the base and an explicit `schedule` wins over them.
+    _schedule = resolve_schedule(
+        _problem,
+        FmhaSchedule(waves_per_eu=waves_per_eu, daz=daz).merge(schedule),
+    )
     # BLOCK_M is invariant to q_row_tiles by construction (see the
     # Q_TILES_PER_BLOCK comment in the kernel), so only the prefetch distance
     # matters here.
-    block_m = aiw_block_m(
-        block_dmodel, 1 if use_bp else aiw_prefetch_dist(block_dmodel)
-    )
+    block_m = aiw_block_m(block_dmodel, _schedule.k_prefetch_dist)
     # The KV tail is masked in-kernel, so seq_len is passed through as-is.
     #
     # It used to be rounded up to BLOCK_M with F.pad -- three tensor copies per
@@ -257,19 +245,7 @@ def flydsl_flash_attn_func_gfx1201(
         launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
         if launch_stream.device != q.device:
             raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
-        exe = _get_kernel(
-            num_heads=num_heads,
-            head_dim=block_dmodel,
-            causal=causal,
-            dtype_str=dtype_str,
-            waves_per_eu=waves_per_eu,
-            daz=daz,
-            use_bp=use_bp,
-            variant=variant,
-            head_dim_v=None,
-            d_offset=0,
-            padded_head=padded_head,
-        )
+        exe = _get_kernel(_problem, _schedule)
         # Whole tensors, not `.reshape(-1)`: the kernel reads strides, and
         # flattening materialises a copy for any non-contiguous input, which
         # would silently defeat the point of reading them.

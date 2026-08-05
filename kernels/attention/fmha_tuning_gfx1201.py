@@ -343,3 +343,139 @@ def _round_to_ladder(head_dim: int) -> int:
 
 
 MAX_HEAD_DIM = _BLOCK_DMODEL_LADDER[-1]
+
+
+# ---------------------------------------------------------------------------
+# The two halves of a build request.
+#
+# Split on *who decides*, which is the distinction the 26-parameter signature
+# they replace could not express: a caller states a problem, the tuning policy
+# answers with a schedule. Keeping them apart is what makes "the tuning module
+# is the only producer of a schedule" a checkable property rather than a
+# convention -- a single blob would let a caller set `block_m` while claiming
+# to have asked for a default, and nothing would notice.
+#
+# Both frozen: a schedule is used as part of a build-cache key, and a mutable
+# key is a bug waiting for a second caller.
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, fields, replace  # noqa: E402
+
+
+@dataclass(frozen=True)
+class FmhaProblem:
+    """What to compute. Set by the caller; never by policy."""
+
+    num_heads: int
+    head_dim: int
+    causal: bool = True
+    dtype_str: str = "bf16"
+    head_dim_v: int | None = None
+    d_offset: int = 0
+    sm_scale: float | None = None
+    causal_type: int | None = None
+    padded_head: bool = False
+    bias: bool = False
+    dropout: bool = False
+    philox_width: int | None = None
+
+
+@dataclass(frozen=True)
+class FmhaSchedule:
+    """How to compute it. Every field `None` means "policy decides".
+
+    `None` rather than a literal default on purpose: it is the only way
+    `resolve_schedule` can tell "the caller wants 1" from "the caller did not
+    say", and that difference is the whole point of the overrides argument.
+    """
+
+    block_m: int | None = None
+    block_n: int | None = None
+    k_prefetch_dist: int | None = None
+    v_prefetch_dist: int | None = None
+    v_lds_layout: str | None = None
+    q_row_tiles: int | None = None
+    shards: int | None = None
+    waves_per_eu: int | None = None
+    flat_work_group_size: int | None = None
+    sched_strategy: str | None = None
+    fp_mode: str | None = None
+    daz: bool | None = None
+    unsafe_fp_math: bool | None = None
+    fast_fp_math: bool | None = None
+    strides_constexpr: bool | None = None
+    lpt_tile_order: bool | None = None
+    unsafe_no_kv_clamp: bool | None = None
+    path_tag: str | None = None
+
+    def merge(self, other: "FmhaSchedule | None") -> "FmhaSchedule":
+        """`other`'s set fields win; its `None`s leave this one's alone."""
+        if other is None:
+            return self
+        set_fields = {
+            f.name: getattr(other, f.name)
+            for f in fields(other)
+            if getattr(other, f.name) is not None
+        }
+        return replace(self, **set_fields)
+
+
+# Defaults for the knobs the policy has no opinion about -- they are the same
+# for every shape, so they are literals here rather than functions.
+_SCHEDULE_FALLBACK = FmhaSchedule(
+    v_prefetch_dist=1,
+    waves_per_eu=2,
+    fp_mode="noninf",
+    daz=True,
+    unsafe_fp_math=True,
+    fast_fp_math=True,
+    strides_constexpr=False,
+    lpt_tile_order=True,
+    unsafe_no_kv_clamp=False,
+    path_tag="auto",
+)
+
+
+def resolve_schedule(
+    problem: FmhaProblem, overrides: "FmhaSchedule | None" = None
+) -> FmhaSchedule:
+    """The complete measured configuration for `problem`.
+
+    The ordering below is the reason this function exists. `k_prefetch_dist`
+    feeds `block_n`, and `q_row_tiles` feeds `k_prefetch_dist`, so a caller
+    assembling a schedule by hand has to know the dependency order to get the
+    same answer -- and until now the interface was the thing that knew it.
+
+    `overrides` is applied *first*, so a pinned knob participates in deriving
+    the ones downstream of it rather than being stamped on afterwards. Pinning
+    `q_row_tiles=2` therefore also forces the prefetch distance it requires,
+    which is what a caller asking for two row-tiles means.
+    """
+    s = _SCHEDULE_FALLBACK.merge(overrides)
+    hd = problem.head_dim
+
+    if s.q_row_tiles is None:
+        s = replace(s, q_row_tiles=2 if hd in _Q_ROW_TILES_2_HEAD_DIMS else 1)
+    if s.q_row_tiles == 2 and hd > _Q_ROW_TILES_2_MAX_HEAD_DIM:
+        raise ValueError(
+            f"q_row_tiles=2 requires head_dim <= {_Q_ROW_TILES_2_MAX_HEAD_DIM}, "
+            f"got {hd}"
+        )
+    if s.k_prefetch_dist is None:
+        # Two row-tiles require the prefetched, transposed V layout.
+        s = replace(
+            s,
+            k_prefetch_dist=(
+                1 if s.q_row_tiles == 2 or hd >= _BP_MIN_HEAD_DIM
+                else default_prefetch_dist(hd)
+            ),
+        )
+    if s.v_lds_layout is None:
+        s = replace(s, v_lds_layout="transposed" if s.k_prefetch_dist else "row")
+    if s.block_n is None:
+        s = replace(s, block_n=default_block_n(hd, problem.causal, s.k_prefetch_dist))
+    if s.block_m is None and s.k_prefetch_dist == 0:
+        # Only the distance-0 path takes BLOCK_M from policy; the other branch
+        # derives it from the shard count inside the builder.
+        s = replace(s, block_m=default_block_m(hd, 0))
+    return s
