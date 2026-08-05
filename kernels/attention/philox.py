@@ -418,6 +418,53 @@ class Philox:
         """`span_u32` and `keep_mask` together: the dropout mask for a run."""
         return keep_mask(self.span_u32(seed, first_offset, count), threshold)
 
+    # -- the 2D grid scheme -------------------------------------------------
+    #
+    # These two exist so that a producer and a checker of the same mask cannot
+    # hold different opinions about which offset an element gets. That is the
+    # whole content of the reproducibility contract: the attention kernel and
+    # the debug mask kernel agree because they call these, not because two
+    # transcriptions of the same formula happened to match. AOTriton's
+    # `fast_dropout_mask` computes the identical thing.
+    #
+    # Randoms are a row-major `(n_rows, n_cols)` grid per plane, packed
+    # `randoms_per_offset` to an offset along the row.
+
+    def grid_plane(
+        self, offset_base: U64, plane: fx.Int32 | int,
+        n_rows: fx.Int32 | int, n_cols: fx.Int32 | int,
+    ) -> tuple[U64, U64]:
+        """`(first offset of this plane, offsets per row)`.
+
+        A plane is one `(batch, head)` pair. Built in 64 bits throughout:
+        `plane * n_rows * row_stride` reaches 2**32 at B*H = 256 with 8K
+        sequences, and a 32-bit wrap there does not fault -- it aliases two
+        heads onto one stream, which every statistical test still passes
+        (`sdpa-dropout-plan.md` §3.2).
+        """
+        rn = self.randoms_per_offset
+        row_stride = fx.Int64(
+            (fx.Int32(n_cols) + fx.Int32(rn - 1)) // fx.Int32(rn)
+        )
+        base = fx.Int64(offset_base) + fx.Int64(plane) * fx.Int64(n_rows) * row_stride
+        return base, row_stride
+
+    def grid_offset(
+        self, plane_base: U64, row_stride: U64,
+        row: fx.Int32 | fx.Int64 | int, col: fx.Int32 | fx.Int64 | int,
+    ) -> U64:
+        """The offset holding element `(row, col)` of a plane.
+
+        `col` is a column index, not an offset index -- the division by
+        `randoms_per_offset` is here so that callers cannot forget it. The
+        element sits at slot `col % randoms_per_offset` of the result.
+        """
+        return (
+            fx.Int64(plane_base)
+            + fx.Int64(row) * fx.Int64(row_stride)
+            + fx.Int64(col) // fx.Int64(self.randoms_per_offset)
+        )
+
 
 def _split64(v: U64) -> tuple[fx.Int32, fx.Int32]:
     """(low 32, high 32) of a 64-bit value, as `fx.Int32`.

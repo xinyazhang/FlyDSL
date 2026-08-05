@@ -427,6 +427,21 @@ check than comparing two attention outputs statistically.
 Emit both encodings AOTriton does: `float32` in `[0, 1)` for inspection, and
 the raw keep/drop for comparison.
 
+**Done** — `dropout_mask_gfx1201.py`. One thing was decided while writing it
+and is worth stating, because it is what makes §8's "mask kernel vs
+attention" row sharp rather than circular: **the offset scheme is shared code,
+not a shared formula.** `Philox.grid_plane` / `grid_offset` live in
+`philox.py` and both kernels call them. Two transcriptions that happened to
+match would have made agreement a statement about typing, and the failure this
+row exists to catch — an offset derived incrementally, agreeing until it wraps
+— is exactly the kind that survives a careful read of two similar-looking
+functions. The attention kernel was moved onto the shared helpers and its
+stream verified unchanged, bit for bit, by the refactor.
+
+The keep/drop compare is *not* shared: the mask kernel emits raw `int32` and
+the tests redo the signed threshold compare in torch. `dropout_threshold` is
+common, the comparison is not, so a sign error in `keep_mask` is visible.
+
 ---
 
 ## 8. Test matrix
@@ -577,6 +592,26 @@ step 2 and re-measured under integration in step 3.
 
 ### Step 5 — the mask kernel, and the invariance test
 §7 and the tiling-invariance row of §8, which is the phase's real gate.
+
+**Done.** `dropout_mask_gfx1201.py` plus `test_dropout_mask_gfx1201.py`, 19
+tests, three layers weakest-last:
+
+| layer | check                                       | result                                                     |
+| ----- | ------------------------------------------- | ---------------------------------------------------------- |
+| 1     | mask kernel vs a CPU Philox, both widths    | exact, every element                                        |
+| 1     | `[0, 1)` encoding vs the raw value          | matches AOTriton's rescale; range is `[0, 1]`               |
+| 2     | **tiling invariance**, 3 tilings x 2 widths | identical, at `Sq, Sk = 200, 300` (no tile divides them)    |
+| 2     | the two widths differ                       | yes — `PHILOX_WIDTH` reaches the stream                     |
+| 2     | seed and offset are 64-bit                  | changing bit 40 alone changes the mask                      |
+| 3     | **attention vs `torch` math backend**       | rel 2.7e-4 at `p` = 0.1, 0.5, 0.9 and head_dim 64, 128      |
+| 3     | negative control: a mask from another seed  | rel 0.64 to 1.05 — a ~3500x separation from the real one    |
+
+Layer 3 works because `_scaled_dot_product_attention_math` accepts a
+`dropout_mask` and applies it the way the kernel does: after the softmax, with
+the `1/(1-p)` scale, denominator left undropped. Passing the same mask as
+`attn_mask` would be a different computation — additive, before the softmax,
+so survivors get renormalised over themselves. The residual 2.7e-4 is f16
+accumulation; *which* elements were dropped is compared exactly.
 
 ---
 

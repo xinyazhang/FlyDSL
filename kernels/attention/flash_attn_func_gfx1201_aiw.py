@@ -1362,21 +1362,12 @@ def build_flash_attn_func_aiw_module_primary(
             # sdpa-dropout-plan.md §3, and it is invisible in any test that
             # uses one tile size.
             #
-            # **Built in 64-bit.** `off_zh * Max_seqlen_q * stride` reaches
-            # 2**32 at B*H = 256 with 8K sequences, and an i32 wrap there does
-            # not fault -- it aliases two heads onto one stream, which every
-            # statistical test still passes (§3.2). `fx.Int64` first, then
-            # multiply.
-            _ph_stride = fx.Int64(
-                (fx.Int32(max_seqlen_k) + fx.Int32(RN_PER_OFFSET - 1))
-                // fx.Int32(RN_PER_OFFSET)
-            )
-            _off_zh = fx.Int64(
-                fx.Int32(_z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
-            )
-            _ph_base = (
-                fx.Int64(philox_offset_base)
-                + _off_zh * fx.Int64(max_seqlen_q) * _ph_stride
+            # The offset scheme itself is `Philox.grid_plane`/`grid_offset`,
+            # shared with the debug mask kernel -- see the comment there. This
+            # kernel supplies only which plane a workgroup is on.
+            _off_zh = fx.Int32(_z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
+            _ph_base, _ph_stride = PHILOX.grid_plane(
+                philox_offset_base, _off_zh, max_seqlen_q, max_seqlen_k
             )
 
         q_tbase, q_toff = _addr_pair(q_st, head_q, _q_batch_v, _q_row_off_v)
@@ -2337,7 +2328,6 @@ def build_flash_attn_func_aiw_module_primary(
                     # A group of eight consecutive elements is eight contiguous
                     # KV columns (§2 of the bias plan has the same identity), so
                     # each group is one span of the stream.
-                    _row_off64 = fx.Int64(q_rows[qt]) * _ph_stride
                     for _st in range_constexpr(NUM_S_ACCS):
                         _c0 = (_st // 2) * 32 + (_st % 2) * 16
                         _bcol = (
@@ -2345,9 +2335,8 @@ def build_flash_attn_func_aiw_module_primary(
                             + fx.Int64(_c0)
                             + fx.Int64(fx.Int32(klane) * fx.Int32(8))
                         )
-                        _first = (
-                            _ph_base + _row_off64
-                            + _bcol // fx.Int64(RN_PER_OFFSET)
+                        _first = PHILOX.grid_offset(
+                            _ph_base, _ph_stride, q_rows[qt], _bcol
                         )
                         _keep = PHILOX.keep_span(
                             philox_seed, _first, 8, idropout_p
