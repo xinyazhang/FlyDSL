@@ -402,9 +402,14 @@ class FmhaKnobs:
     v_prefetch_dist: int | None = None
     v_lds_layout: str | None = None
     q_row_tiles: int | None = None
-    shards: int | None = None
     waves_per_eu: int | None = None
+
+    # The two knobs `resolve_knobs` cannot fill. Both are derived from
+    # NUM_WAVES, which the builder computes from the shard count and the tile
+    # geometry, so filling them here would mean duplicating that derivation.
+    # `None` means "derive it"; every other field is guaranteed resolved.
     flat_work_group_size: int | None = None
+    shards: int | None = None
     sched_strategy: str | None = None
 
     # Three floating-point knobs, which looks like two too many until you see
@@ -515,6 +520,10 @@ def resolve_knobs(
         s = replace(s, v_lds_layout="transposed" if s.k_prefetch_dist else "row")
     if s.block_n is None:
         s = replace(s, block_n=default_block_n(hd, meta.causal, s.k_prefetch_dist))
+    if s.block_dmodel_v is None:
+        # Defaults to the full width: a build that does not slice the V/output
+        # side computes all of it.
+        s = replace(s, block_dmodel_v=s.block_dmodel)
     if s.block_m is None:
         # Always resolved, so there is exactly one BLOCK_M in the system. It
         # used to be filled only on the distance-0 path, with the host

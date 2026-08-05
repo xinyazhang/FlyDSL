@@ -876,10 +876,16 @@ def test_block_m_is_invariant_to_q_row_tiles():
     ],
 )
 def test_knob_validity_predicate(kwargs, match):
-    """Unimplemented knob combinations fail the build, not the output."""
+    """Unimplemented knob combinations fail the build, not the output.
+
+    `AssertionError`, not `ValueError`: these are statements about knobs the
+    tuning module has already resolved, so a violation is an internal
+    inconsistency rather than bad caller input. Caller input is validated in
+    `plan()`, which still raises `ValueError`.
+    """
     base = dict(num_heads=_NUM_HEADS, causal=False, dtype_str="f16")
     base.update(kwargs)
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(AssertionError, match=match):
         build_flash_attn_func_aiw_module(**base)
 
 # ---------------------------------------------------------------------------

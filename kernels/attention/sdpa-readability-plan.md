@@ -977,7 +977,7 @@ perf gate in this plan means the second thing.
 
 ---
 
-## 12. Deferred to Phase 3: move `_primary`'s validation into the tuning module
+## 12. P2.12 (done): the builder reads knobs, and asserts rather than raises
 
 `build_flash_attn_func_aiw_module_primary` still opens with ~10 `raise
 ValueError` checks over its resolved knobs -- BLOCK_DMODEL divisibility,
@@ -991,6 +991,25 @@ builder means an invalid combination is only caught once someone tries to
 compile it, and `resolve_knobs` can hand back a knob set it knows is
 unbuildable.
 
-Not done here because the checks are interleaved with derivation -- VO_WIDTH is
-computed between two of them -- so untangling them is a real refactor rather
-than a move, and Phase 2 was already long. It is a Phase 3 task.
+Done as P2.12, in Phase 2 rather than Phase 3 -- Phase 3 is type discipline and
+this is not that.
+
+Two halves. The larger one removed the `None`-fallbacks: `BLOCK_N = BLOCK_N_KNOB
+if BLOCK_N_KNOB is not None else default_block_n(...)` and its three siblings
+are gone, because `resolve_knobs` now supplies every one of those values and
+the builder only reads. Two knobs keep `None` and say why in the dataclass:
+`flat_work_group_size` and `shards` derive from `NUM_WAVES`, which the builder
+computes from geometry the tuning module would have to duplicate.
+
+The smaller half turned 17 `raise ValueError` into `assert`. That is not only
+brevity: with the fallbacks gone, these stopped being validation of caller
+input and became assertions that the tuning module's output is self-consistent,
+which is what `assert` means. Caller input is still validated with `ValueError`,
+in `plan()` and in the launcher -- and the split is now visible in the
+exception type rather than only in where the check happens.
+
+The checks stay in the builder rather than moving to the tuning module. Moving
+them was the original framing of this item, but once they assert over resolved
+knobs the argument weakens: they are the builder's preconditions, they read
+next to the geometry they constrain, and several depend on values (`VO_SLICE`,
+`NUM_S_VALS`) that only exist part-way through it.

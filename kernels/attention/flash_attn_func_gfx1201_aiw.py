@@ -282,45 +282,34 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # See the operand-layout note in the module docstring.
     WMMA_LANE_K = WMMA_K // (WARP_SIZE // WMMA_M)
 
-    if BLOCK_DMODEL % 16 or not (16 <= BLOCK_DMODEL <= 512):
-        raise ValueError(f"aiw needs 16 <= BLOCK_DMODEL <= 512 and BLOCK_DMODEL % 16 == 0, got {BLOCK_DMODEL}")
-    if dtype_str not in ("f16", "bf16"):
-        raise ValueError(f"aiw supports f16/bf16, got {dtype_str!r}")
+    assert not (BLOCK_DMODEL % 16 or not (16 <= BLOCK_DMODEL <= 512)), f"aiw needs 16 <= BLOCK_DMODEL <= 512 and BLOCK_DMODEL % 16 == 0, got {BLOCK_DMODEL}"
+    assert not (dtype_str not in ("f16", "bf16")), f"aiw supports f16/bf16, got {dtype_str!r}"
 
     # ---- Knob resolution ----
-    K_PREFETCH_DIST = (
-        default_prefetch_dist(BLOCK_DMODEL) if K_PREFETCH_DIST_KNOB is None else K_PREFETCH_DIST_KNOB
-    )
-    if K_PREFETCH_DIST not in (0, 1):
-        raise ValueError(f"K_PREFETCH_DIST_KNOB must be 0 or 1, got {K_PREFETCH_DIST}")
+    K_PREFETCH_DIST = K_PREFETCH_DIST_KNOB
+    assert K_PREFETCH_DIST in (0, 1), f"K_PREFETCH_DIST must be 0 or 1, got {K_PREFETCH_DIST}"
     # K and V prefetch distances are INDEPENDENT. The baseline kernel is
     # (K=0, V=1) -- its "pre-issue first V global load before loop" carries V in
     # registers exactly as bp does, and only K is staged at distance 0. Folding
     # the two into one knob produces a (K=0, V=0) schedule that exists in none
     # of the originals and costs 9.6% at BLOCK_DMODEL 32 non-causal.
-    if V_PREFETCH_DIST not in (0, 1):
-        raise ValueError(f"V_PREFETCH_DIST must be 0 or 1, got {V_PREFETCH_DIST}")
+    assert not (V_PREFETCH_DIST not in (0, 1)), f"V_PREFETCH_DIST must be 0 or 1, got {V_PREFETCH_DIST}"
     V_LDS_LAYOUT = (
         ("transposed" if K_PREFETCH_DIST else "row")
         if V_LDS_LAYOUT is None
         else V_LDS_LAYOUT
     )
-    if V_LDS_LAYOUT not in ("row", "transposed"):
-        raise ValueError(f"V_LDS_LAYOUT must be 'row' or 'transposed', got {V_LDS_LAYOUT!r}")
+    assert not (V_LDS_LAYOUT not in ("row", "transposed")), f"V_LDS_LAYOUT must be 'row' or 'transposed', got {V_LDS_LAYOUT!r}"
     V_TRANSPOSED = V_LDS_LAYOUT == "transposed"
 
     ROWS_PER_WAVE = WMMA_M * Q_ROW_TILES
 
-    BLOCK_N = BLOCK_N_KNOB if BLOCK_N_KNOB is not None else default_block_n(
-        BLOCK_DMODEL, causal, K_PREFETCH_DIST
-    )
-    if BLOCK_N % K_SUB_N:
-        raise ValueError(f"BLOCK_N ({BLOCK_N}) must be a multiple of K_SUB_N ({K_SUB_N})")
+    BLOCK_N = BLOCK_N_KNOB
+    assert not (BLOCK_N % K_SUB_N), f"BLOCK_N ({BLOCK_N}) must be a multiple of K_SUB_N ({K_SUB_N})"
 
-    if BLOCK_N & (BLOCK_N - 1):
-        # `_sdiv_rd` in the kernel is an arithmetic shift, which is only a
-        # floor-division when BLOCK_N is a power of two.
-        raise ValueError(f"BLOCK_N ({BLOCK_N}) must be a power of two")
+    # `_sdiv_rd` in the kernel is an arithmetic shift, which is only a
+    # floor-division when BLOCK_N is a power of two.
+    assert not (BLOCK_N & (BLOCK_N - 1)), f"BLOCK_N ({BLOCK_N}) must be a power of two"
     _BLOCK_N_LOG2 = BLOCK_N.bit_length() - 1
 
     N_SUB_TILES = BLOCK_N // K_SUB_N
@@ -332,7 +321,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # rebinds s_raw to a 16-element list; a wider BLOCK_N would overrun it
         # with an IndexError at trace time. Fail clearly instead. (Dies with the
         # interval-decomposition work.)
-        raise ValueError(
+        raise AssertionError(
             f"causal masking requires BLOCK_N == {K_SUB_N} (NUM_S_VALS == 16), "
             f"got BLOCK_N={BLOCK_N} (NUM_S_VALS={NUM_S_VALS})"
         )
@@ -340,11 +329,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # V/O column *window*: the slice of the output width this build computes.
     # Distinct from VO_SLICE (a wave's share of a window) and from VO_CHUNK_COLS
     # (a staging pass's share of a window).
-    VO_WIDTH = BLOCK_DMODEL if BLOCK_DMODEL_V is None else BLOCK_DMODEL_V
-    if VO_WIDTH % 16 or not (0 < VO_WIDTH <= BLOCK_DMODEL):
-        raise ValueError(f"BLOCK_DMODEL_V must be a positive multiple of 16 and <= BLOCK_DMODEL, got {VO_WIDTH}")
-    if D_OFFSET % 16 or D_OFFSET + VO_WIDTH > BLOCK_DMODEL:
-        raise ValueError(f"D_OFFSET {D_OFFSET} + BLOCK_DMODEL_V {VO_WIDTH} must fit in BLOCK_DMODEL {BLOCK_DMODEL}")
+    VO_WIDTH = BLOCK_DMODEL_V
+    assert not (VO_WIDTH % 16 or not (0 < VO_WIDTH <= BLOCK_DMODEL)), f"BLOCK_DMODEL_V must be a positive multiple of 16 and <= BLOCK_DMODEL, got {VO_WIDTH}"
+    assert not (D_OFFSET % 16 or D_OFFSET + VO_WIDTH > BLOCK_DMODEL), f"D_OFFSET {D_OFFSET} + BLOCK_DMODEL_V {VO_WIDTH} must fit in BLOCK_DMODEL {BLOCK_DMODEL}"
 
     # Head-dimension sharding. QK_SHARDS waves cooperate on one Q row-tile,
     # each reducing over its own BLOCK_DMODEL slice in GEMM1 and owning the matching
@@ -368,33 +355,26 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # K_STEPS_QK = QK_SLICE // WMMA_K truncates otherwise, silently dropping
         # part of the reduction: BLOCK_DMODEL 224 with 4 SHARDS gives a 56-wide
         # slice, of which only 48 would be reduced (measured rel err 0.97).
-        raise ValueError(
+        raise AssertionError(
             f"BLOCK_DMODEL {BLOCK_DMODEL} with {QK_SHARDS} SHARDS gives a {QK_SLICE}-wide "
             f"slice, which must be a multiple of WMMA_K={WMMA_K}"
         )
-    if VO_SLICE % WMMA_N:
-        raise ValueError(f"V/O slice {VO_SLICE} must be a multiple of WMMA_N={WMMA_N}")
+    assert not (VO_SLICE % WMMA_N), f"V/O slice {VO_SLICE} must be a multiple of WMMA_N={WMMA_N}"
 
     # ---- Validity predicate over the knob space ----
     # These combinations are not implemented rather than not expressible. Fail
     # at build time; do not emit a kernel that silently computes the wrong
     # thing.
-    if not V_TRANSPOSED and QK_SHARDS > 1:
-        raise ValueError("V_LDS_LAYOUT='row' does not implement cross-shard reduction; use 'transposed'")
-    if not V_TRANSPOSED and VO_CHUNKS > 1:
-        raise ValueError("V_LDS_LAYOUT='row' does not implement chunked V staging; use 'transposed'")
-    if VO_CHUNKS > 1 and not V_PREFETCH_DIST:
-        raise ValueError("chunked V staging requires V_PREFETCH_DIST=1")
-    if Q_ROW_TILES > 1 and QK_SHARDS > 1:
-        raise ValueError("Q_ROW_TILES > 1 with qk_shards > 1 is untested; pick one")
-    if Q_ROW_TILES not in (1, 2):
-        raise ValueError(f"Q_ROW_TILES must be 1 or 2, got {Q_ROW_TILES}")
+    assert not (not V_TRANSPOSED and QK_SHARDS > 1), "V_LDS_LAYOUT='row' does not implement cross-shard reduction; use 'transposed'"
+    assert not (not V_TRANSPOSED and VO_CHUNKS > 1), "V_LDS_LAYOUT='row' does not implement chunked V staging; use 'transposed'"
+    assert not (VO_CHUNKS > 1 and not V_PREFETCH_DIST), "chunked V staging requires V_PREFETCH_DIST=1"
+    assert not (Q_ROW_TILES > 1 and QK_SHARDS > 1), "Q_ROW_TILES > 1 with qk_shards > 1 is untested; pick one"
+    assert not (Q_ROW_TILES not in (1, 2)), f"Q_ROW_TILES must be 1 or 2, got {Q_ROW_TILES}"
 
     # ---- Workgroup geometry ----
     if K_PREFETCH_DIST == 0:
-        BLOCK_M = BLOCK_M_KNOB if BLOCK_M_KNOB is not None else default_block_m(BLOCK_DMODEL, 0)
-        if BLOCK_M % ROWS_PER_WAVE:
-            raise ValueError(f"BLOCK_M ({BLOCK_M}) must be a multiple of {ROWS_PER_WAVE}")
+        BLOCK_M = BLOCK_M_KNOB
+        assert not (BLOCK_M % ROWS_PER_WAVE), f"BLOCK_M ({BLOCK_M}) must be a multiple of {ROWS_PER_WAVE}"
         Q_TILES_PER_BLOCK = BLOCK_M // ROWS_PER_WAVE
         NUM_WAVES = Q_TILES_PER_BLOCK
     else:

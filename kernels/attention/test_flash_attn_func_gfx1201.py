@@ -203,7 +203,7 @@ def test_builder_rejects_unsupported_head_dim():
     the unified kernel deliberately runs BLOCK_N 64 and 128 on the distance-0
     path at small head_dim.
     """
-    with pytest.raises(ValueError, match="BLOCK_DMODEL"):
+    with pytest.raises(AssertionError, match="BLOCK_DMODEL"):
         build_flash_attn_func_aiw_module(
             num_heads=_NUM_HEADS, head_dim=100, causal=False, dtype_str="f16"
         )
