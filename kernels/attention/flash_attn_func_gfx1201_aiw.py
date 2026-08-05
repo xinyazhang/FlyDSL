@@ -220,6 +220,7 @@ def build_flash_attn_func_aiw_module_primary(
     fast_fp_math=True,
     daz=True,
     sched_strategy=None,
+    lpt_tile_order=True,
     path_tag="auto",
 ):
     """Build the unified gfx1201 flash-attention kernel.
@@ -494,9 +495,7 @@ def build_flash_attn_func_aiw_module_primary(
     # is part of the knob's *definition* and is resolved here rather than
     # re-tested at the use site, where it read as an arbitrary restriction on
     # an unrelated flag.
-    _LPT_TILE_ORDER = (
-        CAUSAL and os.environ.get("FMHA_REVERSE_Q_TILES", "1") == "1"
-    )
+    _LPT_TILE_ORDER = CAUSAL and lpt_tile_order
     # Measurement-only: drops the KV row clamp. UNSAFE in general -- it is
     # what buffer bounds checking would replace -- but valid for a benchmark
     # where seq_len is an exact multiple of BLOCK_M.
