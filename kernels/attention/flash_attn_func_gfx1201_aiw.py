@@ -221,6 +221,7 @@ def build_flash_attn_func_aiw_module_primary(
     daz=True,
     sched_strategy=None,
     lpt_tile_order=True,
+    unsafe_no_kv_clamp=False,
     path_tag="auto",
 ):
     """Build the unified gfx1201 flash-attention kernel.
@@ -499,7 +500,7 @@ def build_flash_attn_func_aiw_module_primary(
     # Measurement-only: drops the KV row clamp. UNSAFE in general -- it is
     # what buffer bounds checking would replace -- but valid for a benchmark
     # where seq_len is an exact multiple of BLOCK_M.
-    _NO_KV_CLAMP = os.environ.get("FMHA_UNSAFE_NO_KV_CLAMP", "0") == "1"
+    _NO_KV_CLAMP = unsafe_no_kv_clamp
     # Floating-point latitude granted to the compiler.
     #
     # "noninf" (default) is `fast` minus `ninf`, and drops the function-level
