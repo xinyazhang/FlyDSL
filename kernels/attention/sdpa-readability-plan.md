@@ -18,6 +18,72 @@ repeatedly and gate each touch separately.
 
 ---
 
+## 0. Status and work breakdown
+
+### 0.1 Where this stands
+
+| phase                      | state       | commit     |
+| -------------------------- | ----------- | ---------- |
+| P5 groundwork              | **landed**  | `49764d29` |
+| P1 free corrections        | not started | --         |
+| P2 policy extraction       | not started | --         |
+| P3 type discipline         | not started | --         |
+| P4 investigations          | not started | --         |
+| P5 helper modules (rest)   | not started | --         |
+
+`49764d29` landed the import shim (`gfx1201_standalone.py`) and moved the first
+helper (`wmma_acc` -> `kernels/common/mma/wmma_ops.py`, generalised to dispatch
+on the operand element type). It is the proof that the Phase 5 path works
+end-to-end -- bitwise-identical across f16/bf16 x causal/non-causal -- and it
+is deliberately *one* helper, ahead of the rest of Phase 5, because the rest
+depends on Phases 3 and 4.
+
+### 0.2 Work breakdown
+
+Every row is one commit. `gate` is what must pass before it lands; the
+protocol behind each gate name is §2. Effort: **S** under an hour, **M** a few
+hours, **L** a day or more.
+
+| id     | task                                                              | files                                          | gate                     | eff | risk | after   |
+| ------ | ------------------------------------------------------------------ | ------------------------------------------------ | -------------------------- | --- | ---- | ------- |
+| P1.1   | Document `K_SUB_N`, `WMMA_LANE_K`; audit every other bare constant | aiw                                            | none (comments)          | S   | none | --      |
+| P1.2   | Fix `_scmp_i32`'s false docstring (§1.4)                          | aiw                                            | none (comment)           | S   | none | --      |
+| P1.3   | Drop the `Vec` alias -> `fx.Vector`                               | aiw                                            | bitwise                  | S   | none | --      |
+| P1.4   | Delete `_ssel_i32`; use `cond.select(a, b)` (§1.2)                | aiw                                            | bitwise                  | S   | low  | --      |
+| P1.5   | Drop `fx.Index(<const>)` casts; sweep for siblings (§1.3)         | aiw                                            | bitwise                  | S   | none | --      |
+| P1.6   | Rename `_REVERSE_Q_TILES` -> `_LPT_TILE_ORDER` (§1.5)             | aiw                                            | bitwise                  | S   | none | --      |
+| P1.7   | Rename `tile_start` -> `start_k`, `q_start` -> `start_q` (21 + n sites) | aiw                                       | bitwise                  | S   | low  | --      |
+| P2.1   | Move 6 tuning functions/constants to the interface (§4.1)         | aiw, interface                                 | schedule-diff + bitwise  | M   | low  | --      |
+| P2.2   | Env vars -> build knobs, incl. `fp_mode` (§4.2)                   | aiw, interface                                 | schedule-diff + bitwise  | M   | med  | P2.1    |
+| P2.3   | Introduce `FmhaProblem` / `FmhaSchedule` dataclasses (§4.3)       | aiw, interface, tests                          | schedule-diff + bitwise  | M   | low  | P2.2    |
+| P2.4   | Make the interface the only producer of a `FmhaSchedule`          | aiw, interface                                 | schedule-diff            | S   | low  | P2.3    |
+| P3.1   | **Inventory**: classify all 100 `fx.Index` sites; publish the 64-bit list | plan (artifact)                        | review                   | M   | none | --      |
+| P3.2   | Narrow sequence-space quantities to `fx.Int32` (§5.2a)            | aiw                                            | bitwise + gSWA-90 + perf | L   | **high** | P3.1, P2.3 |
+| P3.3   | Delete `_scmp_i32`/`_smin_i32`/`_smax_i32`                        | aiw                                            | bitwise                  | S   | low  | P3.2    |
+| P4.1   | ~~`_pointer_to_llvm_ptr` still needed?~~ **answered** -- see §7.1 | --                                             | --                       | --  | --   | done    |
+| P4.2   | Can `fx.add_offset` replace LDS `ptrtoint`+`addi`?                | spike                                          | working example or a no  | S   | none | --      |
+| P4.3   | Can the layout API replace `coop_load/store_*`?                   | spike                                          | example + perf number    | M   | none | --      |
+| P5.1   | Duplication audit vs `common/*` and `flash_attn_utils` (§7.1)     | plan (artifact)                                | review                   | S   | none | --      |
+| P5.2   | Pointer + global load/store -> `common/mem_ops.py`                | aiw, common/mem_ops                            | bitwise (per helper)     | M   | med  | P5.1, P4.1 |
+| P5.3   | LDS load/store -> `common/mem_ops.py`                             | aiw, common/mem_ops                            | bitwise + perf           | M   | med  | P5.2, P4.2 |
+| P5.4   | Interval algebra + `div_rd` -> `common/utils.py`                  | aiw, common/utils                              | bitwise                  | S   | low  | P3.3    |
+| P5.5   | gSWA regions, Q preload, cross-shard reduction, LSE addressing, `_decode_side` -> `attention/fmha_common.py` | aiw, fmha_common | bitwise + perf           | L   | med  | P3.3, P4.3 |
+
+**Critical path:** `P3.1 -> P3.2 -> P3.3 -> P5.4/P5.5`. Everything in P1 and P4
+is independent and can land at any time; P2 gates only on itself.
+
+### 0.3 Definition of done, per phase
+
+| phase | done when                                                                                          |
+| ----- | ---------------------------------------------------------------------------------------------------- |
+| P1    | no bare magic constant, no false comment, no local re-spelling of a house idiom                     |
+| P2    | the AIW file contains no `os.environ`, no tuning table, and takes two frozen dataclasses             |
+| P3    | `grep -c "fx.Index("` in the AIW file counts only addressing and grid ids, and the 64-bit list exists |
+| P4    | each question has a working example or a recorded measurement saying no                              |
+| P5    | no helper in the AIW file has a counterpart elsewhere in the tree                                    |
+
+---
+
 ## 1. The review's questions, answered
 
 Five items are questions rather than requests. They are answered here because
@@ -165,7 +231,7 @@ re-associate differently). So:
 
 Sequential before/after runs of this kernel have a noise floor of about 5% with
 outliers to +19% -- measured, on 48 points whose kernel selection was *provably
-identical*. Any phase claiming "no perf change" must show it with alternating
+identical* (§11.5). Any phase claiming "no perf change" must show it with alternating
 reps in one process, reporting whether the two sides' rep ranges separate.
 
 Where the change is structural rather than numeric, prefer the stronger form:
@@ -335,9 +401,17 @@ stride` reaches 2^32 at B*H = 256 with 8K sequences -- and the risk of this
 phase is silently introducing the other order somewhere that has no such
 comment.
 
-So the phase produces, as an artifact rather than a side effect, **an explicit
-list of which quantities are 64-bit and why**. Anything not on it is `i32`;
-anything on it names the product that overflows.
+So **P3.1 produces, as a reviewable artifact before any code changes, an
+explicit list of which quantities are 64-bit and why.** Anything not on it is
+`i32`; anything on it names the product that overflows. §11.2 is the first cut
+-- the two known 64-bit-required quantities are the Philox plane base and
+`max_seqlen_q * STRIDE_TOKEN`, and the measured bound on the shard offsets is
+384, so those are settled and P3.1 only has to classify the remainder.
+
+Two facts from §11.2 shape the effort. There are 100 `fx.Index(` sites, so the
+audit is a morning rather than a week. And the widen-after-multiply hazard is
+currently **absent** -- 7 `fx.Int64(` sites, one containing a multiply, bounded
+by 24 -- so P3.2's job is to avoid introducing it, not to fix it.
 
 Then delete `_scmp_i32` and `_ssel_i32` (§1.2, §1.4) and reduce
 `_smin_i32`/`_smax_i32` to one-liners over the plain operators -- with the
@@ -366,7 +440,8 @@ with nothing else in it.
 ## 6. Phase 4 -- three API investigations
 
 These decide the *shape* of Phase 5, so they run before it. Each is a question
-with a measurable answer, not a commitment to change anything.
+with a measurable answer, not a commitment to change anything. The first is
+already answered; the other two are short spikes (P4.2, P4.3).
 
 | question                                                        | what is known now                                                                 | decides                              |
 | --------------------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------ |
@@ -388,6 +463,14 @@ to change it, and record the number either way.
 ## 7. Phase 5 -- shared helper modules
 
 Root cause C. Two surveys drive this section, and both changed what it says.
+
+> **Groundwork landed (`49764d29`).** The decision below -- extend
+> `kernels/common/` rather than create `helper_*` modules -- is settled, and
+> the mechanics are in place: `gfx1201_standalone.py` makes the working tree's
+> `kernels/common` importable from files run in place, and `wmma_acc` has moved
+> to `kernels/common/mma/wmma_ops.py` and been generalised to dispatch on the
+> operand element type. That is P5.0. The remaining moves (P5.2 to P5.5) still
+> gate on Phases 3 and 4 -- see §8.
 
 ### 7.1 Survey: the repo already has helper modules, and the AIW file duplicates them
 
@@ -573,3 +656,78 @@ refactor is worse than the refactor.
 - **`sdpa-readability.md` items already fixed.** The `_scmp_i32` docstring is
   listed in Phase 1 rather than treated as done -- `keep_mask`'s copy of the same
   false claim was fixed in c4221b10, but this one is still in the tree.
+
+---
+
+## 11. Measured facts (do not re-derive)
+
+Everything here was checked on device or by reading the installed source
+during the drafting of this plan. It is recorded so that no phase spends its
+budget re-establishing it, and so that a claim can be challenged against a
+number rather than against a memory.
+
+### 11.1 DSL semantics
+
+| claim                                                        | status | how checked                                              |
+| -------------------------------------------------------------- | ------ | ---------------------------------------------------------- |
+| `fx.Index` is 64-bit, `signed=False`                         | true   | `expr/numeric.py:832`; LLVM IR `sext i32 ... to i64`     |
+| `fx.Int32` is `signed=True`; `>` emits `sgt`                 | true   | `expr/numeric.py:716`; dumped `arith.cmpi sgt`           |
+| `fx.Int32`'s `<`/`>` are unsigned                            | **false** | the claim in `_scmp_i32`'s docstring; see §1.4        |
+| Python ints coerce on `fx.Index` and `fx.Int32` operands     | true   | `tid * 96` and `fx.Int32(tid) * 96` both run correctly   |
+| `shard_id * fx.Index(K)` and `shard_id * K` have the same type | true | both emit `arith.muli ... : index`                       |
+| `range_constexpr` is renamed to builtin `range`              | true   | `ast_rewriter.py:1243`                                   |
+| the loop rewrite is per-decorated-function                   | true   | `ast_rewriter.py:171` (`inspect.getsource(f)`)           |
+| `ir.VectorType.isinstance` exists                            | **false** | use Python `isinstance` against the downcast class    |
+
+### 11.2 Integer-width inventory
+
+| quantity                                  | measured bound              | width needed |
+| ------------------------------------------- | ----------------------------- | -------------- |
+| `shard_qk_off = shard_id * QK_SLICE`      | **max 384** over the ladder  | i32 (5.6e6x headroom) |
+| `shard_vo_off`                            | `< VO_CHUNK_COLS <= VO_WIDTH` | i32           |
+| any head_dim column index                 | `< _MAX_HEAD_DIM = 512`      | i32           |
+| Philox plane base `off_zh * Sq * stride`  | crosses 2^32 at B*H=256, 8K  | **i64**       |
+| `max_seqlen_q * STRIDE_TOKEN` (line 1295) | grows with the tensor        | **i64**       |
+
+Only 384 and 512 shard at all (`resolve_shards` returns 1 for every other
+rung), so `shard_qk_off` is identically 0 for eleven of the thirteen compiled
+widths.
+
+**The widen-after-multiply hazard is currently absent.** There are 7
+`fx.Int64(` sites in the AIW file and exactly one contains a multiply --
+`fx.Int64(fx.Int32(klane) * fx.Int32(8))`, bounded by 24. P3.2's job is to keep
+that count at zero-that-matter, not to fix an existing bug.
+
+**Distribution of the 100 `fx.Index(` sites**, by a crude keyword pass (P3.1
+replaces this with a real classification): ~25 addressing, ~10 sequence-space,
+5 grid/thread ids, ~60 unclassified.
+
+### 11.3 Duplication already in the tree
+
+| AIW helper                       | already exists as                                              |
+| ---------------------------------- | ---------------------------------------------------------------- |
+| `_pointer_load` / `_pointer_store` | **verbatim** in `flash_attn_utils.py:523,527`                  |
+| `_pointer_to_llvm_ptr`           | `common/mem_ops.get_llvm_ptr` (+ `global_load`/`global_store`) |
+| `bf16_trunc_pack_v8`             | `flash_attn_utils._bf16_trunc_pack_v8` (check equivalence)     |
+| `_fadd`/`_fsub`/`_fmul`/`_fmax`  | `flash_attn_utils._fadd`... -- and *they take `fm_fast` as a parameter* |
+| `_sdiv_rd`                       | `common/utils.udiv_pow2` (unsigned; ours is signed -- check)   |
+| `wmma_acc`                       | moved to `common/mma/wmma_ops.py` in `49764d29`                |
+
+### 11.4 AOTriton's fwd/bwd shared surface
+
+| their module           | their symbol                                    | our counterpart                        |
+| ------------------------ | ------------------------------------------------- | ---------------------------------------- |
+| `masked_load_store.py` | `calculate_intervals` -> `lb/fb/rb` x `lo/hi`   | the gSWA three-region split (P5.5)     |
+| `masked_load_store.py` | `parse_window`                                  | `_resolve_window` + `_CAUSAL_SENTINEL` |
+| `masked_load_store.py` | `div_rd`, `closed_interval_isect`               | `_sdiv_rd`, open-coded `_smin`/`_smax` |
+| `composed_tensors.py`  | `composed_ptrs/load/store/advance`              | the coop load/store family (P4.3)      |
+| `dropout.py`           | `fast_dropout_mask`, `PHILOX_RN_PER_OFFSET`     | `philox.py` -- **already shared**      |
+| *(leaked into fwd)*    | `_lse_offset`, `remap_xcd`                      | LSE addressing -- extract *before* it leaks |
+
+### 11.5 Measurement noise floor, for anyone reading a perf gate
+
+Sequential before/after runs of this kernel have a noise floor of about **5%
+with outliers to +19%** -- established on 48 points whose kernel selection was
+provably identical. Same-process interleaved A/B separates cleanly at 1%. Any
+perf gate in this plan means the second thing.
+
