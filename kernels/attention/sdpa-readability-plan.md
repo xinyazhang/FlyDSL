@@ -26,7 +26,7 @@ repeatedly and gate each touch separately.
 | -------------------------- | ----------- | ---------- |
 | P5 groundwork              | **landed**  | `49764d29` |
 | P1 free corrections        | **done**    | `a4d9c3f6` .. `cfbf8696` |
-| P2 policy extraction       | not started | --         |
+| P2 policy extraction       | **done**    | `f77294d5` .. `ce713716` |
 | P3 type discipline         | not started | --         |
 | P4 investigations          | not started | --         |
 | P5 helper modules (rest)   | not started | --         |
@@ -63,13 +63,13 @@ baseline. Tier 3 runs once, after P5.5.
 | P1.6   | Rename `_REVERSE_Q_TILES` -> `_LPT_TILE_ORDER` (§1.5)             | aiw                                            | bitwise                  | S   | none | no  | --      |
 | P1.7a  | Rename `tile_start` -> `start_k`; `tbase`'s param -> `seq_start`  | aiw                                            | bitwise                  | S   | low  | no  | --      |
 | P1.7b  | Rename `q_start` -> `start_q`                                     | aiw                                            | bitwise                  | S   | low  | no  | --      |
-| P2.1   | Move 6 tuning functions/constants to the interface (§4.1)         | aiw, interface                                 | schedule-diff + bitwise  | M   | low  | no  | --      |
-| P2.2   | Env vars -> build knobs, incl. `fp_mode` (§4.2)                   | aiw, interface                                 | schedule-diff + bitwise  | M   | med  | no  | P2.1    |
+| P2.1✓  | Move 6 tuning functions/constants to the interface (§4.1)         | aiw, interface                                 | schedule-diff + bitwise  | M   | low  | no  | --      |
+| P2.2✓  | Env vars -> build knobs, incl. `fp_mode` (§4.2)                   | aiw, interface                                 | schedule-diff + bitwise  | M   | med  | no  | P2.1    |
 | P2.5a  | **done** -- interface knob-mapping policy -> tuning module        | interface, tuning                              | schedule-diff            | S   | low  | no  | P2.1    |
-| P2.5b  | `_BLOCK_DMODEL_LADDER` + `_round_to_ladder` -> tuning module; derive `_MAX_HEAD_DIM` from the ladder | interface, tuning | schedule-diff        | S   | low  | no  | P2.5a   |
-| P2.3   | Introduce `FmhaProblem` / `FmhaSchedule` dataclasses (§4.3)       | aiw, tuning, interface, tests                  | schedule-diff + bitwise  | M   | low  | no  | P2.5b   |
-| P2.4   | `fmha_tuning.resolve_schedule(problem)` -- one entry point, sole producer (§4.4) | tuning, interface              | schedule-diff            | M   | low  | no  | P2.3    |
-| P2.6   | Public API takes a knobs dataclass; drop `use_binding_prefetch` and `variant` (§4.4) | interface, tests, benches   | schedule-diff + bitwise  | M   | med  | no  | P2.4    |
+| P2.5b✓ | `_BLOCK_DMODEL_LADDER` + `_round_to_ladder` -> tuning module; derive `_MAX_HEAD_DIM` from the ladder | interface, tuning | schedule-diff        | S   | low  | no  | P2.5a   |
+| P2.3✓  | Introduce `FmhaProblem` / `FmhaSchedule` dataclasses (§4.3)       | aiw, tuning, interface, tests                  | schedule-diff + bitwise  | M   | low  | no  | P2.5b✓  |
+| P2.4✓  | `fmha_tuning.resolve_schedule(problem)` -- one entry point, sole producer (§4.4) | tuning, interface              | schedule-diff            | M   | low  | no  | P2.3    |
+| P2.6✓  | Public API takes a knobs dataclass; drop `use_binding_prefetch` and `variant` (§4.4) | interface, tests, benches   | schedule-diff + bitwise  | M   | med  | no  | P2.4    |
 | P3.1   | **Inventory**: classify all 100 `fx.Index` sites; publish the 64-bit list | plan (artifact)                        | review                   | M   | none | no  | --      |
 | P3.2   | Narrow sequence-space quantities to `fx.Int32` (§5.2a)            | aiw                                            | bitwise + gSWA-90 + perf | L   | **high** | yes | P3.1, P2.3 |
 | P3.3   | Delete `_scmp_i32`/`_smin_i32`/`_smax_i32`                        | aiw                                            | bitwise                  | S   | low  | yes | P3.2    |
