@@ -208,9 +208,11 @@ def test_builder_rejects_unsupported_head_dim():
         )
 
 
-# The m32 variant gives each wave two Q row-tiles (BLOCK_M=256) so one K/V
-# operand feeds two WMMAs. head_dim 64 only -- at 128 the doubled per-wave state
-# exceeds the 256-VGPR cap and spills.
+# The m32 variant gives each wave two Q row-tiles so one K/V operand feeds two
+# WMMAs; BLOCK_M is unchanged and the wave count per workgroup halves. Allowed
+# up to head_dim 80 -- past that the doubled per-wave state exceeds the
+# 256-VGPR cap and spills. Whether it is *faster* is shape-dependent; see the
+# table at `_Q_ROW_TILES_2_HEAD_DIMS` in the interface.
 _M32_SHAPES = [
     (1, 512, False, torch.float16),
     (2, 1024, False, torch.float16),
@@ -241,8 +243,25 @@ def test_m32_rejects_head_dim_128():
     """head_dim 128 would spill; the interface must refuse rather than regress."""
     _require_env()
     q, k, v = _qkv(1, 256, _NUM_HEADS, 128, torch.float16)
-    with pytest.raises(ValueError, match="head_dim 64"):
+    with pytest.raises(ValueError, match="head_dim <= 80"):
         flydsl_flash_attn_func_gfx1201(q, k, v, causal=False, variant="m32")
+
+
+@pytest.mark.parametrize("head_dim", [16, 32, 48, 80])
+def test_m32_accepted_below_the_spill_bound(head_dim):
+    """The bound is the VGPR cap, so everything under it must work.
+
+    It read `head_dim != 64` for a while, which is stricter than the reason
+    given for it -- the doubled per-wave state only grows with head_dim, so a
+    narrower head cannot be the thing that spills.
+    """
+    _require_env()
+    q, k, v = _qkv(1, 512, _NUM_HEADS, head_dim, torch.float16)
+    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=True, variant="m32")
+    torch.cuda.synchronize()
+    rel, cos = _compare(out, _reference(q, k, v, True))
+    assert rel < _REL_TOL[torch.float16], f"max rel err {rel:.3e}"
+    assert cos > _COS_TOL, f"cosine similarity {cos:.6f}"
 
 
 def test_shape_and_dtype_validation():

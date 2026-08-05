@@ -469,3 +469,59 @@ live at once is the scheduler's decision.
 at once" is a no-op.** To force liveness you need something the backend cannot
 reorder across — a runtime `scf.for`, or a barrier. Reaching for a real lever
 (`PHILOX_WIDTH` here, or tiling) beats rewriting straight-line code.
+
+## `q_row_tiles=2` is shape-dependent, and only head_dim 80 wins everywhere
+
+`q_row_tiles=2` (the old `variant="m32"`) gives each wave two Q row-tiles so one
+K or V operand feeds two WMMAs. `BLOCK_M` is *invariant* to it — the kernel
+divides `Q_TILES_PER_BLOCK` by the knob — so the grid is unchanged and what
+halves is the wave count per workgroup. That is the whole trade: operand reuse
+per wave against waves available to hide latency. It is why the answer depends
+on the shape and not only on the width, which the old `head_dim == 64` gate
+assumed.
+
+Ratio of `q_row_tiles=2` over 1, f16, B=1 H=8 across N in {512, 1024, 2048,
+4096, 8192} plus (B=4, N=512) and (B=2, N=1024), best of alternating reps:
+
+| head_dim | causal | N=512 | N=1k  | N=2k  | N=4k  | N=8k  | B4 N512 | B2 N1k | min   | geo   |
+| -------- | ------ | ----- | ----- | ----- | ----- | ----- | ------- | ------ | ----- | ----- |
+| 16       | no     | 0.901 | 0.935 | 0.934 | 1.102 | 1.093 | 0.943   | 0.948  | 0.901 | 0.977 |
+| 16       | yes    | 1.149 | 1.218 | 1.297 | 0.962 | 1.084 | 1.070   | 1.138  | 0.962 | 1.127 |
+| 32       | no     | 0.717 | 0.743 | 1.242 | 0.956 | 1.041 | 0.966   | 0.953  | 0.717 | 0.931 |
+| 32       | yes    | 1.011 | 0.977 | 0.917 | 1.313 | 1.101 | 1.036   | 0.965  | 0.917 | 1.039 |
+| 48       | no     | 0.952 | 0.979 | 1.023 | 1.015 | 1.047 | 0.990   | 1.008  | 0.952 | 1.002 |
+| 48       | yes    | 0.937 | 0.957 | 1.043 | 1.032 | 1.061 | 0.991   | 0.987  | 0.937 | 1.000 |
+| 64       | no     | 0.782 | 0.784 | 1.198 | 0.971 | 1.043 | 0.972   | 0.912  | 0.782 | 0.942 |
+| 64       | yes    | 0.886 | 0.877 | 0.991 | 1.027 | 1.086 | 1.019   | 0.983  | 0.877 | 0.979 |
+| **80**   | no     | 0.991 | 1.013 | 1.028 | 1.019 | 1.047 | 1.011   | 1.022  | 0.991 | 1.018 |
+| **80**   | yes    | 0.975 | 0.998 | 1.046 | 1.038 | 1.058 | 1.009   | 1.025  | 0.975 | 1.021 |
+| 96       | no     | 0.807 | 0.826 | 0.979 | 0.979 | 1.002 | 0.969   | 0.970  | 0.807 | 0.930 |
+| 96       | yes    | 0.787 | 0.795 | 0.942 | 0.905 | 0.999 | 0.939   | 0.947  | 0.787 | 0.899 |
+
+**head_dim 80 is the only width that never loses**, so it is the only one the
+policy takes by default (+1 to +7%, confirmed by a same-process interleaved A/B
+at N 1024 to 8192 with the two sides' rep ranges cleanly separated).
+
+The rest are deliberately left alone. Their peaks are real and large — head_dim
+32 causal reaches 1.33 at N=4096 — but the curve is *jagged*, not a threshold:
+the same row is 0.92 at N=2048. Fitting a policy to that shape at one (B, H)
+buys the measured points and regresses on the unmeasured ones. `variant="m32"`
+stays as the manual override for callers who have measured their own shape.
+
+### The measurement discipline this cost
+
+Two traps, both of which produced confident wrong answers first:
+
+1. **Measuring at one N.** At N=4096 alone, head_dim 16 causal reads 0.91 and
+   head_dim 32 causal reads 1.22 — both are unrepresentative of their rows.
+2. **Sequential before/after runs.** A full-ladder run of the *old* policy
+   against the *new* one gave geo 1.017 over 52 points. But the 48 points where
+   kernel selection is provably identical also moved: geo 1.016, min 0.953, max
+   1.189. That run measured board drift, not the change. Anything under ~5%,
+   and outliers to +19%, is what this methodology produces on its own.
+
+The equivalence proof is what actually established "no regression": enumerate
+every `(head_dim, use_binding_prefetch, variant)` triple and diff the resolved
+knob dict. 52 triples, 12 changed, and 10 of those are `m32` at head_dims that
+previously raised. Only `80|*|""` changes the default path. That is a stronger
+statement than any benchmark, and it takes a second to run.

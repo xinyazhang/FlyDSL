@@ -69,35 +69,77 @@ _MAX_HEAD_DIM = 512
 _BP_MIN_HEAD_DIM = 48
 
 
+# Q row-tiles per wave. At 2, each wave owns two Q row-tiles, so one K or V
+# operand feeds two WMMAs. BLOCK_M is *unchanged* -- the kernel divides
+# Q_TILES_PER_BLOCK by this knob, see its comment -- so the grid is identical
+# and what halves is the wave count per workgroup. The trade is therefore
+# operand reuse per wave against waves available to hide latency with, which is
+# why the answer depends on the shape and not only on the width.
+#
+# Ratio of q_row_tiles=2 over 1, f16, B=1 H=8 across N in {512, 1024, 2048,
+# 4096, 8192} plus (B=4, N=512) and (B=2, N=1024), best of 5 alternating reps:
+#
+#   head_dim  causal    worst   best  |  head_dim  causal    worst   best
+#   --------  ------    -----  -----  |  --------  ------    -----  -----
+#   16        yes        0.96   1.29  |  64        either     0.78   1.20
+#   16        no         0.90   1.10  |  80        yes        0.98   1.07
+#   32        yes        0.92   1.33  |  80        no         0.99   1.05
+#   32        no         0.72   1.24  |  96        either     0.79   1.00
+#   48        either     0.94   1.06  |
+#
+# head_dim 80 is the only width that wins at *every* shape measured, so it is
+# the only one that takes two row-tiles by default. The rest are not left on
+# the table by oversight. Their gains are real but jagged in N -- head_dim 32
+# causal is 0.92 at N=2048 and 1.33 at N=4096 -- and that is not a threshold to
+# key on: a policy fitted to that curve at one (B, H) would regress on every
+# shape it was not fitted to. `variant="m32"` remains for callers who have
+# measured their own shape. The full table is in `sdpa_lore_gfx1201.md`.
+_Q_ROW_TILES_2_HEAD_DIMS = frozenset({80})
+
+# Two row-tiles double the per-wave o_accs + q_b_packs + s_accs. Past this width
+# that crosses the 256-VGPR cap and spills (-27% measured at head_dim 128).
+_Q_ROW_TILES_2_MAX_HEAD_DIM = 80
+
+
+def _q_row_tiles(head_dim: int, variant: str) -> int:
+    """Q row-tiles per wave: the tuning policy, or 2 where the caller forces it."""
+    if variant == "m32":
+        if head_dim > _Q_ROW_TILES_2_MAX_HEAD_DIM:
+            raise ValueError(
+                f"variant='m32' (q_row_tiles=2) requires head_dim <= "
+                f"{_Q_ROW_TILES_2_MAX_HEAD_DIM}, got {head_dim}"
+            )
+        return 2
+    return 2 if head_dim in _Q_ROW_TILES_2_HEAD_DIMS else 1
+
+
 def _use_bp(head_dim: int, use_binding_prefetch: bool, variant: str) -> bool:
-    return variant != "m32" and (
-        use_binding_prefetch or head_dim >= _BP_MIN_HEAD_DIM
-    )
+    """Whether K is staged one tile ahead.
+
+    Two row-tiles require it, so that case answers here rather than being
+    patched up afterwards. Keeping the coupling in one place matters beyond the
+    knob dict: this result is also an `lru_cache` key for `_get_kernel` and the
+    prefetch distance the caller feeds to `aiw_block_m`, and the three
+    disagreeing is the kind of thing that stays latent until some head_dim makes
+    `block_m` depend on the distance.
+    """
+    if _q_row_tiles(head_dim, variant) == 2:
+        return True
+    return use_binding_prefetch or head_dim >= _BP_MIN_HEAD_DIM
 
 
-def _aiw_knobs(head_dim: int, use_binding_prefetch: bool, variant: str) -> dict:
+def _aiw_knobs(head_dim: int, use_bp: bool, variant: str) -> dict:
     """Map the public options onto aiw's knob space.
 
-    ``use_binding_prefetch`` forces prefetch distance 1 below the threshold
-    where the policy would pick 0; ``variant="m32"`` selects two Q row-tiles
-    per wave. Everything else follows the tuning policy in the kernel module.
+    ``use_bp`` is the *resolved* prefetch decision from `_use_bp`, not the
+    caller's raw ``use_binding_prefetch`` flag.
     """
-    dist = 1 if use_binding_prefetch else aiw_prefetch_dist(head_dim)
-    knobs = {
+    dist = 1 if use_bp else aiw_prefetch_dist(head_dim)
+    return {
         "k_prefetch_dist": dist,
         "v_lds_layout": "transposed" if dist else "row",
-        "q_row_tiles": 2 if variant == "m32" else 1,
+        "q_row_tiles": _q_row_tiles(head_dim, variant),
     }
-    if variant == "m32":
-        # Two row-tiles doubles o_accs + q_b_packs + s_accs; above head_dim 64
-        # that crosses the 256-VGPR cap and spills (-27% measured at 128).
-        if head_dim != 64:
-            raise ValueError(
-                f"variant='m32' (q_row_tiles=2) is head_dim 64 only, got {head_dim}"
-            )
-        knobs["k_prefetch_dist"] = 1
-        knobs["v_lds_layout"] = "transposed"
-    return knobs
 
 
 # The compiled tile widths. `head_dim` is rounded up to the smallest of these
@@ -189,9 +231,13 @@ def flydsl_flash_attn_func_gfx1201(
             distances are independent -- V is always staged one tile ahead --
             so this only moves K. Above the threshold it is already the default
             and the flag is a no-op.
-        variant: ``""`` selects the default schedule. ``"m32"`` gives each
-            wave two Q row-tiles, so one K/V operand feeds two WMMAs;
-            head_dim 64 only.
+        variant: ``""`` follows the tuning policy, which already selects two Q
+            row-tiles at the head_dim where that wins at every measured shape.
+            ``"m32"`` forces two row-tiles, so one K/V operand feeds two WMMAs;
+            allowed up to head_dim 80, above which the doubled per-wave state
+            spills. Whether it helps is strongly shape-dependent (see the
+            `_Q_ROW_TILES_2_HEAD_DIMS` table) -- it is a knob for callers who
+            have measured their own shape, not a generally better schedule.
 
     Returns:
         Output tensor with the same shape and dtype as ``q``.
