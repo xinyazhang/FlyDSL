@@ -667,7 +667,17 @@ def build_flash_attn_func_aiw_module_primary(
     # that one decides whether a scheduling group has uniform duration, this
     # one decides the order the groups are issued in. Both matter, and neither
     # of the pre-unification kernels had either.
-    _REVERSE_Q_TILES = os.environ.get("FMHA_REVERSE_Q_TILES", "1") == "1"
+    # Longest-processing-time-first dispatch of the Q tiles. Named for what it
+    # is for rather than what it does: under causal masking a tile's cost grows
+    # with its index, so issuing the expensive ones first leaves only cheap
+    # tiles to fill the tail. With uniform cost -- every non-causal tile -- the
+    # reversal is a permutation with no load-balancing content, so `and CAUSAL`
+    # is part of the knob's *definition* and is resolved here rather than
+    # re-tested at the use site, where it read as an arbitrary restriction on
+    # an unrelated flag.
+    _LPT_TILE_ORDER = (
+        CAUSAL and os.environ.get("FMHA_REVERSE_Q_TILES", "1") == "1"
+    )
     # Measurement-only: drops the KV row clamp. UNSAFE in general -- it is
     # what buffer bounds checking would replace -- but valid for a benchmark
     # where seq_len is an exact multiple of BLOCK_M.
@@ -1244,10 +1254,7 @@ def build_flash_attn_func_aiw_module_primary(
         # verbatim without persistent-dynamic would reintroduce the regression
         # above. Revisit this ordering when persistent-dynamic lands.
         head_q = fx.Index(gpu.block_idx.x)
-        if const_expr(CAUSAL and _REVERSE_Q_TILES):
-            # Longest-processing-time-first: under causal, cost grows with
-            # q_tile, so dispatching the expensive tiles first leaves only
-            # cheap ones to fill the tail.
+        if const_expr(_LPT_TILE_ORDER):
             # Max_seqlen_q, not this sequence's length: the reversal has to
             # be a permutation of the *grid*, whose y extent the host sized
             # from Max_seqlen_q.
