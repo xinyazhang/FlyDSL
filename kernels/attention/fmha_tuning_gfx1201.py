@@ -479,3 +479,56 @@ def resolve_schedule(
         # derives it from the shard count inside the builder.
         s = replace(s, block_m=default_block_m(hd, 0))
     return s
+
+
+@dataclass(frozen=True)
+class FmhaPlan:
+    """Everything a host needs for one build, from one call.
+
+    The three fields are not independent -- `block_m` follows from the
+    schedule's prefetch distance, and the schedule follows from the problem's
+    rounded head_dim -- which is exactly why they are produced together. A
+    caller assembling them separately has to know that order, and getting it
+    wrong yields a `block_m` that disagrees with the kernel's own, which is
+    silent until some head_dim makes the two differ.
+    """
+
+    problem: FmhaProblem
+    schedule: FmhaSchedule
+    block_m: int
+
+
+def plan(
+    num_heads: int,
+    head_dim: int,
+    causal: bool,
+    dtype_str: str,
+    overrides: FmhaSchedule | None = None,
+    **problem_kwargs,
+) -> FmhaPlan:
+    """The one entry point into tuning: a caller's shape in, a full plan out.
+
+    `head_dim` is the caller's real width and is rounded up to the nearest
+    compiled tile here, with `padded_head` set accordingly -- so a caller never
+    needs the ladder, the maximum, or the block-size tables. That is the point:
+    every one of those was previously imported by the interface, which meant
+    the ordering between them lived at the call site.
+
+    Extra keyword arguments go to `FmhaProblem` (`head_dim_v`, `bias`,
+    `dropout`, ...). Raises for a head_dim past the largest compiled tile.
+    """
+    if head_dim < 1 or head_dim > MAX_HEAD_DIM:
+        raise ValueError(f"kernel requires 1 <= head_dim <= {MAX_HEAD_DIM}, got {head_dim}")
+    block_dmodel = _round_to_ladder(head_dim)
+    problem = FmhaProblem(
+        num_heads=num_heads,
+        head_dim=block_dmodel,
+        causal=causal,
+        dtype_str=dtype_str,
+        padded_head=block_dmodel != head_dim,
+        **problem_kwargs,
+    )
+    schedule = resolve_schedule(problem, overrides)
+    # BLOCK_M is invariant to q_row_tiles by construction (see the
+    # Q_TILES_PER_BLOCK comment in the kernel), so only the distance matters.
+    return FmhaPlan(problem, schedule, default_block_m(block_dmodel, schedule.k_prefetch_dist))

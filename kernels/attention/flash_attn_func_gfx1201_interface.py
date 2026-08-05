@@ -34,11 +34,7 @@ from functools import lru_cache
 import torch
 
 from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module_primary
-from fmha_tuning_gfx1201 import FmhaProblem, FmhaSchedule, resolve_schedule
-from fmha_tuning_gfx1201 import MAX_HEAD_DIM as _MAX_HEAD_DIM
-from fmha_tuning_gfx1201 import _round_to_ladder
-from fmha_tuning_gfx1201 import default_block_m as aiw_block_m
-from fmha_tuning_gfx1201 import default_prefetch_dist as aiw_prefetch_dist
+from fmha_tuning_gfx1201 import FmhaProblem, FmhaSchedule, plan as _plan_build
 
 __all__ = ["flydsl_flash_attn_func_gfx1201"]
 
@@ -152,11 +148,19 @@ def flydsl_flash_attn_func_gfx1201(
         raise ValueError(f"expected 4D BSHD tensor, got rank {q.dim()} ({tuple(q.shape)})")
 
     batch, seq_len_real, num_heads, head_dim = q.shape
-    if head_dim < 1 or head_dim > _MAX_HEAD_DIM:
-        raise ValueError(f"kernel requires 1 <= head_dim <= {_MAX_HEAD_DIM}, got {head_dim}")
-    # The tile width is a build axis; the real extent is a runtime argument.
-    block_dmodel = _round_to_ladder(head_dim)
-    padded_head = block_dmodel != head_dim
+    dtype_str = _torch_dtype_to_str(q.dtype)
+    # One call for the whole build configuration: the tile width is a build
+    # axis and the real extent rides along as a runtime argument, but which
+    # tile, which knobs and which BLOCK_M are all the tuning module's to say.
+    # `waves_per_eu` and `daz` remain named arguments for now, so they form the
+    # base and an explicit `schedule` wins over them.
+    _plan = _plan_build(
+        num_heads, head_dim, causal, dtype_str,
+        FmhaSchedule(waves_per_eu=waves_per_eu, daz=daz).merge(schedule),
+    )
+    block_dmodel = _plan.problem.head_dim
+    padded_head = _plan.problem.padded_head
+    block_m = _plan.block_m
     if padded_head:
         # The D-axis pitch must be a multiple of 16 bytes -- 8 elements at
         # f16/bf16. This is the alignment contract (see sdpa-close-gap-plan1.md
@@ -180,27 +184,6 @@ def flydsl_flash_attn_func_gfx1201(
                     f"the allocation padded to match. Pad the last dimension before "
                     f"calling, as PyTorch's SDPA shim does."
                 )
-    dtype_str = _torch_dtype_to_str(q.dtype)
-
-    # Everything below keys on the *tile* width, per N3: BLOCK_DMODEL is the
-    # single tuning key, and hdim rides along as a runtime argument.
-    _problem = FmhaProblem(
-        num_heads=num_heads,
-        head_dim=block_dmodel,
-        causal=causal,
-        dtype_str=dtype_str,
-        padded_head=padded_head,
-    )
-    # `waves_per_eu` and `daz` stay as named arguments for now, so they form
-    # the base and an explicit `schedule` wins over them.
-    _schedule = resolve_schedule(
-        _problem,
-        FmhaSchedule(waves_per_eu=waves_per_eu, daz=daz).merge(schedule),
-    )
-    # BLOCK_M is invariant to q_row_tiles by construction (see the
-    # Q_TILES_PER_BLOCK comment in the kernel), so only the prefetch distance
-    # matters here.
-    block_m = aiw_block_m(block_dmodel, _schedule.k_prefetch_dist)
     # The KV tail is masked in-kernel, so seq_len is passed through as-is.
     #
     # It used to be rounded up to BLOCK_M with F.pad -- three tensor copies per
@@ -245,7 +228,7 @@ def flydsl_flash_attn_func_gfx1201(
         launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
         if launch_stream.device != q.device:
             raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
-        exe = _get_kernel(_problem, _schedule)
+        exe = _get_kernel(_plan.problem, _plan.schedule)
         # Whole tensors, not `.reshape(-1)`: the kernel reads strides, and
         # flattening materialises a copy for any non-contiguous input, which
         # would silently defeat the point of reading them.
