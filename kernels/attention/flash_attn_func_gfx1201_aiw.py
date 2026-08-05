@@ -219,6 +219,7 @@ def build_flash_attn_func_aiw_module_primary(
     unsafe_fp_math=True,
     fast_fp_math=True,
     daz=True,
+    sched_strategy=None,
     path_tag="auto",
 ):
     """Build the unified gfx1201 flash-attention kernel.
@@ -409,8 +410,12 @@ def build_flash_attn_func_aiw_module_primary(
     # Measured at BATCH=2 H=12 N=4096 d=128 f16 -- distance 1: causal
     # 85.6 -> 88.5 TFLOPS, non-causal 91.4 -> 91.9. Distance 0: causal
     # 69.8 -> 79.2, but non-causal 89.4 -> 88.6, so only causal wants it there.
-    _DEFAULT_SCHED = "max-memory-clause" if (K_PREFETCH_DIST or causal) else ""
-    SCHED_STRATEGY = os.environ.get("FMHA_SCHED_STRATEGY", _DEFAULT_SCHED)
+    # `None` means the policy below; pass `""` for the stock GCN scheduler.
+    SCHED_STRATEGY = (
+        ("max-memory-clause" if (K_PREFETCH_DIST or causal) else "")
+        if sched_strategy is None
+        else sched_strategy
+    )
 
     K_STEP_QK = WMMA_K
     K_STEPS_QK = QK_SLICE // K_STEP_QK      # GEMM1 K-steps for this wave's slice
