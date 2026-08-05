@@ -414,12 +414,37 @@ def build_flash_attn_func_aiw_module_primary(
     """
 
     # ---- WMMA / wave32 constants ----
+    #
+    # The first four are the hardware: RDNA4 runs wave32 and its WMMA is
+    # 16x16x16. The last two are *derived* from those, not free parameters, and
+    # are spelled out here because both read as magic at the use site.
     WARP_SIZE = 32
     WMMA_M = 16
     WMMA_N = 16
     WMMA_K = 16
-    K_SUB_N = 32
-    WMMA_LANE_K = 8
+
+    # KV columns spanned by one *pair* of S accumulators -- `2 * WMMA_N`.
+    #
+    # The pair, rather than the single accumulator, is the unit because it is
+    # where the two GEMMs meet. GEMM1 emits `NUM_S_ACCS = N_SUB_TILES * 2`
+    # accumulators of `WMMA_N` columns each, and GEMM2 consumes the same span
+    # as `PV_K_STEPS = K_SUB_N // WMMA_K` steps of K. Both equal 2, so a
+    # sub-tile is exactly one GEMM1 output pair and one GEMM2 input pair.
+    #
+    # The mapping this implies is open-coded wherever accumulators are indexed
+    # by column: accumulator `st` starts at KV column
+    # `(st // 2) * K_SUB_N + (st % 2) * WMMA_N`.
+    K_SUB_N = 2 * WMMA_N
+
+    # K elements each lane holds of a WMMA A/B operand.
+    #
+    # A wave32 WMMA spreads `WMMA_M` rows over 32 lanes, so two lanes share
+    # each row and split the K extent between them: `WMMA_K / (WARP_SIZE /
+    # WMMA_M)` = 8. That is why the operand is a v8f16 and why `klane` (the
+    # half-wave index, `lane // 16`) appears multiplied by this everywhere a
+    # column is computed -- half-wave 0 covers K 0..7, half-wave 1 covers 8..15.
+    # See the operand-layout note in the module docstring.
+    WMMA_LANE_K = WMMA_K // (WARP_SIZE // WMMA_M)
 
     if head_dim % 16 or not (16 <= head_dim <= 512):
         raise ValueError(f"aiw needs 16 <= head_dim <= 512 and head_dim % 16 == 0, got {head_dim}")
