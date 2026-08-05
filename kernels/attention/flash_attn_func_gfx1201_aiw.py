@@ -221,7 +221,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     dtype_str = meta.dtype_str
     sm_scale = meta.sm_scale
     causal_type = meta.causal_type
-    padded_head = meta.padded_head
     bias = meta.bias
     dropout = meta.dropout
     philox_width = meta.philox_width
@@ -234,6 +233,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     v_prefetch_dist = knobs.v_prefetch_dist
     v_lds_layout = knobs.v_lds_layout
     strides_constexpr = knobs.strides_constexpr
+    padded_head = knobs.padded_head
     q_row_tiles = knobs.q_row_tiles
     shards = knobs.shards
     unsafe_fp_math = knobs.unsafe_fp_math

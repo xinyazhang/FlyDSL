@@ -374,7 +374,6 @@ class FmhaInputMetadata:
     d_offset: int = 0
     sm_scale: float | None = None
     causal_type: int | None = None
-    padded_head: bool = False
     bias: bool = False
     dropout: bool = False
     philox_width: int | None = None
@@ -421,6 +420,13 @@ class FmhaKnobs:
     unsafe_fp_math: bool | None = None
     fast_fp_math: bool | None = None
     strides_constexpr: bool | None = None
+
+    # Derived, not chosen: true when the caller's head_dim is not itself a
+    # compiled tile width, so the kernel computes ceil-to-tile columns and
+    # masks the difference. It lives here rather than with the caller's inputs
+    # because deciding it needs the ladder -- the set of every width that
+    # exists -- which is knowledge only this module has.
+    padded_head: bool | None = None
     lpt_tile_order: bool | None = None
     unsafe_no_kv_clamp: bool | None = None
     path_tag: str | None = None
@@ -447,6 +453,7 @@ _KNOBS_FALLBACK = FmhaKnobs(
     unsafe_fp_math=True,
     fast_fp_math=True,
     strides_constexpr=False,
+    padded_head=False,
     lpt_tile_order=True,
     unsafe_no_kv_clamp=False,
     path_tag="auto",
@@ -518,17 +525,16 @@ class FmhaPlan:
 def plan(request: FmhaInputMetadata, overrides: FmhaKnobs | None = None) -> FmhaPlan:
     """The one entry point into tuning: the caller's inputs in, a full plan out.
 
-    `request.head_dim` is the caller's *real* width. The returned
-    `FmhaPlan.meta` carries the width rounded up to the nearest compiled tile,
-    with `padded_head` set accordingly -- so no caller needs the ladder, the
-    maximum, or the block-size tables. That is the point: every one of those
-    used to be imported by the interface, which meant the ordering between them
-    lived at the call site.
+    `request.head_dim` is the caller's *real* width; the returned
+    `FmhaPlan.meta` carries it rounded up to the nearest compiled tile, and
+    `FmhaPlan.knobs.padded_head` records whether that rounding happened. No
+    caller needs the ladder, the maximum, or the block-size tables -- every one
+    of those used to be imported by the interface, which meant the ordering
+    between them lived at the call site.
 
-    The two `FmhaInputMetadata` therefore mean slightly different things: what
-    was asked for going in, what will be built coming out. They are the same
-    type because every other field is untouched, and because the pair
-    `(plan.meta, plan.knobs)` has to be the build-cache key.
+    `padded_head` is a knob rather than metadata because deciding it requires
+    the ladder, which is this module's knowledge and not the caller's. Any
+    value passed in `overrides` is overwritten: the rounding decides it.
 
     Raises for a head_dim past the largest compiled tile.
     """
@@ -536,10 +542,10 @@ def plan(request: FmhaInputMetadata, overrides: FmhaKnobs | None = None) -> Fmha
     if head_dim < 1 or head_dim > MAX_HEAD_DIM:
         raise ValueError(f"kernel requires 1 <= head_dim <= {MAX_HEAD_DIM}, got {head_dim}")
     block_dmodel = _round_to_ladder(head_dim)
-    meta = replace(
-        request, head_dim=block_dmodel, padded_head=block_dmodel != head_dim
+    meta = replace(request, head_dim=block_dmodel)
+    knobs = replace(
+        resolve_knobs(meta, overrides), padded_head=block_dmodel != head_dim
     )
-    knobs = resolve_knobs(meta, overrides)
     # BLOCK_M is invariant to q_row_tiles by construction (see the
     # Q_TILES_PER_BLOCK comment in the kernel), so only the distance matters.
     return FmhaPlan(meta, knobs, default_block_m(block_dmodel, knobs.k_prefetch_dist))

@@ -156,7 +156,7 @@ def flydsl_flash_attn_func_gfx1201(
         knobs,
     )
     block_dmodel = _plan.meta.head_dim
-    padded_head = _plan.meta.padded_head
+    padded_head = _plan.knobs.padded_head
     block_m = _plan.block_m
     if padded_head:
         # The D-axis pitch must be a multiple of 16 bytes -- 8 elements at
