@@ -44,6 +44,10 @@ Every row is one commit. `gate` is what must pass before it lands; the
 protocol behind each gate name is §2. Effort: **S** under an hour, **M** a few
 hours, **L** a day or more.
 
+Every row additionally runs the **tier-1 codegen fingerprint** (§2.3, 12 s);
+the `gate` column lists what is required *beyond* that, and each phase boundary
+adds a tier-3 ladder run against the fixed pre-P1 baseline.
+
 | id     | task                                                              | files                                          | gate                     | eff | risk | after   |
 | ------ | ------------------------------------------------------------------ | ------------------------------------------------ | -------------------------- | --- | ---- | ------- |
 | P1.1   | Document `K_SUB_N`, `WMMA_LANE_K`; audit every other bare constant | aiw                                            | none (comments)          | S   | none | --      |
@@ -64,9 +68,9 @@ hours, **L** a day or more.
 | P4.2   | Can `fx.add_offset` replace LDS `ptrtoint`+`addi`?                | spike                                          | working example or a no  | S   | none | --      |
 | P4.3   | Can the layout API replace `coop_load/store_*`?                   | spike                                          | example + perf number    | M   | none | --      |
 | P5.1   | Duplication audit vs `common/*` and `flash_attn_utils` (§7.1)     | plan (artifact)                                | review                   | S   | none | --      |
-| P5.2   | Pointer + global load/store -> `common/mem_ops.py`                | aiw, common/mem_ops                            | bitwise (per helper)     | M   | med  | P5.1, P4.1 |
+| P5.2   | Pointer + global load/store -> `common/mem_ops.py`                | aiw, common/mem_ops                            | bitwise (per helper) + perf | M   | med  | P5.1, P4.1 |
 | P5.3   | LDS load/store -> `common/mem_ops.py`                             | aiw, common/mem_ops                            | bitwise + perf           | M   | med  | P5.2, P4.2 |
-| P5.4   | Interval algebra + `div_rd` -> `common/utils.py`                  | aiw, common/utils                              | bitwise                  | S   | low  | P3.3    |
+| P5.4   | Interval algebra + `div_rd` -> `common/utils.py`                  | aiw, common/utils                              | bitwise + tier 1         | S   | low  | P3.3    |
 | P5.5   | gSWA regions, Q preload, cross-shard reduction, LSE addressing, `_decode_side` -> `attention/fmha_common.py` | aiw, fmha_common | bitwise + perf           | L   | med  | P3.3, P4.3 |
 
 **Critical path:** `P3.1 -> P3.2 -> P3.3 -> P5.4/P5.5`. Everything in P1 and P4
@@ -175,7 +179,7 @@ out `> 64`) and `keep_mask`'s docstring (same wrong claim about `fx.Int32`,
 fixed in c4221b10). All three read fine in isolation; all three were only
 caught by checking the code against the claim.
 
-**Action:** §2.4 makes "verify the stated reason" part of the review pass
+**Action:** §2.5 makes "verify the stated reason" part of the review pass
 rather than a thing done when someone happens to wonder.
 
 ### 1.5 `_REVERSE_Q_TILES` should be orthogonal to `CAUSAL` -- I disagree
@@ -227,7 +231,48 @@ re-associate differently). So:
   stops being a readability change and gets its own measurement.
 - Phases that could change scheduling (§4, §6) need a perf gate as well.
 
-### 2.3 Perf gates are **interleaved, same-process A/B**
+### 2.3 How often performance is actually checked
+
+Per-task gates alone are not enough, for two reasons that only show up when you
+count them.
+
+**Bitwise identity does not imply codegen identity.** It says the numbers came
+out the same, not that the same instructions produced them. Deleting a helper
+that performed a redundant coercion (P1.4, P3.3) or moving one across a module
+boundary (P5.2 to P5.5) can leave every output bit untouched and still change
+what the scheduler emits.
+
+**And every gate compares against the previous commit.** Fifteen commits each
+losing 0.7% all pass individually and compound to 10%. Nothing in a
+per-task gate can see that, because at no point is any single step out of line.
+
+So three tiers, cheapest first:
+
+| tier | what                                                     | when                                   | cost      |
+| ---- | ---------------------------------------------------------- | ---------------------------------------- | ----------- |
+| 1    | **codegen fingerprint** -- VGPRs, scratch, instruction count, ISA SHA at 3 configs | **every commit**      | **12 s**  |
+| 2    | interleaved same-process A/B on the affected configs     | whenever tier 1 moves, and for the hot-path tasks below | 5-10 min |
+| 3    | full ladder A/B vs the **fixed pre-P1 baseline**         | every phase boundary (5x)              | ~10 min   |
+
+**Tier 1 is the one that makes this affordable.** `codegen_fingerprint.py`
+compiles three representative configs and hashes the ISA body; it is
+deterministic across runs, so an unchanged fingerprint is proof the emitted
+code is identical and no benchmark is needed. It does not measure performance
+-- it decides whether performance *can* have changed. At 12 seconds it runs on
+every commit including the comment-only ones, where it should always be a
+no-op and where a surprise would be genuinely informative.
+
+**Tier 3 is the one the original gate table was missing.** It compares against
+a baseline pinned at the commit before P1.1, never against the previous phase,
+so cumulative drift has nowhere to hide. Five runs over the whole plan.
+
+Given tier 1, the tasks that need a tier-2 A/B up front rather than on demand
+are the ones where the fingerprint is *expected* to move and the code is hot:
+**P3.2, P4.3, P5.2, P5.3, P5.5**. P5.2 was previously gated bitwise-only, which
+was an oversight -- it moves the global load/store helpers, which are in the
+inner loop.
+
+### 2.4 Perf gates are **interleaved, same-process A/B**
 
 Sequential before/after runs of this kernel have a noise floor of about 5% with
 outliers to +19% -- measured, on 48 points whose kernel selection was *provably
@@ -239,7 +284,7 @@ enumerate the inputs and diff the resolved configuration. That is how the
 `q_row_tiles` change established no-regression across 52 triples in a second,
 and it is available to §4.
 
-### 2.4 Every touched comment gets its stated reason checked
+### 2.5 Every touched comment gets its stated reason checked
 
 Not "is this comment clear" but "is this comment *true*". Three false ones in
 one session, each surviving multiple readings. Concretely: any comment
@@ -637,7 +682,7 @@ refactor is worse than the refactor.
 | A refactor changes scheduling in a latency-bound loop | a few percent, invisible to correctness gates                       | interleaved same-process A/B (§2.3), not sequential runs |
 | Extraction across a module boundary blocks inlining | same, and harder to attribute after the fact                        | perf gate on Phase 5 specifically                   |
 | Policy moves change a default silently          | a "readability" commit that also re-tunes the kernel                    | the enumeration gate in §4.3 -- diff every resolved schedule |
-| The plan itself accretes false reasons          | three found this session, all surviving review                          | §2.4: check the claim, not the wording              |
+| The plan itself accretes false reasons          | three found this session, all surviving review                          | §2.5: check the claim, not the wording              |
 | A helper is *replaced* by a near-equivalent, not an equivalent | `common/mem_ops.global_load` takes a byte offset; AIW's `_pointer_load` takes a typed pointer. Silent, and wrong by a factor of the element size | bitwise gate per replacement, not per phase        |
 | `fmha_common.py` inherits `flash_attn_utils.py`'s shape | 5110 lines built around gfx950 dualwave traits/context classes; coupling two designs is worse than duplicating a few lines | borrow signatures, not structure (§7.3)            |
 
