@@ -1036,9 +1036,22 @@ def build_flash_attn_func_aiw_module_primary(
             return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
 
         def _scmp_i32(pred, a, b):
-            """A *signed* integer compare. The `<` and `>` overloads on
-            fx.Int32 pick unsigned, which on a negative window silently
-            compares against something enormous -- plan section 2.4 rule 2."""
+            """A *signed* integer compare, with both operands forced to i32.
+
+            The coercion is the point, not the predicate. `fx.Int32` is
+            declared `signed=True` and its `<`/`>` overloads already emit
+            `slt`/`sgt` -- an earlier version of this docstring claimed
+            otherwise and was wrong. What is genuinely unsafe is comparing an
+            `fx.Index`, which is `signed=False` and 64-bit, so *its* overloads
+            emit `ult`/`ugt` and a negative window bound compares as something
+            enormous.
+
+            Wrapping both sides in `fx.Int32` first makes the signedness a
+            property of this call rather than of whatever the caller happened
+            to be holding. Once the sequence-space quantities are `fx.Int32`
+            throughout there is nothing left to coerce and this helper goes
+            away -- see `sdpa-readability-plan.md` P3.3.
+            """
             return ArithValue(
                 arith.cmpi(pred, _raw(fx.Int32(a)), _raw(fx.Int32(b)))
             )
