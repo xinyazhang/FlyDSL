@@ -44,34 +44,39 @@ Every row is one commit. `gate` is what must pass before it lands; the
 protocol behind each gate name is §2. Effort: **S** under an hour, **M** a few
 hours, **L** a day or more.
 
-Every row additionally runs the **tier-1 codegen fingerprint** (§2.3, 12 s);
-the `gate` column lists what is required *beyond* that, and each phase boundary
-adds a tier-3 ladder run against the fixed pre-P1 baseline.
+Every row runs the **tier-1 codegen fingerprint** (§2.3, 12 s) and nothing
+more unless the fingerprint moves (§2.3.1). The `gate` column lists what is
+required *beyond* tier 1, and the `fp?` column is whether the fingerprint is
+*expected* to move -- "no" means an unchanged ISA is the pass condition and a
+change is a defect, not a reason to benchmark.
 
-| id     | task                                                              | files                                          | gate                     | eff | risk | after   |
-| ------ | ------------------------------------------------------------------ | ------------------------------------------------ | -------------------------- | --- | ---- | ------- |
-| P1.1   | Document `K_SUB_N`, `WMMA_LANE_K`; audit every other bare constant | aiw                                            | none (comments)          | S   | none | --      |
-| P1.2   | Fix `_scmp_i32`'s false docstring (§1.4)                          | aiw                                            | none (comment)           | S   | none | --      |
-| P1.3   | Drop the `Vec` alias -> `fx.Vector`                               | aiw                                            | bitwise                  | S   | none | --      |
-| P1.4   | Delete `_ssel_i32`; use `cond.select(a, b)` (§1.2)                | aiw                                            | bitwise                  | S   | low  | --      |
-| P1.5   | Drop `fx.Index(<const>)` casts; sweep for siblings (§1.3)         | aiw                                            | bitwise                  | S   | none | --      |
-| P1.6   | Rename `_REVERSE_Q_TILES` -> `_LPT_TILE_ORDER` (§1.5)             | aiw                                            | bitwise                  | S   | none | --      |
-| P1.7   | Rename `tile_start` -> `start_k`, `q_start` -> `start_q` (21 + n sites) | aiw                                       | bitwise                  | S   | low  | --      |
-| P2.1   | Move 6 tuning functions/constants to the interface (§4.1)         | aiw, interface                                 | schedule-diff + bitwise  | M   | low  | --      |
-| P2.2   | Env vars -> build knobs, incl. `fp_mode` (§4.2)                   | aiw, interface                                 | schedule-diff + bitwise  | M   | med  | P2.1    |
-| P2.3   | Introduce `FmhaProblem` / `FmhaSchedule` dataclasses (§4.3)       | aiw, interface, tests                          | schedule-diff + bitwise  | M   | low  | P2.2    |
-| P2.4   | Make the interface the only producer of a `FmhaSchedule`          | aiw, interface                                 | schedule-diff            | S   | low  | P2.3    |
-| P3.1   | **Inventory**: classify all 100 `fx.Index` sites; publish the 64-bit list | plan (artifact)                        | review                   | M   | none | --      |
-| P3.2   | Narrow sequence-space quantities to `fx.Int32` (§5.2a)            | aiw                                            | bitwise + gSWA-90 + perf | L   | **high** | P3.1, P2.3 |
-| P3.3   | Delete `_scmp_i32`/`_smin_i32`/`_smax_i32`                        | aiw                                            | bitwise                  | S   | low  | P3.2    |
-| P4.1   | ~~`_pointer_to_llvm_ptr` still needed?~~ **answered** -- see §7.1 | --                                             | --                       | --  | --   | done    |
-| P4.2   | Can `fx.add_offset` replace LDS `ptrtoint`+`addi`?                | spike                                          | working example or a no  | S   | none | --      |
-| P4.3   | Can the layout API replace `coop_load/store_*`?                   | spike                                          | example + perf number    | M   | none | --      |
-| P5.1   | Duplication audit vs `common/*` and `flash_attn_utils` (§7.1)     | plan (artifact)                                | review                   | S   | none | --      |
-| P5.2   | Pointer + global load/store -> `common/mem_ops.py`                | aiw, common/mem_ops                            | bitwise (per helper) + perf | M   | med  | P5.1, P4.1 |
-| P5.3   | LDS load/store -> `common/mem_ops.py`                             | aiw, common/mem_ops                            | bitwise + perf           | M   | med  | P5.2, P4.2 |
-| P5.4   | Interval algebra + `div_rd` -> `common/utils.py`                  | aiw, common/utils                              | bitwise + tier 1         | S   | low  | P3.3    |
-| P5.5   | gSWA regions, Q preload, cross-shard reduction, LSE addressing, `_decode_side` -> `attention/fmha_common.py` | aiw, fmha_common | bitwise + perf           | L   | med  | P3.3, P4.3 |
+Phase boundaries add a tier-2.9 fast screen (11 s) against the fixed pre-P1
+baseline. Tier 3 runs once, after P5.5.
+
+| id     | task                                                              | files                                          | gate                     | eff | risk | fp? | after   |
+| ------ | ------------------------------------------------------------------ | ------------------------------------------------ | -------------------------- | --- | ---- | ---- | ------- |
+| P1.1   | Document `K_SUB_N`, `WMMA_LANE_K`; audit every other bare constant | aiw                                            | none (comments)          | S   | none | no  | --      |
+| P1.2   | Fix `_scmp_i32`'s false docstring (§1.4)                          | aiw                                            | none (comment)           | S   | none | no  | --      |
+| P1.3   | Drop the `Vec` alias -> `fx.Vector`                               | aiw                                            | bitwise                  | S   | none | no  | --      |
+| P1.4   | Delete `_ssel_i32`; use `cond.select(a, b)` (§1.2)                | aiw                                            | bitwise                  | S   | low  | yes | --      |
+| P1.5   | Drop `fx.Index(<const>)` casts; sweep for siblings (§1.3)         | aiw                                            | bitwise                  | S   | none | no  | --      |
+| P1.6   | Rename `_REVERSE_Q_TILES` -> `_LPT_TILE_ORDER` (§1.5)             | aiw                                            | bitwise                  | S   | none | no  | --      |
+| P1.7   | Rename `tile_start` -> `start_k`, `q_start` -> `start_q` (21 + n sites) | aiw                                       | bitwise                  | S   | low  | no  | --      |
+| P2.1   | Move 6 tuning functions/constants to the interface (§4.1)         | aiw, interface                                 | schedule-diff + bitwise  | M   | low  | no  | --      |
+| P2.2   | Env vars -> build knobs, incl. `fp_mode` (§4.2)                   | aiw, interface                                 | schedule-diff + bitwise  | M   | med  | no  | P2.1    |
+| P2.3   | Introduce `FmhaProblem` / `FmhaSchedule` dataclasses (§4.3)       | aiw, interface, tests                          | schedule-diff + bitwise  | M   | low  | no  | P2.2    |
+| P2.4   | Make the interface the only producer of a `FmhaSchedule`          | aiw, interface                                 | schedule-diff            | S   | low  | no  | P2.3    |
+| P3.1   | **Inventory**: classify all 100 `fx.Index` sites; publish the 64-bit list | plan (artifact)                        | review                   | M   | none | no  | --      |
+| P3.2   | Narrow sequence-space quantities to `fx.Int32` (§5.2a)            | aiw                                            | bitwise + gSWA-90 + perf | L   | **high** | yes | P3.1, P2.3 |
+| P3.3   | Delete `_scmp_i32`/`_smin_i32`/`_smax_i32`                        | aiw                                            | bitwise                  | S   | low  | yes | P3.2    |
+| P4.1   | ~~`_pointer_to_llvm_ptr` still needed?~~ **answered** -- see §7.1 | --                                             | --                       | --  | --   | yes | done    |
+| P4.2   | Can `fx.add_offset` replace LDS `ptrtoint`+`addi`?                | spike                                          | working example or a no  | S   | none | yes | --      |
+| P4.3   | Can the layout API replace `coop_load/store_*`?                   | spike                                          | example + perf number    | M   | none | yes | --      |
+| P5.1   | Duplication audit vs `common/*` and `flash_attn_utils` (§7.1)     | plan (artifact)                                | review                   | S   | none | no  | --      |
+| P5.2   | Pointer + global load/store -> `common/mem_ops.py`                | aiw, common/mem_ops                            | bitwise (per helper) + perf | M   | med  | yes | P5.1, P4.1 |
+| P5.3   | LDS load/store -> `common/mem_ops.py`                             | aiw, common/mem_ops                            | bitwise + perf           | M   | med  | yes | P5.2, P4.2 |
+| P5.4   | Interval algebra + `div_rd` -> `common/utils.py`                  | aiw, common/utils                              | bitwise + tier 1         | S   | low  | yes | P3.3    |
+| P5.5   | gSWA regions, Q preload, cross-shard reduction, LSE addressing, `_decode_side` -> `attention/fmha_common.py` | aiw, fmha_common | bitwise + perf           | L   | med  | yes | P3.3, P4.3 |
 
 **Critical path:** `P3.1 -> P3.2 -> P3.3 -> P5.4/P5.5`. Everything in P1 and P4
 is independent and can land at any time; P2 gates only on itself.
@@ -246,31 +251,72 @@ what the scheduler emits.
 losing 0.7% all pass individually and compound to 10%. Nothing in a
 per-task gate can see that, because at no point is any single step out of line.
 
-So three tiers, cheapest first:
+So four tiers, cheapest first, and **a tier only runs if the one below it says
+something changed**:
 
-| tier | what                                                     | when                                   | cost      |
-| ---- | ---------------------------------------------------------- | ---------------------------------------- | ----------- |
-| 1    | **codegen fingerprint** -- VGPRs, scratch, instruction count, ISA SHA at 3 configs | **every commit**      | **12 s**  |
-| 2    | interleaved same-process A/B on the affected configs     | whenever tier 1 moves, and for the hot-path tasks below | 5-10 min |
-| 3    | full ladder A/B vs the **fixed pre-P1 baseline**         | every phase boundary (5x)              | ~10 min   |
+| tier | what                                                                | when                                          | measured cost |
+| ---- | --------------------------------------------------------------------- | ----------------------------------------------- | --------------- |
+| 1    | **codegen fingerprint** -- VGPR, scratch, instruction count, ISA SHA at 3 configs | **every commit**                | **12 s**      |
+| 2    | interleaved A/B on the configs the change touches                   | only when tier 1 moves                        | ~11 s         |
+| 2.9  | **fast screen** -- N=4096 non-causal, head_dim 64/80/128/192/256    | phase boundaries, and any task with a tier-1 move | **11 s**  |
+| 3    | full ladder -- 13 head_dims x causal x N in {1024, 4096}            | **once, at the end of the plan**              | **44 s** (4 GPUs) |
 
-**Tier 1 is the one that makes this affordable.** `codegen_fingerprint.py`
-compiles three representative configs and hashes the ISA body; it is
-deterministic across runs, so an unchanged fingerprint is proof the emitted
-code is identical and no benchmark is needed. It does not measure performance
--- it decides whether performance *can* have changed. At 12 seconds it runs on
-every commit including the comment-only ones, where it should always be a
-no-op and where a surprise would be genuinely informative.
+### 2.3.1 If the ISA is unchanged, there is nothing to measure
 
-**Tier 3 is the one the original gate table was missing.** It compares against
-a baseline pinned at the commit before P1.1, never against the previous phase,
-so cumulative drift has nowhere to hide. Five runs over the whole plan.
+**This is the rule that makes the plan cheap.** A codegen fingerprint that has
+not moved is proof the emitted instruction stream is identical, and identical
+instructions cannot run at different speeds. So tier 1 is not a screen that
+*suggests* skipping the benchmark -- it *decides* it.
 
-Given tier 1, the tasks that need a tier-2 A/B up front rather than on demand
-are the ones where the fingerprint is *expected* to move and the code is hot:
-**P3.2, P4.3, P5.2, P5.3, P5.5**. P5.2 was previously gated bitwise-only, which
-was an oversight -- it moves the global load/store helpers, which are in the
-inner loop.
+Phase 2 is the clearest case. Moving tuning constants to the interface,
+replacing env vars with knobs, and packing 26 parameters into two dataclasses
+are all host-side reorganisation: the same values reach the same builder and
+the same kernel is emitted. The expected tier-1 result is byte-identical ISA at
+all three configs, and if that holds, **P2.1 through P2.4 run no benchmark at
+all**. If it does *not* hold, that is the interesting outcome -- a "cosmetic"
+change altered codegen, which means it was not cosmetic, and it gets a tier 2.9
+before anyone argues about why.
+
+The same applies to most of Phase 1. P1.1 and P1.2 are comments; P1.7 is a
+rename. Those cannot move the fingerprint, and if one does, the commit is wrong
+rather than the tool.
+
+### 2.3.2 The harness, and what it can actually resolve
+
+`perf_ab.py` runs one long-lived worker process per (revision, GPU) with each
+checkout on its own `sys.path`, and the parent alternates requests between
+them. Two git revisions cannot be interleaved inside one interpreter -- the
+kernel modules are imported by name and would cross-contaminate -- but they can
+be interleaved at ~1 second granularity across two processes, which is what
+matters. The alternative, running each revision's whole sweep in turn, puts
+minutes between the two measurements of a point and is what produced the 19%
+outliers in §11.5.
+
+**Run the self-test before trusting a number.** `--base X --head X` compares a
+revision against itself, so whatever ratio it reports is the harness's own
+resolution. Measured here:
+
+| tier | GPUs | wall  | worst self-test ratio | where                |
+| ---- | ---- | ----- | ----------------------- | ---------------------- |
+| 2.9  | 4    | 10.6 s | 0.952                  | head_dim 192          |
+| 2.9  | 1    | 11.6 s | 0.993                  | head_dim 64           |
+| 3    | 4    | 44.2 s | 0.977                  | head_dim 48, N=1024   |
+| 3    | 1    | 69.8 s | 0.941                  | head_dim 48, N=4096   |
+
+Two things fall out, and the second one is a trap avoided:
+
+- **Four GPUs help tier 3 and not tier 2.9** (1.6x against 1.1x). At five
+  configs the run is dominated by process startup, which parallelises anyway.
+- **The noise is not caused by GPU concurrency, it tracks short kernels.** The
+  worst point is head_dim 48 at N=1024 or head_dim 192 -- launch-overhead
+  dominated configs -- and worst-case lands at 0.94 to 0.95 whether one GPU is
+  busy or four. It would have been easy to read the first two rows alone and
+  conclude "concurrency costs resolution"; the tier-3 rows say otherwise.
+
+So: **a config's self-test ratio is its resolution floor, and a "regression"
+smaller than that is not a measurement.** Judge each config against its own
+floor rather than a single global threshold, and re-run rather than believe a
+one-off at head_dim 48 or 192.
 
 ### 2.4 Perf gates are **interleaved, same-process A/B**
 
