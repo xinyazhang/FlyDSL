@@ -6,8 +6,11 @@
 Wraps ``flash_attn_func_gfx1201_aiw.build_flash_attn_func_aiw_module`` behind a
 single function, ``flydsl_flash_attn_func_gfx1201(q, k, v, ...)``:
 
-- Build cache keyed by (num_heads, head_dim, causal, dtype, waves_per_eu, daz)
-  so repeated calls with the same static config compile only once per process.
+- Build cache keyed by the whole ``(FmhaInputMetadata, FmhaKnobs)`` pair, so
+  repeated calls with the same static config compile only once per process.
+  Both are frozen dataclasses precisely so they can be that key: an earlier
+  version listed six of the fields by hand, which is how the tuning env vars
+  managed to change the emitted kernel without changing the key.
 - BSHD (``[B, S, H, D]``) input/output convention, matching upstream
   flash-attention layout.
 - Automatic seq_len padding to the kernel's ``BLOCK_M`` tile (128).
@@ -44,11 +47,6 @@ __all__ = ["flydsl_flash_attn_func_gfx1201"]
 # ``sdpa-close-gap-plan1.md``.
 
 
-# Tile size baked into the gfx1201 kernel (BLOCK_M). Seq_len must be a
-# multiple of this; padding is invisible to callers.
-# BLOCK_M is head_dim-dependent; see default_block_m() in the kernel module.
-_KERNEL_BLOCK_M = 128
-
 def _torch_dtype_to_str(dtype: torch.dtype) -> str:
     if dtype == torch.bfloat16:
         return "bf16"
@@ -74,8 +72,6 @@ def flydsl_flash_attn_func_gfx1201(
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool = False,
-    waves_per_eu: int = 2,
-    daz: bool = True,
     stream: torch.cuda.Stream | None = None,
     knobs: FmhaKnobs | None = None,
     return_lse: bool = False,
@@ -89,8 +85,6 @@ def flydsl_flash_attn_func_gfx1201(
             a multiple of 16 and at most 512; above 256 it is computed in
             128-wide V column slices and so must be a multiple of 128.
         causal: apply causal masking when ``True``.
-        waves_per_eu: kernel occupancy hint passed to the FlyDSL builder.
-        daz: enable denormals-are-zero on the kernel.
         stream: optional CUDA/HIP stream to launch on. Defaults to the current
             stream for ``q.device``.
         schedule: ``None`` uses the measured tuning policy for this shape. An
@@ -152,11 +146,14 @@ def flydsl_flash_attn_func_gfx1201(
     # One call for the whole build configuration: the tile width is a build
     # axis and the real extent rides along as a runtime argument, but which
     # tile, which knobs and which BLOCK_M are all the tuning module's to say.
-    # `waves_per_eu` and `daz` remain named arguments for now, so they form the
-    # base and an explicit `schedule` wins over them.
     _plan = _plan_build(
-        num_heads, head_dim, causal, dtype_str,
-        FmhaKnobs(waves_per_eu=waves_per_eu, daz=daz).merge(knobs),
+        FmhaInputMetadata(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            causal=causal,
+            dtype_str=dtype_str,
+        ),
+        knobs,
     )
     block_dmodel = _plan.meta.head_dim
     padded_head = _plan.meta.padded_head

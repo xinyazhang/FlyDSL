@@ -238,7 +238,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     shards = knobs.shards
     unsafe_fp_math = knobs.unsafe_fp_math
     fast_fp_math = knobs.fast_fp_math
-    daz = knobs.daz
+    denormals_are_zero = knobs.denormals_are_zero
     sched_strategy = knobs.sched_strategy
     lpt_tile_order = knobs.lpt_tile_order
     unsafe_no_kv_clamp = knobs.unsafe_no_kv_clamp
@@ -2708,7 +2708,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     ]
                 )
             )
-        if const_expr(daz):
+        if const_expr(denormals_are_zero):
             passthrough_entries.append(
                 ir.ArrayAttr.get(
                     [
@@ -3192,6 +3192,10 @@ def build_flash_attn_func_aiw_module(**kwargs):
     unknown = set(kwargs) - meta_fields - knob_fields
     if unknown:
         raise TypeError(f"unknown build parameter(s): {sorted(unknown)}")
+    # `resolve_knobs`, not `plan`: this front end takes a *compiled tile width*
+    # and must keep rejecting anything off the ladder. Rounding a real head_dim
+    # up is the interface's job, because only it also arranges the runtime
+    # extent and the padded_head contract that make the rounding safe.
     meta = FmhaInputMetadata(**{k: v for k, v in kwargs.items() if k in meta_fields})
     overrides = FmhaKnobs(**{k: v for k, v in kwargs.items() if k in knob_fields})
     return build_flash_attn_func_aiw_module_primary(meta, resolve_knobs(meta, overrides))

@@ -28,6 +28,9 @@ deciding whether a change needs a benchmark or a correctness argument:
   because the policy functions call them.
 """
 
+from dataclasses import dataclass, fields, replace
+
+
 # ---------------------------------------------------------------------------
 # Tuning policy
 #
@@ -359,9 +362,6 @@ MAX_HEAD_DIM = _BLOCK_DMODEL_LADDER[-1]
 # key is a bug waiting for a second caller.
 # ---------------------------------------------------------------------------
 
-from dataclasses import dataclass, fields, replace  # noqa: E402
-
-
 @dataclass(frozen=True)
 class FmhaInputMetadata:
     """What to compute. Set by the caller; never by policy."""
@@ -399,8 +399,25 @@ class FmhaKnobs:
     waves_per_eu: int | None = None
     flat_work_group_size: int | None = None
     sched_strategy: str | None = None
+
+    # Three floating-point knobs, which looks like two too many until you see
+    # that they act at three different levels:
+    #
+    #   fp_mode        the explicit `arith.FastMathFlags` set put on the
+    #                  *softmax* operations -- "fast", "noninf" or "safe".
+    #                  This is the one that has been measured; "fast" includes
+    #                  `ninf`, which silently deleted the KV tail mask once.
+    #   fast_fp_math   the *ambient* fastmath for traced operations that do not
+    #                  carry their own flags (`effective_fastmath_hint`).
+    #   unsafe_fp_math a ROCm *backend* option, `unsafe-math`, applied to the
+    #                  whole compilation (`compiler/backends/rocm.py`).
+    #
+    # So they are per-op, per-op-default and whole-compilation respectively.
+    # Only `fp_mode` is ever varied in practice; the other two have been True
+    # for every build ever made here, which means their effect is measured only
+    # in combination and collapsing them would need its own experiment.
     fp_mode: str | None = None
-    daz: bool | None = None
+    denormals_are_zero: bool | None = None
     unsafe_fp_math: bool | None = None
     fast_fp_math: bool | None = None
     strides_constexpr: bool | None = None
@@ -426,7 +443,7 @@ _KNOBS_FALLBACK = FmhaKnobs(
     v_prefetch_dist=1,
     waves_per_eu=2,
     fp_mode="noninf",
-    daz=True,
+    denormals_are_zero=True,
     unsafe_fp_math=True,
     fast_fp_math=True,
     strides_constexpr=False,
@@ -498,35 +515,29 @@ class FmhaPlan:
     block_m: int
 
 
-def plan(
-    num_heads: int,
-    head_dim: int,
-    causal: bool,
-    dtype_str: str,
-    overrides: FmhaKnobs | None = None,
-    **problem_kwargs,
-) -> FmhaPlan:
-    """The one entry point into tuning: a caller's shape in, a full plan out.
+def plan(request: FmhaInputMetadata, overrides: FmhaKnobs | None = None) -> FmhaPlan:
+    """The one entry point into tuning: the caller's inputs in, a full plan out.
 
-    `head_dim` is the caller's real width and is rounded up to the nearest
-    compiled tile here, with `padded_head` set accordingly -- so a caller never
-    needs the ladder, the maximum, or the block-size tables. That is the point:
-    every one of those was previously imported by the interface, which meant
-    the ordering between them lived at the call site.
+    `request.head_dim` is the caller's *real* width. The returned
+    `FmhaPlan.meta` carries the width rounded up to the nearest compiled tile,
+    with `padded_head` set accordingly -- so no caller needs the ladder, the
+    maximum, or the block-size tables. That is the point: every one of those
+    used to be imported by the interface, which meant the ordering between them
+    lived at the call site.
 
-    Extra keyword arguments go to `FmhaInputMetadata` (`head_dim_v`, `bias`,
-    `dropout`, ...). Raises for a head_dim past the largest compiled tile.
+    The two `FmhaInputMetadata` therefore mean slightly different things: what
+    was asked for going in, what will be built coming out. They are the same
+    type because every other field is untouched, and because the pair
+    `(plan.meta, plan.knobs)` has to be the build-cache key.
+
+    Raises for a head_dim past the largest compiled tile.
     """
+    head_dim = request.head_dim
     if head_dim < 1 or head_dim > MAX_HEAD_DIM:
         raise ValueError(f"kernel requires 1 <= head_dim <= {MAX_HEAD_DIM}, got {head_dim}")
     block_dmodel = _round_to_ladder(head_dim)
-    meta = FmhaInputMetadata(
-        num_heads=num_heads,
-        head_dim=block_dmodel,
-        causal=causal,
-        dtype_str=dtype_str,
-        padded_head=block_dmodel != head_dim,
-        **problem_kwargs,
+    meta = replace(
+        request, head_dim=block_dmodel, padded_head=block_dmodel != head_dim
     )
     knobs = resolve_knobs(meta, overrides)
     # BLOCK_M is invariant to q_row_tiles by construction (see the
