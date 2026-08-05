@@ -67,8 +67,8 @@ baseline. Tier 3 runs once, after P5.5.
 | P2.2✓  | Env vars -> build knobs, incl. `fp_mode` (§4.2)                   | aiw, interface                                 | schedule-diff + bitwise  | M   | med  | no  | P2.1    |
 | P2.5a  | **done** -- interface knob-mapping policy -> tuning module        | interface, tuning                              | schedule-diff            | S   | low  | no  | P2.1    |
 | P2.5b✓ | `_BLOCK_DMODEL_LADDER` + `_round_to_ladder` -> tuning module; derive `_MAX_HEAD_DIM` from the ladder | interface, tuning | schedule-diff        | S   | low  | no  | P2.5a   |
-| P2.3✓  | Introduce `FmhaProblem` / `FmhaSchedule` dataclasses (§4.3)       | aiw, tuning, interface, tests                  | schedule-diff + bitwise  | M   | low  | no  | P2.5b✓  |
-| P2.4✓  | `fmha_tuning.resolve_schedule(problem)` -- one entry point, sole producer (§4.4) | tuning, interface              | schedule-diff            | M   | low  | no  | P2.3    |
+| P2.3✓  | Introduce `FmhaInputMetadata` / `FmhaKnobs` dataclasses (§4.3)       | aiw, tuning, interface, tests                  | schedule-diff + bitwise  | M   | low  | no  | P2.5b✓  |
+| P2.4✓  | `fmha_tuning.resolve_knobs(problem)` -- one entry point, sole producer (§4.4) | tuning, interface              | schedule-diff            | M   | low  | no  | P2.3    |
 | P2.6✓  | Public API takes a knobs dataclass; drop `use_binding_prefetch` and `variant` (§4.4) | interface, tests, benches   | schedule-diff + bitwise  | M   | med  | no  | P2.4    |
 | P3.1   | **Inventory**: classify all 100 `fx.Index` sites; publish the 64-bit list | plan (artifact)                        | review                   | M   | none | no  | --      |
 | P3.2   | Narrow sequence-space quantities to `fx.Int32` (§5.2a)            | aiw                                            | bitwise + gSWA-90 + perf | L   | **high** | yes | P3.1, P2.3 |
@@ -516,11 +516,11 @@ the parameters are not one kind of thing.
 
 | dataclass       | holds                                                            | who sets it                        |
 | --------------- | ---------------------------------------------------------------- | ---------------------------------- |
-| `FmhaProblem`   | `num_heads`, `head_dim`, `head_dim_v`, `d_offset`, `causal`, `causal_type`, `dtype_str`, `sm_scale`, `padded_head`, `bias`, `dropout`, `philox_width` | the caller -- what to compute      |
-| `FmhaSchedule`  | `block_m`, `block_n`, `k_prefetch_dist`, `v_prefetch_dist`, `v_lds_layout`, `q_row_tiles`, `shards`, `waves_per_eu`, `flat_work_group_size`, `sched_strategy`, `fp_mode`, `daz`, `unsafe_fp_math`, `fast_fp_math`, `strides_constexpr`, `lpt_tile_order`, `unsafe_no_kv_clamp` | the tuning policy -- how to compute it |
+| `FmhaInputMetadata`   | `num_heads`, `head_dim`, `head_dim_v`, `d_offset`, `causal`, `causal_type`, `dtype_str`, `sm_scale`, `padded_head`, `bias`, `dropout`, `philox_width` | the caller -- what to compute      |
+| `FmhaKnobs`  | `block_m`, `block_n`, `k_prefetch_dist`, `v_prefetch_dist`, `v_lds_layout`, `q_row_tiles`, `shards`, `waves_per_eu`, `flat_work_group_size`, `sched_strategy`, `fp_mode`, `daz`, `unsafe_fp_math`, `fast_fp_math`, `strides_constexpr`, `lpt_tile_order`, `unsafe_no_kv_clamp` | the tuning policy -- how to compute it |
 
 Splitting on that line is what makes §4.1 enforceable: the interface produces a
-`FmhaSchedule`, and the AIW file never decides one. A single blob would let
+`FmhaKnobs`, and the AIW file never decides one. A single blob would let
 policy drift back in unnoticed.
 
 Both frozen, so a schedule cannot be mutated after it has been used as a cache
@@ -538,8 +538,8 @@ schedule by hand out of `_use_bp`, `_aiw_knobs`, `default_block_m` and
 sequence. That ordering is knowledge the tuning module should own:
 
 ```python
-def resolve_schedule(problem: FmhaProblem,
-                     overrides: FmhaSchedule | None = None) -> FmhaSchedule:
+def resolve_knobs(problem: FmhaInputMetadata,
+                     overrides: FmhaKnobs | None = None) -> FmhaKnobs:
     """The complete measured configuration for this problem."""
 ```
 
@@ -559,9 +559,9 @@ flydsl_flash_attn_func_gfx1201(q, k, v, causal=..., schedule=None)
 ```
 
 with `schedule=None` meaning "use the policy" and a partially-filled
-`FmhaSchedule` meaning "use the policy except for these". `use_binding_prefetch
-=True` becomes `FmhaSchedule(k_prefetch_dist=1)` and `variant="m32"` becomes
-`FmhaSchedule(q_row_tiles=2)`, which say what they do rather than naming a
+`FmhaKnobs` meaning "use the policy except for these". `use_binding_prefetch
+=True` becomes `FmhaKnobs(k_prefetch_dist=1)` and `variant="m32"` becomes
+`FmhaKnobs(q_row_tiles=2)`, which say what they do rather than naming a
 historical kernel variant.
 
 **Blast radius, since this is the one API-breaking task in the plan.** Ten call
@@ -574,7 +574,7 @@ tree.
 
 **Gate:** the enumeration trick from §2.3 -- for every
 `(head_dim, causal, dtype, flags)` combination the interface can produce, diff
-the resolved `FmhaSchedule` before and after. Identical for all of them, or the
+the resolved `FmhaKnobs` before and after. Identical for all of them, or the
 move changed policy. Then bitwise on the suite.
 
 **Cost:** medium, mostly mechanical. **Risk:** low, but it touches every call

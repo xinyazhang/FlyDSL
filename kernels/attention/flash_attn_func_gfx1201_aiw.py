@@ -115,9 +115,9 @@ from gfx1201_standalone import wmma_ops
 from dataclasses import fields
 
 from fmha_tuning_gfx1201 import (  # noqa: F401
-    FmhaProblem,
-    FmhaSchedule,
-    resolve_schedule,
+    FmhaInputMetadata,
+    FmhaKnobs,
+    resolve_knobs,
     default_block_m,
     default_block_n,
     default_prefetch_dist,
@@ -196,13 +196,13 @@ _WINDOW_BOTRIGHT = -2147483646   # 0x80000002
 
 
 
-def build_flash_attn_func_aiw_module_primary(problem, schedule):
+def build_flash_attn_func_aiw_module_primary(meta, knobs):
     """Build the unified gfx1201 flash-attention kernel.
 
     Takes the two objects rather than 26 loose parameters, split on *who
     decides*: `problem` is what the caller asked for, `schedule` is what the
     tuning policy answered. Build `schedule` with
-    `fmha_tuning_gfx1201.resolve_schedule(problem)` -- every field must be
+    `fmha_tuning_gfx1201.resolve_knobs(problem)` -- every field must be
     resolved, since nothing here falls back to a policy any more.
 
     `build_flash_attn_func_aiw_module` below is the keyword-argument wrapper
@@ -213,37 +213,37 @@ def build_flash_attn_func_aiw_module_primary(problem, schedule):
     """
     # Unpacked to locals so the body below reads unchanged. Anything not
     # resolved is a caller error, not a default to be invented here.
-    num_heads = problem.num_heads
-    head_dim = problem.head_dim
-    head_dim_v = problem.head_dim_v
-    d_offset = problem.d_offset
-    causal = problem.causal
-    dtype_str = problem.dtype_str
-    sm_scale = problem.sm_scale
-    causal_type = problem.causal_type
-    padded_head = problem.padded_head
-    bias = problem.bias
-    dropout = problem.dropout
-    philox_width = problem.philox_width
+    num_heads = meta.num_heads
+    head_dim = meta.head_dim
+    head_dim_v = meta.head_dim_v
+    d_offset = meta.d_offset
+    causal = meta.causal
+    dtype_str = meta.dtype_str
+    sm_scale = meta.sm_scale
+    causal_type = meta.causal_type
+    padded_head = meta.padded_head
+    bias = meta.bias
+    dropout = meta.dropout
+    philox_width = meta.philox_width
 
-    waves_per_eu = schedule.waves_per_eu
-    flat_work_group_size = schedule.flat_work_group_size
-    block_m = schedule.block_m
-    block_n = schedule.block_n
-    k_prefetch_dist = schedule.k_prefetch_dist
-    v_prefetch_dist = schedule.v_prefetch_dist
-    v_lds_layout = schedule.v_lds_layout
-    strides_constexpr = schedule.strides_constexpr
-    q_row_tiles = schedule.q_row_tiles
-    shards = schedule.shards
-    unsafe_fp_math = schedule.unsafe_fp_math
-    fast_fp_math = schedule.fast_fp_math
-    daz = schedule.daz
-    sched_strategy = schedule.sched_strategy
-    lpt_tile_order = schedule.lpt_tile_order
-    unsafe_no_kv_clamp = schedule.unsafe_no_kv_clamp
-    fp_mode = schedule.fp_mode
-    path_tag = schedule.path_tag
+    waves_per_eu = knobs.waves_per_eu
+    flat_work_group_size = knobs.flat_work_group_size
+    block_m = knobs.block_m
+    block_n = knobs.block_n
+    k_prefetch_dist = knobs.k_prefetch_dist
+    v_prefetch_dist = knobs.v_prefetch_dist
+    v_lds_layout = knobs.v_lds_layout
+    strides_constexpr = knobs.strides_constexpr
+    q_row_tiles = knobs.q_row_tiles
+    shards = knobs.shards
+    unsafe_fp_math = knobs.unsafe_fp_math
+    fast_fp_math = knobs.fast_fp_math
+    daz = knobs.daz
+    sched_strategy = knobs.sched_strategy
+    lpt_tile_order = knobs.lpt_tile_order
+    unsafe_no_kv_clamp = knobs.unsafe_no_kv_clamp
+    fp_mode = knobs.fp_mode
+    path_tag = knobs.path_tag
     """Build the unified gfx1201 flash-attention kernel.
 
     See the module docstring for what each knob selects and which of the three
@@ -3183,19 +3183,15 @@ def build_flash_attn_func_aiw_module_primary(problem, schedule):
 def build_flash_attn_func_aiw_module(**kwargs):
     """Keyword front end: name a problem, get the policy's schedule.
 
-    Any `FmhaSchedule` field may be passed as a keyword to pin it; the rest are
-    resolved by `resolve_schedule`. This is what keeps "the tuning module is the
+    Any `FmhaKnobs` field may be passed as a keyword to pin it; the rest are
+    resolved by `resolve_knobs`. This is what keeps "the tuning module is the
     only producer of a schedule" true even for callers who never mention one.
     """
-    problem_fields = {f.name for f in fields(FmhaProblem)}
-    schedule_fields = {f.name for f in fields(FmhaSchedule)}
-    unknown = set(kwargs) - problem_fields - schedule_fields
+    meta_fields = {f.name for f in fields(FmhaInputMetadata)}
+    knob_fields = {f.name for f in fields(FmhaKnobs)}
+    unknown = set(kwargs) - meta_fields - knob_fields
     if unknown:
         raise TypeError(f"unknown build parameter(s): {sorted(unknown)}")
-    problem = FmhaProblem(**{k: v for k, v in kwargs.items() if k in problem_fields})
-    overrides = FmhaSchedule(
-        **{k: v for k, v in kwargs.items() if k in schedule_fields}
-    )
-    return build_flash_attn_func_aiw_module_primary(
-        problem, resolve_schedule(problem, overrides)
-    )
+    meta = FmhaInputMetadata(**{k: v for k, v in kwargs.items() if k in meta_fields})
+    overrides = FmhaKnobs(**{k: v for k, v in kwargs.items() if k in knob_fields})
+    return build_flash_attn_func_aiw_module_primary(meta, resolve_knobs(meta, overrides))

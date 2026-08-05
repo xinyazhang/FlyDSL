@@ -5,7 +5,7 @@
 
 Covers both scheduling variants behind
 ``flydsl_flash_attn_func_gfx1201``: the baseline kernel and the
-binding-prefetch schedule (``FmhaSchedule(k_prefetch_dist=1)``).
+binding-prefetch schedule (``FmhaKnobs(k_prefetch_dist=1)``).
 
 This file is **deliberately outside the `tests/` tree** and is not wired into
 `scripts/run_tests.sh`. It follows the prototype convention of this directory --
@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 
 from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module
-from fmha_tuning_gfx1201 import FmhaSchedule
+from fmha_tuning_gfx1201 import FmhaKnobs
 from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
 
 # Relative-error tolerance against an fp32 reference. The kernel accumulates in
@@ -101,7 +101,7 @@ def test_matches_sdpa(shape, use_binding_prefetch):
     batch, seq, head_dim, causal, dtype = shape
     q, k, v = _qkv(batch, seq, _NUM_HEADS, head_dim, dtype)
 
-    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, schedule=FmhaSchedule(k_prefetch_dist=1 if use_binding_prefetch else None))
+    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, knobs=FmhaKnobs(k_prefetch_dist=1 if use_binding_prefetch else None))
     torch.cuda.synchronize()
 
     assert out.shape == q.shape
@@ -125,8 +125,8 @@ def test_binding_prefetch_matches_baseline_bitwise(shape):
     batch, seq, head_dim, causal, dtype = shape
     q, k, v = _qkv(batch, seq, _NUM_HEADS, head_dim, dtype)
 
-    base = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, schedule=None)
-    bp = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, schedule=FmhaSchedule(k_prefetch_dist=1))
+    base = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, knobs=None)
+    bp = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, knobs=FmhaKnobs(k_prefetch_dist=1))
     torch.cuda.synchronize()
 
     assert torch.equal(base, bp), f"max |base - bp| = {(base.float() - bp.float()).abs().max().item():.3e}"
@@ -144,7 +144,7 @@ def test_causal_seqlen_not_multiple_of_block(use_binding_prefetch):
     assert seq % _KERNEL_BLOCK_M != 0
     q, k, v = _qkv(1, seq, _NUM_HEADS, 128, torch.float16)
 
-    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=True, schedule=FmhaSchedule(k_prefetch_dist=1 if use_binding_prefetch else None))
+    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=True, knobs=FmhaKnobs(k_prefetch_dist=1 if use_binding_prefetch else None))
     torch.cuda.synchronize()
 
     assert out.shape == q.shape
@@ -232,7 +232,7 @@ def test_m32_matches_sdpa(shape):
     _require_env()
     batch, seq, causal, dtype = shape
     q, k, v = _qkv(batch, seq, _NUM_HEADS, 64, dtype)
-    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, schedule=FmhaSchedule(q_row_tiles=2))
+    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, knobs=FmhaKnobs(q_row_tiles=2))
     torch.cuda.synchronize()
     assert out.shape == q.shape and out.dtype == q.dtype
     rel, cos = _compare(out, _reference(q, k, v, causal))
@@ -245,7 +245,7 @@ def test_m32_rejects_head_dim_128():
     _require_env()
     q, k, v = _qkv(1, 256, _NUM_HEADS, 128, torch.float16)
     with pytest.raises(ValueError, match="head_dim <= 80"):
-        flydsl_flash_attn_func_gfx1201(q, k, v, causal=False, schedule=FmhaSchedule(q_row_tiles=2))
+        flydsl_flash_attn_func_gfx1201(q, k, v, causal=False, knobs=FmhaKnobs(q_row_tiles=2))
 
 
 @pytest.mark.parametrize("head_dim", [16, 32, 48, 80])
@@ -258,7 +258,7 @@ def test_m32_accepted_below_the_spill_bound(head_dim):
     """
     _require_env()
     q, k, v = _qkv(1, 512, _NUM_HEADS, head_dim, torch.float16)
-    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=True, schedule=FmhaSchedule(q_row_tiles=2))
+    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=True, knobs=FmhaKnobs(q_row_tiles=2))
     torch.cuda.synchronize()
     rel, cos = _compare(out, _reference(q, k, v, True))
     assert rel < _REL_TOL[torch.float16], f"max rel err {rel:.3e}"

@@ -363,7 +363,7 @@ from dataclasses import dataclass, fields, replace  # noqa: E402
 
 
 @dataclass(frozen=True)
-class FmhaProblem:
+class FmhaInputMetadata:
     """What to compute. Set by the caller; never by policy."""
 
     num_heads: int
@@ -381,11 +381,11 @@ class FmhaProblem:
 
 
 @dataclass(frozen=True)
-class FmhaSchedule:
+class FmhaKnobs:
     """How to compute it. Every field `None` means "policy decides".
 
     `None` rather than a literal default on purpose: it is the only way
-    `resolve_schedule` can tell "the caller wants 1" from "the caller did not
+    `resolve_knobs` can tell "the caller wants 1" from "the caller did not
     say", and that difference is the whole point of the overrides argument.
     """
 
@@ -408,7 +408,7 @@ class FmhaSchedule:
     unsafe_no_kv_clamp: bool | None = None
     path_tag: str | None = None
 
-    def merge(self, other: "FmhaSchedule | None") -> "FmhaSchedule":
+    def merge(self, other: "FmhaKnobs | None") -> "FmhaKnobs":
         """`other`'s set fields win; its `None`s leave this one's alone."""
         if other is None:
             return self
@@ -422,7 +422,7 @@ class FmhaSchedule:
 
 # Defaults for the knobs the policy has no opinion about -- they are the same
 # for every shape, so they are literals here rather than functions.
-_SCHEDULE_FALLBACK = FmhaSchedule(
+_KNOBS_FALLBACK = FmhaKnobs(
     v_prefetch_dist=1,
     waves_per_eu=2,
     fp_mode="noninf",
@@ -436,10 +436,10 @@ _SCHEDULE_FALLBACK = FmhaSchedule(
 )
 
 
-def resolve_schedule(
-    problem: FmhaProblem, overrides: "FmhaSchedule | None" = None
-) -> FmhaSchedule:
-    """The complete measured configuration for `problem`.
+def resolve_knobs(
+    meta: FmhaInputMetadata, overrides: "FmhaKnobs | None" = None
+) -> FmhaKnobs:
+    """The complete measured configuration for `meta`.
 
     The ordering below is the reason this function exists. `k_prefetch_dist`
     feeds `block_n`, and `q_row_tiles` feeds `k_prefetch_dist`, so a caller
@@ -451,8 +451,8 @@ def resolve_schedule(
     `q_row_tiles=2` therefore also forces the prefetch distance it requires,
     which is what a caller asking for two row-tiles means.
     """
-    s = _SCHEDULE_FALLBACK.merge(overrides)
-    hd = problem.head_dim
+    s = _KNOBS_FALLBACK.merge(overrides)
+    hd = meta.head_dim
 
     if s.q_row_tiles is None:
         s = replace(s, q_row_tiles=2 if hd in _Q_ROW_TILES_2_HEAD_DIMS else 1)
@@ -473,7 +473,7 @@ def resolve_schedule(
     if s.v_lds_layout is None:
         s = replace(s, v_lds_layout="transposed" if s.k_prefetch_dist else "row")
     if s.block_n is None:
-        s = replace(s, block_n=default_block_n(hd, problem.causal, s.k_prefetch_dist))
+        s = replace(s, block_n=default_block_n(hd, meta.causal, s.k_prefetch_dist))
     if s.block_m is None and s.k_prefetch_dist == 0:
         # Only the distance-0 path takes BLOCK_M from policy; the other branch
         # derives it from the shard count inside the builder.
@@ -493,8 +493,8 @@ class FmhaPlan:
     silent until some head_dim makes the two differ.
     """
 
-    problem: FmhaProblem
-    schedule: FmhaSchedule
+    meta: FmhaInputMetadata
+    knobs: FmhaKnobs
     block_m: int
 
 
@@ -503,7 +503,7 @@ def plan(
     head_dim: int,
     causal: bool,
     dtype_str: str,
-    overrides: FmhaSchedule | None = None,
+    overrides: FmhaKnobs | None = None,
     **problem_kwargs,
 ) -> FmhaPlan:
     """The one entry point into tuning: a caller's shape in, a full plan out.
@@ -514,13 +514,13 @@ def plan(
     every one of those was previously imported by the interface, which meant
     the ordering between them lived at the call site.
 
-    Extra keyword arguments go to `FmhaProblem` (`head_dim_v`, `bias`,
+    Extra keyword arguments go to `FmhaInputMetadata` (`head_dim_v`, `bias`,
     `dropout`, ...). Raises for a head_dim past the largest compiled tile.
     """
     if head_dim < 1 or head_dim > MAX_HEAD_DIM:
         raise ValueError(f"kernel requires 1 <= head_dim <= {MAX_HEAD_DIM}, got {head_dim}")
     block_dmodel = _round_to_ladder(head_dim)
-    problem = FmhaProblem(
+    meta = FmhaInputMetadata(
         num_heads=num_heads,
         head_dim=block_dmodel,
         causal=causal,
@@ -528,7 +528,7 @@ def plan(
         padded_head=block_dmodel != head_dim,
         **problem_kwargs,
     )
-    schedule = resolve_schedule(problem, overrides)
+    knobs = resolve_knobs(meta, overrides)
     # BLOCK_M is invariant to q_row_tiles by construction (see the
     # Q_TILES_PER_BLOCK comment in the kernel), so only the distance matters.
-    return FmhaPlan(problem, schedule, default_block_m(block_dmodel, schedule.k_prefetch_dist))
+    return FmhaPlan(meta, knobs, default_block_m(block_dmodel, knobs.k_prefetch_dist))
