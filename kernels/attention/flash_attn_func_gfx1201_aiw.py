@@ -1362,9 +1362,14 @@ def build_flash_attn_func_aiw_module_primary(
             s_batch, s_seq, s_head = st
             bh = batch_index * s_batch + head * s_head + row_off * s_seq
 
-            def tbase(tile_start):
-                """Uniform 64-bit element base for (batch, head, tile_start)."""
-                return bh + tile_start * s_seq
+            def tbase(seq_start):
+                """Uniform 64-bit element base for (batch, head, seq_start).
+
+                `seq_start` is a position on whichever sequence axis this
+                tensor is indexed by -- rows for Q/O, KV columns for K/V --
+                since `_addr_pair` builds one of these per tensor.
+                """
+                return bh + seq_start * s_seq
 
             def toff(row_in_tile, col):
                 """Divergent 32-bit element offset inside the tile."""
@@ -1418,19 +1423,19 @@ def build_flash_attn_func_aiw_module_primary(
         v_tbase, v_toff = _addr_pair(v_st, head_k, _k_batch_v, _k_row_off_v)
         o_tbase, o_toff = _addr_pair(o_st, head_q, _q_batch_v, _q_row_off_v)
 
-        def _kv_addr(tbase, toff, tile_start, row_in_tile, col):
+        def _kv_addr(tbase, toff, start_k, row_in_tile, col):
             """(uniform base, divergent offset) for a KV row, clamped in bounds.
 
             At K_PREFETCH_DIST == 1 the loop runs one tile ahead, so the final
             iteration addresses a tile past the end of the sequence; the
             unguarded cooperative load also addresses rows past BLOCK_N. Clamp
-            tile_start first, then the in-tile row -- since the row clamp can
-            only fire when tile_start is within BLOCK_N of the end, the clamped
+            start_k first, then the in-tile row -- since the row clamp can
+            only fire when start_k is within BLOCK_N of the end, the clamped
             row stays below BLOCK_N. The values are never consumed.
 
             With both distances 0 there is no over-read: the interface pads
             seq_len to a multiple of BLOCK_M and BLOCK_N divides BLOCK_M, so
-            tile_start + BLOCK_N <= seq_len always. Skip the clamp there; it is
+            start_k + BLOCK_N <= seq_len always. Skip the clamp there; it is
             pure VALU.
             """
             if const_expr(
@@ -1441,19 +1446,19 @@ def build_flash_attn_func_aiw_module_primary(
                     and not KV_NEEDS_GUARD
                 )
             ):
-                return tbase(tile_start), toff(row_in_tile, col)
+                return tbase(start_k), toff(row_in_tile, col)
             ts = fx.Index(
-                ArithValue(tile_start < seqlen_k_v).select(tile_start, seq_last)
+                ArithValue(start_k < seqlen_k_v).select(start_k, seq_last)
             )
             in_range = (ts + row_in_tile) < seqlen_k_v
             row = fx.Index(ArithValue(in_range).select(row_in_tile, seq_last - ts))
             return tbase(ts), toff(row, col)
 
-        def k_addr(tile_start, row_in_tile, col):
-            return _kv_addr(k_tbase, k_toff, tile_start, row_in_tile, col)
+        def k_addr(start_k, row_in_tile, col):
+            return _kv_addr(k_tbase, k_toff, start_k, row_in_tile, col)
 
-        def v_addr(tile_start, row_in_tile, col):
-            return _kv_addr(v_tbase, v_toff, tile_start, row_in_tile, col)
+        def v_addr(start_k, row_in_tile, col):
+            return _kv_addr(v_tbase, v_toff, start_k, row_in_tile, col)
 
         # ---- PADDED_HEAD column handling ----
         #
@@ -1572,13 +1577,13 @@ def build_flash_attn_func_aiw_module_primary(
 
         # ---- K staging ----
 
-        def coop_load_k_global(tile_start):
+        def coop_load_k_global(start_k):
             """Issue this thread's K global loads; results stay in registers."""
             vecs = []
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 b64, o32 = k_addr(
-                    tile_start, load_row_in_batch + row_offset,
+                    start_k, load_row_in_batch + row_offset,
                     _col_safe(load_col_base, _hdim_qk_i),
                 )
                 vecs.append(
@@ -1606,7 +1611,7 @@ def build_flash_attn_func_aiw_module_primary(
                     lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                     _lds_store_vx(vecs[batch], lds_idx)
 
-        def coop_load_store_k(tile_start, buf_id=0):
+        def coop_load_store_k(start_k, buf_id=0):
             """Distance-0 K staging: load and store inside a single guard.
 
             The guard has to cover the *load*, not just the store. When
@@ -1625,7 +1630,7 @@ def build_flash_attn_func_aiw_module_primary(
                     row_valid = lds_row < fx.Index(BLOCK_N)
                     if row_valid:
                         b64, o32 = k_addr(
-                            tile_start, lds_row, _col_safe(load_col_base, _hdim_qk_i)
+                            start_k, lds_row, _col_safe(load_col_base, _hdim_qk_i)
                         )
                         _lds_store_vx(
                             _apply_col_mask(
@@ -1636,7 +1641,7 @@ def build_flash_attn_func_aiw_module_primary(
                         )
                 else:
                     b64, o32 = k_addr(
-                        tile_start, lds_row, _col_safe(load_col_base, _hdim_qk_i)
+                        start_k, lds_row, _col_safe(load_col_base, _hdim_qk_i)
                     )
                     _lds_store_vx(
                         _apply_col_mask(
@@ -1673,7 +1678,7 @@ def build_flash_attn_func_aiw_module_primary(
         def _v_store_row_major(v_base, lds_row, vec):
             _lds_store_vx(vec, v_base + lds_row * V_STRIDE + v_col_base)
 
-        def coop_load_v_global(tile_start, chunk=0):
+        def coop_load_v_global(start_k, chunk=0):
             """V columns [chunk*VO_CHUNK_COLS, +VO_CHUNK_COLS) of this KV tile.
 
             Columns are relative to the V/O window, so D_OFFSET is added here
@@ -1691,7 +1696,7 @@ def build_flash_attn_func_aiw_module_primary(
                     if const_expr(D_OFFSET):
                         col = fx.Index(D_OFFSET) + col
                     b64, o32 = v_addr(
-                        tile_start, kv_base + _tr_kv_off,
+                        start_k, kv_base + _tr_kv_off,
                         _col_safe(col, _hdim_vo_i),
                     )
                     vecs.append(_global_load_tr_v8(v_ptr_i64, b64, o32))
@@ -1702,7 +1707,7 @@ def build_flash_attn_func_aiw_module_primary(
                     if const_expr(D_OFFSET):
                         col = fx.Index(D_OFFSET) + col
                     b64, o32 = v_addr(
-                        tile_start, v_row_in_batch + row_offset,
+                        start_k, v_row_in_batch + row_offset,
                         _col_safe(col, _hdim_vo_i),
                     )
                     vecs.append(load_global_f16xN(v_ptr, b64, o32))
