@@ -33,11 +33,9 @@ from functools import lru_cache
 
 import torch
 
-from flash_attn_func_gfx1201_aiw import (
-    build_flash_attn_func_aiw_module,
-    default_block_m as aiw_block_m,
-    default_prefetch_dist as aiw_prefetch_dist,
-)
+from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module
+from fmha_tuning_gfx1201 import default_block_m as aiw_block_m
+from fmha_tuning_gfx1201 import default_prefetch_dist as aiw_prefetch_dist
 
 __all__ = ["flydsl_flash_attn_func_gfx1201"]
 

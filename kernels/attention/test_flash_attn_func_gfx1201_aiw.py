@@ -39,10 +39,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from fmha_tuning_gfx1201 import default_block_m as aiw_block_m, resolve_shards
 from flash_attn_func_gfx1201_aiw import (
     build_flash_attn_func_aiw_module,
-    default_block_m as aiw_block_m,
-    resolve_shards,
 )
 
 _NUM_HEADS = 2
