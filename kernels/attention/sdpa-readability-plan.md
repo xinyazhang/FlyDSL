@@ -57,7 +57,7 @@ baseline. Tier 3 runs once, after P5.5.
 | ------ | ------------------------------------------------------------------ | ------------------------------------------------ | -------------------------- | --- | ---- | ---- | ------- |
 | P1.1   | Document `K_SUB_N`, `WMMA_LANE_K`; audit every other bare constant | aiw                                            | none (comments)          | S   | none | no  | --      |
 | P1.2   | Fix `_scmp_i32`'s false docstring (§1.4)                          | aiw                                            | none (comment)           | S   | none | no  | --      |
-| P1.3   | Drop the `Vec` alias -> `fx.Vector`                               | aiw                                            | bitwise                  | S   | none | no  | --      |
+| ~~P1.3~~ | ~~Drop the `Vec` alias~~ **dropped** -- `Vec` is the majority spelling (17 files vs 9), see §1.1 | -- | -- | -- | -- | -- | -- |
 | P1.4   | Delete `_ssel_i32`; use `cond.select(a, b)` (§1.2)                | aiw                                            | bitwise                  | S   | low  | yes | --      |
 | P1.5   | Drop `fx.Index(<const>)` casts; sweep for siblings (§1.3)         | aiw                                            | bitwise                  | S   | none | no  | --      |
 | P1.6   | Rename `_REVERSE_Q_TILES` -> `_LPT_TILE_ORDER` (§1.5)             | aiw                                            | bitwise                  | S   | none | no  | --      |
@@ -199,17 +199,22 @@ Three separate facts, and the useful one is the third:
   class `Float32x8` whose `ir_type` is lazily `Vector.make_type(8, Float32)`.
   It is used in **zero** places across `kernels/`, `tests/`, `examples/` and
   `python/`.
-- **`fx.Vector.make_type(n, dtype)` is the house convention.** Eleven-plus call
-  sites in `splitk_hgemm`, `rdna_f16_gemm`, `small_m_hgemm`, `fp4_gemm_4wave`,
-  `custom_all_reduce_kernel`, `wmma_peak`, `lds_reduce`.
+- **`Vector.make_type(n, dtype)` is the house convention**, under both
+  spellings. Counted across `kernels/`: **17 files import `Vector as Vec`**
+  (all four attention files that use vectors, plus most of gemm and moe) and
+  **9 spell it `fx.Vector`**. The alias is the *majority*.
 
-So the AIW file is already doing what every other kernel does, and the answer
-to "shouldn't this be built in" is that the spelling *is* the built-in one.
-The only thing that deviates is the local alias: line 110 does
-`from flydsl.expr.typing import T, Vector as Vec`, so this file says
-`Vec.make_type(...)` where every other kernel says `fx.Vector.make_type(...)`.
+So the AIW file is already doing what most of the repo does, and the answer to
+"shouldn't this be built in" is that the spelling *is* the built-in one.
 
-**Action (Phase 1):** drop the alias, match the other kernels.
+**Action: none.** An earlier draft of this plan had a P1.3 to drop the `Vec`
+alias, on the stated grounds that "every other kernel says
+`fx.Vector.make_type`". That was wrong -- it generalised from a partial grep
+that happened to surface only the minority spelling. Changing this file would
+have moved it from the majority convention to the minority one and split the
+attention directory 3-1, which is the opposite of the intent. Dropped, and
+recorded here rather than silently, because it is the fourth false claim this
+work has turned up and the first one that was in the plan itself.
 
 **Action (Phase 5):** reconsider `VectorAlias` for the shared helper module,
 where it earns its keep in a way it does not here. A helper that today takes a
