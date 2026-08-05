@@ -691,8 +691,26 @@ _SWA_WINDOWS = [
     (0, 64),       # anti-causal: only keys ahead of the query
     (-16, 64),     # band shifted off the diagonal, left bound negative
     (64, -16),     # ... and the other way
+    (-128, 256),   # left bound past a whole BLOCK_N: the *leading* masked run
+                   # spans several tiles, not just a clipped tile 0
+    (-256, 300),   # ... and further still
     (10_000, 10_000),  # wider than seqlen_k: degenerates to no masking
 ]
+
+
+def test_window_on_a_non_causal_build_is_rejected():
+    """A dropped window returns dense attention: right shape, finite, wrong.
+
+    The non-causal arm splits the KV range into `[full][tail-masked]` and has
+    no left-masked region to apply a window with, so this cannot be honoured
+    at runtime -- and nobody passes `window=` without believing it applies.
+    """
+    _require_env()
+    q, k, v = _qkv(1, 256, 64, torch.float16)
+    with pytest.raises(ValueError, match="requires a causal build"):
+        build_flash_attn_func_aiw_module(
+            num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16",
+        )(q, k, v, torch.empty_like(q), 1, 256, window=(-16, 64))
 
 
 @pytest.mark.parametrize("w_left,w_right", _SWA_WINDOWS, ids=[f"{a}_{b}" for a, b in _SWA_WINDOWS])

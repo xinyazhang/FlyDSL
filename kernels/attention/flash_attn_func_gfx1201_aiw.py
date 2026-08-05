@@ -1799,11 +1799,21 @@ def build_flash_attn_func_aiw_module_primary(
 
         # ---- Split the KV range into full and masked regions ----
         #
-        # A tile needs masking only if it runs past seqlen_k, or (causal) past
-        # this Q block's diagonal. Every earlier tile is fully live. Emitting
-        # the two regions as separate loops means the masks exist only in the
-        # second one -- `MASK_STEPS` in AOTriton's terms, with the split
+        # Emitting the regions as separate loops means the masks exist only in
+        # the masked one -- `MASK_STEPS` in AOTriton's terms, with the split
         # structural rather than a per-tile branch.
+        #
+        # **How many regions there are depends on the arm.** Non-causal has
+        # two, `[full][tail-masked]`, because the only thing that can cut a
+        # tile is running past seqlen_k. Causal has *three*: a left window
+        # kills columns at the start of the range as well, so masked tiles are
+        # a prefix as well as a suffix and tile 0 is not automatically live.
+        # A negative `window_left` is the sharpest case -- it pushes the whole
+        # band right of the diagonal, so the leading masked run can span
+        # several tiles rather than clipping one.
+        #
+        # Do not carry the two-region intuition into the causal branch; the
+        # "every earlier tile is fully live" shortcut is true only above.
         #
         # This is what pays back the unconditional mask P1e had to use: a
         # dynamic `scf.if` guard inside one loop measured much worse than no
@@ -3076,6 +3086,17 @@ def build_flash_attn_func_aiw_module_primary(
         there is more than one sequence.
         """
         if CAUSAL_TYPE == 0:
+            if window is not None:
+                # Silently dropping it would return dense attention that is
+                # the right shape, finite, and wrong -- and a window is only
+                # ever passed by a caller who believes it is being applied.
+                # The non-causal arm has no left-masked region to apply one
+                # with, so this is a build-time choice, not a runtime one.
+                raise ValueError(
+                    "window= requires a causal build; this one has "
+                    "causal=False. Pass causal=True, causal_type=3 for "
+                    "generalized sliding-window attention"
+                )
             return 0, 0
         if HOST_CAUSAL_TYPE in _CAUSAL_SENTINEL:
             if window is not None:
