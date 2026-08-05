@@ -1262,29 +1262,29 @@ def build_flash_attn_func_aiw_module_primary(
             q_tile_idx = _ntiles - fx.Index(1) - fx.Index(gpu.block_idx.y)
         else:
             q_tile_idx = fx.Index(gpu.block_idx.y)
-        q_start = q_tile_idx * BLOCK_M
+        start_q = q_tile_idx * BLOCK_M
 
         # Does this workgroup own any real Q row? Under varlen the grid's Q
         # extent is sized from Max_seqlen_q, so whole workgroups land past the
         # end of a shorter sequence and this is false for them.
         _alive = ArithValue(
-            arith.cmpi(arith.CmpIPredicate.slt, _raw(q_start), _raw(seqlen_q_v))
+            arith.cmpi(arith.CmpIPredicate.slt, _raw(start_q), _raw(seqlen_q_v))
         )
 
         # **The Q base must be clamped, not just the row within the tile.**
-        # `q_tbase(q_start)` folds q_start into the 64-bit base, and the
+        # `q_tbase(start_q)` folds start_q into the 64-bit base, and the
         # in-bounds guard below only clamps the row *inside* the tile -- so a
-        # dead workgroup still addresses `row_off + q_start` rows in, which
+        # dead workgroup still addresses `row_off + start_q` rows in, which
         # for a packed tensor runs past the end of the whole allocation, not
         # merely past this sequence. Dense never reached it: there the grid is
-        # exactly ceil(seqlen_q / BLOCK_M), so q_start < seqlen_q always.
+        # exactly ceil(seqlen_q / BLOCK_M), so start_q < seqlen_q always.
         #
         # Faults for real -- a 1.3 MB overshoot on a 16-sequence batch hits an
         # unmapped page. It is a *read*, and one whose result is discarded, so
         # smaller overshoots land inside the allocation and are silently
         # harmless, which is exactly why the varlen tests did not catch it.
         _q_start_addr = fx.Index(
-            ArithValue(_alive).select(q_start, fx.Index(0))
+            ArithValue(_alive).select(start_q, fx.Index(0))
         )
 
         # MQA/GQA: Num_head_q / Num_head_k query heads share each KV head.
@@ -1746,7 +1746,7 @@ def build_flash_attn_func_aiw_module_primary(
         # ---- Q preload ----
         # One row-tile per Q_ROW_TILES; at 1 this is the single-tile mapping.
         q_rows = [
-            q_start + wave_q_offset + fx.Index(qt * WMMA_M) + lane16
+            start_q + wave_q_offset + fx.Index(qt * WMMA_M) + lane16
             for qt in range_constexpr(Q_ROW_TILES)
         ]
         q_row_i32s = [fx.Int32(r) for r in q_rows]
@@ -1884,14 +1884,14 @@ def build_flash_attn_func_aiw_module_primary(
             # into a single masked run, and an irregular seqlen_q needs no
             # special handling because `_q_hi` already bounds the rows.
             #
-            # Bounds for the rows this Q block actually owns, [q_start, q_hi):
+            # Bounds for the rows this Q block actually owns, [start_q, q_hi):
             #   a column c is live for row i iff  i - w_left <= c <= i + w_right
             # so over the whole block the live columns span
-            #   [ q_start - w_left, (q_hi - 1) + w_right ]
+            #   [ start_q - w_left, (q_hi - 1) + w_right ]
             # and a tile is *fully* live iff every one of its columns is live
             # for every row -- worst case the largest row on the left and the
             # smallest on the right.
-            _q_start_i32 = fx.Int32(q_start)
+            _q_start_i32 = fx.Int32(start_q)
             _q_hi_i32 = _smin_i32(
                 _q_start_i32 + fx.Int32(BLOCK_M), _seqlen_q_i32
             )
@@ -1918,7 +1918,7 @@ def build_flash_attn_func_aiw_module_primary(
             _v_hi = _ssel_i32(_alive, _v_hi, _v_lo - fx.Int32(1))
 
             # First tile clear of the left edge: ceil(((q_hi-1) - w_left)/BN).
-            # First tile touched by the right edge: floor((q_start+w_right+1)/BN).
+            # First tile touched by the right edge: floor((start_q+w_right+1)/BN).
             #
             # Both are *exact*, not the conservative-by-one form the plan
             # sketched: when the boundary column falls exactly on a tile edge
@@ -2752,7 +2752,7 @@ def build_flash_attn_func_aiw_module_primary(
                     def _emit_o_store():
                         _store_global_half(
                             o_ptr,
-                            o_tbase(q_start),
+                            o_tbase(start_q),
                             o_toff(q_rows_in_tile[qt], d_col),
                             o_trunc,
                         )
