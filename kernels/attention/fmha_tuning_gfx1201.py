@@ -313,3 +313,33 @@ def _aiw_knobs(head_dim: int, use_bp: bool, variant: str) -> dict:
         "v_lds_layout": "transposed" if dist else "row",
         "q_row_tiles": _q_row_tiles(head_dim, variant),
     }
+
+
+# ---------------------------------------------------------------------------
+# Which tile widths exist at all.
+#
+# Also tuning: the ladder decides how many kernels get compiled and how much
+# a head_dim between rungs over-computes. `_MAX_HEAD_DIM` is derived from it
+# rather than written twice -- they were both 512 in two files, which is one
+# edit away from disagreeing.
+# ---------------------------------------------------------------------------
+
+# The compiled tile widths. `head_dim` is rounded up to the smallest of these
+# that covers it; the real extent then rides along as a runtime argument and the
+# kernel masks the difference. Mirrors AOTriton's `block_dmodel_values()`, which
+# is the same list minus 384.
+_BLOCK_DMODEL_LADDER = (16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 384, 512)
+
+
+def _round_to_ladder(head_dim: int) -> int:
+    """Smallest compiled tile width covering `head_dim`."""
+    for w in _BLOCK_DMODEL_LADDER:
+        if w >= head_dim:
+            return w
+    raise ValueError(
+        f"head_dim {head_dim} exceeds the largest compiled tile "
+        f"({_BLOCK_DMODEL_LADDER[-1]})"
+    )
+
+
+MAX_HEAD_DIM = _BLOCK_DMODEL_LADDER[-1]

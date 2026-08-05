@@ -34,7 +34,8 @@ from functools import lru_cache
 import torch
 
 from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module
-from fmha_tuning_gfx1201 import _aiw_knobs, _use_bp
+from fmha_tuning_gfx1201 import MAX_HEAD_DIM as _MAX_HEAD_DIM
+from fmha_tuning_gfx1201 import _aiw_knobs, _round_to_ladder, _use_bp
 from fmha_tuning_gfx1201 import default_block_m as aiw_block_m
 from fmha_tuning_gfx1201 import default_prefetch_dist as aiw_prefetch_dist
 
@@ -50,36 +51,6 @@ __all__ = ["flydsl_flash_attn_func_gfx1201"]
 # multiple of this; padding is invisible to callers.
 # BLOCK_M is head_dim-dependent; see default_block_m() in the kernel module.
 _KERNEL_BLOCK_M = 128
-
-# A wave's output accumulator is head_dim/2 VGPRs, so an unsliced head_dim 512
-# would need the whole 256-VGPR file before anything else, and its K+V LDS tile
-# would exceed the 64 KB workgroup limit (66048 B). Both are avoided by slicing
-# the V/output width -- see "head_dim above 256" in gfx1201_fmha.md.
-_MAX_HEAD_DIM = 512
-
-# Above this QK width the V/output side is computed in column slices of this
-# size, so that o_accs (head_dim_v/2 VGPRs) and the V LDS tile stay in budget.
-
-
-# The compiled tile widths. `head_dim` is rounded up to the smallest of these
-# that covers it; the real extent then rides along as a runtime argument and the
-# kernel masks the difference. Mirrors AOTriton's `block_dmodel_values()`, which
-# is the same list minus 384.
-_BLOCK_DMODEL_LADDER = (16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 384, 512)
-
-
-def _round_to_ladder(head_dim: int) -> int:
-    """Smallest compiled tile width covering `head_dim`."""
-    for w in _BLOCK_DMODEL_LADDER:
-        if w >= head_dim:
-            return w
-    raise ValueError(
-        f"head_dim {head_dim} exceeds the largest compiled tile "
-        f"({_BLOCK_DMODEL_LADDER[-1]})"
-    )
-
-
-
 
 def _torch_dtype_to_str(dtype: torch.dtype) -> str:
     if dtype == torch.bfloat16:
