@@ -65,8 +65,11 @@ baseline. Tier 3 runs once, after P5.5.
 | P1.7b  | Rename `q_start` -> `start_q`                                     | aiw                                            | bitwise                  | S   | low  | no  | --      |
 | P2.1   | Move 6 tuning functions/constants to the interface (§4.1)         | aiw, interface                                 | schedule-diff + bitwise  | M   | low  | no  | --      |
 | P2.2   | Env vars -> build knobs, incl. `fp_mode` (§4.2)                   | aiw, interface                                 | schedule-diff + bitwise  | M   | med  | no  | P2.1    |
-| P2.3   | Introduce `FmhaProblem` / `FmhaSchedule` dataclasses (§4.3)       | aiw, interface, tests                          | schedule-diff + bitwise  | M   | low  | no  | P2.2    |
-| P2.4   | Make the interface the only producer of a `FmhaSchedule`          | aiw, interface                                 | schedule-diff            | S   | low  | no  | P2.3    |
+| P2.5a  | **done** -- interface knob-mapping policy -> tuning module        | interface, tuning                              | schedule-diff            | S   | low  | no  | P2.1    |
+| P2.5b  | `_BLOCK_DMODEL_LADDER` + `_round_to_ladder` -> tuning module; derive `_MAX_HEAD_DIM` from the ladder | interface, tuning | schedule-diff        | S   | low  | no  | P2.5a   |
+| P2.3   | Introduce `FmhaProblem` / `FmhaSchedule` dataclasses (§4.3)       | aiw, tuning, interface, tests                  | schedule-diff + bitwise  | M   | low  | no  | P2.5b   |
+| P2.4   | `fmha_tuning.resolve_schedule(problem)` -- one entry point, sole producer (§4.4) | tuning, interface              | schedule-diff            | M   | low  | no  | P2.3    |
+| P2.6   | Public API takes a knobs dataclass; drop `use_binding_prefetch` and `variant` (§4.4) | interface, tests, benches   | schedule-diff + bitwise  | M   | med  | no  | P2.4    |
 | P3.1   | **Inventory**: classify all 100 `fx.Index` sites; publish the 64-bit list | plan (artifact)                        | review                   | M   | none | no  | --      |
 | P3.2   | Narrow sequence-space quantities to `fx.Int32` (§5.2a)            | aiw                                            | bitwise + gSWA-90 + perf | L   | **high** | yes | P3.1, P2.3 |
 | P3.3   | Delete `_scmp_i32`/`_smin_i32`/`_smax_i32`                        | aiw                                            | bitwise                  | S   | low  | yes | P3.2    |
@@ -522,6 +525,52 @@ policy drift back in unnoticed.
 
 Both frozen, so a schedule cannot be mutated after it has been used as a cache
 key.
+
+### 4.4 The public API, and one entry point into tuning
+
+Requested during Phase 2 and deliberately deferred to the end of it, because
+both parts are much easier once all the policy is in one module (P2.1, P2.5)
+and the dataclasses exist (P2.3).
+
+**`fmha_tuning_gfx1201` gets a single entry point.** Today a caller assembles a
+schedule by hand out of `_use_bp`, `_aiw_knobs`, `default_block_m` and
+`aiw_prefetch_dist`, in the right order, with the interface holding that
+sequence. That ordering is knowledge the tuning module should own:
+
+```python
+def resolve_schedule(problem: FmhaProblem,
+                     overrides: FmhaSchedule | None = None) -> FmhaSchedule:
+    """The complete measured configuration for this problem."""
+```
+
+`overrides` is how a caller pins one knob without knowing how the rest are
+derived -- any field left `None` is filled by policy. This is also what makes
+P2.4's "sole producer" claim enforceable: the interface stops resolving
+anything and simply calls this.
+
+**The public API takes the dataclass instead of scattered flags.**
+`flydsl_flash_attn_func_gfx1201` currently exposes `use_binding_prefetch` and
+`variant="m32"`, which are two different spellings of "override the tuning
+policy" -- one boolean and one string enum, neither extensible, and both
+requiring the interface to know what they mean. They become:
+
+```python
+flydsl_flash_attn_func_gfx1201(q, k, v, causal=..., schedule=None)
+```
+
+with `schedule=None` meaning "use the policy" and a partially-filled
+`FmhaSchedule` meaning "use the policy except for these". `use_binding_prefetch
+=True` becomes `FmhaSchedule(k_prefetch_dist=1)` and `variant="m32"` becomes
+`FmhaSchedule(q_row_tiles=2)`, which say what they do rather than naming a
+historical kernel variant.
+
+**Blast radius, since this is the one API-breaking task in the plan.** Ten call
+sites in `test_flash_attn_func_gfx1201.py` pass one of the two flags; the other
+seven files that call the entry point (`bench_aiw_ab`, `bench_fmha`,
+`bench_one`, `accuracy_probe`, `perf_ab`, `codegen_fingerprint`) do not and are
+unaffected. Whether the old keywords stay as deprecated aliases for a release is
+a call for the point of doing it, not now -- there is no external caller in this
+tree.
 
 **Gate:** the enumeration trick from §2.3 -- for every
 `(head_dim, causal, dtype, flags)` combination the interface can produce, diff
