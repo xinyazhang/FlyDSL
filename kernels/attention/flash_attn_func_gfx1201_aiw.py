@@ -111,6 +111,8 @@ from flydsl.expr.typing import T, Vector as Vec
 from philox import Philox, dropout_threshold
 from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
 
+from gfx1201_standalone import wmma_ops
+
 KERNEL_NAME = "flash_attn_func_gfx1201_aiw_kernel"
 _LOG2E = host_math.log2(host_math.e)
 _LN2 = 0.6931471824645996  # matches AOTriton's literal exactly
@@ -1004,13 +1006,9 @@ def build_flash_attn_func_aiw_module_primary(
                 fx.ptr_store(part, lds_kv + fx.Int32(lds_idx + _i * 4))
 
         def wmma_acc(a_v8, b_v8, c_v8):
-            if const_expr(dtype_str == "bf16"):
-                a_i16 = Vec(a_v8).bitcast(fx.Int16)
-                b_i16 = Vec(b_v8).bitcast(fx.Int16)
-                return rocdl.wmma_f32_16x16x16_bf16(
-                    v8f32_type, _raw(a_i16), _raw(b_i16), c_v8
-                ).result
-            return rocdl.wmma_f32_16x16x16_f16(v8f32_type, a_v8, b_v8, c_v8).result
+            # Dispatch is on the operand element type, in `wmma_ops`, rather
+            # than on `dtype_str` here -- see that module for why.
+            return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
 
         def _scmp_i32(pred, a, b):
             """A *signed* integer compare. The `<` and `>` overloads on
