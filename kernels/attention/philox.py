@@ -303,11 +303,17 @@ def dropout_threshold(p: float) -> int:
 def keep_mask(vals: list[fx.Int32], threshold: int | fx.Int32) -> list[ArithValue]:
     """`vals > threshold` as **signed** compares -- one predicate per value.
 
-    The signedness is the whole reason this is here rather than at the call
-    site. `fx.Int32`'s `>` overload is *unsigned*, and the threshold is
-    negative for every `p < 0.5` -- the common case -- so the natural spelling
-    silently keeps everything. This module owns the compare so that trap is
-    written once.
+    Signed is not an implementation detail: the randoms span the full u32
+    range reinterpreted as `i32`, and `dropout_threshold` is negative for
+    every `p < 0.5`. Comparing them unsigned keeps everything, which looks
+    like working dropout at a glance because the output is still finite and
+    still attention-shaped. AOTriton makes the same choice for the same
+    reason, having bitcast to `int32` to get a comparison at all.
+
+    `fx.Int32` is `signed=True`, so the predicate here agrees with what its
+    `>` overload would emit; it is spelled out because the values arrive as
+    raw `u32` bit patterns whose Python-side type is incidental, and this
+    module rather than each caller should own which way they are read.
     """
     thr = fx.Int32(threshold)
     return [
