@@ -67,7 +67,7 @@ The `()` is the tell that a helper is in category 2. Prefer 1 when the object
 allows it; it reads better and constructs once.
 """
 
-from typing import NamedTuple
+from dataclasses import dataclass
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -625,16 +625,30 @@ def resolve_window(window_left, window_right, seqlen_q, seqlen_k):
     return left, right
 
 
-class CausalRegions(NamedTuple):
-    """The three contiguous KV block runs a causal/windowed Q block walks."""
+@dataclass(frozen=True, slots=True)
+class CausalRegions:
+    """The three contiguous KV block runs a causal/windowed Q block walks.
 
-    n_left: object      # masked tiles before the full run
-    n_full: object      # tiles with no mask at all
-    n_right: object     # masked tiles after it
-    left_col0: object   # first KV column of each run
-    full_col0: object
-    right_col0: object
-    masked_col0: object  # first column of the masked run, whichever side
+    Every field is a traced `fx.Int32`, not a Python int -- these are values
+    the kernel computes per workgroup. Signed, because `right_col0` goes
+    negative when the window admits no key at all; see
+    `decompose_causal_regions`.
+
+    A dataclass rather than a `NamedTuple` to match `Philox` next door, and
+    because no caller destructures it positionally -- the kernel reads the
+    seven fields by name. Being a Python object it is subject to the usual
+    rule: do not let one live across a dynamic `if` (see "How to hand a helper
+    object to kernel code"). The kernel unpacks it immediately, which is why
+    it is safe here.
+    """
+
+    n_left: fx.Int32      # masked tiles before the full run
+    n_full: fx.Int32      # tiles with no mask at all
+    n_right: fx.Int32     # masked tiles after it
+    left_col0: fx.Int32   # first KV column of each run
+    full_col0: fx.Int32
+    right_col0: fx.Int32
+    masked_col0: fx.Int32  # first column of the masked run, whichever side
 
 
 def decompose_causal_regions(
