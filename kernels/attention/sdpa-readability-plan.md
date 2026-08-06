@@ -1014,3 +1014,39 @@ them was the original framing of this item, but once they assert over resolved
 knobs the argument weakens: they are the builder's preconditions, they read
 next to the geometry they constrain, and several depend on values (`VO_SLICE`,
 `NUM_S_VALS`) that only exist part-way through it.
+
+---
+
+## 13. Future: accept BHSD shape, not BSHD
+
+Requested for AOTriton integration -- its `attn_fwd` takes BHSD, and matching
+it removes a transpose (or a shape reinterpretation) at every call site of the
+eventual backend shim.
+
+**Terminology, since the current comments muddle it.** *Shape* is `t.shape`;
+*layout* is how the data sits in memory. Today the kernel requires **shape
+BSHD** (`interface.py:144` unpacks `(batch, seq_len, num_heads, head_dim)`) and
+accepts **any layout** whose D axis is innermost -- `_strides_of` reads
+`stride(0..2)` from the tensor and only insists on `stride(3) == 1`, because
+loads and stores are 8 columns wide along D. So a BHSD-*layout* tensor is
+already supported; it is passed as `t.transpose(1, 2)`, which has BSHD shape.
+
+What the change is, and what it is not:
+
+- **Not** a kernel change. The builder never sees a shape -- it receives three
+  strides and a runtime extent, and multiplies indices by the strides it was
+  handed. `_addr_pair`'s `s_batch, s_seq, s_head = st` keeps working; only
+  *which* of the caller's strides lands in each slot moves.
+- **Is** an interface change: the shape unpack at `interface.py:144`, the order
+  the strides are collected in `_strides_of`, and the `num_heads`/`seq_len`
+  arguments derived from the shape.
+- **Is** a test and benchmark change. Every harness in this directory builds
+  `(B, S, H, D)` tensors -- `_qkv`, `perf_ab`, `codegen_fingerprint`,
+  `bench_aiw_ab`, `accuracy_probe`. They are also the reference-comparison
+  sites, and PyTorch SDPA wants BHSD, so several of them currently transpose on
+  the way in and would stop needing to.
+
+Two things to decide when it is done rather than now: whether to accept both
+shapes behind a flag during migration (probably not -- two shape conventions is
+the confusion this removes), and whether `_strides_of`'s comment gets rewritten
+to use the shape/layout distinction above, which it should regardless.
