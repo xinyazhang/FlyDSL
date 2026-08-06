@@ -102,3 +102,37 @@ move `row_in_tile * s_seq` into the 64-bit term. The obstacle remains that the
 base is uniform per workgroup while the row is per-lane, so it needs a third
 address component: uniform-64 + divergent-64-row + divergent-32-col, or the row
 folded per-lane once outside the loop rather than per address inside it.
+
+
+## 6. Recovering the cost: hoist the row term, do not merely split it
+
+Analysed, not yet implemented.
+
+The proposal was to pull `row * s_seq` out of `toff` so the address becomes
+`u64 base + u64 row + i32 col`, on the theory that the row term is a scalar.
+**It is not.** `q_rows_in_tile = wave_q_offset + qt * WMMA_M + lane16`, and
+`lane16 = lane % 16`, so the row is per-lane and the product is a *vector*
+u64. Splitting alone therefore still leaves a 64-bit divergent operand, which
+is precisely what stops LLVM's `SelectGlobalSAddr` keeping the base in SGPRs --
+so it would not recover the 9%.
+
+The half that does work is that the term is **loop-invariant**: it depends only
+on `lane16`, `wave_q_offset` and `qt`, all fixed for the kernel's lifetime.
+
+    per-lane u64 base = tile_base(uniform) + rows_in_tile * s_seq   # once
+    each access       = base + col                                  # i32
+
+so the 64-bit multiply and add are paid once rather than per address, and a
+small constant `col` can fold into the load's immediate-offset field and cost
+no VALU at all.
+
+The correctness half of the proposal is right and is what makes the split
+legal: **only `row * s_seq` can exceed i32.** `col` is a head_dim column index,
+bounded by `BLOCK_DMODEL <= 512`, so it stays 32-bit by proof rather than by
+assumption -- which is the property the original code lacked.
+
+Two things to check when implementing. The K/V side re-bases every KV
+iteration, so its uniform term changes in the loop while its row term does not;
+the hoist still applies but to a different split point. And the win is a
+prediction, not a measurement -- the tier-1 fingerprint will say whether the
+addressing mode came back, and only tier 2.9 says whether the 9% did.
