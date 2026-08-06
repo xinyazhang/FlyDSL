@@ -22,7 +22,7 @@ addressing arithmetic here is bounded by a tile.
 
 | group                                            | bound                                   | sites |
 | -------------------------------------------------- | ----------------------------------------- | ------- |
-| `seqlen_q_v`, `seqlen_k_v`, `seq_last`           | a sequence length; i32 by ABI already     | 3     |
+| `seqlen_q_v` (only -- see §7)                    | a sequence length; i32 by ABI already     | 1     |
 | `start_q`, `start_k`, `q_tile_idx`, `_ntiles`    | < max_seqlen, itself an i32 argument      | ~12   |
 | `shard_qk_off`, `shard_vo_off`                   | **measured max 384** (§11.2)              | 2     |
 | head_dim column indices (`q_col`, `k_col`, `d_*`)| < BLOCK_DMODEL <= 512                     | ~20   |
@@ -198,3 +198,45 @@ Two process notes, both mistakes made on the way here:
   spill more under the hoist and win anyway, which made the mechanism look
   unexplainable. Against the right baseline it spills less. Diff against the
   build the knob actually replaces.
+
+
+## 7. P3.2 negative result: the K sequence length cannot follow the Q one
+
+`seqlen_q_v` narrowed cleanly. `seqlen_k_v` did not, and the difference is not
+about the values -- both are bounded by an i32 ABI argument -- but about who
+consumes them.
+
+`seqlen_q_v` had two consumers, both pure comparisons, so narrowing it removed
+two hand-written `arith.cmpi(slt, ...)` workarounds along with the width and
+came out slightly *smaller*: scratch 56 -> 52 at BLOCK_DMODEL 192.
+
+`seqlen_k_v` has five, and none of them are pure comparisons:
+
+| consumer                       | why it stays 64-bit                             |
+| ------------------------------ | ----------------------------------------------- |
+| `_kv_addr`'s `ts` select       | `ts` feeds `tbase`, which multiplies by `s_seq` |
+| `kv_off`'s bounds predicate    | compares against `ts` and `row_in_tile`, both addressing |
+| `kv_off`'s clamp arm           | the selected row feeds `toff`'s multiply        |
+| `_full_end`, `kv_upper`        | `scf.for` bounds, which are index-typed         |
+| the mask column predicate      | already i32 -- this one was a round trip, now removed |
+
+Narrowing the first three costs **160 bytes of scratch at BLOCK_DMODEL 192**,
+52 -> 212, which is most of the head_dim 192 win from `kv_addr_hoist`. Two
+attempts, both measured:
+
+| variant                                       | scratch @ 192 | insts |
+| --------------------------------------------- | ------------- | ----- |
+| baseline (Q narrowed only)                    |            52 |  2388 |
+| + narrow `ts`, `seq_last` and the predicates  |           212 |  2468 |
+| + narrow the predicates only, `ts` left alone |           212 |  2465 |
+
+The second row was the hypothesis -- that `ts` was the problem because
+`tbase(fx.Index(ts))` re-widens it -- and the third row refutes it. The cost is
+the *predicates*: truncating a value that is also live in 64 bits makes both
+forms live at once, and at a width that already spills, that is paid in
+scratch.
+
+**Rule for the rest of P3.2:** narrow a quantity only when *every* consumer is
+sequence-space. A quantity that is compared in sequence space but multiplied in
+address space is an addressing quantity, and section 1 already says so -- what
+this adds is that the comparison does not get to be narrowed on its own either.
