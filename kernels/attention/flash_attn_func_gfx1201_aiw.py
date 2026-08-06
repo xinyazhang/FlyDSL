@@ -997,100 +997,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             o_st = (fx.Index(stride_o0), fx.Index(stride_o1), fx.Index(stride_o2))
             sm_log2e = fastmath.mul(sm_scale_arg, fx.Float32(_LOG2E))
 
-        # Q/K/V/O each get their own address pair. They genuinely differ: K and
-        # V are whatever the caller allocated (`mha_fwd_aot` passes them through
-        # untouched), and under MQA/GQA they carry Num_head_k rather than
-        # Num_head_q, so their head stride differs from Q's by construction.
-        # Assuming one shared layout is not a simplification, it is wrong.
-        def _addr_pair(st, head, batch_index, row_off):
-            # `row_off` is the varlen row offset, and it belongs in the
-            # **64-bit base** rather than the 32-bit per-lane offset: on a
-            # packed tensor it is a whole-batch quantity and overflows 32 bits
-            # at realistic token counts (sdpa-varlen-plan.md section 5).
-            s_batch, s_seq, s_head = st
-            bh = batch_index * s_batch + head * s_head + row_off * s_seq
-
-            def tbase(seq_start):
-                """Uniform 64-bit element base for (batch, head, seq_start).
-
-                `seq_start` is a position on whichever sequence axis this
-                tensor is indexed by -- rows for Q/O, KV columns for K/V --
-                since `_addr_pair` builds one of these per tensor.
-                """
-                return bh + seq_start * s_seq
-
-            def toff(row_in_tile, col):
-                """Divergent 64-bit element offset inside the tile.
-
-                64-bit because `row_in_tile * s_seq` genuinely does not fit in
-                32: nothing requires the caller's tensor to be compact, and a
-                view keeps its source's strides -- slicing `(1, 64, 16384,
-                512)` f16, a 1 GiB tensor, down to eight heads leaves
-                `s_seq = 8388608`, and 256 rows of that is exactly 2**31.
-
-                It is worth keeping separate from `tbase` for callers outside
-                the KV loop, where it is loop-invariant and LICM pays the
-                64-bit width once. Inside the loop it is `kv_off` that decides
-                whether that stays true.
-                """
-                return row_in_tile * s_seq + col
-
-            def kv_off(ts, row_in_tile, col):
-                """`toff` for a KV row, with the out-of-range row folded in.
-
-                Two forms of the same value, and the whole difference is
-                whether `row_in_tile * s_seq` stays loop-invariant.
-
-                Recomputed (KV_ADDR_HOIST off) clamps the row first, so `row`
-                depends on `ts`, which moves every KV iteration: the 64-bit
-                multiply is loop-carried and re-emitted per load per
-                iteration. At BLOCK_DMODEL 192 that is 14 `v_mul_lo_u32` and
-                21 `v_add_co_u32` in the loop body, against 3 and 11 for the
-                pre-64-bit kernel.
-
-                Hoisted selects between two whole offsets instead, so both
-                arms are loop-invariant per-lane values and the one uniform
-                term is factored out of the select: the loop pays two adds and
-                the select, and the multiply leaves it entirely. What it costs
-                is one more 64-bit value live per cooperative load, which is
-                why this is a knob and not simply the better form -- see
-                `_KV_ADDR_HOIST_HEAD_DIMS` in the tuning module for where each
-                one wins.
-
-                The hoisted out-of-range arm sends the lane to its own column
-                in row `ts`, the tile's first row, rather than to the last row
-                of the sequence: any in-bounds address will do, since the
-                value is discarded, and this one shares `ts * s_seq` with the
-                in-range arm. `col` and not the literal `0`, which is equally
-                in bounds and needs no register of its own -- the 0 arm holds
-                one value fewer live and still spills *more*, 272 bytes of
-                scratch against 44 at BLOCK_DMODEL 192, for 0.863 against
-                1.172 on the same baseline. Re-measure before changing it.
-
-                Each form states the bounds predicate its own way, and that is
-                deliberate rather than untidy. `row_in_tile < seqlen_k - ts`
-                puts the whole uniform half on one side, so it is one compare
-                against an SGPR instead of a divergent 64-bit add and compare
-                -- but only the hoisted form is free to use it, because the
-                recomputed one needs `seq_last - ts` for its clamp anyway and
-                because keeping it verbatim is what makes a knob-off build
-                bitwise identical to the kernel before this knob existed.
-                """
-                if const_expr(not KV_ADDR_HOIST):
-                    in_range = (ts + row_in_tile) < seqlen_k_v
-                    row = fx.Index(
-                        ArithValue(in_range).select(row_in_tile, seq_last - ts)
-                    )
-                    return toff(row, col)
-                # `ts < seqlen_k` always -- it is either start_k, which the
-                # caller's branch tested, or seq_last -- so this cannot wrap.
-                in_range = row_in_tile < (seqlen_k_v - ts)
-                return fx.Index(
-                    ArithValue(in_range).select(toff(row_in_tile, col), col)
-                )
-
-            return tbase, toff, kv_off
-
         # Q and O are indexed by the query head; K and V by the KV head they
         # share. At num_head_q == num_head_k these coincide.
         _q_batch_v = fx.Index(q_batch)
@@ -1132,47 +1038,28 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 philox_offset_base, _off_zh, max_seqlen_q, max_seqlen_k
             )
 
-        # Q and O are addressed once each, outside the KV loop, so they have no
-        # use for the clamped form.
-        q_tbase, q_toff, _ = _addr_pair(q_st, head_q, _q_batch_v, _q_row_off_v)
-        k_tbase, k_toff, k_kv_off = _addr_pair(k_st, head_k, _k_batch_v, _k_row_off_v)
-        v_tbase, v_toff, v_kv_off = _addr_pair(v_st, head_k, _k_batch_v, _k_row_off_v)
-        o_tbase, o_toff, _ = _addr_pair(o_st, head_q, _q_batch_v, _q_row_off_v)
-
-        def _kv_addr(tbase, toff, kv_off, start_k, row_in_tile, col):
-            """(uniform base, divergent offset) for a KV row, clamped in bounds.
-
-            At K_PREFETCH_DIST == 1 the loop runs one tile ahead, so the final
-            iteration addresses a tile past the end of the sequence; the
-            unguarded cooperative load also addresses rows past BLOCK_N. Clamp
-            start_k first, then send any row still past the end to the last
-            row of the sequence. The values are never consumed; the clamp
-            exists only so the address stays inside the allocation.
-
-            With both distances 0 there is no over-read: the interface pads
-            seq_len to a multiple of BLOCK_M and BLOCK_N divides BLOCK_M, so
-            start_k + BLOCK_N <= seq_len always. Skip the clamp there; it is
-            pure VALU.
-            """
-            if const_expr(
-                _NO_KV_CLAMP
-                or (
-                    K_PREFETCH_DIST == 0
-                    and V_PREFETCH_DIST == 0
-                    and not KV_NEEDS_GUARD
-                )
-            ):
-                return tbase(start_k), toff(row_in_tile, col)
-            ts = fx.Index(
-                ArithValue(start_k < seqlen_k_v).select(start_k, seq_last)
-            )
-            return tbase(ts), kv_off(ts, row_in_tile, col)
-
-        def k_addr(start_k, row_in_tile, col):
-            return _kv_addr(k_tbase, k_toff, k_kv_off, start_k, row_in_tile, col)
-
-        def v_addr(start_k, row_in_tile, col):
-            return _kv_addr(v_tbase, v_toff, v_kv_off, start_k, row_in_tile, col)
+        # `clamp` is const_expr: with both prefetch distances 0 and no load
+        # guard there is no over-read, so the clamp is not emitted at all.
+        _KV_CLAMP = not (
+            _NO_KV_CLAMP
+            or (K_PREFETCH_DIST == 0 and V_PREFETCH_DIST == 0 and not KV_NEEDS_GUARD)
+        )
+        _addr_kw = dict(
+            seqlen_k=seqlen_k_v, seq_last=seq_last,
+            hoist=KV_ADDR_HOIST, clamp=_KV_CLAMP,
+        )
+        q_tbase, q_toff, _ = fmha.make_addr_pair(
+            q_st, head_q, _q_batch_v, _q_row_off_v, **_addr_kw
+        )
+        _, _, k_addr = fmha.make_addr_pair(
+            k_st, head_k, _k_batch_v, _k_row_off_v, **_addr_kw
+        )
+        _, _, v_addr = fmha.make_addr_pair(
+            v_st, head_k, _k_batch_v, _k_row_off_v, **_addr_kw
+        )
+        o_tbase, o_toff, _ = fmha.make_addr_pair(
+            o_st, head_q, _q_batch_v, _q_row_off_v, **_addr_kw
+        )
 
         # ---- PADDED_HEAD column handling ----
         #
