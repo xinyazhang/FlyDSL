@@ -209,3 +209,31 @@ testable without a GPU, which is the largest single correctness surface in the
 kernel and today has only end-to-end coverage.
 
 It does not make `_kv_body` shorter, and should not pretend to.
+
+## 6. Where this plan stops, and what would let it go further
+
+The staging and prefetch calls stay in `kv_loop_body`. That is the end state
+for this plan, not a step left undone: their position in the instruction stream
+is the schedule, and the schedule is per-architecture.
+
+A complete offload -- one where the body is nothing but stage calls -- needs a
+**unified framework across the major architectures**, designed by looking at
+gfx950, gfx1201, gfx942 and gfx1250 FMHA together. Only then is it possible to
+say which parts of a schedule are genuinely common and which are one target's
+accident, and only a framework that knows that can own the staging without
+flattening what makes each target fast.
+
+Two reasons not to attempt it from here:
+
+- **One data point cannot design an abstraction.** Deriving a "general" staging
+  interface from gfx1201 alone would encode RDNA4's prefetch structure as the
+  shape everything else must fit. `flash_attn_utils.py` is the cautionary
+  case: its traits/context machinery is a real abstraction, built for gfx950's
+  MFMA/VALU co-execution, and it does not transfer.
+- **The arch-suffixed modules are the right precondition.** Having
+  `fmha_common_gfx1201.py`, and later `_gfx950` / `_gfx1250` siblings, makes
+  the common subset *visible* -- three concrete modules to diff -- instead of
+  hypothetical. That is the input the framework exercise needs.
+
+So the sequence is: finish the per-arch modules, let them stabilise, then
+design across them. Not the reverse.
