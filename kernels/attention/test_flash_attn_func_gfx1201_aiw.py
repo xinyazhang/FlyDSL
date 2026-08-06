@@ -1902,19 +1902,7 @@ _FAR_LAYOUTS = {
     [
         "batch",
         "head",
-        pytest.param(
-            "seq",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="Capability limit, documented rather than hidden. The "
-                "per-lane offset `row_in_tile * stride_seq` is 32-bit (see "
-                "`toff`), so a sequence stride past 2**31 is unaddressable and "
-                "the kernel raises. No physical layout reaches it -- "
-                "stride_seq is at most num_heads * head_dim. strict=True, so "
-                "widening that offset would make this xpass and force the "
-                "decision to be revisited rather than silently absorbed.",
-            ),
-        ),
+        "seq",
     ],
 )
 def test_element_offsets_past_2gi(axis):
@@ -1960,35 +1948,5 @@ def test_element_offsets_past_2gi(axis):
         )
     finally:
         far.clear()
-        torch.cuda.empty_cache()
-
-
-def test_unaddressable_sequence_stride_is_rejected():
-    """A sequence stride the per-lane offset cannot hold must raise, not wrap.
-
-    `toff` computes `row_in_tile * stride_seq` in 32 bits, which is safe for
-    any physical layout -- `stride_seq` is at most `num_heads * head_dim`, so
-    256 rows of it stay far under 2**31. A synthetic strided view can break
-    that, and the original failure mode was silent: the product wrapped
-    negative, the kernel read a different allocation, and the far row came back
-    with rel error 0.497 while row 0 was exact.
-
-    Found by `test_element_offsets_past_2gi[seq]`, which is why that case is no
-    longer parametrised there -- the layout is unrepresentable rather than
-    mishandled, and the honest answer is a diagnosis instead of a wrong number.
-    """
-    _require_env()
-    shape, strides = (1, 2, 2, 64), (2 ** 31, 2 ** 31, 64, 1)
-    span = sum((d - 1) * st for d, st in zip(shape, strides)) + 1
-    free, _ = torch.cuda.mem_get_info()
-    if free < 3 * span * 2 + (1 << 27):
-        pytest.skip("needs ~12 GiB free")
-    pool = torch.zeros(span, dtype=torch.float16, device="cuda")
-    v = pool.as_strided(shape, strides)
-    try:
-        with pytest.raises(ValueError, match="not addressable"):
-            flydsl_flash_attn_func_gfx1201(v, v, v, causal=True)
-    finally:
-        del pool, v
         torch.cuda.empty_cache()
 

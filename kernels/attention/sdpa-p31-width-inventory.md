@@ -78,6 +78,27 @@ removing it**, and the two candidates are:
   base is uniform per workgroup and the row is per-lane, so this needs the row
   term hoisted to wherever the lane's row is already known.
 
-The second is the one worth trying first. Either way the `seq` entry in
-`_FAR_LAYOUTS` is `xfail(strict)`, so whichever lands will xpass and force the
-xfail to be removed deliberately.
+**The first was done and measured.** Two truncations were throwing the high
+half away -- `fx.Int32(off32)` in `_split_ptr`, and an
+`arith.index_cast(T.i32, ...)` in `_global_load_tr_v8`. `s_seq` is already
+`fx.Index`, so the products were always computed in 64 bits; only these casts
+narrowed them. Removing both makes all three axes of
+`test_element_offsets_past_2gi` pass.
+
+It costs, and the cost is why the second option still matters:
+
+| head_dim | 64    | 80    | 128   | 192       | 256   |
+| -------- | ----- | ----- | ----- | --------- | ----- |
+| ratio    | 0.983 | 0.965 | 0.965 | **0.911** | 0.974 |
+
+Against a 0.993 self-test floor, so every one of those is real. The instruction
+counts barely move (2020 -> 2044 at head_dim 128) -- this is not code size but
+addressing mode: a 64-bit divergent offset stops LLVM's SelectGlobalSAddr
+keeping the base in SGPRs, so the address becomes a VGPR pair.
+
+**So option two is now the task, not an alternative.** Keep the divergent
+offset 32-bit and carrying only `col` -- bounded by BLOCK_DMODEL <= 512 -- and
+move `row_in_tile * s_seq` into the 64-bit term. The obstacle remains that the
+base is uniform per workgroup while the row is per-lane, so it needs a third
+address component: uniform-64 + divergent-64-row + divergent-32-col, or the row
+folded per-lane once outside the loop rather than per address inside it.

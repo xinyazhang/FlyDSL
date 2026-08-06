@@ -856,14 +856,18 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             column i of the group's output, so lane g_j receives
             [M_0[j] .. M_7[j]]. Verified empirically on gfx1201.
             """
-            # Split as elsewhere: the (batch, head, tile) origin in 64 bits, the
-            # intra-tile part in 32. Feeding LLVM `uniform_i64 + zext(i32
-            # divergent)` is what lets SelectGlobalSAddr keep the base in SGPRs
-            # instead of forcing a 64-bit VGPR address pair.
+            # Split as elsewhere: the (batch, head, tile) origin and the
+            # intra-tile part, added in 64 bits. Feeding LLVM
+            # `uniform_i64 + divergent` is what lets SelectGlobalSAddr keep the
+            # base in SGPRs instead of forcing a 64-bit VGPR address pair.
+            #
+            # The divergent half is *not* narrowed to i32 on the way. It
+            # carries `row_in_tile * s_seq`, and a view's sequence stride is
+            # bounded by the tensor it was taken from rather than by the shape
+            # here -- eight heads sliced out of a 1 GiB (1, 64, 16384, 512) f16
+            # tensor give `s_seq = 8388608`, whose 256th row is exactly 2**31.
             base_bytes = arith.index_cast(T.i64, _raw(fx.Index(base64) * 2))
-            off_bytes = arith.extui(
-                T.i64, arith.index_cast(T.i32, _raw(fx.Index(off32) * 2))
-            )
+            off_bytes = arith.index_cast(T.i64, _raw(fx.Index(off32) * 2))
             addr = arith.addi(arith.addi(base_i64, base_bytes), off_bytes)
             p = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), addr).result
             return rocdl.global_load_tr_b128(v8f16_type, p)
@@ -1370,10 +1374,23 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             zeros = Vec.filled(width, 0.0, elem_dtype)
             return _col_mask(col, hdim_i, width).select(Vec(vec), zeros).ir_value()
 
-        def _split_ptr(ptr, base64, off32):
-            """ptr + base64 (uniform, 64-bit) + off32 (divergent, 32-bit)."""
+        def _split_ptr(ptr, base64, off):
+            """ptr + base64 (uniform) + off (divergent). Both 64-bit.
+
+            `off` used to be truncated to i32 on the reasoning that a
+            within-tile offset is small. It is not: it carries
+            `row_in_tile * s_seq`, and a non-compact input's sequence stride is
+            bounded by the tensor its view was taken from, not by the shape the
+            kernel sees. Slicing eight heads out of a 1 GiB
+            (1, 64, 16384, 512) f16 tensor gives `s_seq = 8388608`, and 256
+            rows of that is exactly 2**31 -- so the truncation wrapped and the
+            kernel read another allocation.
+
+            `s_seq` is already `fx.Index`, so the product was always computed
+            in 64 bits; only this cast threw the high half away.
+            """
             p = buffer_ops.get_element_ptr(ptr, fx.Int64(base64), elem_type=elem_type)
-            return buffer_ops.get_element_ptr(p, fx.Int32(off32), elem_type=elem_type)
+            return buffer_ops.get_element_ptr(p, fx.Int64(off), elem_type=elem_type)
 
         def _load_global_half_vec(ptr, base64, off32, vec_type):
             return _pointer_load(vec_type, _split_ptr(ptr, base64, off32))
@@ -2802,23 +2819,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             raise ValueError(
                 f"{name} must have a contiguous last dimension, got "
                 f"stride(3)={t.stride(3)}"
-            )
-        # The per-lane offset `row_in_tile * stride_seq` is computed in 32
-        # bits (see `toff`), and a non-compact input can exceed that: a view
-        # keeps its source's strides, so a few heads sliced out of a wide
-        # tensor carry the wide tensor's `stride(1)`. The failure is silent --
-        # the product wraps negative and the kernel reads another allocation --
-        # so it is caught here, the last place the stride is a Python int.
-        # This *rejects input the caller is entitled to pass*; removing the
-        # restriction is P3.2 work, and until then a clear error beats a wrong
-        # answer.
-        _row_span = BLOCK_M * abs(t.stride(1))
-        if _row_span > 2**31 - 1:
-            raise ValueError(
-                f"{name} has stride(1)={t.stride(1)}, and BLOCK_M={BLOCK_M} "
-                f"rows of it span {_row_span} elements, which exceeds the "
-                f"2**31 the kernel's per-lane offset can hold. This layout is "
-                f"not addressable by this kernel."
             )
         return t.stride(0), t.stride(1), t.stride(2)
 
