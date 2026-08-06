@@ -81,7 +81,8 @@ __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", 
            "FastMath", "MaskedAxis",
            "lds_f32_ptr", "lds_f32_store", "lds_f32_load",
            "reduce_s_across_shards",
-           "cond_load", "seqinfo_addr", "decode_addressing", "lse_token_pitch"]
+           "cond_load", "seqinfo_addr", "decode_addressing", "lse_token_pitch",
+           "WINDOW_TOPLEFT", "WINDOW_BOTRIGHT", "resolve_window"]
 
 
 def llvm_ptr_ty() -> ir.Type:
@@ -575,3 +576,47 @@ def lse_token_pitch(varlen_bits, bits_shift, max_seqlen, s0, s1, num_seqlens):
         ),
         fx.Int32(max_seqlen),
     )
+
+
+# --------------------------------------------------------------------------
+# Sliding-window attention: resolving the window, and cutting the KV range
+# --------------------------------------------------------------------------
+
+WINDOW_TOPLEFT = -2147483647   # 0x80000001
+WINDOW_BOTRIGHT = -2147483646  # 0x80000002
+
+
+def resolve_window(window_left, window_right, seqlen_q, seqlen_k):
+    """`(window_left, window_right)` with the causal sentinels resolved.
+
+    `Window_left` / `Window_right` may carry `WINDOW_TOPLEFT` or
+    `WINDOW_BOTRIGHT` instead of a literal bound, and they are resolved
+    against *this sequence's* lengths rather than on the host. That is the
+    whole reason the sentinels exist: host resolution works only when there is
+    one length to resolve against, and under varlen bottom-right needs
+    `seqlen_k[z] - seqlen_q[z]`, which differs per sequence. Matches
+    AOTriton's `parse_window`.
+
+    Both sentinels give an unbounded left edge -- no row reaches further back
+    than the start of its own sequence -- so they differ only in the right one.
+
+    **Everything derived from a window stays i32.** Window bounds go negative;
+    that is what a sentinel and a leading masked region are. `fx.Int32` is
+    signed, so `<`/`>` emit `slt`/`sgt`, while `fx.Index` is unsigned and
+    64-bit -- widening any of these even once makes the same comparison
+    unsigned and a negative bound comes out enormous.
+    """
+    left = fx.Int32(window_left)
+    right = fx.Int32(window_right)
+    left_is_sentinel = arith.ori(
+        _to_raw(left == fx.Int32(WINDOW_TOPLEFT)),
+        _to_raw(left == fx.Int32(WINDOW_BOTRIGHT)),
+    )
+    left = common_utils.ssel(ArithValue(left_is_sentinel), seqlen_q, left)
+    right = common_utils.ssel(right == fx.Int32(WINDOW_TOPLEFT), fx.Int32(0), right)
+    right = common_utils.ssel(
+        fx.Int32(window_right) == fx.Int32(WINDOW_BOTRIGHT),
+        seqlen_k - seqlen_q,
+        right,
+    )
+    return left, right

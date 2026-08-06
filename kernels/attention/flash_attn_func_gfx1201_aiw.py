@@ -1492,46 +1492,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # predicates, per sdpa-gswa-plan.md section 2.4. fx.Index is unsigned,
         # so a negative window reaching it silently becomes enormous.
         if const_expr(CAUSAL):
-            # ---- parse_window: resolve the causal sentinels per sequence ----
-            #
-            # `Window_left`/`Window_right` may carry 0x80000001 (top-left) or
-            # 0x80000002 (bottom-right) instead of a literal bound, and the
-            # kernel resolves them against *this sequence's* lengths.
-            #
-            # That is the whole reason the sentinels exist. Resolving on the
-            # host works only when there is one length to resolve against:
-            # under varlen, bottom-right needs `seqlen_k[z] - seqlen_q[z]`,
-            # and the batch-wide `Max_seqlen_k - Max_seqlen_q` is a different
-            # number for every sequence whose difference is not the maximum.
-            #
-            # Both sentinels give an unbounded left edge -- no row reaches
-            # further back than the start of its own sequence -- so they
-            # differ only in the right one. Matches AOTriton's `parse_window`.
-            #
-            # **Everything derived from a window stays `fx.Int32` from here
-            # down.** Window bounds go negative -- that is what a sentinel and
-            # a leading masked region are -- and `fx.Int32` is `signed=True`,
-            # so its `<`/`>` emit `slt`/`sgt`. `fx.Index` is `signed=False`
-            # and 64-bit, so widening any of these even once makes the same
-            # comparison unsigned and a negative bound comes out enormous.
-            # This used to be enforced by a `_scmp_i32` wrapper that coerced
-            # both operands at every compare; the types carry it now, so it is
-            # a rule about this block rather than a helper.
-            _wl_i32 = fx.Int32(window_left)
-            _wr_i32 = fx.Int32(window_right)
-            _is_tl_l = (_wl_i32 == fx.Int32(_WINDOW_TOPLEFT))
-            _is_br_l = (_wl_i32 == fx.Int32(_WINDOW_BOTRIGHT))
-            _wl_i32 = common_utils.ssel(
-                ArithValue(arith.ori(_raw(_is_tl_l), _raw(_is_br_l))),
-                seqlen_q_i32, _wl_i32,
-            )
-            _wr_i32 = common_utils.ssel(
-                (_wr_i32 == fx.Int32(_WINDOW_TOPLEFT)),
-                fx.Int32(0), _wr_i32,
-            )
-            _wr_i32 = common_utils.ssel(
-                (fx.Int32(window_right) == fx.Int32(_WINDOW_BOTRIGHT)),
-                seqlen_k_i32 - seqlen_q_i32, _wr_i32,
+            # Sentinels resolve per sequence, not on the host -- see
+            # `fmha.resolve_window`. Everything derived from a window stays
+            # i32 from here down: bounds go negative, and `fx.Index` is
+            # unsigned.
+            _wl_i32, _wr_i32 = fmha.resolve_window(
+                window_left, window_right, seqlen_q_i32, seqlen_k_i32
             )
 
         # ---- Split the KV range into full and masked regions ----
