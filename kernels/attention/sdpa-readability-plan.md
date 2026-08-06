@@ -26,7 +26,8 @@ repeatedly and gate each touch separately.
 | -------------------------- | ----------- | ---------- |
 | P5 groundwork              | **landed**  | `49764d29` |
 | P1 free corrections        | **done**    | `a4d9c3f6` .. `cfbf8696` |
-| P2 policy extraction       | **done**    | `f77294d5` .. `ce713716` |
+| P2 policy extraction       | **done**    | `f77294d5` .. `0d345e80` (13 tasks) |
+| P3.1 width inventory       | **done**    | `sdpa-p31-width-inventory.md` |
 | P3 type discipline         | not started | --         |
 | P4 investigations          | not started | --         |
 | P5 helper modules (rest)   | not started | --         |
