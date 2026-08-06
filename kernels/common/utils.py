@@ -6,7 +6,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, rocdl
 from flydsl.expr.typing import T
-from flydsl.expr.utils.arith import ArithValue
+from flydsl.expr.utils.arith import ArithValue, _to_raw
 
 # Pointer/global-load helpers now live in mem_ops; re-exported here for back-compat.
 from kernels.common.mem_ops import extract_global_ptr as extract_global_ptr
@@ -101,6 +101,30 @@ def smin(a, b):
 def smax(a, b):
     """Signed maximum of two i32 values. See `smin`."""
     return ssel((a > b), a, b)
+
+
+def sdiv_rd_pow2(value, divisor: int):
+    """``floor(value / divisor)`` for a *signed* i32 and a power-of-two divisor.
+
+    The signed counterpart to `udiv_pow2`, and the distinction is not
+    cosmetic. An arithmetic right shift rounds toward negative infinity;
+    `arith.divsi` truncates toward zero. They agree on non-negative input and
+    differ on every negative one -- `floor(-1/32)` is -1, truncation gives 0.
+
+    That case is reachable: it is how a sliding window whose left edge reaches
+    past the start of the sequence gets turned into a tile index. Truncating
+    there starts the left run one tile late and silently drops live columns.
+
+    Written as an explicit `arith.shrsi` rather than `value >> n` so the
+    signedness is visible at the definition, which is the entire reason this
+    exists next to `udiv_pow2`.
+    """
+    assert is_pow2(divisor), f"sdiv_rd_pow2 needs a power-of-two divisor, got {divisor}"
+    return fx.Int32(
+        ArithValue(
+            arith.shrsi(_to_raw(fx.Int32(value)), _to_raw(fx.Int32(pow2_shift(divisor))))
+        )
+    )
 
 
 def udiv_const(value, divisor: int):

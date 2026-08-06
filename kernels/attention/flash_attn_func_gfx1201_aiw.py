@@ -302,10 +302,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
     BLOCK_N = BLOCK_N_KNOB
 
-    # `_sdiv_rd` in the kernel is an arithmetic shift, which is only a
-    # floor-division when BLOCK_N is a power of two.
-    _BLOCK_N_LOG2 = BLOCK_N.bit_length() - 1
-
     N_SUB_TILES = BLOCK_N // K_SUB_N
     NUM_S_ACCS = N_SUB_TILES * 2
     NUM_S_VALS = NUM_S_ACCS * 8
@@ -898,22 +894,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # Dispatch is on the operand element type, in `wmma_ops`, rather
             # than on `dtype_str` here -- see that module for why.
             return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
-
-        def _sdiv_rd(x):
-            """floor(x / BLOCK_N), signed -- plan section 2.4 rule 4.
-
-            BLOCK_N is a power of two, so an arithmetic right shift *is* the
-            round-toward-negative-infinity division. `arith.divsi` truncates
-            toward zero instead, which is wrong for every window that reaches
-            past the start of the sequence: at BLOCK_N 32, floor(-1/32) is -1
-            but truncation gives 0, and the left run would then start one tile
-            too late and silently drop live columns.
-            """
-            return fx.Int32(
-                ArithValue(
-                    arith.shrsi(_raw(fx.Int32(x)), _raw(fx.Int32(_BLOCK_N_LOG2)))
-                )
-            )
 
         # ---- Varlen prologue: VarlenBits -> six scalars ----
         #
@@ -1820,13 +1800,13 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # leaves a partial final tile, which must be masked rather than
             # counted as full. The old code spelled the same thing
             # `_full_seq`.
-            _blk_last = _sdiv_rd(_seqlen_k_i32 - fx.Int32(1))
-            _blk_last_whole = _sdiv_rd(_seqlen_k_i32) - fx.Int32(1)
+            _blk_last = common_utils.sdiv_rd_pow2(_seqlen_k_i32 - fx.Int32(1), BLOCK_N)
+            _blk_last_whole = common_utils.sdiv_rd_pow2(_seqlen_k_i32, BLOCK_N) - fx.Int32(1)
 
             # The visited range: outside it every column is dead for every row
             # in this Q block, so those tiles are not walked at all.
-            _v_lo = common_utils.smax(_sdiv_rd(_q_start_i32 - _wl_i32), fx.Int32(0))
-            _v_hi = common_utils.smin(_blk_last, _sdiv_rd(_q_last_i32 + _wr_i32))
+            _v_lo = common_utils.smax(common_utils.sdiv_rd_pow2(_q_start_i32 - _wl_i32, BLOCK_N), fx.Int32(0))
+            _v_hi = common_utils.smin(_blk_last, common_utils.sdiv_rd_pow2(_q_last_i32 + _wr_i32, BLOCK_N))
             # Empty work, not skipped work. Varlen sizes the grid from
             # Max_seqlen_q, so a short sequence gets workgroups whose rows are
             # all past its end; this kernel is one single-exit trace and
@@ -1845,10 +1825,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # invisible to a tolerance test but not to the bitwise one -- and
             # the pre-gSWA causal split is exact here too, so anything else
             # would stop reproducing it.
-            _l_first_full = _sdiv_rd(
-                _q_last_i32 - _wl_i32 + fx.Int32(BLOCK_N - 1)
+            _l_first_full = common_utils.sdiv_rd_pow2(
+                _q_last_i32 - _wl_i32 + fx.Int32(BLOCK_N - 1), BLOCK_N
             )
-            _r_first_mask = _sdiv_rd(_q_start_i32 + _wr_i32 + fx.Int32(1))
+            _r_first_mask = common_utils.sdiv_rd_pow2(_q_start_i32 + _wr_i32 + fx.Int32(1), BLOCK_N)
 
             _fb_lo = common_utils.smax(_l_first_full, _v_lo)
             _fb_hi = common_utils.smin(
