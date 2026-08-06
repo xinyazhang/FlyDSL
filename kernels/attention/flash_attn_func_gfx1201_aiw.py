@@ -933,17 +933,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         _RED_BYTE0 = (LDS_V_BASE if RED_ALIASES_V else LDS_KV_TOTAL_SIZE
                       - (RED_F32_TOTAL * 4 + 1) // 2) * 2
 
-        def _red_addr(i_f32):
-            off = fx.Int32(_RED_BYTE0) + fx.Int32(i_f32) * fx.Int32(4)
-            addr = arith.addi(_lds_byte_base, _raw(off))
-            return _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<3>"), addr).result
-
-        def _red_store(i_f32, val):
-            _llvm.StoreOp(_raw(val), _red_addr(i_f32))
-
-        def _red_load(i_f32):
-            return _llvm.LoadOp(ir.F32Type.get(), _red_addr(i_f32)).result
-
         tid = fx.Index(gpu.thread_idx.x)
 
         wave_id = tid // WARP_SIZE
@@ -1951,41 +1940,19 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # kernels/microbench/lds_reduce.py.
             if const_expr(QK_SHARDS > 1):
                 for qt in range_constexpr(Q_ROW_TILES):
-                    s_flat = []
-                    for st in range_constexpr(NUM_S_ACCS):
-                        for r in range_constexpr(8):
-                            s_flat.append(_raw(Vec(s_accs_all[qt][st])[r]))
-
-                    own = wave_id * fx.Index(RED_F32_PER_WAVE)
-                    for e in range_constexpr(NUM_S_VALS):
-                        _red_store(own + fx.Index(e * WARP_SIZE) + lane, s_flat[e])
-                    gpu.barrier()
-
-                    base_group = q_tile_in_block * fx.Index(
-                        QK_SHARDS * RED_F32_PER_WAVE
+                    s_accs_all[qt] = fmha.reduce_s_across_shards(
+                        s_accs_all[qt],
+                        lds_byte_base=_lds_byte_base,
+                        byte0=_RED_BYTE0,
+                        wave_id=wave_id,
+                        lane=lane,
+                        shard_id=shard_id,
+                        q_tile_in_block=q_tile_in_block,
+                        num_shards=QK_SHARDS,
+                        f32_per_wave=RED_F32_PER_WAVE,
+                        warp_size=WARP_SIZE,
+                        fastmath=fastmath,
                     )
-                    for e in range_constexpr(NUM_S_VALS):
-                        acc = s_flat[e]
-                        for k in range_constexpr(QK_SHARDS - 1):
-                            peer = base_group + (
-                                (shard_id + fx.Index(k + 1)) % fx.Index(QK_SHARDS)
-                            ) * fx.Index(RED_F32_PER_WAVE)
-                            acc = fastmath.add(
-                                acc, _red_load(peer + fx.Index(e * WARP_SIZE) + lane)
-                            )
-                        s_flat[e] = acc
-                    gpu.barrier()
-
-                    s_accs_all[qt] = [
-                        Vec.from_elements(
-                            [
-                                fx.Float32(s_flat[st * 8 + r])
-                                for r in range_constexpr(8)
-                            ],
-                            fx.Float32,
-                        ).ir_value()
-                        for st in range_constexpr(NUM_S_ACCS)
-                    ]
 
             # ==== Online softmax, per Q row-tile ====
             # Each row-tile keeps its own running max/sum and its own O

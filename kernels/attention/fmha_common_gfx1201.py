@@ -70,13 +70,15 @@ allows it; it reads better and constructs once.
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, range_constexpr, rocdl
+from flydsl.expr import arith, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import ArithValue, _to_raw
 
 __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
            "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8",
-           "FastMath", "MaskedAxis"]
+           "FastMath", "MaskedAxis",
+           "lds_f32_ptr", "lds_f32_store", "lds_f32_load",
+           "reduce_s_across_shards"]
 
 
 def llvm_ptr_ty() -> ir.Type:
@@ -355,3 +357,97 @@ class MaskedAxis:
             return vec
         zeros = Vec.filled(width, 0.0, self.elem_dtype)
         return self.mask(idx, width).select(Vec(vec), zeros).ir_value()
+
+
+# --------------------------------------------------------------------------
+# f32 scratch aliased over the 16-bit LDS tile
+# --------------------------------------------------------------------------
+#
+# The cross-shard S reduction needs f32 scratch, and the KV tile it borrows
+# space from is `elem_dtype` (16-bit). There is no retyped view of a shared
+# pointer, so the address is built by hand: `ptrtoint` on a shared pointer
+# yields the 32-bit LDS offset, and the f32 element index is scaled into it.
+#
+# Plain functions taking both halves of the base, rather than an object: these
+# are read inside the reduction's dynamic branches, and an object could not be
+# live there (see "How to hand a helper object to kernel code" above). Both
+# arguments are safe to hold in kernel-body variables -- one is an MLIR value,
+# the other a `const_expr` int.
+
+
+def lds_f32_ptr(lds_byte_base, byte0, index):
+    """`!llvm.ptr<3>` at f32 element `index` of the scratch starting at `byte0`."""
+    off = fx.Int32(byte0) + fx.Int32(index) * fx.Int32(4)
+    addr = arith.addi(lds_byte_base, _to_raw(off))
+    return _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<3>"), addr).result
+
+
+def lds_f32_store(lds_byte_base, byte0, index, value):
+    _llvm.StoreOp(_to_raw(value), lds_f32_ptr(lds_byte_base, byte0, index))
+
+
+def lds_f32_load(lds_byte_base, byte0, index):
+    return _llvm.LoadOp(ir.F32Type.get(), lds_f32_ptr(lds_byte_base, byte0, index)).result
+
+
+def reduce_s_across_shards(
+    s_accs,
+    *,
+    lds_byte_base,
+    byte0,
+    wave_id,
+    lane,
+    shard_id,
+    q_tile_in_block,
+    num_shards,
+    f32_per_wave,
+    warp_size,
+    fastmath,
+):
+    """Sum one Q row-tile's S accumulators across the QK shards, through LDS.
+
+    Each shard-wave holds a partial sum over its own slice of BLOCK_DMODEL;
+    the full S is their sum. Returns the reduced accumulators, same shape in.
+
+    **Explicit partials, not `ds_add_f32`.** The atomic form measured 1055
+    WMMA-equivalents against 54 for this, because every lane contends on the
+    same address -- see `kernels/microbench/lds_reduce.py`. So each wave writes
+    its own partials to a private slot, and then every wave reads the others'
+    and adds them locally: two barriers and no contention.
+
+    Called only when `num_shards > 1`, which on the current ladder is
+    BLOCK_DMODEL 384 (2 shards) and 512 (4). Every other width reduces nothing
+    and never reaches here -- worth knowing when gating a change to it, since
+    the usual 128 build does not execute a line of this.
+    """
+    s_flat = [_to_raw(Vec(a)[r]) for a in s_accs for r in range_constexpr(8)]
+
+    own = wave_id * fx.Index(f32_per_wave)
+    for e in range_constexpr(len(s_flat)):
+        lds_f32_store(
+            lds_byte_base, byte0, own + fx.Index(e * warp_size) + lane, s_flat[e]
+        )
+    gpu.barrier()
+
+    base_group = q_tile_in_block * fx.Index(num_shards * f32_per_wave)
+    for e in range_constexpr(len(s_flat)):
+        acc = s_flat[e]
+        for k in range_constexpr(num_shards - 1):
+            peer = base_group + (
+                (shard_id + fx.Index(k + 1)) % fx.Index(num_shards)
+            ) * fx.Index(f32_per_wave)
+            acc = fastmath.add(
+                acc,
+                lds_f32_load(
+                    lds_byte_base, byte0, peer + fx.Index(e * warp_size) + lane
+                ),
+            )
+        s_flat[e] = acc
+    gpu.barrier()
+
+    return [
+        Vec.from_elements(
+            [fx.Float32(s_flat[st * 8 + r]) for r in range_constexpr(8)], fx.Float32
+        ).ir_value()
+        for st in range_constexpr(len(s_accs))
+    ]
