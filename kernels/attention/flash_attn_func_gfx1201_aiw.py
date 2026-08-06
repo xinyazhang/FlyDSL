@@ -900,7 +900,16 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
 
         def _ssel_i32(pred, a, b):
-            return fx.Int32(ArithValue(pred).select(fx.Int32(a), fx.Int32(b)))
+            """`pred ? a : b`, as an `fx.Int32`.
+
+            Survives P3.3, unlike `_scmp_i32`, and for a reason that is not
+            the coercion: `ArithValue.select` returns a raw MLIR value, so
+            without the `fx.Int32` wrapper the result has no arithmetic
+            overloads and every caller doing `_v_hi + fx.Int32(1)` would have
+            to add one itself. The operand coercion *was* redundant and is
+            gone; the result wrapper is the helper.
+            """
+            return fx.Int32(ArithValue(pred).select(a, b))
 
         def _smin_i32(a, b):
             return _ssel_i32((a < b), a, b)
