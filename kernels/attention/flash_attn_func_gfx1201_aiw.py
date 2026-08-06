@@ -1980,7 +1980,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 init_args.append(_v_vecs_init[batch])
 
         loop_results = init_args
-        def _kv_body(kv_block_start, inner_iter_args, _MASK_STEPS,
+        def kv_loop_body(kv_block_start, inner_iter_args, _MASK_STEPS,
                      next_kv_start=None):
             """One KV tile. `_MASK_STEPS` is a Python bool resolved at trace
             time, so the masked and unmasked regions emit different code.
@@ -2465,7 +2465,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         _m_col0,
                     )
                 )
-                loop_results = yield _kv_body(
+                loop_results = yield kv_loop_body(
                     kv_block_start, inner_iter_args, False, next_kv_start=_nxt
                 )
 
@@ -2483,7 +2483,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             for _mi, inner_iter_args in range(
                 fx.Index(0), _n_masked, 1, init=loop_results
             ):
-                loop_results = yield _kv_body(
+                loop_results = yield kv_loop_body(
                     fx.Index(_masked_col(_mi)),
                     inner_iter_args,
                     True,
@@ -2494,14 +2494,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             for kv_block_start, inner_iter_args in range(
                 fx.Index(0), _full_end, BLOCK_N_OUT, init=init_args
             ):
-                loop_results = yield _kv_body(kv_block_start, inner_iter_args, False)
+                loop_results = yield kv_loop_body(kv_block_start, inner_iter_args, False)
 
             # Region 2: the tail, where columns can be past seqlen_k or past the
             # causal diagonal.
             for kv_block_start, inner_iter_args in range(
                 _full_end, kv_upper, BLOCK_N_OUT, init=loop_results
             ):
-                loop_results = yield _kv_body(kv_block_start, inner_iter_args, True)
+                loop_results = yield kv_loop_body(kv_block_start, inner_iter_args, True)
 
         # ---- logsumexp ----
         # LSE = (m + log2(l)) * ln2, with m in the base-2 scaled domain -- which

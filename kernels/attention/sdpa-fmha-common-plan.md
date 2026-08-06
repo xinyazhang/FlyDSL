@@ -123,22 +123,63 @@ steps, each of which the bwd kernel will want:
 | accumulator element -> KV column map | **no**  | WMMA operand layout; bwd's GEMM shapes differ |
 | GEMM1 / GEMM2, LDS staging   | **no**          | different operands |
 
-### 3.1 Rename: `_kv_body` -> `attn_fwd_inner`
+### 3.1 Naming: `kv_loop_body`, inside the *inner kernel*
 
-Adopted, but not for the reason first offered. The argument was that K and V
-are never used at the same time, so "kv" is a misnomer. That part does not
-hold: both prefetch distances are 1, so `coop_load_k_global(next_kv_start)`
-issues while the current tile's V is still feeding GEMM2 -- K[n+1] and V[n] are
-in flight together. "KV" is also the standard name for the axis both are
-indexed by, which is what the loop walks.
+The two region loops are the **inner kernel**; `kv_loop_body` is one iteration
+of it. Both names are now literal, which neither candidate considered first
+was:
 
-The rename is still right, for a different reason: **parity with AOTriton**,
-which is the integration target. `attn_fwd_inner` is the name of exactly this
-function there, and it sits in a family with `bwd_inner_dk_dv` and
-`bwd_inner_dq` that this kernel will grow equivalents of. A reviewer diffing
-the two implementations should not have to translate names. `_kv_body`
-describes what the loop iterates over; `attn_fwd_inner` describes what the
-function is, and the latter is the one shared with the reference.
+- `attn_fwd_inner` (AOTriton's name) is wrong here because AOTriton's
+  `_attn_fwd_inner` *contains* its `for start_n in range(...)`. This kernel
+  puts the loops in the caller and the body in the function, so borrowing the
+  name without the structure would mislead exactly the reviewer it was meant
+  to help.
+- `kv_loop` is wrong for the same reason in reverse: the function contains no
+  loop. It is called from four `for ... in range(...)` sites.
+
+`kv_loop_body` says which loop and which part of it. "KV" is right for the
+axis: both prefetch distances are 1, so K[n+1] loads while V[n] still feeds
+GEMM2 -- the two are in flight together and the loop walks the axis they share.
+
+**The loop cannot move to this module even if it were named for it.** FlyDSL's
+`range(start, stop, step, init=[...])` -> `scf.for` rewrite is lexical and
+per-decorated-function: a module-level helper keeps builtin `range` and would
+silently emit a host-side Python loop. Anything containing `range(init=)` has
+to stay inside the `@flyc.kernel` body. That is a hard constraint on Tier D,
+and it is why the loop structure stays put while its contents do not.
+
+### 3.2 The target shape: `kv_loop_body` as pseudocode
+
+The goal is that one iteration reads as the algorithm:
+
+    k     = stage_k(kv_block_start)          # fmha_common_gfx1201
+    s     = gemm1_qk(q_packs, k)             # stays: WMMA
+    s     = scale_and_bias(s, ...)           # fmha_common_gfx1201
+    s     = apply_masks(s, ...)              # fmha_common_gfx1201
+    m,l,p = softmax_update(s, m, l)          # fmha_common_gfx1201
+    p     = pack_p(p)                        # fmha_common_gfx1201
+    v     = stage_v(kv_block_start)          # fmha_common_gfx1201
+    acc   = gemm2_pv(p, v, acc)              # stays: WMMA
+
+**Where this will fight back, and the rule for when it does.** A large part of
+the 669 lines is not stage code but *interleaving*: the next tile's K is issued
+during GEMM2, V chunks are hoisted between GEMM2 sub-steps, and the
+`sched_barrier` placement between them is the optimisation. Those placements
+are the schedule, and a clean stage decomposition has nowhere to put them --
+`stage_k(n+1)` called "between" two lines of `gemm2_pv` is not expressible as
+straight-line pseudocode.
+
+So the split is by *what the code is*, not by how long it is:
+
+| kind                                          | moves | why |
+| --------------------------------------------- | ----- | --- |
+| value transforms on S and P (mask, bias, scale, softmax, pack) | yes | pure data flow, no placement meaning; also the bwd-shared set |
+| address and index algebra                     | yes   | already factory-shaped |
+| load *issue points* and `sched_barrier`s      | **no** | their position in the instruction stream is the tuning |
+| GEMM1 / GEMM2 unrolls                         | **no** | operand layout is WMMA-specific and knob-shaped |
+
+If an extraction forces a load issue point to move, stop: that is the bitwise
+gate failing for a real reason, and the pseudocode is not worth the schedule.
 
 ## 4. Sequencing and gates
 
