@@ -106,7 +106,9 @@ folded per-lane once outside the loop rather than per address inside it.
 
 ## 6. Recovering the cost: hoist the row term, do not merely split it
 
-Analysed, not yet implemented.
+Implemented, as the `kv_addr_hoist` knob. Section 6.1 records what the ISA
+said once it was measured rather than predicted, and where the prediction in
+the rest of this section was wrong.
 
 The proposal was to pull `row * s_seq` out of `toff` so the address becomes
 `u64 base + u64 row + i32 col`, on the theory that the row term is a scalar.
@@ -136,3 +138,63 @@ iteration, so its uniform term changes in the loop while its row term does not;
 the hoist still applies but to a different split point. And the win is a
 prediction, not a measurement -- the tier-1 fingerprint will say whether the
 addressing mode came back, and only tier 2.9 says whether the 9% did.
+
+
+### 6.1 What the ISA said
+
+The prediction above was half right, and the wrong half was the important one.
+
+**Right:** the row product is per-lane, so splitting it out of the divergent
+offset does not restore `SelectGlobalSAddr`. Hoisting is the operative move,
+not splitting.
+
+**Wrong:** that the cost was the addressing mode. Counting inside the KV loop
+body at BLOCK_DMODEL 192, pre-64-bit against 64-bit:
+
+|                   | pre | recomputed |
+| ----------------- | --- | ---------- |
+| loop instructions | 575 |        649 |
+| `v_mul_lo_u32`    |   3 |         14 |
+| `v_add_co_u32`    |  11 |         21 |
+| SGPR-base ops     |   3 |          0 |
+
+The eleven extra multiplies are the story. `_kv_addr` clamped the *row* --
+`row = in_range ? row_in_tile : seq_last - ts` -- and `ts` moves every KV
+iteration, so `row * s_seq` was loop-carried and a full 64x64 multiply was
+re-emitted per load per iteration. Widening it from 32 to 64 bits is what made
+that expensive. The lost addressing mode came along with it but was not the
+main term; saddr was already only 3 of 7 accesses before.
+
+So the fix is to select between two whole *offsets* instead of between two
+rows, which leaves `row_in_tile * s_seq` loop-invariant for LICM to hoist.
+
+**It is not free, and not uniformly a win.** The hoisted form keeps one 64-bit
+value live per cooperative load for the whole loop. Scratch per lane,
+recomputed then hoisted: 192 `164 -> 44`, 256 `104 -> 160`, 384 `164 -> 328`,
+512 `140 -> 124`. The sign of that change predicts the sign of the speedup at
+every width on the ladder, so the form is a tuning knob and not a replacement
+-- see `_KV_ADDR_HOIST_HEAD_DIMS` for the policy and its two exceptions.
+
+Full ladder against the recomputed kernel, worst and best over
+N in {1024, 4096} x {causal, not}:
+
+| BLOCK_DMODEL |   16 |   32 |   48 |   64 |   80 |   96 |  128 |  160 |  192 |  224 |  256 |  384 |  512 |
+| ------------ | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| worst        | 0.99 | 1.02 | 1.00 | 1.00 | 1.03 | 1.01 | 1.03 | 1.00 | 1.01 | 1.00 | 1.01 | 1.00 | 1.14 |
+| best         | 1.03 | 1.04 | 1.00 | 1.05 | 1.05 | 1.04 | 1.05 | 1.05 | 1.41 | 1.01 | 1.02 | 1.00 | 1.24 |
+
+The widths reading 1.00 are the ones the policy leaves recomputed; their
+builds are bitwise identical to the kernel before the knob, which is why they
+need no benchmark to defend.
+
+Two process notes, both mistakes made on the way here:
+
+- The tier 2.9 screen said the change was uniformly good (worst 0.891 at
+  head_dim 256). The full ladder said 0.59 at 384. Five head dims are not a
+  ladder when the effect is register pressure, because the widths that spill
+  are exactly the ones the screen omits.
+- Reading spill counts against the *pre-64-bit* build rather than the
+  recomputed one inverted the conclusion for head_dim 512 -- it appeared to
+  spill more under the hoist and win anyway, which made the mechanism look
+  unexplainable. Against the right baseline it spills less. Diff against the
+  build the knob actually replaces.
