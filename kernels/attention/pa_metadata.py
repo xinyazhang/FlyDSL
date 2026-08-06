@@ -51,6 +51,7 @@ from kernels.common.kernels_common import get_warp_size
 from kernels.common.tensor_shim import _run_compiled
 from kernels.common.utils import (
     exp2_f32_fast,
+    ssel,
     global_load_i64x2,
     global_ptr_from_addr,
     is_pow2,
@@ -981,7 +982,16 @@ def compile_pa_metadata_v1(
             buffer_ops.buffer_store(fx.Int32(val).ir_value(), rsrc, fx.Int32(off).ir_value())
 
         def _sel(cond_b, a, b):
-            return fx.Int32(arith.select(cond_b.ir_value(), fx.Int32(a).ir_value(), fx.Int32(b).ir_value()))
+            """Coerce to i32, then defer to the shared select.
+
+            The body used to be a second copy of `common/utils.ssel`. Only the
+            coercion is local now, and it is kept because this kernel's callers
+            rely on it -- several pass Python literals on *both* arms, which
+            `ssel` cannot type on its own (`ArithValue.select` infers a
+            constant's type from the other operand, and two constants give it
+            nothing to infer from).
+            """
+            return ssel(cond_b, fx.Int32(a), fx.Int32(b))
 
         # work_indptr[0] = 0 ; reduce_indptr[0] = 0
         _store(wi_rsrc, 0, 0)
