@@ -81,7 +81,7 @@ baseline. Tier 3 runs once, after P5.5.
 | P5.1   | Duplication audit vs `common/*` and `flash_attn_utils` (§7.1)     | plan (artifact)                                | review                   | S   | none | no  | --      |
 | P5.2   | Pointer + global load/store -> `common/mem_ops.py`                | aiw, common/mem_ops                            | bitwise (per helper) + perf | M   | med  | yes | P5.1, P4.1 |
 | P5.3   | LDS load/store -> `common/mem_ops.py`                             | aiw, common/mem_ops                            | bitwise + perf           | M   | med  | yes | P5.2, P4.2 |
-| P5.4   | Interval algebra + `div_rd` -> `common/utils.py`                  | aiw, common/utils                              | bitwise + tier 1         | S   | low  | yes | P3.3    |
+| P5.4   | Signed i32 select/min/max + `div_rd` -> `common/utils.py` (§0.6)  | aiw, pa_metadata, common/utils                 | bitwise + tier 1         | S   | low  | yes | P3.3    |
 | P5.5   | gSWA regions, Q preload, cross-shard reduction, LSE addressing, `_decode_side` -> `attention/fmha_common.py` | aiw, fmha_common | bitwise + perf           | L   | med  | yes | P3.3, P4.3 |
 
 **Critical path:** `P3.1 -> P3.2 -> P3.3 -> P5.4/P5.5`. Everything in P1 and P4
@@ -140,10 +140,10 @@ The groups in §0.2 expand as follows. Each bullet is one commit.
 | group | commits | one per                                                                                     |
 | ----- | ------- | --------------------------------------------------------------------------------------------- |
 | P3.2  | ~5      | quantity: `seqlen_?_v`; tile/row origins; shard offsets; window bounds; P3.1 remainder      |
-| P3.3  | 4       | `_scmp_i32`, `_ssel_i32`, `_smin_i32`, `_smax_i32`                                          |
+| P3.3  | ~~4~~ 2 | **done.** `_scmp_i32` deleted; `_ssel_i32` kept and simplified; `_smin_i32`/`_smax_i32` fell out as one-liners -- inventory §8.2 |
 | P5.2  | 8       | `_pointer_to_llvm_ptr`, `_pointer_load`, `_pointer_store`, `_global_load_tr_v8`, `_split_ptr`, `_load_global_half_vec`, `_store_global_half`, `load_global_f16xN` + `load_global_v8f16` |
 | P5.3  | 2       | `_lds_load_v8`, `_lds_store_vx`                                                             |
-| P5.4  | 3       | `_sdiv_rd`, `_smin_i32`, `_smax_i32` (post-P3.3 survivors)                                  |
+| P5.4  | 5       | `_ssel_i32`, `_smin_i32`, `_smax_i32`, `_sdiv_rd` (the P3.3 survivors), then dedup `pa_metadata._sel` |
 | P5.5  | ~12     | gSWA extract + move; Q preload extract + move; cross-shard extract + move; `_decode_side` split into 3; `_decode_side` move; `_seqinfo_at` move; LSE addressing extract + move |
 
 That takes the plan from 21 tasks to roughly **50 commits**. That is the
@@ -177,7 +177,50 @@ only one changes the timing, the fingerprint bisect returns the first of them.
 That is why the `fp?` column exists -- the twelve tasks expected not to move it
 narrow the search before it starts.
 
-### 0.3 Definition of done, per phase
+### 0.6 P5.4 survey: where the signed i32 helpers should live
+
+Done up front because P5.4's premise is that these are reusable, and a helper
+nobody else wants is not worth a module.
+
+**Four survive P3.3**: `_ssel_i32`, `_smin_i32`, `_smax_i32`, `_sdiv_rd`.
+`_scmp_i32` is *not* on the list -- it was deleted outright, so there is
+nothing left of it to move.
+
+**There is no existing shared helper for any of them.** Searched
+`kernels/common/*`, `kernels/*_common.py`, `flash_attn_utils.py`, and the
+`flydsl.expr.utils.arith` / `flydsl.expr.numeric` DSL surface. The only thing
+`utils.arith` exposes is `ArithValue.select`, which is the raw builder these
+wrap -- it returns an untyped MLIR value, which is exactly why `_ssel_i32`
+exists.
+
+**One real duplicate exists**, which is the reuse argument:
+
+| site                        | code                                                       |
+| --------------------------- | ---------------------------------------------------------- |
+| `pa_metadata.py:983` `_sel` | `fx.Int32(arith.select(c, fx.Int32(a), fx.Int32(b)))`      |
+| `_ssel_i32` before P3.3     | `fx.Int32(ArithValue(pred).select(fx.Int32(a), fx.Int32(b)))` |
+
+The same function, including the operand coercion P3.3 has since shown to be
+redundant. Deduplicating it is the fifth commit of P5.4, and it is the one that
+proves the helper is shared rather than merely moved.
+(`flash_attn_utils.py:2806` `_max_pair` is *not* a duplicate -- it is a float
+max over `_fmax`, unrelated.)
+
+**Home: `kernels/common/utils.py`.** It already hosts this exact class of
+helper -- `udiv_pow2`, `urem_pow2`, `udiv_const`, `urem_const`, `pow2_shift` --
+and `_sdiv_rd` is precisely the *signed* counterpart to `udiv_pow2` that the
+set is missing today. Naming should follow that convention (`sdiv_rd_pow2`,
+`ssel`, `smin`, `smax`) rather than carrying the leading underscore over.
+
+One caveat for the reviewer, because CLAUDE.md points the other way. It says
+DSL-level numeric/arith helpers belong in `python/flydsl/expr/utils/arith.py`,
+and by type these qualify. Two things argue against it: `kernels/common/utils.py`
+already sets the precedent with the unsigned siblings, and on this box `flydsl`
+is an installed wheel rather than an editable checkout, so anything added under
+`python/flydsl/` is not importable by these kernels without rebuilding it --
+which is the same constraint that produced `gfx1201_standalone.py`. If the
+wheel becomes editable, the DSL tree is the better long-term home and this
+should move again.
 
 | phase | done when                                                                                          |
 | ----- | ---------------------------------------------------------------------------------------------------- |
@@ -451,7 +494,7 @@ Do these first: they are what makes the file readable enough to do the rest.
 | `WMMA_LANE_K = 8`           | same                                                                                | Documentation  |
 | `_scmp_i32` docstring       | replace the false claim with the real reason (coerces `Index` operands)              | §1.4           |
 | `Vec` alias                 | drop; every other kernel says `fx.Vector.make_type`                                 | §1.1           |
-| `_ssel_i32`                 | delete, use `cond.select(a, b)` -- the file already does elsewhere                  | §1.2           |
+| `_ssel_i32`                 | ~~delete, use `cond.select(a, b)`~~ **wrong** -- `select` returns a raw MLIR value with no arithmetic overloads, so the `fx.Int32` around the *result* is load-bearing. Simplified, kept, and promoted to `common/utils.py` in P5.4 | §1.2, §0.6 |
 | `fx.Index(QK_SLICE)`        | delete the cast, sweep for siblings                                                  | §1.3           |
 | `_REVERSE_Q_TILES`          | rename `_LPT_TILE_ORDER`, resolve the causal condition at definition                | §1.5           |
 | `tile_start` (21 sites)     | rename per axis -- see below                                                        | Coding Style   |
@@ -955,7 +998,9 @@ replaces this with a real classification): ~25 addressing, ~10 sequence-space,
 | `_pointer_to_llvm_ptr`           | `common/mem_ops.get_llvm_ptr` (+ `global_load`/`global_store`) |
 | `bf16_trunc_pack_v8`             | `flash_attn_utils._bf16_trunc_pack_v8` (check equivalence)     |
 | `_fadd`/`_fsub`/`_fmul`/`_fmax`  | `flash_attn_utils._fadd`... -- and *they take `fm_fast` as a parameter* |
-| `_sdiv_rd`                       | `common/utils.udiv_pow2` (unsigned; ours is signed -- check)   |
+| `_sdiv_rd`                       | **checked: not a duplicate.** `common/utils.udiv_pow2` is unsigned and truncates; ours is the signed floor. It is the missing *signed* sibling of that set, which is why P5.4 puts it there (§0.6) |
+| `_ssel_i32`                      | `pa_metadata.py:983` `_sel` -- the same function, coercion and all (§0.6) |
+| `_smin_i32` / `_smax_i32`        | nothing; new to `common/utils.py` in P5.4                      |
 | `wmma_acc`                       | moved to `common/mma/wmma_ops.py` in `49764d29`                |
 
 ### 11.4 AOTriton's fwd/bwd shared surface
