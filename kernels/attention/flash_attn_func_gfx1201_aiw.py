@@ -839,27 +839,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         v4f16_type = Vec.make_type(4, elem_dtype)
 
         def _global_load_tr_v8(base_i64, base64, off32):
-            """One global_load_tr_b128: an 8x8 16-bit transpose per lane-group.
-
-            Lane g_i supplies an address; the 8 contiguous elements there become
-            column i of the group's output, so lane g_j receives
-            [M_0[j] .. M_7[j]]. Verified empirically on gfx1201.
-            """
-            # Split as elsewhere: the (batch, head, tile) origin and the
-            # intra-tile part, added in 64 bits. Feeding LLVM
-            # `uniform_i64 + divergent` is what lets SelectGlobalSAddr keep the
-            # base in SGPRs instead of forcing a 64-bit VGPR address pair.
-            #
-            # The divergent half is *not* narrowed to i32 on the way. It
-            # carries `row_in_tile * s_seq`, and a view's sequence stride is
-            # bounded by the tensor it was taken from rather than by the shape
-            # here -- eight heads sliced out of a 1 GiB (1, 64, 16384, 512) f16
-            # tensor give `s_seq = 8388608`, whose 256th row is exactly 2**31.
-            base_bytes = arith.index_cast(T.i64, _raw(fx.Index(base64) * 2))
-            off_bytes = arith.index_cast(T.i64, _raw(fx.Index(off32) * 2))
-            addr = arith.addi(arith.addi(base_i64, base_bytes), off_bytes)
-            p = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), addr).result
-            return rocdl.global_load_tr_b128(v8f16_type, p)
+            return fmha_common.global_load_tr_v8(base_i64, base64, off32, v8f16_type)
 
         def _lds_load_v8(lds_idx):
             return fmha_common.lds_load_v8(lds_kv, lds_idx, v4f16_type)
@@ -1388,49 +1368,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             return _load_global_half_vec(base_ptr, base64, off32, v8f16_type)
 
         def _bitcast_i32(value):
-            return fx.Int32(ArithValue(value).bitcast(fx.Int32.ir_type))
-
-        def _pack_bf16_pair(lo, hi, shift, mask):
-            lo_i32 = _bitcast_i32(lo)
-            hi_i32 = _bitcast_i32(hi)
-            return (hi_i32 & mask) | lo_i32.shrui(shift)
+            return fmha_common.bitcast_i32(value)
 
         def bf16_trunc_pack_v8(f32_vals):
-            """Pack 8 f32 values into v8bf16 via bitwise truncation (upper 16 bits).
-
-            On P precision, before anyone tries to raise it here:
-
-            **There is no way to keep P in f32 through GEMM2 on gfx1201.** RDNA4
-            WMMA has no F32xF32 form (ISA manual Table 41); A/B operands are
-            f16/bf16/iu8/iu4/fp8 only. LLVM does define
-            `v_wmma_f32_16x16x4_f32`, but it is real-ized under
-            `VOP3P_Real_WMMA_gfx1250` -- gfx1250 only, not gfx12/gfx1201. The
-            AOTriton idiom `acc += tl.dot(p, v.to(p.type.element_ty))` works on
-            CDNA because that has `v_mfma_f32_16x16x4f32`; it has no gfx1201
-            equivalent. Doing PV in f32 here would mean dropping to VALU FMA and
-            giving up the matrix cores for GEMM2.
-
-            Note also that V is *not* downcast: it reaches GEMM2 at the input
-            tensor's native 16-bit width, so only P loses precision.
-
-            Truncation is round-toward-zero. Measured against an fp64 reference
-            (`accuracy_probe.py`, B=1 H=4 N=1024 d=128): no output bias (O sums
-            P*V and V is zero-mean, so the one-sided P error cancels), but the
-            RMS error is 1.6x torch SDPA's at bf16 (4.43e-3 vs 2.78e-3). f16 is
-            already at exact parity. Switching to round-to-nearest-even --
-            `x += 0x7FFF + ((x >> 16) & 1)` before the shift -- closes that gap
-            exactly (2.79e-3) but costs 2-3% at distance 1 and 2.7-5.4% at
-            Q_ROW_TILES=2, so it is deliberately not done. Truncation by
-            decision, not oversight.
-            """
-            _c16 = fx.Int32(16)
-            _cmask = fx.Int32(0xFFFF0000)
-            pairs = []
-            for j in range_constexpr(4):
-                pairs.append(
-                    _pack_bf16_pair(f32_vals[j * 2], f32_vals[j * 2 + 1], _c16, _cmask)
-                )
-            return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
+            return fmha_common.bf16_trunc_pack_v8(f32_vals, elem_dtype)
 
         def k_buf_base(buf_id):
             if const_expr(isinstance(buf_id, int)):

@@ -23,10 +23,12 @@ same reason.
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, range_constexpr
+from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector as Vec
+from flydsl.expr.utils.arith import ArithValue, _to_raw
 
-__all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx"]
+__all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
+           "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8"]
 
 
 def llvm_ptr_ty() -> ir.Type:
@@ -94,3 +96,76 @@ def lds_store_vx(lds_ptr, vec, lds_idx, vec_width):
     for _i in range_constexpr(vec_width // 4):
         part = v.shuffle(v, [_i * 4, _i * 4 + 1, _i * 4 + 2, _i * 4 + 3])
         fx.ptr_store(part, lds_ptr + fx.Int32(lds_idx + _i * 4))
+
+
+def global_load_tr_v8(base_i64, base64, off32, v8_type):
+    """One `global_load_tr_b128`: an 8x8 16-bit transpose per lane-group.
+
+    Lane g_i supplies an address; the 8 contiguous elements there become
+    column i of the group's output, so lane g_j receives [M_0[j] .. M_7[j]].
+    Verified empirically on gfx1201. The instruction is RDNA-only, which is
+    what puts this in the arch module.
+
+    Address is split the same way the rest of the kernel splits one: the
+    (batch, head, tile) origin and the intra-tile part, added in 64 bits.
+    Feeding LLVM `uniform_i64 + divergent` is what lets `SelectGlobalSAddr`
+    keep the base in SGPRs instead of forcing a 64-bit VGPR address pair.
+
+    The divergent half is deliberately *not* narrowed to i32 on the way. It
+    carries `row_in_tile * stride_seq`, and a view's sequence stride is bounded
+    by the tensor it was taken from rather than by the shape here -- eight
+    heads sliced out of a 1 GiB (1, 64, 16384, 512) f16 tensor give
+    `stride_seq = 8388608`, whose 256th row is exactly 2**31. Narrowing it
+    wrapped and read another allocation.
+    """
+    base_bytes = arith.index_cast(T.i64, _to_raw(fx.Index(base64) * 2))
+    off_bytes = arith.index_cast(T.i64, _to_raw(fx.Index(off32) * 2))
+    addr = arith.addi(arith.addi(base_i64, base_bytes), off_bytes)
+    p = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), addr).result
+    return rocdl.global_load_tr_b128(v8_type, p)
+
+
+def bitcast_i32(value):
+    return fx.Int32(ArithValue(value).bitcast(fx.Int32.ir_type))
+
+def pack_bf16_pair(lo, hi, shift, mask):
+    lo_i32 = bitcast_i32(lo)
+    hi_i32 = bitcast_i32(hi)
+    return (hi_i32 & mask) | lo_i32.shrui(shift)
+
+def bf16_trunc_pack_v8(f32_vals, elem_dtype):
+    """Pack 8 f32 values into v8bf16 via bitwise truncation (upper 16 bits).
+
+    On P precision, before anyone tries to raise it here:
+
+    **There is no way to keep P in f32 through GEMM2 on gfx1201.** RDNA4
+    WMMA has no F32xF32 form (ISA manual Table 41); A/B operands are
+    f16/bf16/iu8/iu4/fp8 only. LLVM does define
+    `v_wmma_f32_16x16x4_f32`, but it is real-ized under
+    `VOP3P_Real_WMMA_gfx1250` -- gfx1250 only, not gfx12/gfx1201. The
+    AOTriton idiom `acc += tl.dot(p, v.to(p.type.element_ty))` works on
+    CDNA because that has `v_mfma_f32_16x16x4f32`; it has no gfx1201
+    equivalent. Doing PV in f32 here would mean dropping to VALU FMA and
+    giving up the matrix cores for GEMM2.
+
+    Note also that V is *not* downcast: it reaches GEMM2 at the input
+    tensor's native 16-bit width, so only P loses precision.
+
+    Truncation is round-toward-zero. Measured against an fp64 reference
+    (`accuracy_probe.py`, B=1 H=4 N=1024 d=128): no output bias (O sums
+    P*V and V is zero-mean, so the one-sided P error cancels), but the
+    RMS error is 1.6x torch SDPA's at bf16 (4.43e-3 vs 2.78e-3). f16 is
+    already at exact parity. Switching to round-to-nearest-even --
+    `x += 0x7FFF + ((x >> 16) & 1)` before the shift -- closes that gap
+    exactly (2.79e-3) but costs 2-3% at distance 1 and 2.7-5.4% at
+    Q_ROW_TILES=2, so it is deliberately not done. Truncation by
+    decision, not oversight.
+    """
+    _c16 = fx.Int32(16)
+    _cmask = fx.Int32(0xFFFF0000)
+    pairs = []
+    for j in range_constexpr(4):
+        pairs.append(
+            pack_bf16_pair(f32_vals[j * 2], f32_vals[j * 2 + 1], _c16, _cmask)
+        )
+    return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
