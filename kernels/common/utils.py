@@ -88,6 +88,16 @@ def ssel(pred, a, b):
     return fx.Int32(ArithValue(pred).select(a, b))
 
 
+def smin(a, b):
+    """Signed minimum of two i32 values.
+
+    Not `arith.minsi`-backed on purpose: this spells out the select so it
+    composes with `ssel`'s typing rule, and so both operands stay visibly i32
+    at the call site. Same operand contract as `ssel`.
+    """
+    return ssel((a < b), a, b)
+
+
 def udiv_const(value, divisor: int):
     if const_expr(is_pow2(divisor)):
         return udiv_pow2(value, divisor)

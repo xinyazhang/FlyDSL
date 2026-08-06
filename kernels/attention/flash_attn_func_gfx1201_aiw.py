@@ -899,9 +899,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # than on `dtype_str` here -- see that module for why.
             return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
 
-        def _smin_i32(a, b):
-            return common_utils.ssel((a < b), a, b)
-
         def _smax_i32(a, b):
             return common_utils.ssel((a > b), a, b)
 
@@ -1816,7 +1813,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # for every row -- worst case the largest row on the left and the
             # smallest on the right.
             _q_start_i32 = fx.Int32(start_q)
-            _q_hi_i32 = _smin_i32(
+            _q_hi_i32 = common_utils.smin(
                 _q_start_i32 + fx.Int32(BLOCK_M), _seqlen_q_i32
             )
             _q_last_i32 = _q_hi_i32 - fx.Int32(1)
@@ -1832,7 +1829,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # The visited range: outside it every column is dead for every row
             # in this Q block, so those tiles are not walked at all.
             _v_lo = _smax_i32(_sdiv_rd(_q_start_i32 - _wl_i32), fx.Int32(0))
-            _v_hi = _smin_i32(_blk_last, _sdiv_rd(_q_last_i32 + _wr_i32))
+            _v_hi = common_utils.smin(_blk_last, _sdiv_rd(_q_last_i32 + _wr_i32))
             # Empty work, not skipped work. Varlen sizes the grid from
             # Max_seqlen_q, so a short sequence gets workgroups whose rows are
             # all past its end; this kernel is one single-exit trace and
@@ -1857,8 +1854,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _r_first_mask = _sdiv_rd(_q_start_i32 + _wr_i32 + fx.Int32(1))
 
             _fb_lo = _smax_i32(_l_first_full, _v_lo)
-            _fb_hi = _smin_i32(
-                _smin_i32(_r_first_mask - fx.Int32(1), _blk_last_whole), _v_hi
+            _fb_hi = common_utils.smin(
+                common_utils.smin(_r_first_mask - fx.Int32(1), _blk_last_whole), _v_hi
             )
             _fb_empty = (_fb_lo > _fb_hi)
 
