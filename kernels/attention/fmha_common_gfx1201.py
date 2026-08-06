@@ -67,6 +67,8 @@ The `()` is the tell that a helper is in category 2. Prefer 1 when the object
 allows it; it reads better and constructs once.
 """
 
+from typing import NamedTuple
+
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
@@ -82,7 +84,8 @@ __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", 
            "lds_f32_ptr", "lds_f32_store", "lds_f32_load",
            "reduce_s_across_shards",
            "cond_load", "seqinfo_addr", "decode_addressing", "lse_token_pitch",
-           "WINDOW_TOPLEFT", "WINDOW_BOTRIGHT", "resolve_window"]
+           "WINDOW_TOPLEFT", "WINDOW_BOTRIGHT", "resolve_window",
+           "CausalRegions", "decompose_causal_regions"]
 
 
 def llvm_ptr_ty() -> ir.Type:
@@ -620,3 +623,115 @@ def resolve_window(window_left, window_right, seqlen_q, seqlen_k):
         right,
     )
     return left, right
+
+
+class CausalRegions(NamedTuple):
+    """The three contiguous KV block runs a causal/windowed Q block walks."""
+
+    n_left: object      # masked tiles before the full run
+    n_full: object      # tiles with no mask at all
+    n_right: object     # masked tiles after it
+    left_col0: object   # first KV column of each run
+    full_col0: object
+    right_col0: object
+    masked_col0: object  # first column of the masked run, whichever side
+
+
+def decompose_causal_regions(
+    start_q, q_len, k_len, window_left, window_right, block_m, block_n, alive
+):
+    """Cut this Q block's visited KV range into `[masked][full][masked]`.
+
+    **Three regions, not two.** A left window kills columns at the *start* of
+    the range as well as the end, so masked tiles are a prefix as well as a
+    suffix and tile 0 is not automatically live. A negative `window_left` is
+    the sharpest case: it pushes the whole band right of the diagonal, so the
+    leading masked run can span several tiles rather than clipping one. Do not
+    carry the non-causal two-region intuition in here.
+
+    The three are contiguous and non-overlapping *by construction*, because
+    they are derived by cutting one visited range rather than intersected as
+    three independent intervals. That collapses two of the three special cases
+    in `sdpa-gswa-plan.md` section 2.2: a window narrower than a block leaves
+    the full region empty, which is detected once and turns the other two into
+    a single masked run, and an irregular `seqlen_q` needs no special handling
+    because `q_hi` already bounds the rows.
+
+    A column c is live for row i iff `i - window_left <= c <= i + window_right`,
+    so over the block the live columns span
+    `[start_q - window_left, (q_hi - 1) + window_right]`, and a tile is *fully*
+    live iff every one of its columns is live for every row -- worst case the
+    largest row on the left and the smallest on the right.
+
+    `alive` is false for a workgroup whose rows all sit past `q_len`, which the
+    varlen grid dispatches because its Q extent is sized from `Max_seqlen_q`.
+    The kernel is one single-exit trace and cannot return out of those (plan
+    section 6.1), so the visited range is *inverted* instead and every region
+    count falls to zero. Dropping this makes those workgroups walk real tiles.
+
+    Everything here is i32 and signed, deliberately: `left_col0` and friends
+    go negative when the window admits no key at all. See `resolve_window`.
+    """
+    one = fx.Int32(1)
+    zero = fx.Int32(0)
+    bn = fx.Int32(block_n)
+
+    q_start = fx.Int32(start_q)
+    q_hi = common_utils.smin(q_start + fx.Int32(block_m), q_len)
+    q_last = q_hi - one
+
+    # Blocks that exist at all, and the last block that is *whole*. Splitting
+    # these is section 2.2 case 3: a ragged seqlen_k leaves a partial final
+    # tile, which must be masked rather than counted as full.
+    blk_last = common_utils.sdiv_rd_pow2(k_len - one, block_n)
+    blk_last_whole = common_utils.sdiv_rd_pow2(k_len, block_n) - one
+
+    # The visited range: outside it every column is dead for every row in this
+    # Q block, so those tiles are not walked at all.
+    v_lo = common_utils.smax(
+        common_utils.sdiv_rd_pow2(q_start - window_left, block_n), zero
+    )
+    v_hi = common_utils.smin(
+        blk_last, common_utils.sdiv_rd_pow2(q_last + window_right, block_n)
+    )
+    v_hi = common_utils.ssel(alive, v_hi, v_lo - one)
+
+    # Rounded *up* on the left: a block is fully live only once its first
+    # column clears the leftmost row's window. Rounding down would send a
+    # partly-masked tile through the unmasked loop body -- invisible to a
+    # tolerance test, not to the bitwise one.
+    l_first_full = common_utils.sdiv_rd_pow2(
+        q_last - window_left + fx.Int32(block_n - 1), block_n
+    )
+    r_first_mask = common_utils.sdiv_rd_pow2(q_start + window_right + one, block_n)
+
+    fb_lo = common_utils.smax(l_first_full, v_lo)
+    fb_hi = common_utils.smin(
+        common_utils.smin(r_first_mask - one, blk_last_whole), v_hi
+    )
+    fb_empty = fb_lo > fb_hi
+
+    # Cut [v_lo, v_hi] at the full region. With no full region the whole range
+    # becomes one masked run -- section 2.2 case 2, the window narrower than a
+    # block, falling out for free.
+    lb_hi = common_utils.ssel(fb_empty, v_hi, fb_lo - one)
+    rb_lo = common_utils.ssel(fb_empty, v_hi + one, fb_hi + one)
+
+    n_left = common_utils.smax(lb_hi - v_lo + one, zero)
+    n_full = common_utils.smax(fb_hi - fb_lo + one, zero)
+    n_right = common_utils.smax(v_hi - rb_lo + one, zero)
+
+    left_col0 = v_lo * bn
+    right_col0 = rb_lo * bn
+    full_col0 = fb_lo * bn
+    # First tile of the masked run, which is also what the full loop's last
+    # prefetch must fetch: the two loops are adjacent only when the left run is
+    # empty. Clamped, because with a window admitting no key at all every run
+    # is empty and `rb_lo` sits below zero -- and this value still reaches the
+    # prologue's address computation.
+    masked_col0 = common_utils.smax(
+        common_utils.ssel(n_left > zero, left_col0, right_col0), zero
+    )
+    return CausalRegions(
+        n_left, n_full, n_right, left_col0, full_col0, right_col0, masked_col0
+    )

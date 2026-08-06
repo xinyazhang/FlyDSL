@@ -181,8 +181,10 @@ def _pointer_store(value: ir.Value, ptr: ir.Value):
 # Causal alignment as a *window* sentinel, AOTriton's `WindowValue`. These
 # occupy two values a real bound never takes, so `Window_left`/`Window_right`
 # stay plain signed integers rather than gaining a discriminant.
-_WINDOW_TOPLEFT = -2147483647    # 0x80000001
-_WINDOW_BOTRIGHT = -2147483646   # 0x80000002
+# The sentinel values themselves live in `fmha_common_gfx1201`, beside the
+# kernel-side code that resolves them; the host only needs to emit them.
+_WINDOW_TOPLEFT = fmha.WINDOW_TOPLEFT
+_WINDOW_BOTRIGHT = fmha.WINDOW_BOTRIGHT
 
 
 
@@ -1546,79 +1548,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # and a tile is *fully* live iff every one of its columns is live
             # for every row -- worst case the largest row on the left and the
             # smallest on the right.
-            _q_start_i32 = fx.Int32(start_q)
-            _q_hi_i32 = common_utils.smin(
-                _q_start_i32 + fx.Int32(BLOCK_M), seqlen_q_i32
+            _regions = fmha.decompose_causal_regions(
+                start_q, seqlen_q_i32, seqlen_k_i32,
+                _wl_i32, _wr_i32, BLOCK_M, BLOCK_N, _alive,
             )
-            _q_last_i32 = _q_hi_i32 - fx.Int32(1)
-
-            # Blocks that exist at all, and the last block that is *whole*.
-            # Splitting these two is section 2.2 case 3: a ragged seqlen_k
-            # leaves a partial final tile, which must be masked rather than
-            # counted as full. The old code spelled the same thing
-            # `_full_seq`.
-            _blk_last = common_utils.sdiv_rd_pow2(seqlen_k_i32 - fx.Int32(1), BLOCK_N)
-            _blk_last_whole = common_utils.sdiv_rd_pow2(seqlen_k_i32, BLOCK_N) - fx.Int32(1)
-
-            # The visited range: outside it every column is dead for every row
-            # in this Q block, so those tiles are not walked at all.
-            _v_lo = common_utils.smax(common_utils.sdiv_rd_pow2(_q_start_i32 - _wl_i32, BLOCK_N), fx.Int32(0))
-            _v_hi = common_utils.smin(_blk_last, common_utils.sdiv_rd_pow2(_q_last_i32 + _wr_i32, BLOCK_N))
-            # Empty work, not skipped work. Varlen sizes the grid from
-            # Max_seqlen_q, so a short sequence gets workgroups whose rows are
-            # all past its end; this kernel is one single-exit trace and
-            # cannot `return` out of them (plan section 6.1). Inverting the
-            # visited range drives every region count to zero, and the
-            # existing row-bound guards already suppress both stores.
-            _v_hi = common_utils.ssel(_alive, _v_hi, _v_lo - fx.Int32(1))
-
-            # First tile clear of the left edge: ceil(((q_hi-1) - w_left)/BN).
-            # First tile touched by the right edge: floor((start_q+w_right+1)/BN).
-            #
-            # Both are *exact*, not the conservative-by-one form the plan
-            # sketched: when the boundary column falls exactly on a tile edge
-            # that tile is still wholly live, and rounding it into the masked
-            # run would send a tile through the other loop body. That is
-            # invisible to a tolerance test but not to the bitwise one -- and
-            # the pre-gSWA causal split is exact here too, so anything else
-            # would stop reproducing it.
-            _l_first_full = common_utils.sdiv_rd_pow2(
-                _q_last_i32 - _wl_i32 + fx.Int32(BLOCK_N - 1), BLOCK_N
-            )
-            _r_first_mask = common_utils.sdiv_rd_pow2(_q_start_i32 + _wr_i32 + fx.Int32(1), BLOCK_N)
-
-            _fb_lo = common_utils.smax(_l_first_full, _v_lo)
-            _fb_hi = common_utils.smin(
-                common_utils.smin(_r_first_mask - fx.Int32(1), _blk_last_whole), _v_hi
-            )
-            _fb_empty = (_fb_lo > _fb_hi)
-
-            # Cut [_v_lo, _v_hi] at the full region. With no full region the
-            # whole range becomes one masked run, which is section 2.2 case 2
-            # (the window is narrower than a block) falling out for free.
-            _lb_hi = common_utils.ssel(_fb_empty, _v_hi, _fb_lo - fx.Int32(1))
-            _rb_lo = common_utils.ssel(_fb_empty, _v_hi + fx.Int32(1), _fb_hi + fx.Int32(1))
-            _n_l = common_utils.smax(_lb_hi - _v_lo + fx.Int32(1), fx.Int32(0))
-            _n_f = common_utils.smax(_fb_hi - _fb_lo + fx.Int32(1), fx.Int32(0))
-            _n_r = common_utils.smax(_v_hi - _rb_lo + fx.Int32(1), fx.Int32(0))
-
             _BN_I32 = fx.Int32(BLOCK_N)
-            _l_col0 = _v_lo * _BN_I32
-            _r_col0 = _rb_lo * _BN_I32
-            _f_col0 = _fb_lo * _BN_I32
-            # First tile of the masked run, which is also what the full loop's
-            # last prefetch must fetch: the two loops are adjacent only when
-            # the left run is empty.
-            # Clamped: with a window that admits no key at all every run is
-            # empty and `_rb_lo` sits below zero, and this value still reaches
-            # the prologue's address computation.
-            _m_col0 = common_utils.smax(
-                common_utils.ssel(
-                    (_n_l > fx.Int32(0)),
-                    _l_col0, _r_col0,
-                ),
-                fx.Int32(0),
-            )
+            _n_l, _n_f, _n_r = _regions.n_left, _regions.n_full, _regions.n_right
+            _l_col0, _f_col0 = _regions.left_col0, _regions.full_col0
+            _r_col0, _m_col0 = _regions.right_col0, _regions.masked_col0
             _n_masked = fx.Index(_n_l + _n_r)
         else:
             # No mask beyond the KV tail: one full region, then one partial
