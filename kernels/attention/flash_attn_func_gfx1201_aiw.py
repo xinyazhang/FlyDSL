@@ -546,10 +546,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     #
     # "fast" restores the old behaviour for A/B; "safe" additionally drops
     # `nnan` (~0.6%).
-    _FP_MODE = FP_MODE
     # Host-side: `fp_mode` is const_expr, so this is a Python object the kernel
     # body captures rather than a traced value.
-    fastmath = fmha.FastMath(_FP_MODE)
+    fastmath = fmha.FastMath(FP_MODE)
 
     # Two softmax corrections, unconditional. Both come from AOTriton's
     # hard-won list and there is no reason to keep the un-corrected form
@@ -2656,7 +2655,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     ]
                 )
             )
-            if const_expr(_FP_MODE == "fast"):
+            if const_expr(FP_MODE == "fast"):
                 passthrough_entries.append(
                     ir.ArrayAttr.get(
                         [ir.StringAttr.get("no-nans-fp-math"), ir.StringAttr.get("true")]
