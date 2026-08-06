@@ -842,11 +842,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             of sdpa-varlen-plan.md; the axes are STACKED (bit 0), LENGTH (bits
             2:1) and POSITION (bits 4:3).
 
-            `tokens` is the LSE token pitch, and only the Q call's is used. It
-            is derived rather than passed because the logsumexp tensor -- alone
-            among the tensors here -- is always compact, so its strides are a
-            function of the bits and would otherwise be a second source of
-            truth for one fact (plan section 4.2).
+            The LSE token pitch is *not* here, though it decodes from the
+            same bits: it describes the logsumexp output rather than where Q
+            or K live, and only the Q side needs it. Computing it here meant
+            the K call did the work and the caller discarded it. See
+            `_lse_token_pitch`.
 
             **Stays in the kernel file.** It branches on `varlen_bits`, and the
             rewrite that turns a dynamic `if` into an `scf.if` is lexical per
@@ -885,26 +885,39 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 fx.Int32(0), _z_i32,
             )
 
-            # LSE token pitch. Batched layouts pad every row-group to
-            # Max_seqlen; stacked ones run to the batch total, which lives in
-            # slot [N] of whichever array supplies positions. That `[N]` read
-            # is the prefix-sum assumption of plan section 9.4, asserted host
-            # side.
+            return _seqlen, _row_off, _batch
+
+        def _lse_token_pitch(max_seqlen, s0, s1):
+            """Row pitch of the logsumexp output, in tokens. Q side only.
+
+            Batched layouts pad every row-group to Max_seqlen; stacked ones run
+            to the batch total, which lives in slot [N] of whichever array
+            supplies positions -- the prefix-sum assumption of plan section
+            9.4, asserted host side.
+
+            Derived from the bits rather than passed because the logsumexp
+            tensor, alone among the tensors here, is always compact: its
+            strides are a function of the bits and passing them would be a
+            second source of truth for one fact (plan section 4.2).
+            """
+            _b = fx.Int32(varlen_bits)
+            _posmode = (_b >> fx.Int32(3)) & fx.Int32(3)
             _tokens = fx.Int32(max_seqlen)
-            if _stacked != fx.Int32(0):
+            if (_b & fx.Int32(1)) != fx.Int32(0):
                 _tokens = fx.Int32(num_seqlens) * fx.Int32(max_seqlen)
                 if _posmode == fx.Int32(1):
                     _tokens = fmha.seqinfo_at(s0, fx.Int32(num_seqlens))
                 elif _posmode == fx.Int32(2):
                     _tokens = fmha.seqinfo_at(s1, fx.Int32(num_seqlens))
-            return _seqlen, _row_off, _batch, _tokens
+            return _tokens
 
-        _seqlen_q_i32, _q_row_off, _q_batch, _lse_tokens = _decode_side(
+        _seqlen_q_i32, _q_row_off, _q_batch = _decode_side(
             0, max_seqlen_q, seqinfo_q0, seqinfo_q1
         )
-        _seqlen_k_i32, _k_row_off, _k_batch, _ = _decode_side(
+        _seqlen_k_i32, _k_row_off, _k_batch = _decode_side(
             8, max_seqlen_k, seqinfo_k0, seqinfo_k1
         )
+        _lse_tokens = _lse_token_pitch(max_seqlen_q, seqinfo_q0, seqinfo_q1)
 
         seqlen_k_v = fx.Index(_seqlen_k_i32)
 
