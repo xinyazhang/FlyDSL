@@ -240,3 +240,58 @@ scratch.
 sequence-space. A quantity that is compared in sequence space but multiplied in
 address space is an addressing quantity, and section 1 already says so -- what
 this adds is that the comparison does not get to be narrowed on its own either.
+
+
+## 8. Phase 3 outcome: the site count was the wrong unit
+
+P3.1 classified 100 `fx.Index(` sites and concluded 73 should become
+`fx.Int32`. Four commits later the file still has 98, and that is the right
+answer rather than an unfinished one.
+
+What the classification got wrong is that it sorted sites by *what the quantity
+is* -- a sequence position, a column index -- when the property that decides
+the width is *what it flows into*. Re-audited on that basis:
+
+| group (P3.1 §2)           | sites | verdict                                              |
+| ------------------------- | ----- | ---------------------------------------------------- |
+| `seqlen_q_v`              |     1 | narrowed, but only the uniform compare (§8.1)        |
+| `seqlen_k_v`, `seq_last`  |     2 | refuted -- §7                                        |
+| tile / row origins        |   ~12 | feed `tbase`/`o_tbase`; addressing by §1             |
+| shard + column indices    |   ~22 | summed into a 64-bit offset in `toff`                |
+| KV region bounds          |   ~15 | **already i32** -- the gSWA work converted them      |
+| in-tile row / lane offsets|   ~20 | feed `row * s_seq`; addressing by §1                 |
+
+So the 73 was really about 16, of which 15 were already done before P3.2
+started and the last one is half-done by choice.
+
+### 8.1 The rule, restated
+
+Truncating a value that stays live in 64 bits does not remove a value, it adds
+one. Both forms are then live, and at any width that already spills, that is
+paid in scratch. Three independent measurements of the same effect:
+
+| change                                     | cost                                    |
+| ------------------------------------------ | --------------------------------------- |
+| narrow `ts` / `seq_last` / the KV predicate | +160 B scratch @ BLOCK_DMODEL 192       |
+| narrow the KV predicate only                | +160 B scratch @ BLOCK_DMODEL 192       |
+| narrow the per-lane Q row compare           | +16 B scratch and -6% @ 384 causal      |
+
+The one narrowing that stuck -- `_alive` -- is the one whose operand is uniform
+and has no 64-bit consumer. That is the test: **narrow a quantity only when
+every consumer is sequence-space**, not when the value merely fits.
+
+### 8.2 What Phase 3 did deliver
+
+Two bitwise-identical cleanups and one small one:
+
+- `_scmp_i32` deleted. Its docstring named its own exit condition and the
+  condition was met; 14 call sites became plain `<`/`>`/`==`/`!=`.
+- `_ssel_i32`'s operand coercion dropped. The helper stays, against the plan:
+  `ArithValue.select` returns a raw MLIR value, so the `fx.Int32` around the
+  *result* is load-bearing and deleting it would lengthen 14 call sites.
+  `_smin_i32`/`_smax_i32` became one-liners as a side effect.
+- the K sequence length's widen-then-truncate round trip removed.
+
+P3.3 is therefore complete and P3.2 is closed as mostly-not-applicable. The
+`fx.Int64(a * b)` hazard the phase was most worried about (§4) never appeared:
+the file still has zero `fx.Int64(` sites containing a multiply.
