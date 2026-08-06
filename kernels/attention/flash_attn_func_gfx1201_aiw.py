@@ -1047,7 +1047,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             8, max_seqlen_k, seqinfo_k0, seqinfo_k1
         )
 
-        seqlen_q_v = fx.Index(_seqlen_q_i32)
         seqlen_k_v = fx.Index(_seqlen_k_i32)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -1121,9 +1120,15 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # Does this workgroup own any real Q row? Under varlen the grid's Q
         # extent is sized from Max_seqlen_q, so whole workgroups land past the
         # end of a shorter sequence and this is false for them.
-        _alive = ArithValue(
-            arith.cmpi(arith.CmpIPredicate.slt, _raw(start_q), _raw(seqlen_q_v))
-        )
+        #
+        # Compared in i32, and the Q sequence length is never widened past it.
+        # Both operands are bounded by Max_seqlen_q, an i32 ABI argument, so 64
+        # bits buys nothing -- and it costs: `fx.Index` is *unsigned*, so the
+        # widened form lowered to `v_cmp_gt_u64` and every such comparison in
+        # this file had to be hand-written as an explicit `arith.cmpi(slt, ...)`
+        # to get the signed predicate back. `fx.Int32` is signed, so `<` is
+        # already the right thing.
+        _alive = ArithValue(fx.Int32(start_q) < _seqlen_q_i32)
 
         # **The Q base must be clamped, not just the row within the tile.**
         # `q_tbase(start_q)` folds start_q into the 64-bit base, and the
@@ -1694,11 +1699,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         q_in_bounds_all = []
         q_b_packs_all = []
         for qt in range_constexpr(Q_ROW_TILES):
-            # Explicit signed-less-than predicate: fx.Index defaults to unsigned,
-            # which lowers to v_cmp_gt_u64_e64 instead of the signed form.
-            _in = arith.cmpi(
-                arith.CmpIPredicate.slt, _raw(q_rows[qt]), _raw(seqlen_q_v)
-            )
+            _in = _raw(fx.Int32(q_rows[qt]) < _seqlen_q_i32)
             _safe = fx.Index(
                 ArithValue(_in).select(q_rows_in_tile[qt], fx.Index(0))
             )
