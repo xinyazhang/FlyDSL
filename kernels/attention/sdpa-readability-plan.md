@@ -1031,22 +1031,42 @@ accepts **any layout** whose D axis is innermost -- `_strides_of` reads
 loads and stores are 8 columns wide along D. So a BHSD-*layout* tensor is
 already supported; it is passed as `t.transpose(1, 2)`, which has BSHD shape.
 
-What the change is, and what it is not:
+**This is a kernel ABI change, not an interface change.** AOTriton dispatches
+BHSD tensors to the hsaco compiled from FlyDSL *directly* -- it never calls
+`flydsl_flash_attn_func_gfx1201`. So the contract that has to move is the one
+the binary exposes: the order in which the three strides arrive.
 
-- **Not** a kernel change. The builder never sees a shape -- it receives three
-  strides and a runtime extent, and multiplies indices by the strides it was
-  handed. `_addr_pair`'s `s_batch, s_seq, s_head = st` keeps working; only
-  *which* of the caller's strides lands in each slot moves.
-- **Is** an interface change: the shape unpack at `interface.py:144`, the order
-  the strides are collected in `_strides_of`, and the `num_heads`/`seq_len`
-  arguments derived from the shape.
-- **Is** a test and benchmark change. Every harness in this directory builds
-  `(B, S, H, D)` tensors -- `_qkv`, `perf_ab`, `codegen_fingerprint`,
-  `bench_aiw_ab`, `accuracy_probe`. They are also the reference-comparison
-  sites, and PyTorch SDPA wants BHSD, so several of them currently transpose on
-  the way in and would stop needing to.
+The kernel currently reads them in BSHD order. `_addr_pair` does
 
-Two things to decide when it is done rather than now: whether to accept both
-shapes behind a flag during migration (probably not -- two shape conventions is
-the confusion this removes), and whether `_strides_of`'s comment gets rewritten
-to use the shape/layout distinction above, which it should regardless.
+```python
+s_batch, s_seq, s_head = st        # st = (stride_?0, stride_?1, stride_?2)
+```
+
+so slot 1 is the sequence stride and slot 2 the head stride. A BHSD caller
+passes `stride(1)` = head and `stride(2)` = seq, which silently transposes
+every address -- the kernel would read heads where it expects tokens, produce
+finite garbage, and never fault.
+
+Scope:
+
+- **Kernel.** The unpack order in `_addr_pair`, and the four `stride_?1` /
+  `stride_?2` launch parameters, which should be renamed for the axis they
+  carry rather than their position -- the whole class of bug here is a
+  positional argument whose meaning is a convention.
+- **Interface.** The shape unpack at `interface.py:144` becomes
+  `(batch, num_heads, seq_len, head_dim)`; `_strides_of` is unchanged, since it
+  already reads positionally.
+- **Every harness in the directory.** `_qkv`, `perf_ab`, `codegen_fingerprint`,
+  `bench_aiw_ab`, `accuracy_probe` all build `(B, S, H, D)`. Several already
+  transpose to BHSD for the PyTorch reference and would stop needing to, so
+  this makes them simpler rather than merely different.
+- **The bias and varlen paths**, which carry their own stride triples on the
+  same convention and must move together or not at all.
+
+Two notes for whoever does it. There is no compile-time or runtime signal that
+distinguishes the two orders -- a wrongly-ordered call is wrong output, not an
+error -- so the migration wants a test that fails loudly on the old order
+before the change lands, in the style of the stride test in
+`test_element_offsets_past_2gi`. And `_strides_of`'s comment must be rewritten
+with the shape/layout distinction above; it currently uses "shape" for both and
+is the one place a reader goes to learn the convention.
