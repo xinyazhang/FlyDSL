@@ -29,7 +29,7 @@ from flydsl.expr.utils.arith import ArithValue, _to_raw
 
 __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
            "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8",
-           "FastMath"]
+           "FastMath", "MaskedAxis"]
 
 
 def llvm_ptr_ty() -> ir.Type:
@@ -216,3 +216,85 @@ class FastMath:
 
     def max(self, a, b):
         return arith.MaxNumFOp(_to_raw(a), _to_raw(b), fastmath=self.flags).result
+
+
+class MaskedAxis:
+    """One axis of a tile whose index can run past the real extent.
+
+    Out-of-range indices always need two things, and keeping them together is
+    the point: an address that is *safe to issue*, and a way to *discard what
+    it returns*. Issuing the access unconditionally and throwing the value away
+    beats branching around it, but only once the address has been redirected
+    somewhere legal -- element 0 of the axis, which always exists.
+
+    **One class covers rows and columns**, because the apparent difference
+    between them is not about the axes. An access reads `width` contiguous
+    elements *along one axis*; for that axis the extent boundary can fall
+    inside the access, so validity is per element. For every other axis the
+    index is a single scalar and the whole access stands or falls together.
+    In this kernel the vector runs along the column axis, which is why columns
+    look "per element" and rows "whole" -- but that is a property of the
+    access, not of the axis, and `valid(idx)` is exactly `mask(idx, 1)`.
+
+    `active=False` compiles the masking away, for an axis whose extent is known
+    to be a multiple of the access width.
+    """
+
+    __slots__ = ("extent", "active")
+
+    def __init__(self, extent, active=True):
+        self.extent = extent
+        self.active = active
+
+    def _bound(self):
+        """The extent as a traced value.
+
+        Resolved lazily so the object can be built on the host when the extent
+        is a `const_expr` int, which is what the kernel body requires: an
+        object assigned inside the body becomes a local of the recompiled
+        function and does not survive the AST rewriter's scoping.
+        """
+        return fx.Index(self.extent) if isinstance(self.extent, int) else self.extent
+
+    def valid(self, idx):
+        """i1: is this index inside the extent?
+
+        A signed compare, on every axis. `fx.Index` is *unsigned*, so a plain
+        `idx < extent` emits `v_cmp_lt_u64`; the answer agrees here because
+        every index and extent is non-negative, but the two are not the same
+        code and mixing them per axis was a difference with no reason behind
+        it. Signed throughout, matching the rest of the file.
+        """
+        return arith.cmpi(arith.CmpIPredicate.slt, _to_raw(idx), _to_raw(self._bound()))
+
+    def mask(self, idx, width):
+        """i1 vector, element j set iff `idx + j` is inside the extent.
+
+        Built from a loop-invariant index at every current caller, so it hoists
+        out of the KV loop and costs one vector select per access inside it.
+        """
+        return Vec.from_elements(
+            [ArithValue(self.valid(idx + fx.Index(j))) for j in range_constexpr(width)],
+            fx.Boolean,
+        )
+
+    def safe(self, idx, addressed=None):
+        """`addressed` if `idx` is inside the extent, else 0.
+
+        `addressed` defaults to `idx`, which is the column case. Rows need the
+        two to differ: the bound is on the *absolute* row, `start_q + ...`,
+        while the address is built from the row's offset *within the tile*, so
+        the tested and the redirected quantity are not the same value.
+        """
+        if addressed is None:
+            addressed = idx
+        if not self.active:
+            return addressed
+        return fx.Index(ArithValue(self.valid(idx)).select(addressed, fx.Index(0)))
+
+    def discard(self, vec, idx, width, elem_dtype):
+        """Zero the elements of `vec` whose index is past the extent."""
+        if not self.active:
+            return vec
+        zeros = Vec.filled(width, 0.0, elem_dtype)
+        return self.mask(idx, width).select(Vec(vec), zeros).ir_value()

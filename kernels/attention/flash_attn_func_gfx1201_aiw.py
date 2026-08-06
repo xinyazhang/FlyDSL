@@ -1280,29 +1280,25 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         _hdim_qk_i = fx.Index(hdim_qk)
         _hdim_vo_i = fx.Index(hdim_vo)
 
-        def _col_safe(col, hdim_i):
-            """Redirect a wholly-invalid chunk to column 0 so the load is safe."""
-            if const_expr(not PADDED_HEAD):
-                return col
-            return fx.Index(ArithValue(col < hdim_i).select(col, fx.Index(0)))
+        # The two column axes: QK accesses are bounded by hdim_qk, V/O by
+        # hdim_vo. `PADDED_HEAD` false means the extent is a multiple of the
+        # access width, so every access is wholly in range and the masking
+        # compiles away.
+        #
+        # **Functions, not variables, and that is forced.** A kernel-body
+        # variable holding a plain Python object cannot be read inside a
+        # dynamic `if`: the AST rewriter collects such variables as `scf`
+        # state and requires MLIR-backed values ("state variable 'x' is
+        # MaskedAxis, not an MLIR Value"). `coop_load_store_k` reads these
+        # inside `if row_valid:` whenever KV_NEEDS_GUARD, which is every
+        # BLOCK_DMODEL whose load geometry does not tile BLOCK_N exactly --
+        # 16 among them. A call re-creates the object at trace time, which is
+        # free and emits nothing.
+        def qk_cols():
+            return fmha.MaskedAxis(_hdim_qk_i, active=PADDED_HEAD)
 
-        def _col_mask(col, hdim_i, width):
-            """i1 vector, element j set iff column `col + j` holds real data.
-
-            Built from a loop-invariant column, so for the cooperative loads
-            this is hoisted out of the KV loop entirely and costs one vector
-            select per load inside it.
-            """
-            return Vec.from_elements(
-                [(col + fx.Index(j)) < hdim_i for j in range_constexpr(width)],
-                fx.Boolean,
-            )
-
-        def _apply_col_mask(vec, col, hdim_i, width):
-            if const_expr(not PADDED_HEAD):
-                return vec
-            zeros = Vec.filled(width, 0.0, elem_dtype)
-            return _col_mask(col, hdim_i, width).select(Vec(vec), zeros).ir_value()
+        def vo_cols():
+            return fmha.MaskedAxis(_hdim_vo_i, active=PADDED_HEAD)
 
         def _split_ptr(ptr, base64, off):
             """ptr + base64 (uniform) + off (divergent). Both 64-bit.
@@ -1351,12 +1347,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 b64, o32 = k_addr(
                     start_k, load_row_in_batch + row_offset,
-                    _col_safe(load_col_base, _hdim_qk_i),
+                    qk_cols().safe(load_col_base),
                 )
                 vecs.append(
-                    _apply_col_mask(
+                    qk_cols().discard(
                         load_global_f16xN(k_ptr, b64, o32),
-                        load_col_base, _hdim_qk_i, VEC_WIDTH,
+                        load_col_base, VEC_WIDTH, elem_dtype,
                     )
                 )
             return vecs
@@ -1397,30 +1393,30 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     row_valid = lds_row < fx.Index(BLOCK_N)
                     if row_valid:
                         b64, o32 = k_addr(
-                            start_k, lds_row, _col_safe(load_col_base, _hdim_qk_i)
+                            start_k, lds_row, qk_cols().safe(load_col_base)
                         )
                         fmha.lds_store_vx(
                             lds_kv,
-                            _apply_col_mask(
+                            qk_cols().discard(
                                 load_global_f16xN(k_ptr, b64, o32),
-                                load_col_base, _hdim_qk_i, VEC_WIDTH,
+                                load_col_base, VEC_WIDTH, elem_dtype,
                             ),
                             k_base + lds_row * K_STRIDE + load_col_base,
                             VEC_WIDTH,
                         )
                 else:
                     b64, o32 = k_addr(
-                        start_k, lds_row, _col_safe(load_col_base, _hdim_qk_i)
+                        start_k, lds_row, qk_cols().safe(load_col_base)
                     )
                     fmha.lds_store_vx(
                         lds_kv,
-                        _apply_col_mask(
+                        qk_cols().discard(
                             load_global_f16xN(k_ptr, b64, o32),
-                            load_col_base, _hdim_qk_i, VEC_WIDTH,
+                            load_col_base, VEC_WIDTH, elem_dtype,
                         ),
                         k_base + lds_row * K_STRIDE + load_col_base,
                         VEC_WIDTH,
-                        )
+                    )
 
         # ---- V staging ----
         #
@@ -1468,7 +1464,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         col = fx.Index(D_OFFSET) + col
                     b64, o32 = v_addr(
                         start_k, kv_base + _tr_kv_off,
-                        _col_safe(col, _hdim_vo_i),
+                        vo_cols().safe(col),
                     )
                     vecs.append(fmha.global_load_tr_v8(v_ptr_i64, b64, o32, v8f16_type))
             else:
@@ -1479,7 +1475,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         col = fx.Index(D_OFFSET) + col
                     b64, o32 = v_addr(
                         start_k, v_row_in_batch + row_offset,
-                        _col_safe(col, _hdim_vo_i),
+                        vo_cols().safe(col),
                     )
                     vecs.append(load_global_f16xN(v_ptr, b64, o32))
             return vecs
@@ -1526,34 +1522,33 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             wave_q_offset + fx.Index(qt * WMMA_M) + lane16
             for qt in range_constexpr(Q_ROW_TILES)
         ]
+        # Rows are bounded by the real Q length; a workgroup's last tile can
+        # hang past it. Unlike the column axes this is never inactive. A
+        # function for the same reason as those -- see `qk_cols`.
+        def q_rows_axis():
+            return fmha.MaskedAxis(fx.Index(_seqlen_q_i32))
         q_tile_base = q_tbase(_q_start_addr)
         c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
 
         q_in_bounds_all = []
         q_b_packs_all = []
         for qt in range_constexpr(Q_ROW_TILES):
-            # Deliberately *not* `q_row_i32s[qt] < _seqlen_q_i32`, which is the
-            # same value and reads better. That form starts the i32 copy's live
-            # range here rather than at the causal mask that needs it, and at
-            # the widest causal builds the extra overlap spills: BLOCK_DMODEL
-            # 384 causal paid 16 more bytes of scratch and 6% throughput.
-            # `fx.Index` is unsigned, hence the explicit signed predicate.
-            _in = arith.cmpi(
-                arith.CmpIPredicate.slt,
-                _raw(q_rows[qt]),
-                _raw(fx.Index(_seqlen_q_i32)),
-            )
-            _safe = fx.Index(
-                ArithValue(_in).select(q_rows_in_tile[qt], fx.Index(0))
-            )
+            # The index-typed row, deliberately, not `q_row_i32s[qt]`. The i32
+            # copy exists for the causal mask; testing against it here would
+            # start its live range early, and at the widest causal builds that
+            # overlap spills -- BLOCK_DMODEL 384 causal paid 16 more bytes of
+            # scratch and 6% throughput. `MaskedTile.valid` emits the signed
+            # compare that `fx.Index` being unsigned would otherwise deny.
+            _in = q_rows_axis().valid(q_rows[qt])
+            _safe = q_rows_axis().safe(q_rows[qt], q_rows_in_tile[qt])
             _packs = []
             for ks in range_constexpr(K_STEPS_QK):
                 q_col = shard_qk_off + fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
                 raw = load_global_v8f16(
                     q_ptr, q_tile_base,
-                    q_toff(_safe, _col_safe(q_col, _hdim_qk_i)),
+                    q_toff(_safe, qk_cols().safe(q_col)),
                 )
-                raw = _apply_col_mask(raw, q_col, _hdim_qk_i, 8)
+                raw = qk_cols().discard(raw, q_col, 8, elem_dtype)
                 _packs.append(ArithValue(_in).select(raw, c_zero_v8f16))
             q_in_bounds_all.append(_in)
             q_b_packs_all.append(_packs)
