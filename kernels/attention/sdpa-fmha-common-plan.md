@@ -92,11 +92,53 @@ taking the knobs they need. No runtime values cross the boundary.
 - **Q preload + address setup (~140 lines).** Extract `make_addr_pair` (already
   a factory) and `preload_q(...)`.
 
-**Does not move.** `_kv_body` stays in the kernel file. It is the algorithm,
-its 669 lines are the pipeline structure the tuning knobs shape, and the
-scheduling comments in it are load-bearing. Breaking it up is a separate
-question from offloading hardware detail, and answering both at once would make
-any regression unattributable.
+**Tier D -- inside the inner loop.** An earlier draft of this plan said
+`_kv_body` does not move, on the grounds that splitting the main loop and
+offloading hardware detail at once would make a regression unattributable.
+That was too cautious. These are trace-time Python moves gated bitwise, and
+P5.4 landed five consecutive extractions with byte-identical ISA; when the gate
+holds there is nothing to attribute. It only becomes true if an extraction
+*fails* the gate, and then the rule is to stop and measure, not to have never
+tried.
+
+What is shareable is the middle of the three stages -- `gemm(q, k)`, **process
+the QK block**, `gemm(p, v)`. The backward pass recomputes P, so it needs the
+same mask, the same bias add, the same base-2 scaling and the same dropout;
+it does *not* share the GEMMs or the LDS staging, whose operand shapes differ.
+That matches what AOTriton shares between its own fwd and bwd -- `parse_window`,
+`calculate_intervals`, `closed_interval_isect`, the masked load/store family and
+`dropout.py` -- and notably not the inner loop itself, which it splits into
+`attn_fwd_inner`, `bwd_inner_dk_dv` and `bwd_inner_dq`.
+
+So the extraction targets inside the loop are the S-block post-processing
+steps, each of which the bwd kernel will want:
+
+| block                        | shared with bwd | note |
+| ---------------------------- | --------------- | ---- |
+| causal / SWA mask on S       | yes             | same predicate, same sentinels |
+| KV tail mask                 | yes             | |
+| bias add                     | yes             | after the scale, before the mask |
+| base-2 scale + row max       | yes             | bwd recomputes P |
+| dropout mask                 | yes             | already shared via `philox.py` |
+| accumulator element -> KV column map | **no**  | WMMA operand layout; bwd's GEMM shapes differ |
+| GEMM1 / GEMM2, LDS staging   | **no**          | different operands |
+
+### 3.1 Rename: `_kv_body` -> `attn_fwd_inner`
+
+Adopted, but not for the reason first offered. The argument was that K and V
+are never used at the same time, so "kv" is a misnomer. That part does not
+hold: both prefetch distances are 1, so `coop_load_k_global(next_kv_start)`
+issues while the current tile's V is still feeding GEMM2 -- K[n+1] and V[n] are
+in flight together. "KV" is also the standard name for the axis both are
+indexed by, which is what the loop walks.
+
+The rename is still right, for a different reason: **parity with AOTriton**,
+which is the integration target. `attn_fwd_inner` is the name of exactly this
+function there, and it sits in a family with `bwd_inner_dk_dv` and
+`bwd_inner_dq` that this kernel will grow equivalents of. A reviewer diffing
+the two implementations should not have to translate names. `_kv_body`
+describes what the loop iterates over; `attn_fwd_inner` describes what the
+function is, and the latter is the one shared with the reference.
 
 ## 4. Sequencing and gates
 
