@@ -212,15 +212,18 @@ and `_sdiv_rd` is precisely the *signed* counterpart to `udiv_pow2` that the
 set is missing today. Naming should follow that convention (`sdiv_rd_pow2`,
 `ssel`, `smin`, `smax`) rather than carrying the leading underscore over.
 
-One caveat for the reviewer, because CLAUDE.md points the other way. It says
-DSL-level numeric/arith helpers belong in `python/flydsl/expr/utils/arith.py`,
-and by type these qualify. Two things argue against it: `kernels/common/utils.py`
-already sets the precedent with the unsigned siblings, and on this box `flydsl`
-is an installed wheel rather than an editable checkout, so anything added under
-`python/flydsl/` is not importable by these kernels without rebuilding it --
-which is the same constraint that produced `gfx1201_standalone.py`. If the
-wheel becomes editable, the DSL tree is the better long-term home and this
-should move again.
+CLAUDE.md points the other way -- it says DSL-level numeric/arith helpers
+belong in `python/flydsl/expr/utils/arith.py`, and by type these qualify. They
+still go under `kernels/`, because **`python/flydsl/` is FlyDSL developer
+surface and this is kernel work.** Changing the DSL to serve one kernel widens
+the blast radius to every kernel in the tree and puts the change in front of a
+different set of reviewers. `kernels/common/utils.py` already sets the
+precedent with the unsigned siblings.
+
+That is a scope boundary, not a packaging one. `flydsl` also happens to be an
+installed wheel here rather than an editable checkout, so the DSL tree is not
+even importable by these kernels without a rebuild -- but that is a separate,
+mechanical fact, and fixing it would not make the DSL the right home.
 
 | phase | done when                                                                                          |
 | ----- | ---------------------------------------------------------------------------------------------------- |
