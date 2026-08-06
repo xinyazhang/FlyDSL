@@ -110,7 +110,7 @@ from flydsl.expr.typing import T, Vector as Vec
 from philox import Philox, dropout_threshold
 from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
 
-from gfx1201_standalone import wmma_ops
+from gfx1201_standalone import utils as common_utils, wmma_ops
 
 from dataclasses import fields
 
@@ -899,23 +899,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # than on `dtype_str` here -- see that module for why.
             return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
 
-        def _ssel_i32(pred, a, b):
-            """`pred ? a : b`, as an `fx.Int32`.
-
-            Survives P3.3, unlike `_scmp_i32`, and for a reason that is not
-            the coercion: `ArithValue.select` returns a raw MLIR value, so
-            without the `fx.Int32` wrapper the result has no arithmetic
-            overloads and every caller doing `_v_hi + fx.Int32(1)` would have
-            to add one itself. The operand coercion *was* redundant and is
-            gone; the result wrapper is the helper.
-            """
-            return fx.Int32(ArithValue(pred).select(a, b))
-
         def _smin_i32(a, b):
-            return _ssel_i32((a < b), a, b)
+            return common_utils.ssel((a < b), a, b)
 
         def _smax_i32(a, b):
-            return _ssel_i32((a > b), a, b)
+            return common_utils.ssel((a > b), a, b)
 
         def _sdiv_rd(x):
             """floor(x / BLOCK_N), signed -- plan section 2.4 rule 4.
@@ -1000,7 +988,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 _seqlen = _seqinfo_at(s0, _z_i32)
 
             # POSITION.
-            _row_off = _ssel_i32(
+            _row_off = common_utils.ssel(
                 (_stacked != fx.Int32(0)),
                 _z_i32 * fx.Int32(max_seqlen), fx.Int32(0),
             )
@@ -1009,7 +997,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             elif _posmode == fx.Int32(2):        # ARRAY
                 _row_off = _seqinfo_at(s1, _z_i32)
 
-            _batch = _ssel_i32(
+            _batch = common_utils.ssel(
                 (_stacked != fx.Int32(0)),
                 fx.Int32(0), _z_i32,
             )
@@ -1768,15 +1756,15 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _wr_i32 = fx.Int32(window_right)
             _is_tl_l = (_wl_i32 == fx.Int32(_WINDOW_TOPLEFT))
             _is_br_l = (_wl_i32 == fx.Int32(_WINDOW_BOTRIGHT))
-            _wl_i32 = _ssel_i32(
+            _wl_i32 = common_utils.ssel(
                 ArithValue(arith.ori(_raw(_is_tl_l), _raw(_is_br_l))),
                 _seqlen_q_i32, _wl_i32,
             )
-            _wr_i32 = _ssel_i32(
+            _wr_i32 = common_utils.ssel(
                 (_wr_i32 == fx.Int32(_WINDOW_TOPLEFT)),
                 fx.Int32(0), _wr_i32,
             )
-            _wr_i32 = _ssel_i32(
+            _wr_i32 = common_utils.ssel(
                 (fx.Int32(window_right) == fx.Int32(_WINDOW_BOTRIGHT)),
                 _seqlen_k_i32 - _seqlen_q_i32, _wr_i32,
             )
@@ -1851,7 +1839,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # cannot `return` out of them (plan section 6.1). Inverting the
             # visited range drives every region count to zero, and the
             # existing row-bound guards already suppress both stores.
-            _v_hi = _ssel_i32(_alive, _v_hi, _v_lo - fx.Int32(1))
+            _v_hi = common_utils.ssel(_alive, _v_hi, _v_lo - fx.Int32(1))
 
             # First tile clear of the left edge: ceil(((q_hi-1) - w_left)/BN).
             # First tile touched by the right edge: floor((start_q+w_right+1)/BN).
@@ -1877,8 +1865,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # Cut [_v_lo, _v_hi] at the full region. With no full region the
             # whole range becomes one masked run, which is section 2.2 case 2
             # (the window is narrower than a block) falling out for free.
-            _lb_hi = _ssel_i32(_fb_empty, _v_hi, _fb_lo - fx.Int32(1))
-            _rb_lo = _ssel_i32(_fb_empty, _v_hi + fx.Int32(1), _fb_hi + fx.Int32(1))
+            _lb_hi = common_utils.ssel(_fb_empty, _v_hi, _fb_lo - fx.Int32(1))
+            _rb_lo = common_utils.ssel(_fb_empty, _v_hi + fx.Int32(1), _fb_hi + fx.Int32(1))
             _n_l = _smax_i32(_lb_hi - _v_lo + fx.Int32(1), fx.Int32(0))
             _n_f = _smax_i32(_fb_hi - _fb_lo + fx.Int32(1), fx.Int32(0))
             _n_r = _smax_i32(_v_hi - _rb_lo + fx.Int32(1), fx.Int32(0))
@@ -1894,7 +1882,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # empty and `_rb_lo` sits below zero, and this value still reaches
             # the prologue's address computation.
             _m_col0 = _smax_i32(
-                _ssel_i32(
+                common_utils.ssel(
                     (_n_l > fx.Int32(0)),
                     _l_col0, _r_col0,
                 ),
@@ -1941,7 +1929,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         if const_expr(CAUSAL):
             _first_col = fx.Index(
                 _smax_i32(
-                    _ssel_i32(
+                    common_utils.ssel(
                         (_n_f > fx.Int32(0)),
                         _f_col0, _m_col0,
                     ),
@@ -1969,7 +1957,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # while a loop carries exactly that list. The trip count is uniform
         # across the workgroup, so no divergence is introduced.
         _pf_n = fx.Index(
-            _ssel_i32(
+            common_utils.ssel(
                 (_kv_tiles_i32 > fx.Int32(0)),
                 fx.Int32(1), fx.Int32(0),
             )
@@ -2506,7 +2494,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # The successor of the last full tile is the first masked one,
                 # which is only the adjacent tile when the left run is empty.
                 _nxt = fx.Index(
-                    _ssel_i32(
+                    common_utils.ssel(
                         (fx.Int32(kv_block_start) + _BN_I32 < _f_col0 + _n_f * _BN_I32),
                         fx.Int32(kv_block_start) + _BN_I32,
                         _m_col0,
@@ -2521,7 +2509,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 right one. Discontinuous at the seam, which is exactly why the
                 prefetch has to go through this same map."""
                 _i = fx.Int32(i_idx)
-                return _ssel_i32(
+                return common_utils.ssel(
                     (_i < _n_l),
                     _l_col0 + _i * _BN_I32,
                     _r_col0 + (_i - _n_l) * _BN_I32,

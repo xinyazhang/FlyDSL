@@ -6,6 +6,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, rocdl
 from flydsl.expr.typing import T
+from flydsl.expr.utils.arith import ArithValue
 
 # Pointer/global-load helpers now live in mem_ops; re-exported here for back-compat.
 from kernels.common.mem_ops import extract_global_ptr as extract_global_ptr
@@ -69,6 +70,22 @@ def udiv_pow2(value, divisor: int):
 
 def urem_pow2(value, divisor: int):
     return value & fx.Int32(divisor - 1)
+
+
+def ssel(pred, a, b):
+    """``pred ? a : b`` as an ``fx.Int32``.
+
+    Thin, and the thinness is the point: ``ArithValue.select`` returns a raw
+    MLIR value with no arithmetic overloads, so a caller writing
+    ``ssel(c, x, y) + fx.Int32(1)`` needs the result typed. Without this the
+    wrap gets open-coded at every call site, which is how the gfx1201 SDPA
+    kernel and ``pa_metadata.py`` each ended up with their own copy.
+
+    Operands are *not* coerced. Pass i32; passing an ``fx.Index`` gets you a
+    64-bit unsigned select, which is a silent bug wherever the value can be
+    negative.
+    """
+    return fx.Int32(ArithValue(pred).select(a, b))
 
 
 def udiv_const(value, divisor: int):
