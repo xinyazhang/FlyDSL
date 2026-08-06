@@ -28,7 +28,8 @@ repeatedly and gate each touch separately.
 | P1 free corrections        | **done**    | `a4d9c3f6` .. `cfbf8696` |
 | P2 policy extraction       | **done**    | `f77294d5` .. `0d345e80` (13 tasks) |
 | P3.1 width inventory       | **done**    | `sdpa-p31-width-inventory.md` |
-| P3 type discipline         | not started | --         |
+| P3.2 narrow to `fx.Int32`  | **closed, mostly N/A** | `3d8dc2b0`, `e5111fb9`, `1fc50786`; the 73 predicted sites were really ~1 -- inventory §8 |
+| P3.3 delete the i32 helpers| **done**    | `69dc838f`, `1faba130` (2 commits, not 4 -- inventory §8.2) |
 | P4 investigations          | not started | --         |
 | P5 helper modules (rest)   | not started | --         |
 

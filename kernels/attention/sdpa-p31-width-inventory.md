@@ -35,7 +35,7 @@ addressing arithmetic here is bounded by a tile.
 | ---------------- | ------- | -------------------------------------------------------------------- |
 | grid / launch  | 5     | **stay `fx.Index`** -- `gpu.block_idx` and `.launch()` want index   |
 | addressing     | 22    | **stay 64-bit**, per §1                                             |
-| sequence/other | 73    | **-> `fx.Int32`**, per §2                                           |
+| sequence/other | 73    | predicted `-> fx.Int32`; **the real number was ~1** -- see §8       |
 
 ## 4. What P3.2 must not do
 
