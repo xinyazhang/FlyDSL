@@ -107,8 +107,7 @@ from flydsl.expr import (
     rocdl,
 )
 from flydsl.expr.typing import T, Vector as Vec
-import fmha_common_gfx1201 as fmha_common
-from fmha_common_gfx1201 import pointer_to_llvm_ptr as _pointer_to_llvm_ptr
+import fmha_common_gfx1201 as fmha
 from philox import Philox, dropout_threshold
 from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
 
@@ -677,7 +676,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # of 8 elements (say a 16-wide head sliced out of a 24-wide allocation)
     # puts every odd row on a 16-byte boundary, and the wider load is then
     # undefined behaviour. This is the same over-promised-alignment failure
-    # documented on `_lds_load_v8` for LDS, where it cost 2.2x.
+    # documented on `fmha.lds_load_v8` for LDS, where it cost 2.2x.
     #
     # It is also not a win. Measured 8 against 16 (B=1 H=8 N=4096 f16, TFLOPS):
     #
@@ -803,11 +802,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         def _to_global_ptr_i64(ptr):
             return arith.index_cast(T.i64, fx.ptrtoint(ptr))
 
-        q_ptr = _pointer_to_llvm_ptr(Q)
-        k_ptr = _pointer_to_llvm_ptr(K)
-        v_ptr = _pointer_to_llvm_ptr(V)
+        q_ptr = fmha.pointer_to_llvm_ptr(Q)
+        k_ptr = fmha.pointer_to_llvm_ptr(K)
+        v_ptr = fmha.pointer_to_llvm_ptr(V)
         v_ptr_i64 = _to_global_ptr_i64(V)
-        o_ptr = _pointer_to_llvm_ptr(O)
+        o_ptr = fmha.pointer_to_llvm_ptr(O)
         # Fast-math set for the softmax arithmetic. `fast` includes `ninf`,
         # which is what silently deleted the KV tail mask (see the comment at
         # that mask). FMHA_FP_MODE selects a narrower set for measurement.
@@ -837,15 +836,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         v8f16_type = Vec.make_type(8, elem_dtype)
         vxf16_type = Vec.make_type(VEC_WIDTH, elem_dtype)
         v4f16_type = Vec.make_type(4, elem_dtype)
-
-        def _global_load_tr_v8(base_i64, base64, off32):
-            return fmha_common.global_load_tr_v8(base_i64, base64, off32, v8f16_type)
-
-        def _lds_load_v8(lds_idx):
-            return fmha_common.lds_load_v8(lds_kv, lds_idx, v4f16_type)
-
-        def _lds_store_vx(vec, lds_idx):
-            fmha_common.lds_store_vx(lds_kv, vec, lds_idx, VEC_WIDTH)
 
         def wmma_acc(a_v8, b_v8, c_v8):
             # Dispatch is on the operand element type, in `wmma_ops`, rather
@@ -1221,7 +1211,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # q_row_off) the varlen decode produced, so it inherits every layout
         # for free rather than needing its own -- sdpa-bias-plan.md 3.
         if const_expr(BIAS_TYPE):
-            _b_ptr = _pointer_to_llvm_ptr(Bias)
+            _b_ptr = fmha.pointer_to_llvm_ptr(Bias)
             _b_base = (
                 _q_batch_v * fx.Index(stride_b0)
                 + head_q * fx.Index(stride_b1)
@@ -1367,12 +1357,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         def load_global_v8f16(base_ptr, base64, off32):
             return _load_global_half_vec(base_ptr, base64, off32, v8f16_type)
 
-        def _bitcast_i32(value):
-            return fmha_common.bitcast_i32(value)
-
-        def bf16_trunc_pack_v8(f32_vals):
-            return fmha_common.bf16_trunc_pack_v8(f32_vals, elem_dtype)
-
         def k_buf_base(buf_id):
             if const_expr(isinstance(buf_id, int)):
                 return fx.Index(buf_id * LDS_K_TILE_SIZE)
@@ -1411,11 +1395,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     if row_valid:
                         lds_row = load_row_in_batch + row_offset
                         lds_idx = k_base + lds_row * K_STRIDE + load_col_base
-                        _lds_store_vx(vecs[batch], lds_idx)
+                        fmha.lds_store_vx(lds_kv, vecs[batch], lds_idx, VEC_WIDTH)
                 else:
                     lds_row = load_row_in_batch + row_offset
                     lds_idx = k_base + lds_row * K_STRIDE + load_col_base
-                    _lds_store_vx(vecs[batch], lds_idx)
+                    fmha.lds_store_vx(lds_kv, vecs[batch], lds_idx, VEC_WIDTH)
 
         def coop_load_store_k(start_k, buf_id=0):
             """Distance-0 K staging: load and store inside a single guard.
@@ -1438,24 +1422,28 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         b64, o32 = k_addr(
                             start_k, lds_row, _col_safe(load_col_base, _hdim_qk_i)
                         )
-                        _lds_store_vx(
+                        fmha.lds_store_vx(
+                            lds_kv,
                             _apply_col_mask(
                                 load_global_f16xN(k_ptr, b64, o32),
                                 load_col_base, _hdim_qk_i, VEC_WIDTH,
                             ),
                             k_base + lds_row * K_STRIDE + load_col_base,
+                            VEC_WIDTH,
                         )
                 else:
                     b64, o32 = k_addr(
                         start_k, lds_row, _col_safe(load_col_base, _hdim_qk_i)
                     )
-                    _lds_store_vx(
+                    fmha.lds_store_vx(
+                        lds_kv,
                         _apply_col_mask(
                             load_global_f16xN(k_ptr, b64, o32),
                             load_col_base, _hdim_qk_i, VEC_WIDTH,
                         ),
                         k_base + lds_row * K_STRIDE + load_col_base,
-                    )
+                        VEC_WIDTH,
+                        )
 
         # ---- V staging ----
         #
@@ -1465,7 +1453,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
         # Address each lane must supply so the hardware transpose lands the
         # right 16(d) x 16(kv) block in WMMA-operand order (see the derivation
-        # in _global_load_tr_v8): within a group of 8 lanes the lane index picks
+        # in fmha.global_load_tr_v8): within a group of 8 lanes the lane index picks
         # the kv row, and the group index picks the 8-wide d half.
         _tr_kv_off = (lane // 16) * WMMA_LANE_K + (lane % 8)
         _tr_d_off = ((lane // 8) % 2) * WMMA_LANE_K
@@ -1482,7 +1470,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 fx.ptr_store(part, lds_kv + fx.Int32(lds_idx + h * 4))
 
         def _v_store_row_major(v_base, lds_row, vec):
-            _lds_store_vx(vec, v_base + lds_row * V_STRIDE + v_col_base)
+            fmha.lds_store_vx(lds_kv, vec, v_base + lds_row * V_STRIDE + v_col_base, VEC_WIDTH)
 
         def coop_load_v_global(start_k, chunk=0):
             """V columns [chunk*VO_CHUNK_COLS, +VO_CHUNK_COLS) of this KV tile.
@@ -1505,7 +1493,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         start_k, kv_base + _tr_kv_off,
                         _col_safe(col, _hdim_vo_i),
                     )
-                    vecs.append(_global_load_tr_v8(v_ptr_i64, b64, o32))
+                    vecs.append(fmha.global_load_tr_v8(v_ptr_i64, b64, o32, v8f16_type))
             else:
                 for batch in range_constexpr(NUM_BATCHES_V):
                     row_offset = batch * V_ROWS_PER_BATCH
@@ -1969,10 +1957,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     st_base_row = st_idx * K_SUB_N
 
                     k_row_a = lane16 + fx.Index(st_base_row)
-                    k_pack_a = _lds_load_v8(k_base + k_row_a * K_STRIDE + k_col)
+                    k_pack_a = fmha.lds_load_v8(lds_kv, k_base + k_row_a * K_STRIDE + k_col, v4f16_type)
 
                     k_row_b = lane16 + fx.Index(st_base_row + 16)
-                    k_pack_b = _lds_load_v8(k_base + k_row_b * K_STRIDE + k_col)
+                    k_pack_b = fmha.lds_load_v8(lds_kv, k_base + k_row_b * K_STRIDE + k_col, v4f16_type)
 
                     acc_idx_a = st_idx * 2
                     acc_idx_b = st_idx * 2 + 1
@@ -2240,7 +2228,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         p_slice = [p_vals[p_base + j] for j in range(8)]
 
                         if const_expr(dtype_str == "bf16"):
-                            p_packs_st.append(bf16_trunc_pack_v8(p_slice))
+                            p_packs_st.append(fmha.bf16_trunc_pack_v8(p_slice, elem_dtype))
                         else:
                             elem_list = []
                             for j in range_constexpr(8):
@@ -2265,7 +2253,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                             fx.Index(st_kv_base_val + pks_val * PV_K_STEP)
                             + klane * WMMA_LANE_K
                         )
-                        return _lds_load_v8(v_base + d_pos * VT_STRIDE + kv0)
+                        return fmha.lds_load_v8(lds_kv, v_base + d_pos * VT_STRIDE + kv0, v4f16_type)
                     d_pos = fx.Index(dc_val * D_CHUNK) + lane16
                     v_elems = []
                     for k_sub in range_constexpr(8):
@@ -2479,7 +2467,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 _lse = ArithValue(
                     arith.cmpi(
                         arith.CmpIPredicate.ne,
-                        _raw(_bitcast_i32(fx.Float32(_l))),
+                        _raw(fmha.bitcast_i32(fx.Float32(_l))),
                         _raw(fx.Int32(0)),
                     )
                 ).select(fx.Float32(_lse), fx.Float32(float("inf")))
@@ -2510,7 +2498,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 _pointer_store(
                     _lse,
                     buffer_ops.get_element_ptr(
-                        _pointer_to_llvm_ptr(L),
+                        fmha.pointer_to_llvm_ptr(L),
                         fx.Int64(_lse_off),
                         elem_type=_f32_ty,
                     ),
