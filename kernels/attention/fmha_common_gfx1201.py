@@ -70,7 +70,8 @@ allows it; it reads better and constructs once.
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl._mlir.dialects import scf as _scf
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import ArithValue, _to_raw
 from gfx1201_standalone import utils as common_utils
@@ -79,7 +80,8 @@ __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", 
            "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8",
            "FastMath", "MaskedAxis",
            "lds_f32_ptr", "lds_f32_store", "lds_f32_load",
-           "reduce_s_across_shards", "seqinfo_at"]
+           "reduce_s_across_shards",
+           "cond_load", "seqinfo_addr", "decode_addressing", "lse_token_pitch"]
 
 
 def llvm_ptr_ty() -> ir.Type:
@@ -455,33 +457,121 @@ def reduce_s_across_shards(
 
 
 # --------------------------------------------------------------------------
-# Varlen prologue: VarlenBits -> per-sequence scalars
+# Varlen prologue: VarlenBits -> per-sequence addressing
 # --------------------------------------------------------------------------
 
 
-def seqinfo_at(ptr, idx_i32):
-    """Read `ptr[idx_i32]` from an i32 sequence-info array.
+def cond_load(cond, addr, default):
+    """Load i32 from `addr` when `cond`, else `default`. The load is skipped.
 
-    The pointer type is built here rather than passed in. `fx.PointerType` is
-    a Python object, and the caller reads this inside dynamic `if`s, where such
-    an object cannot be live -- see "How to hand a helper object to kernel
-    code". Constructing it per call is free.
+    A real `scf.if`, not a select, and that is the point: the sequence-info
+    pointers are **null** whenever their mode is off, so a select -- which
+    evaluates both arms -- would fault. Inside the region the load is never
+    issued; verified against a null pointer.
 
-    Its caller, `_decode_side`, deliberately stays in the kernel file: it
-    branches on `varlen_bits`, and the rewrite that turns a dynamic `if` into
-    an `scf.if` is lexical per `@flyc.kernel` function. A module-level copy
-    keeps Python's `if` and dies with "cannot evaluate dynamic 'Boolean' as
-    Python bool during tracing" -- the same lexical limit that keeps
-    `range(init=)` loops in the kernel body.
+    Built as an explicit `IfOp` rather than Python's `if`, which is what lets
+    this live in a module at all: the rewrite from `if` to `scf.if` is lexical
+    per `@flyc.kernel` function, but an `IfOp` written out needs no rewriting.
 
-    The shorthand `fx.recast_iter(fx.Int32, ptr)` does *not* work: it inherits
-    the source pointer's alignment, and a kernel argument arrives as `u8` with
-    alignment 1, so it raises "alignment must be a positive multiple of element
-    byte size (4), got 1". The type has to be spelled out -- the same idiom as
-    `kernels/moe/moe_a8w4_mxscale_gfx1250.py` and
-    `kernels/gemm/mxfp4_preshuffle.py`.
+    `addr` is computed by the caller and may be derived from a null pointer --
+    address arithmetic touches no memory.
     """
-    gptr = fx.PointerType.get(
-        elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
+    if_op = _scf.IfOp(_to_raw(cond), results_=[T.i32], has_else=True)
+    with ir.InsertionPoint(if_op.then_block):
+        _scf.YieldOp([_llvm.LoadOp(T.i32, addr).result])
+    with ir.InsertionPoint(if_op.else_block):
+        _scf.YieldOp([_to_raw(default)])
+    return fx.Int32(if_op.results[0])
+
+
+def seqinfo_addr(ptr, index):
+    """`&ptr[index]` for an i32 sequence-info array. No memory is touched."""
+    return buffer_ops.get_element_ptr(
+        pointer_to_llvm_ptr(ptr), fx.Int64(index), elem_type=T.i32
     )
-    return fx.Int32(fx.ptr_load(fx.recast_iter(gptr, ptr) + fx.Int64(idx_i32)))
+
+
+def decode_addressing(varlen_bits, bits_shift, max_seqlen, s0, s1, z, num_seqlens):
+    """One side of VarlenBits: where this workgroup's sequence lives.
+
+    Returns `(seqlen, row_off, batch)` -- how long this sequence is, which row
+    it starts at, and which batch index to use. Called once for Q and once for
+    K. See section 3.1 of `sdpa-varlen-plan.md`; the axes are STACKED (bit 0),
+    LENGTH (bits 2:1) and POSITION (bits 4:3).
+
+    The LSE token pitch is *not* here, though it decodes from the same bits: it
+    describes the logsumexp output rather than where Q or K live, and only the
+    Q side needs it. See `lse_token_pitch`.
+
+    Every load goes through `cond_load`, so the shape is flat -- fetch what
+    each mode might need, then select. `s0[z]` serves both length modes and,
+    under REUSE, the position too, which is why three loads cover five modes.
+    """
+    bits = fx.Int32(varlen_bits) >> fx.Int32(bits_shift)
+    stacked = (bits & fx.Int32(1)) != fx.Int32(0)
+    lenmode = (bits >> fx.Int32(1)) & fx.Int32(3)
+    posmode = (bits >> fx.Int32(3)) & fx.Int32(3)
+
+    cumulative = lenmode == fx.Int32(1)
+    individual = lenmode == fx.Int32(2)
+    reuse = posmode == fx.Int32(1)      # position already read as `cur`
+    array = posmode == fx.Int32(2)      # position from its own array
+    zero = fx.Int32(0)
+
+    cur = cond_load(lenmode != zero, seqinfo_addr(s0, z), zero)
+    nxt = cond_load(cumulative, seqinfo_addr(s0, z + fx.Int32(1)), zero)
+    pos = cond_load(array, seqinfo_addr(s1, z), zero)
+
+    seqlen = common_utils.ssel(
+        cumulative, nxt - cur,
+        common_utils.ssel(individual, cur, fx.Int32(max_seqlen)),
+    )
+    row_off = common_utils.ssel(
+        array, pos,
+        common_utils.ssel(
+            reuse, cur,
+            common_utils.ssel(stacked, z * fx.Int32(max_seqlen), zero),
+        ),
+    )
+    batch = common_utils.ssel(stacked, zero, z)
+    return seqlen, row_off, batch
+
+
+def lse_token_pitch(varlen_bits, bits_shift, max_seqlen, s0, s1, num_seqlens):
+    """Row pitch of the logsumexp output, in tokens. Q side only.
+
+    Batched layouts pad every row-group to `max_seqlen`; stacked ones run to
+    the batch total, which lives in slot [N] of whichever array supplies
+    positions -- the prefix-sum assumption of plan section 9.4, asserted host
+    side.
+
+    Derived from the bits rather than passed because the logsumexp tensor,
+    alone among the tensors here, is always compact: its strides are a function
+    of the bits, and passing them would be a second source of truth for one
+    fact (plan section 4.2).
+    """
+    bits = fx.Int32(varlen_bits) >> fx.Int32(bits_shift)
+    stacked = (bits & fx.Int32(1)) != fx.Int32(0)
+    posmode = (bits >> fx.Int32(3)) & fx.Int32(3)
+    reuse = posmode == fx.Int32(1)
+    array = posmode == fx.Int32(2)
+    zero = fx.Int32(0)
+
+    total_s0 = cond_load(
+        arith.andi(_to_raw(stacked), _to_raw(reuse)),
+        seqinfo_addr(s0, num_seqlens), zero,
+    )
+    total_s1 = cond_load(
+        arith.andi(_to_raw(stacked), _to_raw(array)),
+        seqinfo_addr(s1, num_seqlens), zero,
+    )
+    return common_utils.ssel(
+        stacked,
+        common_utils.ssel(
+            reuse, total_s0,
+            common_utils.ssel(
+                array, total_s1, fx.Int32(num_seqlens) * fx.Int32(max_seqlen)
+            ),
+        ),
+        fx.Int32(max_seqlen),
+    )

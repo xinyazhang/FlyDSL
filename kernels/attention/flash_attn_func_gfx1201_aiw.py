@@ -833,93 +833,19 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # loads unconditionally and fault on the null `seqinfo` pointers that
         # the dense case passes; the branch also keeps `VarlenBits == 0` free
         # rather than merely correct.
-        _z_i32 = fx.Int32(gpu.block_idx.z)
+        z_i32 = fx.Int32(gpu.block_idx.z)
 
-        def _decode_side(bits_shift, max_seqlen, s0, s1):
-            """One side of VarlenBits. Called twice, identically.
-
-            Returns (seqlen, row_off, batch_index, tokens). See section 3.1
-            of sdpa-varlen-plan.md; the axes are STACKED (bit 0), LENGTH (bits
-            2:1) and POSITION (bits 4:3).
-
-            The LSE token pitch is *not* here, though it decodes from the
-            same bits: it describes the logsumexp output rather than where Q
-            or K live, and only the Q side needs it. Computing it here meant
-            the K call did the work and the caller discarded it. See
-            `_lse_token_pitch`.
-
-            **Stays in the kernel file.** It branches on `varlen_bits`, and the
-            rewrite that turns a dynamic `if` into an `scf.if` is lexical per
-            `@flyc.kernel` function -- a module-level copy keeps Python's `if`
-            and fails with "cannot evaluate dynamic 'Boolean' as Python bool
-            during tracing". Only the leaf read, `fmha.seqinfo_at`, could move.
-            """
-            _b = fx.Int32(varlen_bits) >> fx.Int32(bits_shift)
-            _stacked = _b & fx.Int32(1)
-            _lenmode = (_b >> fx.Int32(1)) & fx.Int32(3)
-            _posmode = (_b >> fx.Int32(3)) & fx.Int32(3)
-
-            # LENGTH. `_s0_z` is the cumulative *position* that REUSE then
-            # reuses -- the whole point of that mode is that this load has
-            # already happened (plan section 1.2).
-            _seqlen = fx.Int32(max_seqlen)
-            _s0_z = fx.Int32(0)
-            if _lenmode == fx.Int32(1):          # CUMULATIVE
-                _s0_z = fmha.seqinfo_at(s0, _z_i32)
-                _seqlen = fmha.seqinfo_at(s0, _z_i32 + fx.Int32(1)) - _s0_z
-            elif _lenmode == fx.Int32(2):        # INDIVIDUAL
-                _seqlen = fmha.seqinfo_at(s0, _z_i32)
-
-            # POSITION.
-            _row_off = common_utils.ssel(
-                (_stacked != fx.Int32(0)),
-                _z_i32 * fx.Int32(max_seqlen), fx.Int32(0),
-            )
-            if _posmode == fx.Int32(1):          # REUSE: already in a register
-                _row_off = _s0_z
-            elif _posmode == fx.Int32(2):        # ARRAY
-                _row_off = fmha.seqinfo_at(s1, _z_i32)
-
-            _batch = common_utils.ssel(
-                (_stacked != fx.Int32(0)),
-                fx.Int32(0), _z_i32,
-            )
-
-            return _seqlen, _row_off, _batch
-
-        def _lse_token_pitch(max_seqlen, s0, s1):
-            """Row pitch of the logsumexp output, in tokens. Q side only.
-
-            Batched layouts pad every row-group to Max_seqlen; stacked ones run
-            to the batch total, which lives in slot [N] of whichever array
-            supplies positions -- the prefix-sum assumption of plan section
-            9.4, asserted host side.
-
-            Derived from the bits rather than passed because the logsumexp
-            tensor, alone among the tensors here, is always compact: its
-            strides are a function of the bits and passing them would be a
-            second source of truth for one fact (plan section 4.2).
-            """
-            _b = fx.Int32(varlen_bits)
-            _posmode = (_b >> fx.Int32(3)) & fx.Int32(3)
-            _tokens = fx.Int32(max_seqlen)
-            if (_b & fx.Int32(1)) != fx.Int32(0):
-                _tokens = fx.Int32(num_seqlens) * fx.Int32(max_seqlen)
-                if _posmode == fx.Int32(1):
-                    _tokens = fmha.seqinfo_at(s0, fx.Int32(num_seqlens))
-                elif _posmode == fx.Int32(2):
-                    _tokens = fmha.seqinfo_at(s1, fx.Int32(num_seqlens))
-            return _tokens
-
-        _seqlen_q_i32, _q_row_off, _q_batch = _decode_side(
-            0, max_seqlen_q, seqinfo_q0, seqinfo_q1
+        seqlen_q_i32, q_row_off, q_batch = fmha.decode_addressing(
+            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, z_i32, num_seqlens
         )
-        _seqlen_k_i32, _k_row_off, _k_batch = _decode_side(
-            8, max_seqlen_k, seqinfo_k0, seqinfo_k1
+        seqlen_k_i32, k_row_off, k_batch = fmha.decode_addressing(
+            varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32, num_seqlens
         )
-        _lse_tokens = _lse_token_pitch(max_seqlen_q, seqinfo_q0, seqinfo_q1)
+        lse_tokens = fmha.lse_token_pitch(
+            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, num_seqlens
+        )
 
-        seqlen_k_v = fx.Index(_seqlen_k_i32)
+        seqlen_k_v = fx.Index(seqlen_k_i32)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_kv = lds.kv.ptr
@@ -989,7 +915,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # this file had to be hand-written as an explicit `arith.cmpi(slt, ...)`
         # to get the signed predicate back. `fx.Int32` is signed, so `<` is
         # already the right thing.
-        _alive = ArithValue(fx.Int32(start_q) < _seqlen_q_i32)
+        _alive = ArithValue(fx.Int32(start_q) < seqlen_q_i32)
 
         # **The Q base must be clamped, not just the row within the tile.**
         # `q_tbase(start_q)` folds start_q into the 64-bit base, and the
@@ -1030,7 +956,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # there are no KV tiles. Kept because the hazard is an unsigned wrap,
         # which produces a plausible address rather than an obvious failure,
         # and it costs one scalar op to pin.
-        _slast_i32 = common_utils.smax(_seqlen_k_i32 - fx.Int32(1), fx.Int32(0))
+        _slast_i32 = common_utils.smax(seqlen_k_i32 - fx.Int32(1), fx.Int32(0))
         seq_last = fx.Index(_slast_i32)
 
         # ---- Address split: 64-bit uniform base + 32-bit divergent offset ----
@@ -1165,10 +1091,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
         # Q and O are indexed by the query head; K and V by the KV head they
         # share. At num_head_q == num_head_k these coincide.
-        _q_batch_v = fx.Index(_q_batch)
-        _k_batch_v = fx.Index(_k_batch)
-        _q_row_off_v = fx.Index(_q_row_off)
-        _k_row_off_v = fx.Index(_k_row_off)
+        _q_batch_v = fx.Index(q_batch)
+        _k_batch_v = fx.Index(k_batch)
+        _q_row_off_v = fx.Index(q_row_off)
+        _k_row_off_v = fx.Index(k_row_off)
         # Bias is (B, H, Sq, Sk): the last axis is the KV column, so unlike
         # Q/K/V/O its "row" stride is stride_b2 and the contiguous axis is the
         # one the KV tile walks. Indexed with the *same* (batch_index,
@@ -1199,7 +1125,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # The offset scheme itself is `Philox.grid_plane`/`grid_offset`,
             # shared with the debug mask kernel -- see the comment there. This
             # kernel supplies only which plane a workgroup is on.
-            _off_zh = fx.Int32(_z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
+            _off_zh = fx.Int32(z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
             _ph_base, _ph_stride = PHILOX.grid_plane(
                 philox_offset_base, _off_zh, max_seqlen_q, max_seqlen_k
             )
@@ -1513,7 +1439,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # hang past it. Unlike the column axes this is never inactive. A
         # factory for the same reason as those -- see `qk_cols`.
         def q_rows_axis():
-            return fmha.MaskedAxis(fx.Index(_seqlen_q_i32))
+            return fmha.MaskedAxis(fx.Index(seqlen_q_i32))
         q_tile_base = q_tbase(_q_start_addr)
         c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
 
@@ -1597,7 +1523,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _is_br_l = (_wl_i32 == fx.Int32(_WINDOW_BOTRIGHT))
             _wl_i32 = common_utils.ssel(
                 ArithValue(arith.ori(_raw(_is_tl_l), _raw(_is_br_l))),
-                _seqlen_q_i32, _wl_i32,
+                seqlen_q_i32, _wl_i32,
             )
             _wr_i32 = common_utils.ssel(
                 (_wr_i32 == fx.Int32(_WINDOW_TOPLEFT)),
@@ -1605,7 +1531,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             )
             _wr_i32 = common_utils.ssel(
                 (fx.Int32(window_right) == fx.Int32(_WINDOW_BOTRIGHT)),
-                _seqlen_k_i32 - _seqlen_q_i32, _wr_i32,
+                seqlen_k_i32 - seqlen_q_i32, _wr_i32,
             )
 
         # ---- Split the KV range into full and masked regions ----
@@ -1656,7 +1582,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # smallest on the right.
             _q_start_i32 = fx.Int32(start_q)
             _q_hi_i32 = common_utils.smin(
-                _q_start_i32 + fx.Int32(BLOCK_M), _seqlen_q_i32
+                _q_start_i32 + fx.Int32(BLOCK_M), seqlen_q_i32
             )
             _q_last_i32 = _q_hi_i32 - fx.Int32(1)
 
@@ -1665,8 +1591,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # leaves a partial final tile, which must be masked rather than
             # counted as full. The old code spelled the same thing
             # `_full_seq`.
-            _blk_last = common_utils.sdiv_rd_pow2(_seqlen_k_i32 - fx.Int32(1), BLOCK_N)
-            _blk_last_whole = common_utils.sdiv_rd_pow2(_seqlen_k_i32, BLOCK_N) - fx.Int32(1)
+            _blk_last = common_utils.sdiv_rd_pow2(seqlen_k_i32 - fx.Int32(1), BLOCK_N)
+            _blk_last_whole = common_utils.sdiv_rd_pow2(seqlen_k_i32, BLOCK_N) - fx.Int32(1)
 
             # The visited range: outside it every column is dead for every row
             # in this Q block, so those tiles are not walked at all.
@@ -2053,7 +1979,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     # loop. The region split gives the same benefit statically.
                     _kv_i32 = fx.Int32(kv_block_start)
                     _klane_off = fx.Int32(klane) * fx.Int32(8)
-                    _seq_i32 = _seqlen_k_i32
+                    _seq_i32 = seqlen_k_i32
                     for _i in range_constexpr(NUM_S_VALS):
                         _col = (
                             _kv_i32
@@ -2416,7 +2342,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 #   _HT  (H, T)   AOTriton's, and the default: T contiguous
                 #   _TH  (T, H)   Transformer Engine's:         H contiguous
                 _row = _q_row_off_v + q_rows[qt]
-                _tok = fx.Index(_lse_tokens)
+                _tok = fx.Index(lse_tokens)
                 _nhq = fx.Index(num_head_q)
                 _lse_off_ht = (_q_batch_v * _nhq + head_q) * _tok + _row
                 # Compact in both layouts, so the head pitch is exactly
