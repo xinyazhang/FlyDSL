@@ -39,6 +39,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
 from fmha_tuning_gfx1201 import default_block_m as aiw_block_m, resolve_shards
 from flash_attn_func_gfx1201_aiw import (
     build_flash_attn_func_aiw_module,
@@ -1874,3 +1875,87 @@ def test_dropout_requires_p():
     q, k, v = _qkv(1, 256, 64, torch.float16)
     with pytest.raises(ValueError, match="requires dropout_p"):
         _drop_build(64)(q, k, v, torch.empty_like(q), 1, 256)
+
+
+# ---------------------------------------------------------------------------
+# 64-bit addressing
+# ---------------------------------------------------------------------------
+
+_I32_MAX = 2 ** 31 - 1
+
+# (shape, strides) whose *named* axis has a stride crossing 2^31, with every
+# other axis packed. Only two slices along that axis exist, so the allocation
+# is `big + a few kB` rather than the tensor the strides imply.
+_BIG = 2 ** 31
+_FAR_LAYOUTS = {
+    #        B  S   H  D            b_str  s_str  h_str  d
+    "batch": ((2, 64, 2, 64), (_BIG, 128, 64, 1)),
+    "head":  ((1, 64, 2, 64), (_BIG, 128, _BIG, 1)),
+    "seq":   ((1, 2, 2, 64), (_BIG, _BIG, 64, 1)),
+}
+
+
+@pytest.mark.parametrize(
+    "axis",
+    [
+        "batch",
+        "head",
+        pytest.param(
+            "seq",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="FOUND BUG (pre-existing, not from the type work): a "
+                "sequence stride past 2^31 returns wrong data for the far row "
+                "-- rel 0.497, and the inputs are verified identical after the "
+                "strided copy, so it is the kernel's row addressing and not the "
+                "harness. Batch and head strides at the same magnitude are "
+                "fine, which localises it to the seq term. Fix in P3.2.",
+            ),
+        ),
+    ],
+)
+def test_element_offsets_past_2gi(axis):
+    """An axis whose stride pushes an element past 2^31 must still address.
+
+    This is the case no other test in the suite reaches. Every offset here is
+    `base + index * stride`, and the file is full of places where that product
+    could be formed in 32 bits and widened afterwards -- `fx.Int64(a * b)`
+    rather than `fx.Int64(a) * fx.Int64(b)`. Both spellings compile, both are
+    correct for every shape the rest of the suite uses, and they diverge
+    exactly here: a product past 2^31 wraps negative and the kernel reads
+    someone else's memory or faults.
+
+    A strided view over one large allocation, so the offsets are real while the
+    memory is not -- the far slice starts beyond element 2^31 and everything
+    touched is one of the two slices.
+    """
+    _require_env()
+    shape, strides = _FAR_LAYOUTS[axis]
+    span = sum((d - 1) * st for d, st in zip(shape, strides)) + 1
+    need = 3 * span * 2 + (1 << 27)
+    free, _ = torch.cuda.mem_get_info()
+    if free < need:
+        pytest.skip(f"needs {need / 2**30:.1f} GiB free, have {free / 2**30:.1f}")
+    assert span > _I32_MAX, "the layout does not actually cross 2^31"
+
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    ref = [torch.randn(*shape, dtype=torch.float16, device="cuda", generator=gen)
+           for _ in range(3)]
+    far = []
+    try:
+        for r in ref:
+            pool = torch.zeros(span, dtype=torch.float16, device="cuda")
+            v = pool.as_strided(shape, strides)
+            v.copy_(r)
+            far.append(v)
+        got = flydsl_flash_attn_func_gfx1201(*far, causal=True)
+        want = flydsl_flash_attn_func_gfx1201(*ref, causal=True)
+        torch.cuda.synchronize()
+        assert torch.equal(got, want.to(got.dtype)), (
+            f"a {axis}-axis stride past 2^31 changed the result: an offset "
+            f"product was formed in 32 bits"
+        )
+    finally:
+        far.clear()
+        torch.cuda.empty_cache()
+
