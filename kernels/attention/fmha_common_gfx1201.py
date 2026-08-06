@@ -23,10 +23,10 @@ same reason.
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith
-from flydsl.expr.typing import T
+from flydsl.expr import arith, range_constexpr
+from flydsl.expr.typing import T, Vector as Vec
 
-__all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr"]
+__all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx"]
 
 
 def llvm_ptr_ty() -> ir.Type:
@@ -60,3 +60,37 @@ def pointer_to_llvm_ptr(ptr) -> ir.Value:
     """
     ptr_i64 = arith.index_cast(T.i64, fx.ptrtoint(ptr))
     return _llvm.IntToPtrOp(llvm_ptr_ty(), ptr_i64).result
+
+
+# --------------------------------------------------------------------------
+# LDS access, split for honest alignment
+# --------------------------------------------------------------------------
+#
+# The two functions below exist only to avoid over-promising alignment, which
+# is a property of RDNA's LDS instruction selection rather than of attention,
+# and is why they live in the arch module.
+
+
+def lds_load_v8(lds_ptr, lds_idx, v4_type):
+    """Load 8 half-precision elements from LDS as two honest 8-byte accesses.
+
+    **Not one v8 load.** K/V rows are `K_STRIDE * 2` bytes apart, so these
+    addresses are only guaranteed 8-byte aligned. `fly.ptr_load` emits no
+    alignment attribute, so LLVM falls back to the vector type's ABI
+    alignment -- 16 B for v8f16, 32 B for v16f16 -- and that over-promise makes
+    the backend select `ds_load_b128` on addresses that are not 16-byte
+    aligned. Measured 2.2x slower (92 -> 39 TFLOPS), and undefined behaviour
+    besides. Two v4f16 accesses carry a truthful `align 8` and fold back into
+    `ds_load2_b64`.
+    """
+    lo = fx.ptr_load(lds_ptr + fx.Int32(lds_idx), result_type=v4_type)
+    hi = fx.ptr_load(lds_ptr + fx.Int32(lds_idx + 4), result_type=v4_type)
+    return Vec(lo).shuffle(Vec(hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+
+
+def lds_store_vx(lds_ptr, vec, lds_idx, vec_width):
+    """Store `vec_width` half elements to LDS in 8-byte pieces. See `lds_load_v8`."""
+    v = Vec(vec)
+    for _i in range_constexpr(vec_width // 4):
+        part = v.shuffle(v, [_i * 4, _i * 4 + 1, _i * 4 + 2, _i * 4 + 3])
+        fx.ptr_store(part, lds_ptr + fx.Int32(lds_idx + _i * 4))

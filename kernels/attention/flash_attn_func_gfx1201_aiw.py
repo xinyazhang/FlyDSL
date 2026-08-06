@@ -107,6 +107,7 @@ from flydsl.expr import (
     rocdl,
 )
 from flydsl.expr.typing import T, Vector as Vec
+import fmha_common_gfx1201 as fmha_common
 from fmha_common_gfx1201 import pointer_to_llvm_ptr as _pointer_to_llvm_ptr
 from philox import Philox, dropout_threshold
 from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
@@ -860,26 +861,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             p = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), addr).result
             return rocdl.global_load_tr_b128(v8f16_type, p)
 
-        # ---- Honest-alignment LDS access ----
-        # K/V rows are K_STRIDE * 2 bytes apart, so LDS addresses here are only
-        # guaranteed 8-byte aligned. `fly.ptr_load` / `fly.ptr_store` emit no
-        # alignment attribute, so LLVM falls back to the vector type's ABI
-        # alignment -- 16 B for v8f16, 32 B for v16f16. That over-promise is what
-        # makes the backend select ds_load_b128 / ds_store_b128 on addresses
-        # that are not actually 16-byte aligned: 2.2x slower here (39 -> 92
-        # TFLOPS) and undefined behaviour besides. Splitting into 8-byte (v4f16)
-        # accesses carries a truthful `align 8` and folds back into
-        # ds_load2_b64 / ds_store2_b64.
         def _lds_load_v8(lds_idx):
-            lo = fx.ptr_load(lds_kv + fx.Int32(lds_idx), result_type=v4f16_type)
-            hi = fx.ptr_load(lds_kv + fx.Int32(lds_idx + 4), result_type=v4f16_type)
-            return Vec(lo).shuffle(Vec(hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+            return fmha_common.lds_load_v8(lds_kv, lds_idx, v4f16_type)
 
         def _lds_store_vx(vec, lds_idx):
-            v = Vec(vec)
-            for _i in range_constexpr(VEC_WIDTH // 4):
-                part = v.shuffle(v, [_i * 4, _i * 4 + 1, _i * 4 + 2, _i * 4 + 3])
-                fx.ptr_store(part, lds_kv + fx.Int32(lds_idx + _i * 4))
+            fmha_common.lds_store_vx(lds_kv, vec, lds_idx, VEC_WIDTH)
 
         def wmma_acc(a_v8, b_v8, c_v8):
             # Dispatch is on the operand element type, in `wmma_ops`, rather
