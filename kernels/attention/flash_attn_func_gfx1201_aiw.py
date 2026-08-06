@@ -107,6 +107,7 @@ from flydsl.expr import (
     rocdl,
 )
 from flydsl.expr.typing import T, Vector as Vec
+from fmha_common import pointer_to_llvm_ptr as _pointer_to_llvm_ptr
 from philox import Philox, dropout_threshold
 from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
 
@@ -167,16 +168,6 @@ def _llvm_value(value):
     if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
         return value.ir_value()
     return value
-
-
-def _llvm_ptr_ty():
-    return ir.Type.parse("!llvm.ptr")
-
-
-def _pointer_to_llvm_ptr(ptr) -> ir.Value:
-    """Convert a FlyDSL pointer argument to the LLVM pointer used by raw loads."""
-    ptr_i64 = arith.index_cast(T.i64, fx.ptrtoint(ptr))
-    return _llvm.IntToPtrOp(_llvm_ptr_ty(), ptr_i64).result
 
 
 def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
