@@ -835,27 +835,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # rather than merely correct.
         _z_i32 = fx.Int32(gpu.block_idx.z)
 
-        # The `seqinfo` arguments arrive as untyped byte pointers, so type
-        # them once and index in elements. `fx.recast_iter` + `fx.ptr_load` is
-        # the DSL idiom (see `kernels/moe/moe_a8w4_mxscale_gfx1250.py` and
-        # `kernels/gemm/mxfp4_preshuffle.py`, which build the same type).
-        #
-        # The shorthand `fx.recast_iter(fx.Int32, ptr)` does *not* work here:
-        # it inherits the source pointer's alignment, and a kernel argument
-        # arrives as `u8` with alignment 1, so it raises "alignment must be a
-        # positive multiple of element byte size (4), got 1". The type has to
-        # be spelled out.
-        _i32_gptr = fx.PointerType.get(
-            elem_ty=fx.Int32.ir_type,
-            address_space=fx.AddressSpace.Global,
-            alignment=4,
-        )
-
-        def _seqinfo_at(ptr, idx_i32):
-            return fx.Int32(
-                fx.ptr_load(fx.recast_iter(_i32_gptr, ptr) + fx.Int64(idx_i32))
-            )
-
         def _decode_side(bits_shift, max_seqlen, s0, s1):
             """One side of VarlenBits. Called twice, identically.
 
@@ -868,6 +847,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             among the tensors here -- is always compact, so its strides are a
             function of the bits and would otherwise be a second source of
             truth for one fact (plan section 4.2).
+
+            **Stays in the kernel file.** It branches on `varlen_bits`, and the
+            rewrite that turns a dynamic `if` into an `scf.if` is lexical per
+            `@flyc.kernel` function -- a module-level copy keeps Python's `if`
+            and fails with "cannot evaluate dynamic 'Boolean' as Python bool
+            during tracing". Only the leaf read, `fmha.seqinfo_at`, could move.
             """
             _b = fx.Int32(varlen_bits) >> fx.Int32(bits_shift)
             _stacked = _b & fx.Int32(1)
@@ -880,10 +865,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _seqlen = fx.Int32(max_seqlen)
             _s0_z = fx.Int32(0)
             if _lenmode == fx.Int32(1):          # CUMULATIVE
-                _s0_z = _seqinfo_at(s0, _z_i32)
-                _seqlen = _seqinfo_at(s0, _z_i32 + fx.Int32(1)) - _s0_z
+                _s0_z = fmha.seqinfo_at(s0, _z_i32)
+                _seqlen = fmha.seqinfo_at(s0, _z_i32 + fx.Int32(1)) - _s0_z
             elif _lenmode == fx.Int32(2):        # INDIVIDUAL
-                _seqlen = _seqinfo_at(s0, _z_i32)
+                _seqlen = fmha.seqinfo_at(s0, _z_i32)
 
             # POSITION.
             _row_off = common_utils.ssel(
@@ -893,7 +878,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             if _posmode == fx.Int32(1):          # REUSE: already in a register
                 _row_off = _s0_z
             elif _posmode == fx.Int32(2):        # ARRAY
-                _row_off = _seqinfo_at(s1, _z_i32)
+                _row_off = fmha.seqinfo_at(s1, _z_i32)
 
             _batch = common_utils.ssel(
                 (_stacked != fx.Int32(0)),
@@ -909,9 +894,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             if _stacked != fx.Int32(0):
                 _tokens = fx.Int32(num_seqlens) * fx.Int32(max_seqlen)
                 if _posmode == fx.Int32(1):
-                    _tokens = _seqinfo_at(s0, fx.Int32(num_seqlens))
+                    _tokens = fmha.seqinfo_at(s0, fx.Int32(num_seqlens))
                 elif _posmode == fx.Int32(2):
-                    _tokens = _seqinfo_at(s1, fx.Int32(num_seqlens))
+                    _tokens = fmha.seqinfo_at(s1, fx.Int32(num_seqlens))
             return _seqlen, _row_off, _batch, _tokens
 
         _seqlen_q_i32, _q_row_off, _q_batch, _lse_tokens = _decode_side(

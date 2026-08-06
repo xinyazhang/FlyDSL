@@ -70,15 +70,16 @@ allows it; it reads better and constructs once.
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import ArithValue, _to_raw
+from gfx1201_standalone import utils as common_utils
 
 __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
            "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8",
            "FastMath", "MaskedAxis",
            "lds_f32_ptr", "lds_f32_store", "lds_f32_load",
-           "reduce_s_across_shards"]
+           "reduce_s_across_shards", "seqinfo_at"]
 
 
 def llvm_ptr_ty() -> ir.Type:
@@ -451,3 +452,36 @@ def reduce_s_across_shards(
         ).ir_value()
         for st in range_constexpr(len(s_accs))
     ]
+
+
+# --------------------------------------------------------------------------
+# Varlen prologue: VarlenBits -> per-sequence scalars
+# --------------------------------------------------------------------------
+
+
+def seqinfo_at(ptr, idx_i32):
+    """Read `ptr[idx_i32]` from an i32 sequence-info array.
+
+    The pointer type is built here rather than passed in. `fx.PointerType` is
+    a Python object, and the caller reads this inside dynamic `if`s, where such
+    an object cannot be live -- see "How to hand a helper object to kernel
+    code". Constructing it per call is free.
+
+    Its caller, `_decode_side`, deliberately stays in the kernel file: it
+    branches on `varlen_bits`, and the rewrite that turns a dynamic `if` into
+    an `scf.if` is lexical per `@flyc.kernel` function. A module-level copy
+    keeps Python's `if` and dies with "cannot evaluate dynamic 'Boolean' as
+    Python bool during tracing" -- the same lexical limit that keeps
+    `range(init=)` loops in the kernel body.
+
+    The shorthand `fx.recast_iter(fx.Int32, ptr)` does *not* work: it inherits
+    the source pointer's alignment, and a kernel argument arrives as `u8` with
+    alignment 1, so it raises "alignment must be a positive multiple of element
+    byte size (4), got 1". The type has to be spelled out -- the same idiom as
+    `kernels/moe/moe_a8w4_mxscale_gfx1250.py` and
+    `kernels/gemm/mxfp4_preshuffle.py`.
+    """
+    gptr = fx.PointerType.get(
+        elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
+    )
+    return fx.Int32(fx.ptr_load(fx.recast_iter(gptr, ptr) + fx.Int64(idx_i32)))
