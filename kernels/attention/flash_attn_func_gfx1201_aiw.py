@@ -1221,7 +1221,17 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 return bh + seq_start * s_seq
 
             def toff(row_in_tile, col):
-                """Divergent 32-bit element offset inside the tile."""
+                """Divergent 32-bit element offset inside the tile.
+
+                32-bit because it is per-lane and the VALU cost is paid on
+                every address; the whole-tensor magnitude lives in `tbase`,
+                which is 64-bit. That split carries a precondition --
+                `BLOCK_M * s_seq` must fit in i32 -- which holds for any
+                physical layout, since `s_seq` is at most `num_heads *
+                head_dim` and `row_in_tile` is under 256. It does *not* hold
+                for an arbitrary synthetic stride, so `_strides_of` checks it
+                on the host rather than leaving a silent wrap here.
+                """
                 return row_in_tile * s_seq + col
 
             return tbase, toff
@@ -2786,6 +2796,20 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             raise ValueError(
                 f"{name} must have a contiguous last dimension, got "
                 f"stride(3)={t.stride(3)}"
+            )
+        # The per-lane offset `row_in_tile * stride_seq` is computed in 32
+        # bits (see `toff`). Physical layouts cannot reach 2**31 there --
+        # stride_seq is at most num_heads * head_dim -- but a strided view can,
+        # and the failure is silent: the product wraps negative and the kernel
+        # reads another allocation. Checked here because this is the last place
+        # the stride is a Python int.
+        _row_span = BLOCK_M * abs(t.stride(1))
+        if _row_span > 2**31 - 1:
+            raise ValueError(
+                f"{name} has stride(1)={t.stride(1)}, and BLOCK_M={BLOCK_M} "
+                f"rows of it span {_row_span} elements, which exceeds the "
+                f"2**31 the kernel's per-lane offset can hold. This layout is "
+                f"not addressable by this kernel."
             )
         return t.stride(0), t.stride(1), t.stride(2)
 
