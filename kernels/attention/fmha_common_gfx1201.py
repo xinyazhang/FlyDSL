@@ -18,6 +18,53 @@ its dualwave traits/context machinery exists to serve that. Merging the two
 would mean one abstraction serving two schedules that agree on almost nothing.
 When gfx1250 FMHA arrives it gets its own `fmha_common_gfx1250.py` for the
 same reason.
+
+
+How to hand a helper *object* to kernel code
+--------------------------------------------
+
+A helper that carries state -- `FastMath`, `MaskedAxis` -- cannot simply be
+built and assigned in the kernel body. **No variable of any kind may hold a
+non-MLIR Python object that is live across a dynamic `if`.** The AST rewriter
+turns such an `if` into an `scf.if` and collects every variable live across it
+as loop-carried state, which must be MLIR-backed. A Python object is not, and
+the failure is late, config-dependent and unobvious:
+
+    fastmath = FastMath(FP_MODE)         # assigned in the body
+    -> TypeError: state variable 'fastmath' is FastMath, not an MLIR Value
+
+    qk_cols = MaskedAxis(hdim, ...)      # assigned in the body, read in a
+    -> UnboundLocalError: cannot access   #   nested fn under `if row_valid:`
+       local variable 'qk_cols'
+
+Passing the object as a *parameter* does not help; it is still a variable live
+across the branch. That was measured, not assumed: threading it through
+`coop_load_store_k(start_k, cols, ...)` compiles at BLOCK_DMODEL 16 non-causal
+and fails at 16 causal with `state variable 'cols' is MaskedAxis, not an MLIR
+Value`.
+
+Two patterns work, and which one applies depends on what the object needs:
+
+1. **Build it on the host** when everything it captures is `const_expr`. This
+   is `FastMath(FP_MODE)`, constructed in the builder beside the knob unpacking
+   and captured by the traced code as a plain constant.
+
+2. **Build it in a factory function** when it needs traced values. This is
+   `MaskedAxis`, whose extent is `hdim_qk` -- a kernel *argument*, so there is
+   nothing to capture on the host:
+
+       def qk_cols():
+           return fmha.MaskedAxis(_hdim_qk_i, active=PADDED_HEAD, ...)
+
+       ... qk_cols().safe(load_col_base) ...
+
+   The call re-creates the object inside whatever branch reads it, so nothing
+   is ever live across the `scf.if`. It costs nothing -- trace-time Python that
+   emits no IR, and every gate config is bitwise identical to the variable form
+   where the variable form compiles at all.
+
+The `()` is the tell that a helper is in category 2. Prefer 1 when the object
+allows it; it reads better and constructs once.
 """
 
 import flydsl.expr as fx
@@ -240,11 +287,21 @@ class MaskedAxis:
     to be a multiple of the access width.
     """
 
-    __slots__ = ("extent", "active")
+    __slots__ = ("extent", "active", "elem_dtype")
 
-    def __init__(self, extent, active=True):
+    def __init__(self, extent, active=True, elem_dtype=None):
         self.extent = extent
         self.active = active
+        # Only `discard` needs this, so the row axis leaves it unset. It is a
+        # property of the tensor and every access along an axis shares it.
+        #
+        # `width` is deliberately *not* bound here. It belongs to the access,
+        # not the axis, and the two accesses along the QK column axis agree
+        # only by coincidence: the cooperative loads are `VEC_WIDTH` wide while
+        # the Q preload is 8 wide because `load_global_v8f16` is tied to the
+        # WMMA operand shape. Both are 8 today from unrelated definitions, and
+        # binding one would make the Q preload silently follow `VEC_WIDTH`.
+        self.elem_dtype = elem_dtype
 
     def _bound(self):
         """The extent as a traced value.
@@ -292,9 +349,9 @@ class MaskedAxis:
             return addressed
         return fx.Index(ArithValue(self.valid(idx)).select(addressed, fx.Index(0)))
 
-    def discard(self, vec, idx, width, elem_dtype):
+    def discard(self, vec, idx, width):
         """Zero the elements of `vec` whose index is past the extent."""
         if not self.active:
             return vec
-        zeros = Vec.filled(width, 0.0, elem_dtype)
+        zeros = Vec.filled(width, 0.0, self.elem_dtype)
         return self.mask(idx, width).select(Vec(vec), zeros).ir_value()

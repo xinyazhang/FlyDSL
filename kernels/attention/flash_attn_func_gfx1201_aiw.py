@@ -1285,20 +1285,20 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # access width, so every access is wholly in range and the masking
         # compiles away.
         #
-        # **Functions, not variables, and that is forced.** A kernel-body
-        # variable holding a plain Python object cannot be read inside a
-        # dynamic `if`: the AST rewriter collects such variables as `scf`
-        # state and requires MLIR-backed values ("state variable 'x' is
-        # MaskedAxis, not an MLIR Value"). `coop_load_store_k` reads these
-        # inside `if row_valid:` whenever KV_NEEDS_GUARD, which is every
-        # BLOCK_DMODEL whose load geometry does not tile BLOCK_N exactly --
-        # 16 among them. A call re-creates the object at trace time, which is
-        # free and emits nothing.
+        # Factories, not variables: `coop_load_store_k` reads these inside
+        # `if row_valid:` whenever KV_NEEDS_GUARD, and an object held in a
+        # variable cannot be live across a dynamic `if`. See "How to hand a
+        # helper object to kernel code" in `fmha_common_gfx1201` -- this is
+        # pattern 2 there, and `fastmath` above is pattern 1.
         def qk_cols():
-            return fmha.MaskedAxis(_hdim_qk_i, active=PADDED_HEAD)
+            return fmha.MaskedAxis(
+                _hdim_qk_i, active=PADDED_HEAD, elem_dtype=elem_dtype
+            )
 
         def vo_cols():
-            return fmha.MaskedAxis(_hdim_vo_i, active=PADDED_HEAD)
+            return fmha.MaskedAxis(
+                _hdim_vo_i, active=PADDED_HEAD, elem_dtype=elem_dtype
+            )
 
         def _split_ptr(ptr, base64, off):
             """ptr + base64 (uniform) + off (divergent). Both 64-bit.
@@ -1352,7 +1352,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 vecs.append(
                     qk_cols().discard(
                         load_global_f16xN(k_ptr, b64, o32),
-                        load_col_base, VEC_WIDTH, elem_dtype,
+                        load_col_base, VEC_WIDTH,
                     )
                 )
             return vecs
@@ -1399,7 +1399,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                             lds_kv,
                             qk_cols().discard(
                                 load_global_f16xN(k_ptr, b64, o32),
-                                load_col_base, VEC_WIDTH, elem_dtype,
+                                load_col_base, VEC_WIDTH,
                             ),
                             k_base + lds_row * K_STRIDE + load_col_base,
                             VEC_WIDTH,
@@ -1412,7 +1412,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         lds_kv,
                         qk_cols().discard(
                             load_global_f16xN(k_ptr, b64, o32),
-                            load_col_base, VEC_WIDTH, elem_dtype,
+                            load_col_base, VEC_WIDTH,
                         ),
                         k_base + lds_row * K_STRIDE + load_col_base,
                         VEC_WIDTH,
@@ -1524,7 +1524,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         ]
         # Rows are bounded by the real Q length; a workgroup's last tile can
         # hang past it. Unlike the column axes this is never inactive. A
-        # function for the same reason as those -- see `qk_cols`.
+        # factory for the same reason as those -- see `qk_cols`.
         def q_rows_axis():
             return fmha.MaskedAxis(fx.Index(_seqlen_q_i32))
         q_tile_base = q_tbase(_q_start_addr)
@@ -1548,7 +1548,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     q_ptr, q_tile_base,
                     q_toff(_safe, qk_cols().safe(q_col)),
                 )
-                raw = qk_cols().discard(raw, q_col, 8, elem_dtype)
+                raw = qk_cols().discard(raw, q_col, 8)
                 _packs.append(ArithValue(_in).select(raw, c_zero_v8f16))
             q_in_bounds_all.append(_in)
             q_b_packs_all.append(_packs)
