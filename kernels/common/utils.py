@@ -98,6 +98,11 @@ def smin(a, b):
     return ssel((a < b), a, b)
 
 
+def smax(a, b):
+    """Signed maximum of two i32 values. See `smin`."""
+    return ssel((a > b), a, b)
+
+
 def udiv_const(value, divisor: int):
     if const_expr(is_pow2(divisor)):
         return udiv_pow2(value, divisor)

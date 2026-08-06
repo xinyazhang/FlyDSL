@@ -899,9 +899,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # than on `dtype_str` here -- see that module for why.
             return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
 
-        def _smax_i32(a, b):
-            return common_utils.ssel((a > b), a, b)
-
         def _sdiv_rd(x):
             """floor(x / BLOCK_N), signed -- plan section 2.4 rule 4.
 
@@ -1142,7 +1139,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # there are no KV tiles. Kept because the hazard is an unsigned wrap,
         # which produces a plausible address rather than an obvious failure,
         # and it costs one scalar op to pin.
-        _slast_i32 = _smax_i32(_seqlen_k_i32 - fx.Int32(1), fx.Int32(0))
+        _slast_i32 = common_utils.smax(_seqlen_k_i32 - fx.Int32(1), fx.Int32(0))
         seq_last = fx.Index(_slast_i32)
 
         # ---- Address split: 64-bit uniform base + 32-bit divergent offset ----
@@ -1828,7 +1825,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
             # The visited range: outside it every column is dead for every row
             # in this Q block, so those tiles are not walked at all.
-            _v_lo = _smax_i32(_sdiv_rd(_q_start_i32 - _wl_i32), fx.Int32(0))
+            _v_lo = common_utils.smax(_sdiv_rd(_q_start_i32 - _wl_i32), fx.Int32(0))
             _v_hi = common_utils.smin(_blk_last, _sdiv_rd(_q_last_i32 + _wr_i32))
             # Empty work, not skipped work. Varlen sizes the grid from
             # Max_seqlen_q, so a short sequence gets workgroups whose rows are
@@ -1853,7 +1850,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             )
             _r_first_mask = _sdiv_rd(_q_start_i32 + _wr_i32 + fx.Int32(1))
 
-            _fb_lo = _smax_i32(_l_first_full, _v_lo)
+            _fb_lo = common_utils.smax(_l_first_full, _v_lo)
             _fb_hi = common_utils.smin(
                 common_utils.smin(_r_first_mask - fx.Int32(1), _blk_last_whole), _v_hi
             )
@@ -1864,9 +1861,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # (the window is narrower than a block) falling out for free.
             _lb_hi = common_utils.ssel(_fb_empty, _v_hi, _fb_lo - fx.Int32(1))
             _rb_lo = common_utils.ssel(_fb_empty, _v_hi + fx.Int32(1), _fb_hi + fx.Int32(1))
-            _n_l = _smax_i32(_lb_hi - _v_lo + fx.Int32(1), fx.Int32(0))
-            _n_f = _smax_i32(_fb_hi - _fb_lo + fx.Int32(1), fx.Int32(0))
-            _n_r = _smax_i32(_v_hi - _rb_lo + fx.Int32(1), fx.Int32(0))
+            _n_l = common_utils.smax(_lb_hi - _v_lo + fx.Int32(1), fx.Int32(0))
+            _n_f = common_utils.smax(_fb_hi - _fb_lo + fx.Int32(1), fx.Int32(0))
+            _n_r = common_utils.smax(_v_hi - _rb_lo + fx.Int32(1), fx.Int32(0))
 
             _BN_I32 = fx.Int32(BLOCK_N)
             _l_col0 = _v_lo * _BN_I32
@@ -1878,7 +1875,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # Clamped: with a window that admits no key at all every run is
             # empty and `_rb_lo` sits below zero, and this value still reaches
             # the prologue's address computation.
-            _m_col0 = _smax_i32(
+            _m_col0 = common_utils.smax(
                 common_utils.ssel(
                     (_n_l > fx.Int32(0)),
                     _l_col0, _r_col0,
@@ -1925,7 +1922,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # bounds.
         if const_expr(CAUSAL):
             _first_col = fx.Index(
-                _smax_i32(
+                common_utils.smax(
                     common_utils.ssel(
                         (_n_f > fx.Int32(0)),
                         _f_col0, _m_col0,
