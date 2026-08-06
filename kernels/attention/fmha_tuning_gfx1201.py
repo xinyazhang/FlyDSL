@@ -277,6 +277,66 @@ _Q_ROW_TILES_2_HEAD_DIMS = frozenset({80})
 _Q_ROW_TILES_2_MAX_HEAD_DIM = 80
 
 
+# How the kernel forms the clamped KV address: hoist `row * stride_seq` out of
+# the KV loop, or recompute it per access. See `kv_off` in the builder for the
+# two forms.
+#
+# It is a pure hoist-versus-rematerialise trade, and it exists as a knob only
+# because the answer is not monotone in the width. Hoisting removes a 64-bit
+# multiply per load per iteration -- at BLOCK_DMODEL 192 the loop body drops
+# from 648 instructions to 585 -- but it keeps one 64-bit value live per
+# cooperative load for the whole loop.
+#
+# Full ladder, hoisted over recomputed, f16, B=1 H=8, N in {1024, 4096}, both
+# masking modes, best of 5 alternating reps:
+#
+#   BLOCK_DMODEL   worst   best  |  BLOCK_DMODEL   worst   best
+#   ------------   -----  -----  |  ------------   -----  -----
+#   16              0.99   1.03  |  160 non-causal  1.03   1.05
+#   32              1.02   1.04  |  160 causal      0.85   0.85
+#   48 at N=1024    1.02   1.03  |  192             1.01   1.41
+#   48 at N=4096    0.95   0.98  |  224             0.89   0.93
+#   64              1.00   1.05  |  256             0.89   0.91
+#   80              1.03   1.05  |  384             0.59   0.67
+#   96              1.01   1.04  |  512             1.14   1.24
+#   128             1.03   1.05  |
+#
+# So: hoist up to 192 and again at 512, with two exceptions below.
+#
+# 48 is the one width that splits on N rather than on the build: it gains 2-3%
+# at N=1024 and loses 3-4% at N=4096, reproduced over three ladder runs. N is a
+# runtime extent, so no knob can separate them, and the loss lands where the
+# kernel spends sixteen times as long. It recomputes.
+#
+# 512 looks anomalous and is not. Scratch per lane, recomputed then hoisted:
+#
+#   BLOCK_DMODEL   192      256      384      512
+#   scratch (B)    164->44  104->160 164->328 140->124
+#   ratio          1.35     0.89     0.59     1.19
+#
+# The sign of the scratch change predicts the sign of the ratio at every width
+# on the ladder, 512 included. Fewer instructions in the loop is what the hoist
+# buys; whether that survives the extra live values is decided by the register
+# allocator, one width at a time. Re-measure rather than extending this set by
+# analogy -- and dump the ISA against the *recomputed* build, not against a
+# pre-64-bit one, which spills differently for unrelated reasons.
+_KV_ADDR_HOIST_HEAD_DIMS = frozenset({16, 32, 64, 80, 96, 128, 160, 192, 512})
+
+# BLOCK_DMODEL 160 is the one width where the two masking modes disagree:
+# +2 to +4% non-causal, -15% causal. Causal builds take a different BLOCK_N
+# (`default_block_n` keys on it), so they are a different register problem
+# wearing the same width, and this is the same kind of exception that function
+# already makes. No other width on the ladder needs one.
+_KV_ADDR_HOIST_CAUSAL_EXCLUDED = frozenset({160})
+
+
+def _kv_addr_hoist(head_dim: int, causal: bool) -> bool:
+    """Whether the KV address hoists `row * stride_seq` out of the loop."""
+    if causal and head_dim in _KV_ADDR_HOIST_CAUSAL_EXCLUDED:
+        return False
+    return head_dim in _KV_ADDR_HOIST_HEAD_DIMS
+
+
 def _q_row_tiles(head_dim: int, variant: str) -> int:
     """Q row-tiles per wave: the tuning policy, or 2 where the caller forces it."""
     if variant == "m32":
@@ -403,6 +463,7 @@ class FmhaKnobs:
     v_lds_layout: str | None = None
     q_row_tiles: int | None = None
     waves_per_eu: int | None = None
+    kv_addr_hoist: bool | None = None
 
     # The two knobs `resolve_knobs` cannot fill. Both are derived from
     # NUM_WAVES, which the builder computes from the shard count and the tile
@@ -507,6 +568,8 @@ def resolve_knobs(
             f"q_row_tiles=2 requires head_dim <= {_Q_ROW_TILES_2_MAX_HEAD_DIM}, "
             f"got {hd}"
         )
+    if s.kv_addr_hoist is None:
+        s = replace(s, kv_addr_hoist=_kv_addr_hoist(hd, meta.causal))
     if s.k_prefetch_dist is None:
         # Two row-tiles require the prefetched, transposed V layout.
         s = replace(
