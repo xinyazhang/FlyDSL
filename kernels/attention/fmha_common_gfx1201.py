@@ -28,7 +28,8 @@ from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import ArithValue, _to_raw
 
 __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
-           "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8"]
+           "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8",
+           "FastMath"]
 
 
 def llvm_ptr_ty() -> ir.Type:
@@ -169,3 +170,49 @@ def bf16_trunc_pack_v8(f32_vals, elem_dtype):
             pack_bf16_pair(f32_vals[j * 2], f32_vals[j * 2 + 1], _c16, _cmask)
         )
     return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
+
+
+class FastMath:
+    """The softmax's float ops, with one `arith.FastMathFlags` set bound once.
+
+    A class rather than four free functions taking the flags, because the flag
+    set is the thing worth making visible. It is a *knob* -- `fp_mode` selects
+    between "fast", "noninf" and "safe" -- and the choice is load-bearing:
+    "fast" includes `ninf`, which once silently deleted the KV tail mask,
+    because `exp2(-inf - m)` folds to something the flag says cannot happen.
+
+    Takes the mode rather than a flag set, so the mapping from knob to flags
+    lives here and not at each kernel that uses it. Construct it on the **host**
+    side of the builder, not in the kernel body: `fp_mode` is `const_expr`, so
+    this is a plain Python object the traced code captures, and assigning it
+    inside the body makes the AST rewriter treat it as `scf` loop/if state
+    ("state variable 'fastmath' is FastMath, not an MLIR Value").
+    """
+
+    __slots__ = ("flags",)
+
+    def __init__(self, fp_mode: str):
+        _F = arith.FastMathFlags
+        if fp_mode == "fast":
+            self.flags = _F.fast
+        elif fp_mode == "noninf":
+            self.flags = _F.reassoc | _F.nnan | _F.nsz | _F.arcp | _F.contract | _F.afn
+        elif fp_mode == "safe":  # as "noninf", also dropping nnan
+            self.flags = _F.reassoc | _F.nsz | _F.arcp | _F.contract | _F.afn
+        else:
+            raise ValueError(f"unknown fp_mode {fp_mode!r}; expected fast/noninf/safe")
+
+    def div(self, a, b):
+        return arith.divf(_to_raw(a), _to_raw(b), fastmath=self.flags)
+
+    def add(self, a, b):
+        return arith.addf(_to_raw(a), _to_raw(b), fastmath=self.flags)
+
+    def sub(self, a, b):
+        return arith.subf(_to_raw(a), _to_raw(b), fastmath=self.flags)
+
+    def mul(self, a, b):
+        return arith.mulf(_to_raw(a), _to_raw(b), fastmath=self.flags)
+
+    def max(self, a, b):
+        return arith.MaxNumFOp(_to_raw(a), _to_raw(b), fastmath=self.flags).result

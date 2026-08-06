@@ -547,6 +547,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # "fast" restores the old behaviour for A/B; "safe" additionally drops
     # `nnan` (~0.6%).
     _FP_MODE = FP_MODE
+    # Host-side: `fp_mode` is const_expr, so this is a Python object the kernel
+    # body captures rather than a traced value.
+    fastmath = fmha.FastMath(_FP_MODE)
 
     # Two softmax corrections, unconditional. Both come from AOTriton's
     # hard-won list and there is no reason to keep the un-corrected form
@@ -807,31 +810,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         v_ptr = fmha.pointer_to_llvm_ptr(V)
         v_ptr_i64 = _to_global_ptr_i64(V)
         o_ptr = fmha.pointer_to_llvm_ptr(O)
-        # Fast-math set for the softmax arithmetic. `fast` includes `ninf`,
-        # which is what silently deleted the KV tail mask (see the comment at
-        # that mask). FMHA_FP_MODE selects a narrower set for measurement.
-        _F = arith.FastMathFlags
-        if const_expr(_FP_MODE == "fast"):
-            fm_fast = _F.fast
-        elif const_expr(_FP_MODE == "noninf"):
-            fm_fast = _F.reassoc | _F.nnan | _F.nsz | _F.arcp | _F.contract | _F.afn
-        else:  # "safe": also drop nnan
-            fm_fast = _F.reassoc | _F.nsz | _F.arcp | _F.contract | _F.afn
-
-        # Local fast-math arithmetic helpers -- preserve the fastmath flag while
-        # using the lowercase op names that accept _raw() unwrapping.
-        def _fadd(a, b):
-            return arith.addf(_raw(a), _raw(b), fastmath=fm_fast)
-
-        def _fsub(a, b):
-            return arith.subf(_raw(a), _raw(b), fastmath=fm_fast)
-
-        def _fmul(a, b):
-            return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
-
-        def _fmax(a, b):
-            return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
-
         v8f32_type = Vec.make_type(8, fx.Float32)
         v8f16_type = Vec.make_type(8, elem_dtype)
         vxf16_type = Vec.make_type(VEC_WIDTH, elem_dtype)
@@ -1103,7 +1081,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             k_st = (fx.Index(stride_k0), fx.Index(stride_k1), fx.Index(stride_k2))
             v_st = (fx.Index(stride_v0), fx.Index(stride_v1), fx.Index(stride_v2))
             o_st = (fx.Index(stride_o0), fx.Index(stride_o1), fx.Index(stride_o2))
-            sm_log2e = _fmul(sm_scale_arg, fx.Float32(_LOG2E))
+            sm_log2e = fastmath.mul(sm_scale_arg, fx.Float32(_LOG2E))
 
         # Q/K/V/O each get their own address pair. They genuinely differ: K and
         # V are whatever the caller allocated (`mha_fwd_aot` passes them through
@@ -1998,7 +1976,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                             peer = base_group + (
                                 (shard_id + fx.Index(k + 1)) % fx.Index(QK_SHARDS)
                             ) * fx.Index(RED_F32_PER_WAVE)
-                            acc = _fadd(
+                            acc = fastmath.add(
                                 acc, _red_load(peer + fx.Index(e * WARP_SIZE) + lane)
                             )
                         s_flat[e] = acc
@@ -2049,7 +2027,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
                 # Scale before the row max, so m_i lives in the scaled
                 # domain and the exponent is a plain subtract.
-                s_raw = [_fmul(v, c_sm_scale_log2e) for v in s_raw]
+                s_raw = [fastmath.mul(v, c_sm_scale_log2e) for v in s_raw]
 
                 if const_expr(BIAS_TYPE):
                     # ---- Bias, after the scale and before the mask ----
@@ -2081,9 +2059,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         )
                         for _r in range_constexpr(8):
                             _bs = fx.Float32(Vec(_bv)[_r].to(fx.Float32))
-                            s_raw[_st * 8 + _r] = _fadd(
+                            s_raw[_st * 8 + _r] = fastmath.add(
                                 s_raw[_st * 8 + _r],
-                                _fmul(_bs, fx.Float32(_LOG2E)),
+                                fastmath.mul(_bs, fx.Float32(_LOG2E)),
                             )
 
                 if const_expr(_MASK_STEPS):
@@ -2148,35 +2126,35 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
                 local_max = s_raw[0]
                 for r in range_constexpr(NUM_S_VALS - 1):
-                    local_max = _fmax(local_max, s_raw[r + 1])
+                    local_max = fastmath.max(local_max, s_raw[r + 1])
                 peer_max = reduction_peer(local_max)
-                row_max = _fmax(local_max, peer_max)
-                m_new_raw = _fmax(m_running, row_max)
+                row_max = fastmath.max(local_max, peer_max)
+                m_new_raw = fastmath.max(m_running, row_max)
 
                 # m is already scaled, so no scale appears in either exponent.
                 corr = rocdl.exp2(
-                    ir.F32Type.get(), _raw(_fsub(m_running, m_new_raw))
+                    ir.F32Type.get(), _raw(fastmath.sub(m_running, m_new_raw))
                 )
-                neg_m = _fsub(c_zero_f, m_new_raw)
+                neg_m = fastmath.sub(c_zero_f, m_new_raw)
 
                 p_vals = []
                 local_sum = _raw(c_zero_f)
                 for r in range_constexpr(NUM_S_VALS):
-                    diff = _fadd(s_raw[r], neg_m)
+                    diff = fastmath.add(s_raw[r], neg_m)
                     p = rocdl.exp2(ir.F32Type.get(), _raw(diff))
                     p_vals.append(p)
-                    local_sum = _fadd(local_sum, p)
+                    local_sum = fastmath.add(local_sum, p)
 
                 peer_sum = reduction_peer(local_sum)
-                tile_sum = _fadd(local_sum, peer_sum)
-                l_corr = _fmul(corr, l_running)
-                l_new = _fadd(l_corr, tile_sum)
+                tile_sum = fastmath.add(local_sum, peer_sum)
+                l_corr = fastmath.mul(corr, l_running)
+                l_new = fastmath.add(l_corr, tile_sum)
 
                 corr_vec = (
                     Vec.from_elements([corr], fx.Float32).broadcast_to(8).ir_value()
                 )
                 for dc in range_constexpr(O_ACCS):
-                    o_accs_all[qt][dc] = _fmul(o_accs_all[qt][dc], corr_vec)
+                    o_accs_all[qt][dc] = fastmath.mul(o_accs_all[qt][dc], corr_vec)
 
                 if const_expr(ENABLE_DROPOUT):
                     # **After `l_new`, before the O accumulation.** The softmax
@@ -2456,8 +2434,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             if _do_store:
                 _m = loop_results[2 * qt]
                 _l = loop_results[2 * qt + 1]
-                _lse = _fmul(
-                    _fadd(_m, rocdl.log(_f32_ty, _raw(_l))), fx.Float32(_LN2)
+                _lse = fastmath.mul(
+                    fastmath.add(_m, rocdl.log(_f32_ty, _raw(_l))), fx.Float32(_LN2)
                 )
                 # A row with no live keys gets +inf, not -inf: the backward
                 # pass subtracts LSE from qk, so +inf makes exp(qk - inf)
@@ -2516,8 +2494,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # Clamp rather than branch: for a live row l >= 1 always, since
             # the running max contributes exp2(0) = 1, so this is a no-op
             # there.
-            _l_safe = _fmax(l_final, fx.Float32(1e-30))
-            inv_l = arith.divf(_raw(c_one_f), _raw(_l_safe), fastmath=fm_fast)
+            _l_safe = fastmath.max(l_final, fx.Float32(1e-30))
+            inv_l = fastmath.div(c_one_f, _l_safe)
             if const_expr(ENABLE_DROPOUT):
                 # `1/(1-p)` folds into the existing `1/l` rather than becoming
                 # a per-element multiply: it is uniform across the tile, and
@@ -2527,14 +2505,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # `l` is deliberately *not* scaled -- it is the undropped sum,
                 # and the logsumexp written below is the undropped one, which
                 # is what the backward pass needs.
-                inv_l = _raw(_fmul(fx.Float32(inv_l), dropout_scale))
+                inv_l = _raw(fastmath.mul(fx.Float32(inv_l), dropout_scale))
             inv_l_vec = (
                 Vec.from_elements([inv_l], fx.Float32).broadcast_to(8).ir_value()
             )
             if q_in_bounds_all[qt]:
                 for _oi in range_constexpr(O_ACCS):
                     vc, dc = _oi // D_CHUNKS, _oi % D_CHUNKS
-                    o_norm_vec = _fmul(loop_results[_ML + qt * O_ACCS + _oi], inv_l_vec)
+                    o_norm_vec = fastmath.mul(loop_results[_ML + qt * O_ACCS + _oi], inv_l_vec)
                     o_trunc = Vec(o_norm_vec).to(elem_dtype).ir_value()
                     d_col = shard_vo_off + fx.Index(dc * D_CHUNK) + klane * 8
                     if const_expr(vc):
