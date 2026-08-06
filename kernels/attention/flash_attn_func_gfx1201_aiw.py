@@ -2246,7 +2246,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     # loop. The region split gives the same benefit statically.
                     _kv_i32 = fx.Int32(kv_block_start)
                     _klane_off = fx.Int32(klane) * fx.Int32(8)
-                    _seq_i32 = fx.Int32(seqlen_k_v)
+                    _seq_i32 = _seqlen_k_i32
                     for _i in range_constexpr(NUM_S_VALS):
                         _col = (
                             _kv_i32
