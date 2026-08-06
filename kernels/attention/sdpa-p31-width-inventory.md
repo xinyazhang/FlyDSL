@@ -54,3 +54,30 @@ pass. Today the file has 7 `fx.Int64(` sites and exactly one contains a
 multiply, bounded by 24. P3.2's gate is that this count stays at zero-that-
 matter, checked by grepping every new `fx.Int64(` for a multiply inside it,
 plus a host-side check of the resolved offsets at a synthetic large shape.
+
+
+## 5. Correction: `stride_seq` is not bounded by `num_heads * head_dim`
+
+Added after the fact, because §1 originally justified leaving the per-lane
+offset at 32 bits with "no physical layout reaches 2**31 there". That is
+**false**, and the reasoning behind it was: input tensors are not required to
+be compact, and a view keeps the strides of its source.
+
+Slicing eight heads out of a `(1, 64, 16384, 512)` f16 tensor -- 1 GiB, nothing
+exotic -- gives a view whose `stride(1)` is 8388608. At `BLOCK_M = 256` the
+per-lane row offset is exactly 2**31.
+
+So `toff`'s 32-bit product is a genuine restriction on legitimate input, and
+`_strides_of` currently converts it into a rejection. That is the right
+behaviour versus silent corruption and the wrong end state. **P3.2 owns
+removing it**, and the two candidates are:
+
+- widen the per-lane offset to 64 bits, which costs VALU on every address in
+  the inner loop -- measure before assuming it is affordable; or
+- fold `row_in_tile * s_seq` into the 64-bit base. The obstacle is that the
+  base is uniform per workgroup and the row is per-lane, so this needs the row
+  term hoisted to wherever the lane's row is already known.
+
+The second is the one worth trying first. Either way the `seq` entry in
+`_FAR_LAYOUTS` is `xfail(strict)`, so whichever lands will xpass and force the
+xfail to be removed deliberately.

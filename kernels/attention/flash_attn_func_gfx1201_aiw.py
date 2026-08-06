@@ -1225,12 +1225,18 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
                 32-bit because it is per-lane and the VALU cost is paid on
                 every address; the whole-tensor magnitude lives in `tbase`,
-                which is 64-bit. That split carries a precondition --
-                `BLOCK_M * s_seq` must fit in i32 -- which holds for any
-                physical layout, since `s_seq` is at most `num_heads *
-                head_dim` and `row_in_tile` is under 256. It does *not* hold
-                for an arbitrary synthetic stride, so `_strides_of` checks it
-                on the host rather than leaving a silent wrap here.
+                which is 64-bit. That split carries a precondition:
+                `BLOCK_M * s_seq` must fit in i32.
+
+                **This is a real restriction on legitimate inputs, not a
+                theoretical one.** Nothing requires the caller's tensor to be
+                compact, and a view keeps its source's strides -- slicing
+                `(1, 64, 16384, 512)` f16, a 1 GiB tensor, down to eight heads
+                leaves `s_seq = 8388608`, and 256 rows of that is exactly
+                2**31. `_strides_of` rejects such a call rather than letting
+                the product wrap, but rejecting it is a limitation to remove,
+                not the end state: see the P3.2 note in
+                `sdpa-p31-width-inventory.md`.
                 """
                 return row_in_tile * s_seq + col
 
@@ -2798,11 +2804,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 f"stride(3)={t.stride(3)}"
             )
         # The per-lane offset `row_in_tile * stride_seq` is computed in 32
-        # bits (see `toff`). Physical layouts cannot reach 2**31 there --
-        # stride_seq is at most num_heads * head_dim -- but a strided view can,
-        # and the failure is silent: the product wraps negative and the kernel
-        # reads another allocation. Checked here because this is the last place
-        # the stride is a Python int.
+        # bits (see `toff`), and a non-compact input can exceed that: a view
+        # keeps its source's strides, so a few heads sliced out of a wide
+        # tensor carry the wide tensor's `stride(1)`. The failure is silent --
+        # the product wraps negative and the kernel reads another allocation --
+        # so it is caught here, the last place the stride is a Python int.
+        # This *rejects input the caller is entitled to pass*; removing the
+        # restriction is P3.2 work, and until then a clear error beats a wrong
+        # answer.
         _row_span = BLOCK_M * abs(t.stride(1))
         if _row_span > 2**31 - 1:
             raise ValueError(
