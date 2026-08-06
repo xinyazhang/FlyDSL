@@ -206,6 +206,16 @@ proves the helper is shared rather than merely moved.
 (`flash_attn_utils.py:2806` `_max_pair` is *not* a duplicate -- it is a float
 max over `_fmax`, unrelated.)
 
+**The dedup is not a straight substitution**, which is the plan's own
+"near-equivalent, not equivalent" hazard showing up on schedule. `_sel` coerces
+its operands and `ssel` deliberately does not, and 24 of `pa_metadata`'s 26
+call sites are fine on that -- `ArithValue.select` materialises a Python int
+against the *other* operand's type, so `ssel(c, pidx_, -1)` works. The two that
+pass a literal on **both** arms do not: there is then no typed operand to infer
+from. Those two need an explicit `fx.Int32` on one side. The commit must also
+run `tests/kernels/test_pa.py`, since it lands in a different kernel from the
+rest of P5.4.
+
 **Home: `kernels/common/utils.py`.** It already hosts this exact class of
 helper -- `udiv_pow2`, `urem_pow2`, `udiv_const`, `urem_const`, `pow2_shift` --
 and `_sdiv_rd` is precisely the *signed* counterpart to `udiv_pow2` that the
