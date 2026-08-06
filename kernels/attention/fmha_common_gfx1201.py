@@ -1,13 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Helpers shared by the FlyDSL attention kernels.
+"""Hardware detail for the gfx1201 (RDNA4) attention kernels.
 
-Attention-specific, and deliberately not in `kernels/common/`: what is here
-either encodes an attention ABI decision or has no meaning outside one. The
-general-purpose siblings live next door -- `kernels/common/mem_ops.py` for
-pointer and global load/store, `kernels/common/utils.py` for the scalar
-integer helpers.
+Two boundaries, and the arch suffix is the important one.
+
+**Not `kernels/common/`**: what is here either encodes an attention ABI
+decision or has no meaning outside one. The general-purpose siblings live next
+door -- `kernels/common/mem_ops.py` for pointer and global load/store,
+`kernels/common/utils.py` for the scalar integer helpers.
+
+**Not shared with gfx950 or gfx1250 either.** `flash_attn_utils.py` is the
+gfx950 equivalent and this module deliberately does not import from it or
+extend it. The hardware differs enough that the *algorithms* differ: gfx950
+schedules around MFMA/VALU co-execution, which RDNA4 has no equivalent of, and
+its dualwave traits/context machinery exists to serve that. Merging the two
+would mean one abstraction serving two schedules that agree on almost nothing.
+When gfx1250 FMHA arrives it gets its own `fmha_common_gfx1250.py` for the
+same reason.
 """
 
 import flydsl.expr as fx

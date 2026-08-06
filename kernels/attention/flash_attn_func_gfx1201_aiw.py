@@ -107,7 +107,7 @@ from flydsl.expr import (
     rocdl,
 )
 from flydsl.expr.typing import T, Vector as Vec
-from fmha_common import pointer_to_llvm_ptr as _pointer_to_llvm_ptr
+from fmha_common_gfx1201 import pointer_to_llvm_ptr as _pointer_to_llvm_ptr
 from philox import Philox, dropout_threshold
 from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
 
