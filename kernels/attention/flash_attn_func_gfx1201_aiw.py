@@ -1687,7 +1687,17 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         q_in_bounds_all = []
         q_b_packs_all = []
         for qt in range_constexpr(Q_ROW_TILES):
-            _in = _raw(fx.Int32(q_rows[qt]) < _seqlen_q_i32)
+            # Deliberately *not* `q_row_i32s[qt] < _seqlen_q_i32`, which is the
+            # same value and reads better. That form starts the i32 copy's live
+            # range here rather than at the causal mask that needs it, and at
+            # the widest causal builds the extra overlap spills: BLOCK_DMODEL
+            # 384 causal paid 16 more bytes of scratch and 6% throughput.
+            # `fx.Index` is unsigned, hence the explicit signed predicate.
+            _in = arith.cmpi(
+                arith.CmpIPredicate.slt,
+                _raw(q_rows[qt]),
+                _raw(fx.Index(_seqlen_q_i32)),
+            )
             _safe = fx.Index(
                 ArithValue(_in).select(q_rows_in_tile[qt], fx.Index(0))
             )
