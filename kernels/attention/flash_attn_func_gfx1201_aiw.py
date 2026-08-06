@@ -899,35 +899,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # than on `dtype_str` here -- see that module for why.
             return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
 
-        def _scmp_i32(pred, a, b):
-            """A *signed* integer compare, with both operands forced to i32.
-
-            The coercion is the point, not the predicate. `fx.Int32` is
-            declared `signed=True` and its `<`/`>` overloads already emit
-            `slt`/`sgt` -- an earlier version of this docstring claimed
-            otherwise and was wrong. What is genuinely unsafe is comparing an
-            `fx.Index`, which is `signed=False` and 64-bit, so *its* overloads
-            emit `ult`/`ugt` and a negative window bound compares as something
-            enormous.
-
-            Wrapping both sides in `fx.Int32` first makes the signedness a
-            property of this call rather than of whatever the caller happened
-            to be holding. Once the sequence-space quantities are `fx.Int32`
-            throughout there is nothing left to coerce and this helper goes
-            away -- see `sdpa-readability-plan.md` P3.3.
-            """
-            return ArithValue(
-                arith.cmpi(pred, _raw(fx.Int32(a)), _raw(fx.Int32(b)))
-            )
-
         def _ssel_i32(pred, a, b):
             return fx.Int32(ArithValue(pred).select(fx.Int32(a), fx.Int32(b)))
 
         def _smin_i32(a, b):
-            return _ssel_i32(_scmp_i32(arith.CmpIPredicate.slt, a, b), a, b)
+            return _ssel_i32((a < b), a, b)
 
         def _smax_i32(a, b):
-            return _ssel_i32(_scmp_i32(arith.CmpIPredicate.sgt, a, b), a, b)
+            return _ssel_i32((a > b), a, b)
 
         def _sdiv_rd(x):
             """floor(x / BLOCK_N), signed -- plan section 2.4 rule 4.
@@ -1013,7 +992,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
             # POSITION.
             _row_off = _ssel_i32(
-                _scmp_i32(arith.CmpIPredicate.ne, _stacked, fx.Int32(0)),
+                (_stacked != fx.Int32(0)),
                 _z_i32 * fx.Int32(max_seqlen), fx.Int32(0),
             )
             if _posmode == fx.Int32(1):          # REUSE: already in a register
@@ -1022,7 +1001,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 _row_off = _seqinfo_at(s1, _z_i32)
 
             _batch = _ssel_i32(
-                _scmp_i32(arith.CmpIPredicate.ne, _stacked, fx.Int32(0)),
+                (_stacked != fx.Int32(0)),
                 fx.Int32(0), _z_i32,
             )
 
@@ -1756,26 +1735,30 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # Both sentinels give an unbounded left edge -- no row reaches
             # further back than the start of its own sequence -- so they
             # differ only in the right one. Matches AOTriton's `parse_window`.
+            #
+            # **Everything derived from a window stays `fx.Int32` from here
+            # down.** Window bounds go negative -- that is what a sentinel and
+            # a leading masked region are -- and `fx.Int32` is `signed=True`,
+            # so its `<`/`>` emit `slt`/`sgt`. `fx.Index` is `signed=False`
+            # and 64-bit, so widening any of these even once makes the same
+            # comparison unsigned and a negative bound comes out enormous.
+            # This used to be enforced by a `_scmp_i32` wrapper that coerced
+            # both operands at every compare; the types carry it now, so it is
+            # a rule about this block rather than a helper.
             _wl_i32 = fx.Int32(window_left)
             _wr_i32 = fx.Int32(window_right)
-            _is_tl_l = _scmp_i32(
-                arith.CmpIPredicate.eq, _wl_i32, fx.Int32(_WINDOW_TOPLEFT)
-            )
-            _is_br_l = _scmp_i32(
-                arith.CmpIPredicate.eq, _wl_i32, fx.Int32(_WINDOW_BOTRIGHT)
-            )
+            _is_tl_l = (_wl_i32 == fx.Int32(_WINDOW_TOPLEFT))
+            _is_br_l = (_wl_i32 == fx.Int32(_WINDOW_BOTRIGHT))
             _wl_i32 = _ssel_i32(
                 ArithValue(arith.ori(_raw(_is_tl_l), _raw(_is_br_l))),
                 _seqlen_q_i32, _wl_i32,
             )
             _wr_i32 = _ssel_i32(
-                _scmp_i32(arith.CmpIPredicate.eq, _wr_i32,
-                          fx.Int32(_WINDOW_TOPLEFT)),
+                (_wr_i32 == fx.Int32(_WINDOW_TOPLEFT)),
                 fx.Int32(0), _wr_i32,
             )
             _wr_i32 = _ssel_i32(
-                _scmp_i32(arith.CmpIPredicate.eq, fx.Int32(window_right),
-                          fx.Int32(_WINDOW_BOTRIGHT)),
+                (fx.Int32(window_right) == fx.Int32(_WINDOW_BOTRIGHT)),
                 _seqlen_k_i32 - _seqlen_q_i32, _wr_i32,
             )
 
@@ -1870,7 +1853,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _fb_hi = _smin_i32(
                 _smin_i32(_r_first_mask - fx.Int32(1), _blk_last_whole), _v_hi
             )
-            _fb_empty = _scmp_i32(arith.CmpIPredicate.sgt, _fb_lo, _fb_hi)
+            _fb_empty = (_fb_lo > _fb_hi)
 
             # Cut [_v_lo, _v_hi] at the full region. With no full region the
             # whole range becomes one masked run, which is section 2.2 case 2
@@ -1893,7 +1876,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # the prologue's address computation.
             _m_col0 = _smax_i32(
                 _ssel_i32(
-                    _scmp_i32(arith.CmpIPredicate.sgt, _n_l, fx.Int32(0)),
+                    (_n_l > fx.Int32(0)),
                     _l_col0, _r_col0,
                 ),
                 fx.Int32(0),
@@ -1940,7 +1923,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _first_col = fx.Index(
                 _smax_i32(
                     _ssel_i32(
-                        _scmp_i32(arith.CmpIPredicate.sgt, _n_f, fx.Int32(0)),
+                        (_n_f > fx.Int32(0)),
                         _f_col0, _m_col0,
                     ),
                     fx.Int32(0),
@@ -1968,7 +1951,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # across the workgroup, so no divergence is introduced.
         _pf_n = fx.Index(
             _ssel_i32(
-                _scmp_i32(arith.CmpIPredicate.sgt, _kv_tiles_i32, fx.Int32(0)),
+                (_kv_tiles_i32 > fx.Int32(0)),
                 fx.Int32(1), fx.Int32(0),
             )
         )
@@ -2505,11 +2488,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # which is only the adjacent tile when the left run is empty.
                 _nxt = fx.Index(
                     _ssel_i32(
-                        _scmp_i32(
-                            arith.CmpIPredicate.slt,
-                            fx.Int32(kv_block_start) + _BN_I32,
-                            _f_col0 + _n_f * _BN_I32,
-                        ),
+                        (fx.Int32(kv_block_start) + _BN_I32 < _f_col0 + _n_f * _BN_I32),
                         fx.Int32(kv_block_start) + _BN_I32,
                         _m_col0,
                     )
@@ -2524,7 +2503,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 prefetch has to go through this same map."""
                 _i = fx.Int32(i_idx)
                 return _ssel_i32(
-                    _scmp_i32(arith.CmpIPredicate.slt, _i, _n_l),
+                    (_i < _n_l),
                     _l_col0 + _i * _BN_I32,
                     _r_col0 + (_i - _n_l) * _BN_I32,
                 )
