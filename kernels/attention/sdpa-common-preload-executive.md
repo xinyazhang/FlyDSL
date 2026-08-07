@@ -1,9 +1,11 @@
 # Executive plan: the `Aperture` refactor for gfx1201 SDPA
 
-**Status: executed, `a40cd565..0660a6d5`.** Steps 1-8 landed as eight
-commits; step 9 was surveyed and declined. See §12 for what each step
-actually did and where it departed from the plan below, which is left as
-written so the departures are legible.
+**Status: executed, `a40cd565..df81ef2c`, twelve commits.** Steps 1-8 landed,
+step 9 was surveyed and declined, and three unplanned commits followed:
+V staging (which steps 1-8 had skipped), `reader`, and the removal of the
+carry protocol that step 2 had added. See §12 for what each step actually did
+and where it departed from the plan below, which is left as written -- with
+supersession notes -- so the departures stay legible.
 
 Self-contained. Everything needed to execute is here; nothing depends on
 recalling how it was derived. Companion documents: `sdpa-common-preload.md`
@@ -86,7 +88,12 @@ helper:
 Consequence: `_decode_side`-style branching code can move only if rewritten
 onto explicit `IfOp`, and loop bodies with `range(init=)` cannot move at all.
 
-### 4.2 Objects across a dynamic `if` — solved, use the protocol
+### 4.2 Objects across a dynamic `if`
+
+> **Superseded — see §12.6.** This section's advice was followed and then
+> undone. The protocol was implemented, became unused two steps later when the
+> branching helpers moved to module scope, and was deleted. Read §12.6 before
+> reaching for it.
 
 A Python object live across a dynamic `if` fails (`state variable 'x' is …,
 not an MLIR Value`; sometimes surfacing as `UnboundLocalError`). Passing it as
@@ -105,8 +112,6 @@ def __construct_from_ir_values__(cls, values, exemplar=None): ...
 
 `exemplar` restores non-IR fields (`active`, `elem_dtype`, LDS geometry) while
 IR values thread through as `scf` state. Verified on a probe kernel.
-**`Aperture` and `MaskedAxis` must implement these**; then the `qk_cols()` /
-`vo_cols()` / `q_rows_axis()` factory functions are deleted.
 
 ### 4.3 Static selector vs traced predicate — do not confuse them
 
@@ -140,14 +145,41 @@ Prefer the stable spelling; new code must not add unstable surface.
 | use | instead of |
 | --- | --- |
 | `fx.as_ir_value(x)` | `_to_raw(x)` / `_raw(x)` |
-| `(a < b).select(x, y)` — `<` on `fx.Int32` returns stable `fx.Boolean` | `ArithValue(pred).select(...)` |
-| the `<` operator on i32 | `arith.cmpi(slt, ...)` |
+| `(a < b).select(x, y)` — `<` returns a stable `fx.Boolean` | `ArithValue(pred).select(...)` |
+| the `<` operator | `arith.cmpi(slt, ...)` + `arith.CmpIPredicate` |
 | `fx.ptr_load` / `fx.ptr_store` / `fx.recast_iter` (all stable) | `_llvm.LoadOp` / `StoreOp` |
+
+**Signedness rides on the type, so picking the type picks the opcode.**
+`_make_binop` in `expr/numeric.py` passes each operand's class-level `signed`
+into the comparison, and:
+
+| type | width | `signed` | `<` emits |
+| --- | --- | --- | --- |
+| `fx.Index` | 64 | **False** | unsigned |
+| `fx.Int64` | 64 | True | signed |
+| `fx.Int32` | 32 | True | signed |
+
+So `fx.Index` is not merely "unsigned if you go negative" -- it silently
+selects `u64` compares, and that is what produced the only ISA change in this
+whole refactor (§12, step 8: eight `v_cmp_gt_u64` becoming `v_cmp_gt_i64` once
+the O store went through `cols.valid`). **`fx.Int64` is the signed 64-bit
+spelling**, and it is the one that reaches the stable `<` operator. Reaching
+signed 64-bit any other way today means `arith.cmpi` with the unstable
+`arith.CmpIPredicate` enum, which is what `MaskedAxis.valid` still does.
 
 No stable equivalent exists for `scf.IfOp`, `ir.InsertionPoint`,
 `llvm.IntToPtrOp`/`PtrToIntOp`, or `fx.rocdl.global_load_tr_b128`. **Contain**
-each in exactly one function. `fx.arith.index_cast` is deprecated for removal
-in **v0.4**; do not add new uses.
+each in exactly one function. `fx.index_cast` (equivalently
+`fx.arith.index_cast`) is deprecated for removal in **v0.4**; do not add new
+uses.
+
+**Do not read stability off `scripts/list_stable_apis.py` alone.** The catalog
+excludes §3 deprecated APIs, so absence from it means unstable *or*
+deprecated, and those need opposite responses. Check the owning module's
+`__all__`: `index_cast` is in `arith.__all__`, hence stable-but-deprecated,
+while `addi`, `andi`, `ori`, `addf`, `subf`, `mulf`, `divf`, `CmpIPredicate`
+and `MaxNumFOp` are not in it and are genuinely unstable. `cmpi`,
+`FastMathFlags`, `maxnumf`, `maximumf` and `minimumf` are stable.
 
 ---
 
@@ -242,6 +274,19 @@ one. Naming it puts the seam where the ISA difference is.
 | `coop_load_store_k` | 2 | `stage` |
 | `_store_global_half` | 2 | `store` (O epilogue) |
 | `fmha.global_load_tr_v8` | 1 | `load(transposed=True)` |
+
+Three dispositions above turned out wrong; the executed versions are:
+
+- `_v_store_transposed` and `fmha.global_load_tr_v8` -- there is no
+  `transposed=` flag anywhere. The store is plain `to_lds(..., d, kv, 8)`
+  (§12.1) and the load is `read_transposed`, which differs by *which
+  instruction* it is handed, not by a flag.
+- `load_global_f16xN`, `load_global_v8f16` and `_load_global_half_vec` are
+  **not** absorbed. They became the `load` half of `fmha.reader(addr, load)`.
+  Absorbing them would have meant moving `_split_ptr` too, and its 64-bit
+  reasoning -- a view's sequence stride is bounded by the tensor it was sliced
+  from, so a 256-row offset can reach exactly 2**31 -- is per tensor and
+  belongs with the pointer arithmetic, not with the movement helper.
 
 ---
 
@@ -369,8 +414,9 @@ live and still spills **more** — 272 B vs 44 B of scratch at 192, for 0.863 vs
   sites** — the number this work should move.
 
 All met. 392 tests pass (298 kernel + 94 interface). The full ladder against
-`a40cd565` spans 0.993 to 1.008 across 13 widths x 2 lengths x 2 modes, which
-is inside the harness's own resolution.
+`a40cd565` spans 0.985 to 1.010 across 13 widths x 2 lengths x 2 modes, which
+is inside the harness's own resolution; the one low point is shown to be
+measurement noise in §12.7.
 
 ---
 
@@ -379,7 +425,7 @@ is inside the harness's own resolution.
 | # | step | outcome |
 | - | --- | --- |
 | 1 | rename | `5906abd3`, bitwise identical |
-| 2 | `MaskedAxis` protocol | `4100c045`, bitwise identical |
+| 2 | `MaskedAxis` protocol | `4100c045`, bitwise identical (later undone, §12.6) |
 | 3 | `Aperture` | `2be30327`, bitwise identical |
 | 4 | `to_lds` / `from_lds` | `17d8a65f`, bitwise identical |
 | 5 | Q load | `0136b7c5`, bitwise identical |
@@ -387,11 +433,26 @@ is inside the harness's own resolution.
 | 7 | `stage` | `944e66a9`, bitwise identical |
 | 8 | O store | `0660a6d5`, 8 opcodes changed, deliberately |
 | 9 | `map_subtiles` | declined; §12.4 |
+| + | V staging | `54cad459`, scheduling-only; §12.7 |
+| + | `reader` | `b683e821`, bitwise identical |
+| + | protocol removed | `df81ef2c`, bitwise identical; §12.6 |
 
-The kernel is 2826 -> 2781 lines and the arch module 875 -> 1137. The point
+The last three were not in the plan. Steps 1-8 left V's staging untouched at
+68 lines of code while K's fell to 14 -- an asymmetry with no reason behind
+it, and one that had `coop_store_v_lds` open-coding an exact duplicate of
+`fmha.publish`. §12.7.
+
+The kernel is 2826 -> 2727 lines and the arch module 875 -> 1249. The point
 was never the line count: what moved is that all four tensors' bounds and
 geometry now live on one object each, and the movement helpers are shared
-with the backward kernels.
+with the backward kernels. The memory-access sections of the kernel body went
+from 177 lines of code to 86:
+
+| section | before | after |
+| --- | ---: | ---: |
+| K staging | 71 | 14 |
+| V staging | 69 | 29 |
+| PADDED_HEAD axes / apertures | 37 | 43 |
 
 ### 12.1 Departures from the plan, and why
 
@@ -423,10 +484,13 @@ the store itself.
 
 **V does not use `read_vec`** (step 6). Neither V arm discards, only `safe`s,
 and that is correct: V reaches only O, and an O column past `hdim_vo` is
-dropped by the epilogue store, so zeroing it is work with no reader. The
-transposed arm could not discard per element in any case -- after the 8x8
-transpose a lane's vector runs along kv, so all 8 elements share one column.
-Both facts are now recorded at the site; neither was before.
+dropped by the epilogue store, so zeroing it is work with no reader -- and the
+configs that would pay are exactly the small padded row-major ones (7-in-16,
+8-in-16, 40-in-48). The transposed arm could not discard per element in any
+case: after the 8x8 transpose a lane's vector runs along kv, so all 8 elements
+share one column. This is now `read_batches_unmasked`, a separate named
+function rather than a `mask_cols=False` argument, so the unusual case has to
+be spelled out by the caller instead of hiding in a keyword.
 
 ### 12.2 Methods versus free functions
 
@@ -480,17 +544,82 @@ different refactor from this one.
 
 The DoD asked for the delta. It is roughly zero, and that is the honest
 answer: this work moved unstable calls between files rather than removing
-them. `fmha_common_gfx1201.py` has ~72 unstable call sites and
-`flash_attn_func_gfx1201_aiw.py` ~81, dominated by `_to_raw`/`_raw` (53) and
-`ArithValue` (19).
+them, dominated by `_to_raw`/`_raw` and `ArithValue`.
 
-Two corrections to §4.4 found while auditing:
+Four things found while auditing, all of which feed `sdpa-fix-unstable.md`:
 
 - `fx.as_ir_value` **is** stable, via `flydsl.expr.typing.as_ir_value`. It is
-  the drop-in for all 53 `_to_raw` sites and is the single largest item in
-  `sdpa-fix-unstable.md`.
-- `flydsl.expr.arith.maxnumf` is stable, so `FastMath.max`'s
-  `arith.MaxNumFOp` has a stable spelling if it accepts `fastmath=`.
+  the drop-in for every `_to_raw` site and the single largest item there.
+- `arith.maxnumf`, `arith.maximumf` and `arith.minimumf` are stable, so
+  `FastMath.max`'s `arith.MaxNumFOp` has a stable spelling if `maxnumf`
+  accepts `fastmath=`.
+- `arith.cmpi` is stable but `arith.CmpIPredicate` is not, so the two travel
+  together badly. Using the `<` operator avoids needing the enum -- but only
+  on a signed type; see the signedness table in §4.4, and note that
+  `MaskedAxis.valid` compares `fx.Index` values with an explicit `slt`
+  precisely because `fx.Index` is unsigned.
+- A first pass at this list was wrong because it read stability off
+  `list_stable_apis.py`, which omits §3 deprecated APIs. See the last
+  paragraph of §4.4.
+
+Beware one measurement artefact when counting: `rocdl.WAVES_PER_EU`,
+`rocdl.FLAT_WORK_GROUP_SIZE` and `gpu.func` in the aiw kernel are **MLIR
+attribute-name and op-name string literals**, not Python attribute accesses.
+A regex over `rocdl\.[a-z_]*` counts them as API uses; they are raw MLIR
+attribute manipulation, which is a different (and also unstable) coupling.
 
 `exe._cf = cf` in the builder remains the one `[PRIVATE-WRITE]`; unchanged by
 this work and still `sdpa-fix-unstable.md` P3.
+
+### 12.6 The carry protocol was load-bearing, then it was not
+
+Step 2 added `__get_ir_types__` / `__extract_to_ir_values__` /
+`__construct_from_ir_values__` to `MaskedAxis`, and step 3 to `Aperture`, so
+they could cross a rewriter-generated `scf.if`. That was true when it was
+written. Steps 7 and 8 removed the last consumer and nobody noticed until the
+question "why does `_over_batches` use `_scf.IfOp` instead?" was asked
+directly.
+
+The answer, and the thing to keep: **the protocol is a service the AST
+rewriter consumes, and module-level code is never rewritten.** The rewriter
+lifts an `if` body into a generated function and calls `scf_if_dispatch`, so
+free variables cross a real Python function boundary *and* become region
+operands -- hence the need to say how an object decomposes. A hand-written
+`IfOp` has neither problem: `with ir.InsertionPoint(...)` is not a function
+boundary, and the object's IR values were materialised before the op, so they
+dominate the region and need no block arguments.
+
+Verified by deleting all six methods: 392 tests pass, all eight gate configs
+bitwise identical. Reach for it again only if kernel code has to method-call
+one of these objects under a dynamic `if` -- and prefer moving that code to a
+module-level function instead.
+
+### 12.7 What V staging cost by being skipped
+
+Steps 1-8 migrated K and left V, on no principle other than that `read_vec`
+covered K's shape and the step list said to move on. The result was 68 lines
+of code in the kernel body against K's 14 -- the densest block outside the
+loop, more than the varlen prologue and the address split combined -- and
+`coop_store_v_lds`'s row-major arm was an exact duplicate of `fmha.publish`,
+written two commits earlier and never called.
+
+`TransposedTiling` owns the V^T geometry: how many 16(d) x 16(kv) blocks
+there are, how they map onto `l` and `wave_id`, and where a lane sits inside
+one. Same argument as §9.5 for K and V, one level further -- this is
+per-*layout* geometry, live only when `V_LDS_LAYOUT` is "transposed", which is
+why it sits beside `Aperture` rather than inside it.
+
+The four lane offsets are now named as the two distinct mappings they are:
+`load_*` is the address a lane supplies so the hardware transpose lands the
+right block, `store_*` is where its transposed result belongs. As bare
+`_tr_d_off` / `lane16` they were interchangeable by accident.
+
+Unlike every other step this one is not bitwise clean, and the reason is worth
+recording. hd16 and hd32 (row-major) are identical. The six transposed configs
+differ only by instruction scheduling: identical instruction counts, VGPR
+counts and scratch everywhere, identical opcode histograms on hd48, hd64,
+hd160-causal and hd384, and a one-instruction delta on hd128-causal and
+hd160. The full ladder spans 0.985 to 1.010; the single low point, hd48
+causal, has a provably identical opcode histogram, so it is the harness rather
+than the code -- which is the check to run before believing any tier-3 outlier
+on this kernel.
