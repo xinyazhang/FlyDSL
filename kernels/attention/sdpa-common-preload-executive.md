@@ -6,7 +6,7 @@ recalling how it was derived. Companion documents: `sdpa-common-preload.md`
 `sdpa-readability-plan.md` (the parent plan; this is its Tier C/D).
 
 Baseline: branch rebased onto `v0.3.0`, 298 tests green,
-`flash_attn_func_gfx1201_aiw.py` at 2814 lines,
+`flash_attn_func_gfx1201_aiw.py` at 2826 lines,
 `fmha_common_gfx1201.py` at 875.
 
 ---
@@ -105,18 +105,28 @@ IR values thread through as `scf` state. Verified on a probe kernel.
 
 ### 4.3 Static selector vs traced predicate — do not confuse them
 
-`KV_NEEDS_GUARD`, `V_NEEDS_GUARD`, `V_TR_NEEDS_GUARD` are **const_expr** and
+`K_NEEDS_GUARD`, `V_NEEDS_GUARD`, `V_TR_NEEDS_GUARD` are **const_expr** and
 harmless. They select whether a guarded form is emitted. The `scf.if` is the
 *traced* predicate inside:
 
 | static selector | traced predicate | site |
 | --- | --- | --- |
-| `KV_NEEDS_GUARD` | `row_valid = lds_row < BLOCK_N` | `coop_load_store_k`, `coop_store_k_lds` |
+| `K_NEEDS_GUARD` | `row_valid = lds_row < BLOCK_N` | `coop_load_store_k`, `coop_store_k_lds` |
 | `V_NEEDS_GUARD` | `row_valid = v_row_in_batch + off < BLOCK_N` | `coop_store_v_lds` row-major arm |
 | `V_TR_NEEDS_GUARD` | `tile_ok = wave_id + l*NUM_WAVES < V_TR_TILES` | `coop_store_v_lds` transposed arm |
 
 `_load_geom` is called separately for the QK and V/O widths, so a config can
-need one guard without the other.
+need one guard without the other. The K tuple is
+`K_TPR_LOAD, K_ROWS_PER_BATCH, NUM_BATCHES_K, K_NEEDS_GUARD`; the V tuple is
+`V_TPR_LOAD, V_ROWS_PER_BATCH, NUM_BATCHES_V, V_NEEDS_GUARD`.
+
+**Anything that gates both tensors must consult both guards.** The clamp flag
+handed to the K *and* V apertures used to read only the K one. The two ask
+whether their own rows-per-batch divides `BLOCK_N`, computed from different
+widths, so they are different questions; they agree at every point on the
+current ladder, which is coincidence rather than invariant. Already fixed, but
+the shape of the mistake is the one to watch when geometry moves onto the
+apertures in step 3.
 
 ### 4.4 API stability
 
@@ -145,9 +155,20 @@ class Aperture:
     cols: MaskedAxis       # extent = this tensor's head_dim; active=PADDED_HEAD
     lds_base: int | None   # element offset; None if never staged
     lds_stride: int | None
-    vec_width: int
+    vec_width: int         # LDS *staging* width only -- see §9.3
     # + the three carry-protocol methods from §4.2
 ```
+
+**An `Aperture` describes placement; it never holds staged data.** An aperture
+is the opening, not the light through it: `lds_base` answers "if this tensor is
+staged, where does it land", which is a property of the opening. The values
+live in `LoadedRegion`, and the split is not merely tidy -- **aperture bounds
+are loop-invariant while K and V values are not.** Merging them would thread
+`seqlen_k` and `hdim` through the `scf.for` as loop-carried state on every
+iteration alongside the data. They are uniform scalars, so the cost is small,
+but this kernel has measured sensitivity to exactly that (§9.1 is 6% from one
+value's live range starting early). If the merged form is ever wanted, gate it
+at hd192 causal and hd384 causal and compare scratch before adopting.
 
 Four instances, one per tensor:
 
@@ -227,7 +248,7 @@ Each step is one commit, independently revertible, bitwise-gated.
 | - | --- | --- | --- |
 | 1 | rename `Q_ROW_TILES`→`ROW_SUBTILES`, `N_SUB_TILES`→`COL_SUBTILES`, `K_SUB_N`→`COLS_PER_SUBTILE`; includes `FmhaKnobs.q_row_tiles` and its tuning table | — | A |
 | 2 | `MaskedAxis` gains the §4.2 protocol; delete the `qk_cols()`/`vo_cols()`/`q_rows_axis()` factories, use plain variables | factories | B (16 both modes is the one that failed before) |
-| 3 | `Aperture` dataclass; build the four instances; `lds_base`/`lds_stride` fields | `k_buf_base`, `v_buf_base` | A |
+| 3 | `Aperture` dataclass; build the four instances; `lds_base`/`lds_stride`, and move the per-tensor load geometry (`NUM_BATCHES_*`, `*_ROWS_PER_BATCH`, `*_NEEDS_GUARD`) onto the aperture that owns it | `k_buf_base`, `v_buf_base`, the free K/V geometry constants | A + B |
 | 4 | `from_lds` / `to_lds` | `lds_load_v8`, `lds_store_vx`, `_v_store_row_major`, `_v_store_transposed` | C (needs V_TRANSPOSED both ways) |
 | 5 | `load` for Q | the Q preload | D |
 | 6 | `load` for K and V | `coop_load_k_global`, `coop_load_v_global`, `load_global_*` | C |
@@ -249,7 +270,7 @@ Config sets, chosen for the *arm* they select, not by habit:
 | set | configs | why |
 | --- | --- | --- |
 | A | hd128 c0, hd128 c1 | baseline; pure-refactor steps |
-| B | hd16 c0, **hd16 c1** | `KV_NEEDS_GUARD` true → the `row_valid` `scf.if` exists. hd16 **causal** is the one that caught the parameter-passing failure |
+| B | hd16 c0, **hd16 c1** | `K_NEEDS_GUARD` true → the `row_valid` `scf.if` exists. hd16 **causal** is the one that caught the parameter-passing failure |
 | C | hd64 c0, hd384 c0 | `V_TRANSPOSED` on vs off; hd384 also has 2 QK shards |
 | D | hd128 c0/c1, hd100 padded, hd80, hd384 c1 | `rows_i32` reaching the mask; `PADDED_HEAD`; `ROW_SUBTILES==2`; the spilling build |
 | E | hd100 padded | column masking on the store |
@@ -306,7 +327,14 @@ inside the `ks` / V-chunk unroll, so each K operand feeds every row-subtile
 while live in registers. That nesting is what `ROW_SUBTILES == 2` buys. Step 9
 touches only the 5 map-shaped sites; these two keep explicit loops.
 
-### 9.5 The out-of-range arm of `kv_off`
+### 9.5 Per-tensor geometry must stay per-tensor
+K and V have independent load geometries from two `_load_geom` calls. Free
+constants let one tensor's flag be used for the other silently -- it happened
+once with the clamp (§4.3) and the free names `THREADS_PER_ROW_LOAD` /
+`ROWS_PER_BATCH_LOAD` carried no K/V marker at all. Putting geometry on the
+aperture that owns it is the structural fix, and is why step 3 absorbs it.
+
+### 9.6 The out-of-range arm of `kv_off`
 Redirects to `col` and not to literal `0`. The `0` arm holds one value fewer
 live and still spills **more** — 272 B vs 44 B of scratch at 192, for 0.863 vs
 1.172. Re-measure before changing.
