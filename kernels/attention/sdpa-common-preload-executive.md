@@ -62,10 +62,13 @@ CuTe's namespace.
   `from gfx1201_standalone import buffer_ops`.
 - `_LAZY_MODULES` is now `_BACKEND_MODULES`; `expr.rocdl` has gained
   `rdna3` / `rdna4` submodules (they contain only `s_waitcnt` helpers).
-- gfx1201 now has `lib/Dialect/FlyROCDL/GFX120X/` with `MmaAtom.cpp`.
-  **There is still no RDNA `CopyAtom.cpp`** (only CDNA3, CDNA4, GFX1250), so
-  `fx.copy_atom_call` / `TiledCopy` cannot lower here. The layout API is not an
-  option for load/store.
+- ~~There is no RDNA `CopyAtom.cpp`, so `fx.copy_atom_call` / `TiledCopy`
+  cannot lower here. The layout API is not an option for load/store.~~
+  **Wrong -- see §13.** The absence of `GFX120X/CopyAtom.cpp` was read as
+  "copies do not lower on RDNA4"; they do. `examples/02-tiledCopy.py` runs on
+  this box and `kernels/gemm/rdna_f16_gemm.py` is a complete RDNA4 GEMM built
+  entirely from the layout API. The reason FMHA does not use it is different,
+  and it is not about lowering.
 - `fx.make_tile` builds a CuTe **Tiler** (a partitioning of an index space).
   It is not a data container and is not what we need.
 
@@ -623,3 +626,89 @@ hd160. The full ladder spans 0.985 to 1.010; the single low point, hd48
 causal, has a provably identical opcode histogram, so it is the harness rather
 than the code -- which is the check to run before believing any tier-3 outlier
 on this kernel.
+
+---
+
+## 13. Why this kernel does not use the layout / TiledMma API
+
+Asked directly, and the first answer in §3 was wrong, so this is the measured
+version.
+
+### 13.1 The primitives do work on gfx1201
+
+Three things run on this box:
+
+| what | result |
+| --- | --- |
+| `examples/02-tiledCopy.py` (`fx.copy`, `TiledCopy`, `BufferCopy128b`) | correct |
+| `kernels/gemm/rdna_f16_gemm.py` via `tests/kernels/test_rdna_gemm.py` | 25 passed |
+| `examples/03-tiledMma.py` | `LLVM ERROR: Cannot select: intrinsic llvm.amdgcn.mfma.f32.16x16x4f32` |
+
+`03-tiledMma` fails only because it hardcodes an **MFMA** atom, which RDNA has
+no instruction for. It is a CDNA example and is correctly absent from
+`RDNA_COMPATIBLE_EXAMPLES` in `tests/arch_compat.py`. Swap in
+`fx.rocdl.WMMA(...)` and the machinery is fine: `rdna_f16_gemm.py` is a
+complete RDNA4 GEMM built from `make_mma_atom(WMMA)` + `make_tiled_mma` +
+`make_tiled_copy_{A,B,C}` + `fx.gemm`, with an LDS multi-stage pipeline.
+
+The missing `GFX120X/CopyAtom.cpp` misled the earlier reading. Buffer
+instructions exist on RDNA, so the CDNA3-named buffer copy atoms lower here.
+
+### 13.2 Both FMHA kernels in the tree stop at the atom
+
+The decisive evidence is not gfx1201 at all -- it is gfx950.
+`flash_attn_utils.py` is a mature CDNA FMHA on hardware where every layout-API
+path is supported, and it *does* call `fx.make_mma_atom`. But it then calls
+`fly.mma_atom_call_ssa(...)` on **raw register vectors**, never `fx.gemm` on
+fragments, and it hand-rolls its LDS staging.
+
+That is exactly what this kernel does with `wmma_ops.wmma_f32_16x16x16`. Two
+independently written attention kernels, two architectures, same boundary: use
+the atom for the instruction and its operand ABI, hand-roll everything around
+it. Only the GEMMs use the fragment layer.
+
+### 13.3 The four gaps
+
+**1. No accumulator-to-operand relayout.** `fx.gemm` leaves `frag_C` in the
+atom's accumulator thread-value layout. FMHA needs S = QK^T's accumulator,
+after softmax, to become GEMM2's *A* operand. There is nothing in `dir(fx)`
+that converts a C fragment into an A fragment; `rdna_f16_gemm` only ever
+`fx.copy`s `frag_C` out to global. This kernel does it by knowing the WMMA lane
+mapping and building the P packs by hand, which is what `COLS_PER_SUBTILE`
+and the `p_packs_all` construction are.
+
+**2. No fragment-level reduction.** Online softmax needs a row max and row sum
+across the accumulator's N axis, and at `QK_SHARDS > 1` a further reduction
+across waves through LDS. `dir(fx)` has no reduce or scan over a fragment.
+`reduce_s_across_shards` and the `shuffle_xor` peer reduction are hand-written.
+
+**3. No copy atom for `global_load_tr_b128`.** Nothing in `include/`, `lib/` or
+`python/` names it. The hardware 8x8 transpose is reachable only as a raw
+intrinsic, and it is what lets GEMM2 read one contiguous vector per V operand
+instead of gathering 8 strided scalars.
+
+**4. Masking is on values, not on the copy.** `fx.copy` takes `pred=`, which
+covers "do not load this element". Causal, sliding-window and varlen masks are
+different: they set computed scores to -inf based on each accumulator
+element's (row, col) against runtime sequence lengths. That is a mask on the
+GEMM result, after the copy, and it needs the same accumulator layout
+knowledge as gap 1.
+
+### 13.4 What this means
+
+The gap is not RDNA support and not lowering. It is that the layout API
+currently models **one GEMM, tile in, tile out** -- and FMHA is two chained
+GEMMs with a data-dependent, cross-lane reduction between them, where the
+first GEMM's accumulator is the second's operand.
+
+Gaps 3 and 4 are additive: a TR-load copy atom and a value-masking helper
+could be added without disturbing anything. Gaps 1 and 2 are the real ones,
+and they are the same gap seen twice -- both need the accumulator's
+thread-value layout to be a thing user code can address, rather than an
+implementation detail of `fx.gemm`. Until that exists, an FMHA kernel has to
+know the lane mapping, and once it knows the lane mapping it may as well do
+its own loads.
+
+That is also why the `Aperture` work went where it did: it standardises the
+memory access this kernel has to hand-roll, rather than trying to reach a
+layer that does not yet fit the algorithm.
