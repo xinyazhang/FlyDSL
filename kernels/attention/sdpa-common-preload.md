@@ -476,3 +476,87 @@ because it multiplies the migration surface instead of concentrating it.
 
 The remaining unstable dependencies, and what to do about them, are in
 `sdpa-fix-unstable.md`.
+
+# Part V: the name, and folding the axes in
+
+Settles the naming left open in Parts II-IV and changes one structural
+decision. Supersedes `Tile` / `TileInfo` / `LoadedTile` everywhere above.
+
+## 17. `Aperture`
+
+An aperture is **an opening through which a bounded part of something is
+visible**. That is exactly what this object is: the region of a tensor a
+workgroup may touch, with everything outside it not merely unread but
+*invisible* -- which is what masking means.
+
+The name also already lives in GPU vocabulary (the PCIe / GART aperture, a
+window of host memory the GPU can address), so it reads as systems terminology
+rather than metaphor. **Caveat worth one docstring line:** that hardware sense
+denotes host RAM visible to the device, while ours denotes a bounded region of
+a device tensor. The optical root is shared; the referent is not.
+
+It is safe on the criterion that killed `Tile` and `Fragment`: aperture is not
+matrix-partitioning vocabulary, so a full cuTile / CuTe port has no reason to
+claim it. Free in `flydsl` and unused in `kernels/`.
+
+## 18. The axes belong *inside* the aperture
+
+Previously `load_tile(..., rows_axis=, cols_axis=, ...)` took the two
+`MaskedAxis` objects as arguments. They move into the aperture, because bounds
+are not a property of an access -- they are what makes the aperture an
+aperture. `MaskedAxis` survives as a type; it stops being a parameter.
+
+    @dataclass(frozen=True, slots=True)
+    class Aperture:
+        rows: MaskedAxis      # extent = this tensor's seqlen; always active
+        cols: MaskedAxis      # extent = this tensor's head_dim; active=PADDED_HEAD
+        lds_base: int | None  # element offset, None if never staged
+        lds_stride: int | None
+        vec_width: int
+
+Four of them, one per tensor, each owning the pair that is right for it:
+
+| aperture | rows extent | cols extent |
+| -------- | ----------- | ----------- |
+| Q        | `seqlen_q`  | `hdim_qk`   |
+| K        | `seqlen_k`  | `hdim_qk`   |
+| V        | `seqlen_k`  | `hdim_vo`   |
+| O        | `seqlen_q`  | `hdim_vo`   |
+
+**This retires the objection in Part II §2.** I argued against per-tensor 2-D
+grouping because the column bound is shared between Q and K, so grouping would
+"duplicate the column axis four ways". With the axes folded in, that duplication
+is two references to the same bound, and each aperture becomes self-contained
+in exchange -- a good trade, and cheaper still now that the carry protocol
+(§14) lets one object cross a dynamic `if`.
+
+## 19. What the signature becomes
+
+    load(aperture, ptr, tbase, toff, rows, rows_in_tile, col_base, ...) -> LoadedRegion
+    store(aperture, ptr, tbase, toff, values, rows, ...)
+    to_lds(aperture, lds_ptr, values, row, col, *, transposed=False)
+    from_lds(aperture, lds_ptr, row, col) -> list[fx.Vector]
+    stage(aperture, ptr, tbase, toff, lds_ptr, ...)     # vram -> lds, Part II §8
+
+Masking needs no argument at any of them: the aperture knows its own bounds, so
+`load` redirects an out-of-range row to a legal address and discards the result
+without the caller saying so. That was the point of the proposal -- a caller
+cannot forget to mask, because there is no unmasked spelling.
+
+`LoadedRegion` replaces `LoadedTile` as the return type (fields per §3, types
+per the measured list there).
+
+## 20. Naming summary
+
+| concept                              | name                    |
+| ------------------------------------ | ----------------------- |
+| bounded region of a tensor + residence | `Aperture`              |
+| one bounded axis of it               | `MaskedAxis` (unchanged)|
+| values read out of one               | `LoadedRegion`          |
+| row sub-tiles of the Q block, per wave | `ROW_SUBTILES`        |
+| column sub-tiles of the KV block     | `COL_SUBTILES`          |
+| columns per column sub-tile          | `COLS_PER_SUBTILE`      |
+
+The class is named for residence and visibility; the constants are named for
+partitioning. Keeping those two registers apart is what keeps this module out
+of CuTe's namespace, and is deliberate rather than inconsistent.
