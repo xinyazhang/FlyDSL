@@ -404,3 +404,75 @@ between them.
 - **No change to GEMM1/GEMM2 operand indexing** -- Part II §10(c).
 - **No `transposed=True` on the vram side beyond V** until a bwd kernel needs
   K^T, per §6.
+
+# Part IV: API-stability constraints on this design
+
+Added after the `api-stability` consumer audit of this branch. Two of Part II's
+conclusions change.
+
+## 14. The carry protocol is stable, so `Tile` *can* own its values
+
+Part II §7 said a `TileInfo` cannot hold traced values, because no Python object
+may be live across a dynamic `if`. **That is obsolete.** flydsl 0.3.0 ships
+PR #874, which carries containers through dynamic `if`/`for`/`while`/`ifexp`,
+and `get_ir_types` dispatches on `hasattr(obj, "__get_ir_types__")` first -- so
+any class can opt in with three methods.
+
+Better still, the extension point is **stable**: §2.2 makes every name in
+`flydsl.compiler.protocol.__all__` stable, and says so explicitly -- "the
+public extension namespace for user implementations of JIT / DSL-value
+protocols". `get_ir_types`, `extract_to_ir_values` and
+`construct_from_ir_values` are all in that manifest.
+
+    class Tile:
+        def __get_ir_types__(self): ...
+        def __extract_to_ir_values__(self): ...
+        @classmethod
+        def __construct_from_ir_values__(cls, values, exemplar=None): ...
+
+`exemplar` is what makes a mixed class work: IR values thread through the
+`scf.if` as state, and the non-IR fields (`active`, `elem_dtype`, LDS geometry)
+are restored from it. Verified on a probe kernel, and it means the `qk_cols()`
+factory workaround can go.
+
+So the original proposal -- a `Tile` owning vram/lds/vgpr residence -- is
+viable as specified, on a stable foundation.
+
+## 15. Prefer the stable spelling; contain the rest
+
+The audit found this module is not stable-only, and parts of that are
+self-inflicted. Three swaps cost nothing and should be adopted **before** more
+helpers land, so new code is not written in the unstable dialect:
+
+| instead of                          | use                          | why |
+| ----------------------------------- | ---------------------------- | --- |
+| `_to_raw(x)` / `_raw(x)`            | `fx.as_ir_value(x)`          | stable (`typing.__all__`); its own docstring calls it the canonical DSL -> `ir.Value` converter |
+| `ArithValue(pred).select(a, b)`     | `(a < b).select(a, b)`       | `<` on `fx.Int32` returns `fx.Boolean`, a stable type, and `select` is a non-underscore member so stable under §1. Measured, not assumed |
+| `arith.cmpi(slt, ...)`              | the `<` operator on i32       | the explicit predicate exists only because `fx.Index` is unsigned; on i32 the operator is already signed *and* returns `Boolean` |
+
+**A regression I introduced.** `seqinfo_at` originally read through
+`fx.recast_iter` + `fx.ptr_load` -- both **stable**. Adding `cond_load` I
+rewrote it onto `_llvm.LoadOp` + `buffer_ops.get_element_ptr`, which is
+unstable and upstream. The load has to be inside the `scf.if` region; it does
+not have to be an `llvm.LoadOp`. Fix when `cond_load` is next touched.
+
+**What genuinely cannot be stable today**, and so must be *contained* rather
+than avoided:
+
+- `scf.IfOp` / `YieldOp` / `ir.InsertionPoint` -- there is no stable predicated
+  load and no stable value-producing dynamic `if`. Keep every use inside
+  `cond_load`; no other helper should build an `IfOp`.
+- `llvm.IntToPtrOp` / `PtrToIntOp` for the addrspace(3) f32 pun -- keep inside
+  `lds_f32_ptr`.
+- `fx.rocdl.global_load_tr_b128` -- absent from `rocdl.__all__`, and the only
+  way to reach the RDNA transpose load. Keep inside `global_load_tr_v8`.
+
+## 16. Rule for new helpers in this module
+
+Every helper added by the `Tile` work must either be stable-only, or name the
+unstable API it needs and confine it to one function. A helper that sprinkles
+`_llvm.*` across call sites is worse than the hand-written code it replaces,
+because it multiplies the migration surface instead of concentrating it.
+
+The remaining unstable dependencies, and what to do about them, are in
+`sdpa-fix-unstable.md`.
