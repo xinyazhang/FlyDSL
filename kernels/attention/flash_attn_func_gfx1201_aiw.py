@@ -707,11 +707,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         return tpr, rpb, nb, nb * rpb != BLOCK_N
 
     # Cover BLOCK_N rows with ceil() batches, not floor(). Flooring silently
-    # dropped rows whenever ROWS_PER_BATCH_LOAD neither reached BLOCK_N nor
+    # dropped rows whenever K_ROWS_PER_BATCH neither reached BLOCK_N nor
     # divided it: BLOCK_DMODEL 160/192/224 give 25/21/18, so BLOCK_N // that == 1
     # and only 25/21/18 of the 32 KV rows reached LDS. The rest was stale LDS,
     # which surfaced as NaN.
-    THREADS_PER_ROW_LOAD, ROWS_PER_BATCH_LOAD, NUM_BATCHES_KV, KV_NEEDS_GUARD = _load_geom(HEAD_DIM)
+    K_TPR_LOAD, K_ROWS_PER_BATCH, NUM_BATCHES_K, K_NEEDS_GUARD = _load_geom(HEAD_DIM)
 
     # global_load_tr_b128 transposes an 8x8 tile of 16-bit elements across each
     # group of 8 lanes, so one wave-wide TR load produces a 16(d) x 16(kv) block
@@ -939,8 +939,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # immaterial; the per-head division below is by that ratio.
         head_k = head_q // (fx.Index(num_head_q) // fx.Index(num_head_k))
 
-        load_row_in_batch = tid // THREADS_PER_ROW_LOAD
-        load_lane_in_row = tid % THREADS_PER_ROW_LOAD
+        load_row_in_batch = tid // K_TPR_LOAD
+        load_lane_in_row = tid % K_TPR_LOAD
         load_col_base = load_lane_in_row * VEC_WIDTH
 
         v_row_in_batch = tid // V_TPR_LOAD
@@ -1037,11 +1037,24 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 philox_offset_base, _off_zh, max_seqlen_q, max_seqlen_k
             )
 
-        # `clamp` is const_expr: with both prefetch distances 0 and no load
-        # guard there is no over-read, so the clamp is not emitted at all.
+        # `clamp` is const_expr: with both prefetch distances 0 and neither
+        # load guard, there is no over-read, so the clamp is not emitted.
+        #
+        # **Both** guards, because this one flag is handed to K's *and* V's
+        # aperture. They are computed from different widths -- `_load_geom` is
+        # called on the QK width for K and on VO_CHUNK_COLS for V -- and each
+        # asks whether its rows-per-batch divides BLOCK_N. They agree at every
+        # point on the current ladder, so this changes no emitted code today;
+        # it stops a future V width that does not divide BLOCK_N from silently
+        # losing V's clamp.
         _KV_CLAMP = not (
             _NO_KV_CLAMP
-            or (K_PREFETCH_DIST == 0 and V_PREFETCH_DIST == 0 and not KV_NEEDS_GUARD)
+            or (
+                K_PREFETCH_DIST == 0
+                and V_PREFETCH_DIST == 0
+                and not K_NEEDS_GUARD
+                and not V_NEEDS_GUARD
+            )
         )
         _addr_kw = dict(
             seqlen_k=seqlen_k_v, seq_last=seq_last,
@@ -1087,7 +1100,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # compiles away.
         #
         # Factories, not variables: `coop_load_store_k` reads these inside
-        # `if row_valid:` whenever KV_NEEDS_GUARD, and an object held in a
+        # `if row_valid:` whenever K_NEEDS_GUARD, and an object held in a
         # variable cannot be live across a dynamic `if`. See "How to hand a
         # helper object to kernel code" in `fmha_common_gfx1201` -- this is
         # pattern 2 there, and `fastmath` above is pattern 1.
@@ -1144,8 +1157,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         def coop_load_k_global(start_k):
             """Issue this thread's K global loads; results stay in registers."""
             vecs = []
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
+            for batch in range_constexpr(NUM_BATCHES_K):
+                row_offset = batch * K_ROWS_PER_BATCH
                 b64, o32 = k_addr(
                     start_k, load_row_in_batch + row_offset,
                     qk_cols().safe(load_col_base),
@@ -1160,9 +1173,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
         def coop_store_k_lds(vecs, buf_id=0):
             k_base = k_buf_base(buf_id)
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                if const_expr(KV_NEEDS_GUARD):
+            for batch in range_constexpr(NUM_BATCHES_K):
+                row_offset = batch * K_ROWS_PER_BATCH
+                if const_expr(K_NEEDS_GUARD):
                     row_valid = (
                         load_row_in_batch + fx.Index(row_offset) < fx.Index(BLOCK_N)
                     )
@@ -1179,7 +1192,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             """Distance-0 K staging: load and store inside a single guard.
 
             The guard has to cover the *load*, not just the store. When
-            ROWS_PER_BATCH_LOAD overshoots BLOCK_N some cooperative-load lanes
+            K_ROWS_PER_BATCH overshoots BLOCK_N some cooperative-load lanes
             have no row -- at BLOCK_DMODEL 32 with BLOCK_N 64 that is exactly half
             of them -- and issuing their (clamped, redundant) global loads
             anyway measured -9.6% against the baseline kernel. Distance 1
@@ -1187,10 +1200,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             to exist unconditionally.
             """
             k_base = k_buf_base(buf_id)
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
+            for batch in range_constexpr(NUM_BATCHES_K):
+                row_offset = batch * K_ROWS_PER_BATCH
                 lds_row = load_row_in_batch + row_offset
-                if const_expr(KV_NEEDS_GUARD):
+                if const_expr(K_NEEDS_GUARD):
                     row_valid = lds_row < fx.Index(BLOCK_N)
                     if row_valid:
                         b64, o32 = k_addr(
@@ -1518,7 +1531,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         )
         _pf_init = []
         if const_expr(K_PREFETCH_DIST):
-            for _ in range_constexpr(NUM_BATCHES_KV):
+            for _ in range_constexpr(NUM_BATCHES_K):
                 _pf_init.append(Vec.filled(VEC_WIDTH, 0.0, elem_dtype).ir_value())
         if const_expr(V_PREFETCH_DIST):
             for _ in range_constexpr(V_LOADS):
@@ -1541,9 +1554,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             if const_expr(len(_pf_init) == 1):
                 _pf = [_pf]
         if const_expr(K_PREFETCH_DIST):
-            _k_vecs_init = [_pf[_i] for _i in range_constexpr(NUM_BATCHES_KV)]
+            _k_vecs_init = [_pf[_i] for _i in range_constexpr(NUM_BATCHES_K)]
         if const_expr(V_PREFETCH_DIST):
-            _off = NUM_BATCHES_KV if K_PREFETCH_DIST else 0
+            _off = NUM_BATCHES_K if K_PREFETCH_DIST else 0
             _v_vecs_init = [_pf[_off + _i] for _i in range_constexpr(V_LOADS)]
 
         # Loop-carried state layout:
@@ -1553,7 +1566,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         _ML = 2 * Q_ROW_TILES
         _OFF = _ML + Q_ROW_TILES * O_ACCS
         _KOFF = _OFF
-        _VOFF = _OFF + (NUM_BATCHES_KV if K_PREFETCH_DIST else 0)
+        _VOFF = _OFF + (NUM_BATCHES_K if K_PREFETCH_DIST else 0)
 
         init_args = []
         for _ in range_constexpr(Q_ROW_TILES):
@@ -1562,7 +1575,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         for _ in range_constexpr(Q_ROW_TILES * O_ACCS):
             init_args.append(_raw(c_zero_v8f32))
         if const_expr(K_PREFETCH_DIST):
-            for batch in range_constexpr(NUM_BATCHES_KV):
+            for batch in range_constexpr(NUM_BATCHES_K):
                 init_args.append(_k_vecs_init[batch])
         if const_expr(V_PREFETCH_DIST):
             for batch in range_constexpr(V_LOADS):
@@ -1591,7 +1604,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             ]
             if const_expr(K_PREFETCH_DIST):
                 _k_vecs_cur = [
-                    inner_iter_args[_KOFF + b] for b in range_constexpr(NUM_BATCHES_KV)
+                    inner_iter_args[_KOFF + b] for b in range_constexpr(NUM_BATCHES_K)
                 ]
             if const_expr(V_PREFETCH_DIST):
                 _v_vecs_cur = [
@@ -1995,7 +2008,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 for i in range_constexpr(O_ACCS):
                     _yield_args.append(o_accs_all[qt][i])
             if const_expr(K_PREFETCH_DIST):
-                for batch in range_constexpr(NUM_BATCHES_KV):
+                for batch in range_constexpr(NUM_BATCHES_K):
                     _yield_args.append(_k_vecs_next[batch])
             if const_expr(V_PREFETCH_DIST):
                 for batch in range_constexpr(V_LOADS):
