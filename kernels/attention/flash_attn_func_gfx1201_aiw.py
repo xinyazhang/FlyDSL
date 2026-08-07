@@ -815,7 +815,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         v8f32_type = Vec.make_type(8, fx.Float32)
         v8f16_type = Vec.make_type(8, elem_dtype)
         vxf16_type = Vec.make_type(VEC_WIDTH, elem_dtype)
-        v4f16_type = Vec.make_type(4, elem_dtype)
 
         def wmma_acc(a_v8, b_v8, c_v8):
             # Dispatch is on the operand element type, in `wmma_ops`, rather
@@ -1189,15 +1188,13 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 if const_expr(ap.needs_guard):
                     row_valid = lds_row < fx.Index(BLOCK_N)
                     if row_valid:
-                        fmha.lds_store_vx(
-                            lds_kv, vecs[batch],
-                            ap.lds_index(lds_row, load_col_base),
+                        ap.to_lds(
+                            lds_kv, vecs[batch], lds_row, load_col_base,
                             ap.vec_width,
                         )
                 else:
-                    fmha.lds_store_vx(
-                        lds_kv, vecs[batch],
-                        ap.lds_index(lds_row, load_col_base),
+                    ap.to_lds(
+                        lds_kv, vecs[batch], lds_row, load_col_base,
                         ap.vec_width,
                     )
 
@@ -1227,27 +1224,25 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         b64, o32 = k_addr(
                             start_k, lds_row, ap.cols.safe(load_col_base)
                         )
-                        fmha.lds_store_vx(
+                        ap.to_lds(
                             lds_kv,
                             ap.cols.discard(
                                 load_global_f16xN(k_ptr, b64, o32),
                                 load_col_base, ap.vec_width,
                             ),
-                            ap.lds_index(lds_row, load_col_base),
-                            ap.vec_width,
+                            lds_row, load_col_base, ap.vec_width,
                         )
                 else:
                     b64, o32 = k_addr(
                         start_k, lds_row, ap.cols.safe(load_col_base)
                     )
-                    fmha.lds_store_vx(
+                    ap.to_lds(
                         lds_kv,
                         ap.cols.discard(
                             load_global_f16xN(k_ptr, b64, o32),
                             load_col_base, ap.vec_width,
                         ),
-                        ap.lds_index(lds_row, load_col_base),
-                        ap.vec_width,
+                        lds_row, load_col_base, ap.vec_width,
                     )
 
         # ---- V staging ----
@@ -1264,20 +1259,18 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         _tr_d_off = ((lane // 8) % 2) * WMMA_LANE_K
 
         def _v_store_transposed(l, vec):
-            """Lane holds V[kv0+klane*8 .. +7][d]; contiguous in V^T[d][kv]."""
+            """Lane holds V[kv0+klane*8 .. +7][d]; contiguous in V^T[d][kv].
+
+            8 wide because that is what `global_load_tr_v8` returns -- the WMMA
+            operand shape -- not because it is the cooperative-load width.
+            """
             tile = wave_id + fx.Index(l * NUM_WAVES)
             d = (tile % V_TR_D_BLOCKS) * WMMA_N + lane16
             kv = (tile // V_TR_D_BLOCKS) * WMMA_K + klane * WMMA_LANE_K
-            lds_idx = v_ap.lds_index(d, kv)
-            v = Vec(vec)
-            for h in range_constexpr(2):  # 2x v4f16: honest 8-byte alignment
-                part = v.shuffle(v, [h * 4, h * 4 + 1, h * 4 + 2, h * 4 + 3])
-                fx.ptr_store(part, lds_kv + fx.Int32(lds_idx + h * 4))
+            v_ap.to_lds(lds_kv, vec, d, kv, 8)
 
         def _v_store_row_major(lds_row, vec):
-            fmha.lds_store_vx(
-                lds_kv, vec, v_ap.lds_index(lds_row, v_col_base), v_ap.vec_width
-            )
+            v_ap.to_lds(lds_kv, vec, lds_row, v_col_base, v_ap.vec_width)
 
         def coop_load_v_global(start_k, chunk=0):
             """V columns [chunk*VO_CHUNK_COLS, +VO_CHUNK_COLS) of this KV tile.
@@ -1654,14 +1647,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     st_base_row = st_idx * COLS_PER_SUBTILE
 
                     k_row_a = lane16 + fx.Index(st_base_row)
-                    k_pack_a = fmha.lds_load_v8(
-                        lds_kv, k_ap.lds_index(k_row_a, k_col), v4f16_type
-                    )
+                    k_pack_a = k_ap.from_lds(lds_kv, k_row_a, k_col)
 
                     k_row_b = lane16 + fx.Index(st_base_row + 16)
-                    k_pack_b = fmha.lds_load_v8(
-                        lds_kv, k_ap.lds_index(k_row_b, k_col), v4f16_type
-                    )
+                    k_pack_b = k_ap.from_lds(lds_kv, k_row_b, k_col)
 
                     acc_idx_a = st_idx * 2
                     acc_idx_b = st_idx * 2 + 1
@@ -1931,9 +1920,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                             fx.Index(st_kv_base_val + pks_val * PV_K_STEP)
                             + klane * WMMA_LANE_K
                         )
-                        return fmha.lds_load_v8(
-                            lds_kv, v_ap.lds_index(d_pos, kv0), v4f16_type
-                        )
+                        return v_ap.from_lds(lds_kv, d_pos, kv0)
                     d_pos = fx.Index(dc_val * D_CHUNK) + lane16
                     v_elems = []
                     for k_sub in range_constexpr(8):

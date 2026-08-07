@@ -452,6 +452,20 @@ class Aperture:
         """The row `base_row` maps to in cooperative-load batch `batch`."""
         return base_row + batch * self.rows_per_batch
 
+    def to_lds(self, lds_ptr, vec, row, col, width):
+        """Publish `width` elements of `vec` at (row, col) of the LDS tile.
+
+        `width` is the access's, not the aperture's: the staged vector is
+        `vec_width` wide for a cooperative load but 8 wide for a transposed
+        one, and those two are equal today only by coincidence.
+        """
+        lds_store_vx(lds_ptr, vec, self.lds_index(row, col), width)
+
+    def from_lds(self, lds_ptr, row, col):
+        """The 8 contiguous elements at (row, col) -- one WMMA operand."""
+        v4 = Vec.make_type(4, self.cols.elem_dtype)
+        return lds_load_v8(lds_ptr, self.lds_index(row, col), v4)
+
     # ---- carry protocol; see the module docstring ----
 
     def __get_ir_types__(self):
