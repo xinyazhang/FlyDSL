@@ -6,14 +6,14 @@ gfx1201 (RDNA4, Navi48).
 
 Everything below is either gfx1201-specific or still-settling vocabulary. The
 arch-neutral half of the glossary should graduate into
-[`docs/kernel_tuning_guide.md`](../../docs/kernel_tuning_guide.md) once the terms
+[`docs/kernel_tuning_guide.md`](../../../docs/kernel_tuning_guide.md) once the terms
 stop moving; see [Graduation](#graduation).
 
 ## Running it
 
 ```bash
 export ROCM_PATH=$(rocm-sdk path --root)   # only needed for pip-installed ROCm
-cd kernels/attention && python3 bench_fmha.py
+cd kernels/attention/parity && python3 bench_fmha.py
 ```
 
 `ROCM_PATH` must point at a ROCm tree containing `llvm/bin/ld.lld` and
@@ -31,7 +31,7 @@ scheduling variants against PyTorch SDPA. They are intentionally **not** wired
 into `scripts/run_tests.sh`; run them the same way:
 
 ```bash
-cd kernels/attention && python3 -m pytest test_flash_attn_func_gfx1201.py -v
+cd kernels/attention/parity && python3 -m pytest test_flash_attn_func_gfx1201.py -v
 ```
 
 ## Scheduling variants
@@ -117,7 +117,7 @@ on the op.
 ## Roofline and measured bottlenecks
 
 Dense WMMA peak is **~205 TFLOPS** measured on this (overclocked) board with
-[`kernels/microbench/wmma_peak.py`](../microbench/wmma_peak.py); AMD's published
+[`kernels/microbench/wmma_peak.py`](../../microbench/wmma_peak.py); AMD's published
 figure is **191 TFLOPS** at reference clock. Use 191 as the denominator for
 "% of theoretical" so numbers stay comparable off this machine. The kernel runs
 at ~92 TFLOPS, i.e. **~48% of spec**.
@@ -178,7 +178,7 @@ and spilling is catastrophic. Doubling a wave's Q row-tiles costs
 Two traps, both of which produced confidently wrong conclusions:
 
 1. **Never `sys.path.insert` a directory containing same-named modules.** A
-   benchmark that inserted the repo's `kernels/attention` (to pick up
+   benchmark that inserted the repo's `kernels/attention/parity` (to pick up
    `bench_shim`) silently imported the *repo* kernel instead of the variant
    under test, so six different ablations all benchmarked the same binary and
    agreed to within 1%. Copy the harness into the variant's directory instead.

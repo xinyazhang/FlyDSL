@@ -21,8 +21,7 @@ Pick by architecture first — the builders are not interchangeable.
 | `flash_attn_gfx950.py` | **gfx950** dual-wave software-pipelined kernel, D=64/128 bf16/f16. Requires `ds_read_tr16_b64`. |
 | `flash_attn_fp8_gfx950.py` | **gfx950** DUALWAVE_SWP FP8 variant. |
 | `flash_attn_utils.py` | Shared helpers for the gfx950 dual-wave family (DMA, barriers, traits). |
-| `flash_attn_func_gfx1201_interface.py` | High-level API for **gfx1201 / RDNA4**. Deliberately separate from `flash_attn_interface.py`. |
-| `flash_attn_func_gfx1201.py` | **gfx1201** kernel builder (WMMA, wave32). |
+| [`parity/`](parity/README.md) | **gfx1201 / RDNA4**, the whole family. Kernel, tuning policy, interface, benchmarks, plans. Separate directory because it targets parity with AOTriton's `attn_fwd` and is run in place rather than imported. |
 
 ## Paged attention (decode)
 

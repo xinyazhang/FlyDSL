@@ -163,7 +163,7 @@ sound predicate:
 
 ```
 git bisect start <bad> <good>
-git bisect run python3 kernels/attention/codegen_fingerprint.py --expect <baseline.json>
+git bisect run python3 kernels/attention/parity/codegen_fingerprint.py --expect <baseline.json>
 ```
 
 That localises the commit where the *emitted code* changed, in

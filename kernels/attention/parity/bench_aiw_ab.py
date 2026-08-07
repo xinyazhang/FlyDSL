@@ -20,7 +20,7 @@ non-causal is bimodal at ~58 and ~63 TFLOPS independent of the code, so any
 delta there below ~10% needs at least three alternating runs.
 
     export ROCM_PATH=$(rocm-sdk path --root)
-    cd kernels/attention && python3 bench_aiw_ab.py
+    cd kernels/attention/parity && python3 bench_aiw_ab.py
 """
 
 import sys

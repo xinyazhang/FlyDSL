@@ -14,7 +14,7 @@ Overridable via environment variables: ``BATCH``, ``N_HEADS``, ``D_HEAD``,
 Run with::
 
     export ROCM_PATH=$(rocm-sdk path --root)   # only needed for pip-installed ROCm
-    cd FlyDSL/kernels/attention && python3 bench_fmha.py
+    cd FlyDSL/kernels/attention/parity && python3 bench_fmha.py
 
 The cwd is assumed to be this directory. These four files (``bench_fmha.py``,
 ``bench_shim.py``, ``flash_attn_func_gfx1201_interface.py``,

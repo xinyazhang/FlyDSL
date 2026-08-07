@@ -9,10 +9,10 @@ binding-prefetch schedule (``FmhaKnobs(k_prefetch_dist=1)``).
 
 This file is **deliberately outside the `tests/` tree** and is not wired into
 `scripts/run_tests.sh`. It follows the prototype convention of this directory --
-bare module imports, cwd must be `kernels/attention` -- so run it individually::
+bare module imports, cwd must be `kernels/attention/parity` -- so run it individually::
 
     export ROCM_PATH=$(rocm-sdk path --root)
-    cd kernels/attention && python3 -m pytest test_flash_attn_func_gfx1201.py -v
+    cd kernels/attention/parity && python3 -m pytest test_flash_attn_func_gfx1201.py -v
 
 Note that `scripts/run_tests.sh` passes explicit directories under `tests/`, so
 this file is never collected by the project's suite. A bare `pytest` from the

@@ -29,7 +29,7 @@ building aiw and both worth remembering before trusting a green run here:
 Run it individually, per this directory's prototype convention::
 
     export ROCM_PATH=$(rocm-sdk path --root)
-    cd kernels/attention && python3 -m pytest test_flash_attn_func_gfx1201_aiw.py -v
+    cd kernels/attention/parity && python3 -m pytest test_flash_attn_func_gfx1201_aiw.py -v
 """
 
 import math

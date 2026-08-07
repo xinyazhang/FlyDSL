@@ -43,8 +43,8 @@ under the installed package the import becomes a plain
 import sys
 from pathlib import Path
 
-# kernels/attention/gfx1201_standalone.py -> kernels/attention -> kernels -> repo
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+# parity/gfx1201_standalone.py -> parity -> attention -> kernels -> repo
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 if str(_REPO_ROOT) not in sys.path:
     # Front of the path: if a `kernels` package is ever installed, the working
@@ -76,6 +76,7 @@ def repo_root() -> Path:
     """The repository root this module put on `sys.path`.
 
     Exposed so a caller can resolve a sibling path without recomputing the
-    `parents[2]` hop, which is wrong the moment this file moves.
+    `parents[3]` hop, which is wrong the moment this file moves -- as it
+    was when these files moved into `parity/`.
     """
     return _REPO_ROOT

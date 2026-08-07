@@ -44,7 +44,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(os.path.dirname(_HERE))
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(_HERE)))
 
 # Tier 2.9: the fast screen. One sequence length, one masking mode, the head
 # dims that production actually uses plus the two that are structurally
@@ -68,7 +68,7 @@ B, H, REPS = 1, 8, 5
 
 def _worker() -> int:
     """Read `hd causal N` lines on stdin, print `tflops` per line."""
-    sys.path.insert(0, os.path.join(os.environ["FLYDSL_AB_ROOT"], "kernels", "attention"))
+    sys.path.insert(0, os.path.join(os.environ["FLYDSL_AB_ROOT"], "kernels", "attention", "parity"))
     import torch
     from bench_shim import do_bench
     from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201 as F

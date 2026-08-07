@@ -331,7 +331,7 @@ Config sets, chosen for the *arm* they select, not by habit:
 `PADDED_HEAD` configs need a padded allocation — a contiguous `(…,100)` tensor
 is rejected by the pitch check. Allocate `(…, 104)[..., :100]`.
 
-**Tests:** `cd kernels/attention && python3 -m pytest
+**Tests:** `cd kernels/attention/parity && python3 -m pytest
 test_flash_attn_func_gfx1201_aiw.py -q` (298 expected). Collection fails from
 the repo root. Subsets: `-k varlen` (55), `-k "swa or window or gswa"` (69),
 `-k causal` (116).
@@ -348,7 +348,7 @@ compare. Three rules learned the hard way:
 3. Compare the loop's **opcode sequence**, not just its length; register and
    branch-label numbering differ harmlessly.
 
-**Perf.** `kernels/attention/perf_ab.py --base <rev>` is tier 2.9 and has
+**Perf.** `kernels/attention/parity/perf_ab.py --base <rev>` is tier 2.9 and has
 produced **two false regressions** (hd192 ≈0.96, hd64 ≈0.97) that the full
 ladder read as neutral. Never revert on tier 2.9 alone. Use `--full`, and run
 `--base X --head X` to establish the per-config self-test floor first — hd192
