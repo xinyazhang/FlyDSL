@@ -1100,10 +1100,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # access width, so every access is wholly in range and the masking
         # compiles away.
         #
-        # `coop_load_store_k` reads K's aperture inside `if row_valid:` whenever
-        # K_NEEDS_GUARD, so it is live across a dynamic `if`. That works because
-        # `MaskedAxis` and `Aperture` implement the carry protocol; see "How to
-        # hand a helper object to kernel code" in `fmha_common_gfx1201`.
         qk_cols = fmha.MaskedAxis(_hdim_qk_i, active=PADDED_HEAD, elem_dtype=elem_dtype)
         vo_cols = fmha.MaskedAxis(_hdim_vo_i, active=PADDED_HEAD, elem_dtype=elem_dtype)
 

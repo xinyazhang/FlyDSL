@@ -20,50 +20,52 @@ When gfx1250 FMHA arrives it gets its own `fmha_common_gfx1250.py` for the
 same reason.
 
 
-How to hand a helper *object* to kernel code
---------------------------------------------
+Why the branching helpers live here
+-----------------------------------
 
-The AST rewriter turns a dynamic `if` into an `scf.if` and collects every
-symbol live across it as region state, which has to be MLIR-backed. A plain
-Python object is not, and the failure is late and config-dependent:
+Nothing in this file is AST-rewritten. The rewrite from Python's `if` to
+`scf.if` is lexical per `@flyc.kernel` function, so a module-level helper gets
+a branch only by building the `scf.IfOp` itself -- which is exactly what
+`stage`, `publish`, `publish_transposed`, `write_v8` and `cond_load` do.
+
+That is a feature, not a tax, and it is why those five are free functions
+while `Aperture`'s non-branching operations are methods. Two problems
+disappear at the module boundary:
+
+**Objects can be held in ordinary variables.** In kernel code an object live
+across a dynamic `if` becomes region state, which has to be MLIR-backed:
 
     fastmath = FastMath(FP_MODE)
     -> TypeError: state variable 'fastmath' is FastMath, not an MLIR Value
 
-Two things make an object safe to hold in a kernel-body variable, and a helper
-here needs whichever one fits:
+Here, `with ir.InsertionPoint(...)` is not a function boundary. An aperture
+referenced inside the region is a plain Python local, and the IR values it
+holds were materialised before the `IfOp`, so they dominate the region and
+need no block arguments. (`flydsl.compiler.protocol`'s carry protocol --
+`__get_ir_types__` and friends -- is the other way to solve this, for objects
+that must cross a *rewritten* `if`. `MaskedAxis` and `Aperture` implemented it
+until the branching helpers moved here; removing it broke no test, so it is
+gone. Reach for it again only if kernel code has to method-call one of these
+objects under a dynamic `if`.)
 
-1. **Nothing traced to carry.** Build it on the host, in the builder beside the
-   knob unpacking, and let the traced code capture it as a constant. This is
-   `FastMath(FP_MODE)`: every field is `const_expr`, so the object never has to
-   become region state at all.
+**The guarded and unguarded arms stop being duplicated.** A `const_expr` test
+in kernel code cannot wrap a single call -- `if const_expr(needs_guard): if
+pred: body()` / `else: body()` has to spell `body()` twice -- so every staging
+site carried two copies. `_over_batches` writes it once.
 
-2. **The carry protocol.** An object whose fields *are* traced implements the
-   three methods from `flydsl.compiler.protocol` and the rewriter threads it
-   through as `scf` state:
-
-       def __get_ir_types__(self): ...
-       def __extract_to_ir_values__(self): ...
-       @classmethod
-       def __construct_from_ir_values__(cls, values, exemplar=None): ...
-
-   `exemplar` is the pre-branch object, which is how the const_expr fields
-   (`active`, `elem_dtype`) come back -- only the IR-backed ones actually
-   travel. This is `MaskedAxis`, whose extent is a kernel argument.
-
-One scoping trap survives, and it is Python's rather than the rewriter's.
-`_collect_assigned_vars` counts `name.method(...)` under a dynamic `if` as a
-use of carried state, so the rewritten code assigns `name` back after the
-region. If `name` came from an *enclosing* scope, that assignment makes it a
-local of the inner function, and any sibling path that skips the `if` -- a
-`const_expr` arm, typically -- reads it unbound:
+One trap remains for kernel-side code. `ast_rewriter._collect_assigned_vars`
+counts `name.method(...)` under a dynamic `if` as a use of carried state and
+assigns `name` back after the region. If `name` came from an *enclosing*
+scope, that makes it a local of the inner function, unbound on any sibling
+path that skips the `if` -- a `const_expr` arm, typically:
 
     UnboundLocalError: cannot access local variable 'qk_cols'
 
-Bind a local alias before the branch (`cols = qk_cols`), which is what
-`ast_rewriter._check_local_var` recommends in its warning. A module-level
-function is immune: the rewrite is lexical per `@flyc.kernel` function, so
-nothing in this file is rewritten at all.
+Three ways out, best first: put the code in a module-level function; call a
+free function so the base name is a module rather than the object
+(`fmha.write_v8(ap, ...)` rather than `ap.write_v8(...)`); or bind a local
+alias before the branch, which is what `_check_local_var` recommends in its
+own warning.
 """
 
 from dataclasses import dataclass
@@ -296,11 +298,6 @@ class MaskedAxis:
 
     `active=False` compiles the masking away, for an axis whose extent is known
     to be a multiple of the access width.
-
-    The three `__..._ir_values__` methods are the carry protocol from
-    `flydsl.compiler.protocol`; they are what lets an instance be held in a
-    plain kernel-body variable that is live across a dynamic `if`. See "How to
-    hand a helper object to kernel code" at the top of this module.
     """
 
     __slots__ = ("extent", "active", "elem_dtype")
@@ -318,26 +315,6 @@ class MaskedAxis:
         # WMMA operand shape. Both are 8 today from unrelated definitions, and
         # binding one would make the Q preload silently follow `VEC_WIDTH`.
         self.elem_dtype = elem_dtype
-
-    # ---- carry protocol ----
-    #
-    # `extent` is the only IR-backed field; `active` and `elem_dtype` are
-    # const_expr and come back off the exemplar. A const_expr extent
-    # contributes no IR value at all, so such an axis crosses a branch as a
-    # zero-value carry.
-
-    def __get_ir_types__(self):
-        return [v.type for v in self.__extract_to_ir_values__()]
-
-    def __extract_to_ir_values__(self):
-        return [] if isinstance(self.extent, int) else [_to_raw(self.extent)]
-
-    @classmethod
-    def __construct_from_ir_values__(cls, values, exemplar=None):
-        if exemplar is None:
-            raise TypeError("MaskedAxis needs an exemplar to restore active/elem_dtype")
-        extent = exemplar.extent if not values else type(exemplar.extent)(values[0])
-        return cls(extent, active=exemplar.active, elem_dtype=exemplar.elem_dtype)
 
     def _bound(self):
         """The extent as a traced value.
@@ -422,12 +399,9 @@ class Aperture:
                      and registers.
     `num_batches=0`  not read cooperatively. Same two.
 
-    The address closures are deliberately *not* fields. They capture traced
-    values, so an aperture holding one could not implement the carry protocol
-    below, and K's aperture has to cross `coop_load_store_k`'s row guard.
-
-    Only the axes are IR-backed; every other field is `const_expr`, so the
-    geometry costs nothing to carry.
+    The address closures are deliberately *not* fields; see `reader`. Only the
+    axes hold IR values at all -- every other field is `const_expr`, which is
+    what keeps an aperture free to pass around.
     """
 
     __slots__ = (
@@ -490,9 +464,9 @@ class Aperture:
         because starting that compare early has measured 6% at the widest
         causal build.
 
-        `fetch(row, col)` issues the access. It stays the caller's: the
-        64-bit-base / 32-bit-offset split is per tensor, and its closure would
-        not survive the carry protocol if it lived here.
+        `fetch(row, col)` issues the access, and stays the caller's because
+        the 64-bit-base / 32-bit-offset split is per tensor. `reader` builds
+        one.
         """
         raw = self.cols.discard(fetch(row, self.cols.safe(col)), col, 8)
         zeros = Vec.filled(8, 0.0, self.cols.elem_dtype).ir_value()
@@ -509,36 +483,6 @@ class Aperture:
         """
         return self.cols.discard(
             fetch(row, self.cols.safe(col)), col, self.vec_width
-        )
-
-    # ---- carry protocol; see the module docstring ----
-
-    def __get_ir_types__(self):
-        return [v.type for v in self.__extract_to_ir_values__()]
-
-    def __extract_to_ir_values__(self):
-        vals = list(self.cols.__extract_to_ir_values__())
-        if self.rows is not None:
-            vals += self.rows.__extract_to_ir_values__()
-        return vals
-
-    @classmethod
-    def __construct_from_ir_values__(cls, values, exemplar=None):
-        if exemplar is None:
-            raise TypeError("Aperture needs an exemplar to restore its const_expr fields")
-        n = len(exemplar.cols.__extract_to_ir_values__())
-        cols = MaskedAxis.__construct_from_ir_values__(values[:n], exemplar.cols)
-        rows = exemplar.rows
-        if rows is not None:
-            rows = MaskedAxis.__construct_from_ir_values__(values[n:], rows)
-        return cls(
-            cols, rows,
-            lds_base=exemplar.lds_base, lds_stride=exemplar.lds_stride,
-            vec_width=exemplar.vec_width,
-            threads_per_row=exemplar.threads_per_row,
-            rows_per_batch=exemplar.rows_per_batch,
-            num_batches=exemplar.num_batches,
-            needs_guard=exemplar.needs_guard,
         )
 
 
@@ -611,9 +555,8 @@ def reader(addr, load):
     `read` argument every movement helper here takes, so the helpers never
     need to know how a tensor is addressed or which load it uses.
 
-    Not an `Aperture` field, for the reason in that class's docstring: `addr`
-    closes over traced values, and an object holding one could not implement
-    the carry protocol.
+    Not an `Aperture` field: an aperture is placement, which is the same on
+    every iteration, while this closes over the tile origin, which is not.
     """
     def at(start):
         def read(row, col):
