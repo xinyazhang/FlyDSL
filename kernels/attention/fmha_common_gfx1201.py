@@ -23,48 +23,47 @@ same reason.
 How to hand a helper *object* to kernel code
 --------------------------------------------
 
-A helper that carries state -- `FastMath`, `MaskedAxis` -- cannot simply be
-built and assigned in the kernel body. **No variable of any kind may hold a
-non-MLIR Python object that is live across a dynamic `if`.** The AST rewriter
-turns such an `if` into an `scf.if` and collects every variable live across it
-as loop-carried state, which must be MLIR-backed. A Python object is not, and
-the failure is late, config-dependent and unobvious:
+The AST rewriter turns a dynamic `if` into an `scf.if` and collects every
+symbol live across it as region state, which has to be MLIR-backed. A plain
+Python object is not, and the failure is late and config-dependent:
 
-    fastmath = FastMath(FP_MODE)         # assigned in the body
+    fastmath = FastMath(FP_MODE)
     -> TypeError: state variable 'fastmath' is FastMath, not an MLIR Value
 
-    qk_cols = MaskedAxis(hdim, ...)      # assigned in the body, read in a
-    -> UnboundLocalError: cannot access   #   nested fn under `if row_valid:`
-       local variable 'qk_cols'
+Two things make an object safe to hold in a kernel-body variable, and a helper
+here needs whichever one fits:
 
-Passing the object as a *parameter* does not help; it is still a variable live
-across the branch. That was measured, not assumed: threading it through
-`coop_load_store_k(start_k, cols, ...)` compiles at BLOCK_DMODEL 16 non-causal
-and fails at 16 causal with `state variable 'cols' is MaskedAxis, not an MLIR
-Value`.
+1. **Nothing traced to carry.** Build it on the host, in the builder beside the
+   knob unpacking, and let the traced code capture it as a constant. This is
+   `FastMath(FP_MODE)`: every field is `const_expr`, so the object never has to
+   become region state at all.
 
-Two patterns work, and which one applies depends on what the object needs:
+2. **The carry protocol.** An object whose fields *are* traced implements the
+   three methods from `flydsl.compiler.protocol` and the rewriter threads it
+   through as `scf` state:
 
-1. **Build it on the host** when everything it captures is `const_expr`. This
-   is `FastMath(FP_MODE)`, constructed in the builder beside the knob unpacking
-   and captured by the traced code as a plain constant.
+       def __get_ir_types__(self): ...
+       def __extract_to_ir_values__(self): ...
+       @classmethod
+       def __construct_from_ir_values__(cls, values, exemplar=None): ...
 
-2. **Build it in a factory function** when it needs traced values. This is
-   `MaskedAxis`, whose extent is `hdim_qk` -- a kernel *argument*, so there is
-   nothing to capture on the host:
+   `exemplar` is the pre-branch object, which is how the const_expr fields
+   (`active`, `elem_dtype`) come back -- only the IR-backed ones actually
+   travel. This is `MaskedAxis`, whose extent is a kernel argument.
 
-       def qk_cols():
-           return fmha.MaskedAxis(_hdim_qk_i, active=PADDED_HEAD, ...)
+One scoping trap survives, and it is Python's rather than the rewriter's.
+`_collect_assigned_vars` counts `name.method(...)` under a dynamic `if` as a
+use of carried state, so the rewritten code assigns `name` back after the
+region. If `name` came from an *enclosing* scope, that assignment makes it a
+local of the inner function, and any sibling path that skips the `if` -- a
+`const_expr` arm, typically -- reads it unbound:
 
-       ... qk_cols().safe(load_col_base) ...
+    UnboundLocalError: cannot access local variable 'qk_cols'
 
-   The call re-creates the object inside whatever branch reads it, so nothing
-   is ever live across the `scf.if`. It costs nothing -- trace-time Python that
-   emits no IR, and every gate config is bitwise identical to the variable form
-   where the variable form compiles at all.
-
-The `()` is the tell that a helper is in category 2. Prefer 1 when the object
-allows it; it reads better and constructs once.
+Bind a local alias before the branch (`cols = qk_cols`), which is what
+`ast_rewriter._check_local_var` recommends in its warning. A module-level
+function is immune: the rewrite is lexical per `@flyc.kernel` function, so
+nothing in this file is rewritten at all.
 """
 
 from dataclasses import dataclass
@@ -294,6 +293,11 @@ class MaskedAxis:
 
     `active=False` compiles the masking away, for an axis whose extent is known
     to be a multiple of the access width.
+
+    The three `__..._ir_values__` methods are the carry protocol from
+    `flydsl.compiler.protocol`; they are what lets an instance be held in a
+    plain kernel-body variable that is live across a dynamic `if`. See "How to
+    hand a helper object to kernel code" at the top of this module.
     """
 
     __slots__ = ("extent", "active", "elem_dtype")
@@ -312,13 +316,31 @@ class MaskedAxis:
         # binding one would make the Q preload silently follow `VEC_WIDTH`.
         self.elem_dtype = elem_dtype
 
+    # ---- carry protocol ----
+    #
+    # `extent` is the only IR-backed field; `active` and `elem_dtype` are
+    # const_expr and come back off the exemplar. A const_expr extent
+    # contributes no IR value at all, so such an axis crosses a branch as a
+    # zero-value carry.
+
+    def __get_ir_types__(self):
+        return [v.type for v in self.__extract_to_ir_values__()]
+
+    def __extract_to_ir_values__(self):
+        return [] if isinstance(self.extent, int) else [_to_raw(self.extent)]
+
+    @classmethod
+    def __construct_from_ir_values__(cls, values, exemplar=None):
+        if exemplar is None:
+            raise TypeError("MaskedAxis needs an exemplar to restore active/elem_dtype")
+        extent = exemplar.extent if not values else type(exemplar.extent)(values[0])
+        return cls(extent, active=exemplar.active, elem_dtype=exemplar.elem_dtype)
+
     def _bound(self):
         """The extent as a traced value.
 
         Resolved lazily so the object can be built on the host when the extent
-        is a `const_expr` int, which is what the kernel body requires: an
-        object assigned inside the body becomes a local of the recompiled
-        function and does not survive the AST rewriter's scoping.
+        is a `const_expr` int.
         """
         return fx.Index(self.extent) if isinstance(self.extent, int) else self.extent
 

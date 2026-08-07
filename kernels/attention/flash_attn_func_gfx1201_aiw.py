@@ -1101,20 +1101,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # access width, so every access is wholly in range and the masking
         # compiles away.
         #
-        # Factories, not variables: `coop_load_store_k` reads these inside
-        # `if row_valid:` whenever K_NEEDS_GUARD, and an object held in a
-        # variable cannot be live across a dynamic `if`. See "How to hand a
-        # helper object to kernel code" in `fmha_common_gfx1201` -- this is
-        # pattern 2 there, and `fastmath` above is pattern 1.
-        def qk_cols():
-            return fmha.MaskedAxis(
-                _hdim_qk_i, active=PADDED_HEAD, elem_dtype=elem_dtype
-            )
-
-        def vo_cols():
-            return fmha.MaskedAxis(
-                _hdim_vo_i, active=PADDED_HEAD, elem_dtype=elem_dtype
-            )
+        # `coop_load_store_k` reads `qk_cols` inside `if row_valid:` whenever
+        # K_NEEDS_GUARD, so this object is live across a dynamic `if`. That
+        # works because `MaskedAxis` implements the carry protocol; see "How to
+        # hand a helper object to kernel code" in `fmha_common_gfx1201`.
+        qk_cols = fmha.MaskedAxis(_hdim_qk_i, active=PADDED_HEAD, elem_dtype=elem_dtype)
+        vo_cols = fmha.MaskedAxis(_hdim_vo_i, active=PADDED_HEAD, elem_dtype=elem_dtype)
 
         def _split_ptr(ptr, base64, off):
             """ptr + base64 (uniform) + off (divergent). Both 64-bit.
@@ -1163,10 +1155,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 row_offset = batch * K_ROWS_PER_BATCH
                 b64, o32 = k_addr(
                     start_k, load_row_in_batch + row_offset,
-                    qk_cols().safe(load_col_base),
+                    qk_cols.safe(load_col_base),
                 )
                 vecs.append(
-                    qk_cols().discard(
+                    qk_cols.discard(
                         load_global_f16xN(k_ptr, b64, o32),
                         load_col_base, VEC_WIDTH,
                     )
@@ -1202,6 +1194,13 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             to exist unconditionally.
             """
             k_base = k_buf_base(buf_id)
+            # A local alias, not `qk_cols` directly. The rewriter collects any
+            # `name.method(...)` under a dynamic `if` as carried state and
+            # assigns the name back afterwards, which would make `qk_cols` a
+            # local of *this* function -- unbound on the K_NEEDS_GUARD-false
+            # path, which never runs that `if`. Binding a local before the
+            # branch is the fix `ast_rewriter._check_local_var` recommends.
+            cols = qk_cols
             for batch in range_constexpr(NUM_BATCHES_K):
                 row_offset = batch * K_ROWS_PER_BATCH
                 lds_row = load_row_in_batch + row_offset
@@ -1209,11 +1208,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     row_valid = lds_row < fx.Index(BLOCK_N)
                     if row_valid:
                         b64, o32 = k_addr(
-                            start_k, lds_row, qk_cols().safe(load_col_base)
+                            start_k, lds_row, cols.safe(load_col_base)
                         )
                         fmha.lds_store_vx(
                             lds_kv,
-                            qk_cols().discard(
+                            cols.discard(
                                 load_global_f16xN(k_ptr, b64, o32),
                                 load_col_base, VEC_WIDTH,
                             ),
@@ -1222,11 +1221,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         )
                 else:
                     b64, o32 = k_addr(
-                        start_k, lds_row, qk_cols().safe(load_col_base)
+                        start_k, lds_row, cols.safe(load_col_base)
                     )
                     fmha.lds_store_vx(
                         lds_kv,
-                        qk_cols().discard(
+                        cols.discard(
                             load_global_f16xN(k_ptr, b64, o32),
                             load_col_base, VEC_WIDTH,
                         ),
@@ -1280,7 +1279,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         col = fx.Index(D_OFFSET) + col
                     b64, o32 = v_addr(
                         start_k, kv_base + _tr_kv_off,
-                        vo_cols().safe(col),
+                        vo_cols.safe(col),
                     )
                     vecs.append(fmha.global_load_tr_v8(v_ptr_i64, b64, o32, v8f16_type))
             else:
@@ -1291,7 +1290,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         col = fx.Index(D_OFFSET) + col
                     b64, o32 = v_addr(
                         start_k, v_row_in_batch + row_offset,
-                        vo_cols().safe(col),
+                        vo_cols.safe(col),
                     )
                     vecs.append(load_global_f16xN(v_ptr, b64, o32))
             return vecs
@@ -1340,10 +1339,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             for qt in range_constexpr(ROW_SUBTILES)
         ]
         # Rows are bounded by the real Q length; a workgroup's last tile can
-        # hang past it. Unlike the column axes this is never inactive. A
-        # factory for the same reason as those -- see `qk_cols`.
-        def q_rows_axis():
-            return fmha.MaskedAxis(fx.Index(seqlen_q_i32))
+        # hang past it. Unlike the column axes this is never inactive.
+        q_rows_axis = fmha.MaskedAxis(fx.Index(seqlen_q_i32))
         q_tile_base = q_tbase(_q_start_addr)
         c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
 
@@ -1354,18 +1351,18 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # copy exists for the causal mask; testing against it here would
             # start its live range early, and at the widest causal builds that
             # overlap spills -- BLOCK_DMODEL 384 causal paid 16 more bytes of
-            # scratch and 6% throughput. `MaskedTile.valid` emits the signed
+            # scratch and 6% throughput. `MaskedAxis.valid` emits the signed
             # compare that `fx.Index` being unsigned would otherwise deny.
-            _in = q_rows_axis().valid(q_rows[qt])
-            _safe = q_rows_axis().safe(q_rows[qt], q_rows_in_tile[qt])
+            _in = q_rows_axis.valid(q_rows[qt])
+            _safe = q_rows_axis.safe(q_rows[qt], q_rows_in_tile[qt])
             _packs = []
             for ks in range_constexpr(K_STEPS_QK):
                 q_col = shard_qk_off + fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
                 raw = load_global_v8f16(
                     q_ptr, q_tile_base,
-                    q_toff(_safe, qk_cols().safe(q_col)),
+                    q_toff(_safe, qk_cols.safe(q_col)),
                 )
-                raw = qk_cols().discard(raw, q_col, 8)
+                raw = qk_cols.discard(raw, q_col, 8)
                 _packs.append(ArithValue(_in).select(raw, c_zero_v8f16))
             q_in_bounds_all.append(_in)
             q_b_packs_all.append(_packs)
