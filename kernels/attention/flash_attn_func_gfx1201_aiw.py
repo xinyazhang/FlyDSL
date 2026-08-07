@@ -1173,13 +1173,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
         def coop_load_k_global(start_k):
             """Issue this thread's K global loads; results stay in registers."""
-            read = fetch_k(start_k)
-            return [
-                k_ap.read_vec(
-                    read, k_ap.batch_row(load_row_in_batch, batch), load_col_base
-                )
-                for batch in range_constexpr(k_ap.num_batches)
-            ]
+            return fmha.read_batches(
+                k_ap, fetch_k(start_k), load_row_in_batch, load_col_base
+            )
 
         def coop_store_k_lds(vecs):
             """Distance-1 K staging: publish the tile loaded last iteration."""
@@ -1199,96 +1195,61 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         #
         # Two layouts. Transposed stages V^T[d][kv] via global_load_tr_b128 so
         # GEMM2 reads one contiguous vector per operand; row-major stages
-        # V[kv][d] and GEMM2 gathers 8 strided scalars.
+        # V[kv][d] and GEMM2 gathers 8 strided scalars. The two differ in the
+        # helper they call and in nothing else here.
+        #
+        # The lane offsets are two distinct mappings. The *load* pair is the
+        # address each lane must supply so the hardware transpose lands the
+        # right 16(d) x 16(kv) block in WMMA-operand order (derivation in
+        # `fmha.global_load_tr_v8`): within a group of 8 lanes the lane index
+        # picks the kv row and the group index picks the 8-wide d half. The
+        # *store* pair is where the lane's transposed result then belongs.
+        v_tr = fmha.TransposedTiling(
+            d_blocks=V_TR_D_BLOCKS, tiles=_V_TR_TILES, loads=V_TR_LOADS,
+            needs_guard=V_TR_NEEDS_GUARD, num_waves=NUM_WAVES,
+            d_step=WMMA_N, kv_step=WMMA_K, wave_id=wave_id,
+            load_d_off=((lane // 8) % 2) * WMMA_LANE_K,
+            load_kv_off=(lane // 16) * WMMA_LANE_K + (lane % 8),
+            store_d_off=lane16,
+            store_kv_off=klane * WMMA_LANE_K,
+        )
 
-        # Address each lane must supply so the hardware transpose lands the
-        # right 16(d) x 16(kv) block in WMMA-operand order (see the derivation
-        # in fmha.global_load_tr_v8): within a group of 8 lanes the lane index picks
-        # the kv row, and the group index picks the 8-wide d half.
-        _tr_kv_off = (lane // 16) * WMMA_LANE_K + (lane % 8)
-        _tr_d_off = ((lane // 8) % 2) * WMMA_LANE_K
+        def fetch_v(start_k):
+            """`(row, col) -> one V vector`, row-major."""
+            def read(row, col):
+                b64, o32 = v_addr(start_k, row, col)
+                return load_global_f16xN(v_ptr, b64, o32)
+            return read
 
-        def _v_store_transposed(l, vec):
-            """Lane holds V[kv0+klane*8 .. +7][d]; contiguous in V^T[d][kv].
-
-            8 wide because that is what `global_load_tr_v8` returns -- the WMMA
-            operand shape -- not because it is the cooperative-load width.
-            """
-            tile = wave_id + fx.Index(l * NUM_WAVES)
-            d = (tile % V_TR_D_BLOCKS) * WMMA_N + lane16
-            kv = (tile // V_TR_D_BLOCKS) * WMMA_K + klane * WMMA_LANE_K
-            v_ap.to_lds(lds_kv, vec, d, kv, 8)
-
-        def _v_store_row_major(lds_row, vec):
-            v_ap.to_lds(lds_kv, vec, lds_row, v_col_base, v_ap.vec_width)
+        def fetch_v_transposed(start_k):
+            """`(row, col) -> one transposed V block`, via `global_load_tr_b128`."""
+            def read(row, col):
+                b64, o32 = v_addr(start_k, row, col)
+                return fmha.global_load_tr_v8(v_ptr_i64, b64, o32, v8f16_type)
+            return read
 
         def coop_load_v_global(start_k, chunk=0):
-            """V columns [chunk*VO_CHUNK_COLS, +VO_CHUNK_COLS) of this KV tile.
-
-            Columns are relative to the V/O window, so D_OFFSET is added here
-            and only here -- LDS indices stay window-relative.
-
-            **`safe` but no `discard`, on either arm** -- so this does not go
-            through `Aperture.read_vec` the way K does. Under PADDED_HEAD the
-            columns past hdim_vo do load garbage, but V reaches only O, and an
-            O column past hdim_vo is dropped by the epilogue store. Zeroing it
-            would be work with no reader. The *address* still has to be
-            redirected, which is what `safe` is doing.
-
-            The transposed arm could not discard per element anyway: after the
-            8x8 transpose a lane's vector runs along kv, not d, so all 8
-            elements share one column and the mask would be whole-vector.
-            """
-            vecs = []
+            """V columns [chunk*VO_CHUNK_COLS, +VO_CHUNK_COLS) of this KV tile."""
             if const_expr(V_TRANSPOSED):
-                for l in range_constexpr(V_TR_LOADS):
-                    tile = wave_id + fx.Index(l * NUM_WAVES)
-                    d_base = (tile % V_TR_D_BLOCKS) * WMMA_N
-                    kv_base = (tile // V_TR_D_BLOCKS) * WMMA_K
-                    col = d_base + _tr_d_off
-                    if const_expr(chunk):
-                        col = fx.Index(chunk * VO_CHUNK_COLS) + col
-                    if const_expr(D_OFFSET):
-                        col = fx.Index(D_OFFSET) + col
-                    b64, o32 = v_addr(
-                        start_k, kv_base + _tr_kv_off,
-                        v_ap.cols.safe(col),
-                    )
-                    vecs.append(fmha.global_load_tr_v8(v_ptr_i64, b64, o32, v8f16_type))
-            else:
-                for batch in range_constexpr(v_ap.num_batches):
-                    col = v_col_base
-                    if const_expr(D_OFFSET):
-                        col = fx.Index(D_OFFSET) + col
-                    b64, o32 = v_addr(
-                        start_k, v_ap.batch_row(v_row_in_batch, batch),
-                        v_ap.cols.safe(col),
-                    )
-                    vecs.append(load_global_f16xN(v_ptr, b64, o32))
-            return vecs
+                return fmha.read_transposed(
+                    v_ap, v_tr, fetch_v_transposed(start_k),
+                    chunk * VO_CHUNK_COLS + D_OFFSET,
+                )
+            col = v_col_base
+            if const_expr(D_OFFSET):
+                col = fx.Index(D_OFFSET) + col
+            return fmha.read_batches_unmasked(
+                v_ap, fetch_v(start_k), v_row_in_batch, col
+            )
 
         def coop_store_v_lds(vecs):
             if const_expr(V_TRANSPOSED):
-                # When V_TR_LOADS * NUM_WAVES overshoots the tile count the last
-                # step has tail waves with no tile. Their global load still ran
-                # -- kv_addr clamped the row, so it read in bounds -- and is
-                # simply not published here.
-                for l in range_constexpr(V_TR_LOADS):
-                    if const_expr(V_TR_NEEDS_GUARD and (l + 1) * NUM_WAVES > _V_TR_TILES):
-                        tile_ok = wave_id + fx.Index(l * NUM_WAVES) < fx.Index(_V_TR_TILES)
-                        if tile_ok:
-                            _v_store_transposed(l, vecs[l])
-                    else:
-                        _v_store_transposed(l, vecs[l])
+                fmha.publish_transposed(v_ap, v_tr, lds_kv, vecs)
             else:
-                for batch in range_constexpr(v_ap.num_batches):
-                    lds_row = v_ap.batch_row(v_row_in_batch, batch)
-                    if const_expr(v_ap.needs_guard):
-                        row_valid = lds_row < fx.Index(BLOCK_N)
-                        if row_valid:
-                            _v_store_row_major(lds_row, vecs[batch])
-                    else:
-                        _v_store_row_major(lds_row, vecs[batch])
+                fmha.publish(
+                    v_ap, lds_kv, vecs, v_row_in_batch, v_col_base,
+                    fx.Index(BLOCK_N),
+                )
 
         # ---- Q preload ----
         # One row per row sub-tile; at ROW_SUBTILES == 1 this is the

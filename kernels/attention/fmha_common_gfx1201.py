@@ -81,6 +81,8 @@ __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", 
            "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8",
            "FastMath", "MaskedAxis", "Aperture",
            "stage", "publish", "write_v8",
+           "read_batches", "read_batches_unmasked",
+           "TransposedTiling", "read_transposed", "publish_transposed",
            "lds_f32_ptr", "lds_f32_store", "lds_f32_load",
            "reduce_s_across_shards",
            "cond_load", "seqinfo_addr", "decode_addressing", "lse_token_pitch",
@@ -599,6 +601,153 @@ def publish(aperture, lds_ptr, vecs, base_row, col, block_rows):
         aperture.to_lds(lds_ptr, vecs[batch], row, col, aperture.vec_width)
 
     _over_batches(aperture, base_row, block_rows, body)
+
+
+def read_batches(aperture, read, base_row, col):
+    """VRAM -> registers: this thread's share of one tile, columns masked.
+
+    No row guard, unlike `stage`. A distance-1 schedule carries the loaded
+    vectors through the loop, so every batch has to produce a value whether
+    or not its row exists; `publish` guards the store instead.
+    """
+    return [
+        aperture.read_vec(read, aperture.batch_row(base_row, batch), col)
+        for batch in range_constexpr(aperture.num_batches)
+    ]
+
+
+def read_batches_unmasked(aperture, read, base_row, col):
+    """`read_batches` without the column zeroing. Addresses are still safe.
+
+    For a tensor whose out-of-range columns reach nothing. That is V and only
+    V here: its garbage lands in O columns past `hdim_vo`, which the epilogue
+    store drops, so zeroing it would be work with no reader -- and the
+    configs that would pay are exactly the small padded ones (7-in-16,
+    8-in-16, 40-in-48) where V is row-major.
+
+    Named rather than a `mask_cols=False` argument, so the unusual case has to
+    be spelled out at the call site instead of hiding in a keyword.
+    """
+    return [
+        read(aperture.batch_row(base_row, batch), aperture.cols.safe(col))
+        for batch in range_constexpr(aperture.num_batches)
+    ]
+
+
+# --------------------------------------------------------------------------
+# The transposed V layout
+# --------------------------------------------------------------------------
+
+
+class TransposedTiling:
+    """How V^T's 16(d) x 16(kv) blocks are spread over the waves.
+
+    `global_load_tr_b128` transposes an 8x8 block of 16-bit elements across
+    each group of 8 lanes, so one wave-wide load produces a 16(d) x 16(kv)
+    block already in WMMA-operand order. This object owns the resulting
+    tiling: how many blocks there are, how they map onto `l` and `wave_id`,
+    and where this lane sits inside one.
+
+    It is separate from `Aperture` for the reason §9.5 gives about K and V --
+    per-tensor geometry belongs with its tensor -- taken one level further:
+    this is per-*layout* geometry, live only when `V_LDS_LAYOUT` is
+    "transposed", and folding it into the aperture would put fields on V that
+    half the configs never read.
+
+    The four lane offsets are two different mappings and must not be
+    interchanged. The load pair says which address this lane supplies so the
+    hardware transpose lands the right block; the store pair says where the
+    lane's transposed result belongs in LDS.
+    """
+
+    __slots__ = (
+        "d_blocks", "tiles", "loads", "needs_guard", "num_waves",
+        "d_step", "kv_step", "wave_id",
+        "load_d_off", "load_kv_off", "store_d_off", "store_kv_off",
+    )
+
+    def __init__(self, d_blocks, tiles, loads, needs_guard, num_waves,
+                 d_step, kv_step, wave_id,
+                 load_d_off, load_kv_off, store_d_off, store_kv_off):
+        self.d_blocks = d_blocks
+        self.tiles = tiles
+        self.loads = loads
+        self.needs_guard = needs_guard
+        self.num_waves = num_waves
+        self.d_step = d_step
+        self.kv_step = kv_step
+        self.wave_id = wave_id
+        self.load_d_off = load_d_off
+        self.load_kv_off = load_kv_off
+        self.store_d_off = store_d_off
+        self.store_kv_off = store_kv_off
+
+    def tile(self, l):
+        """Which V^T block this wave handles on step `l`."""
+        return self.wave_id + fx.Index(l * self.num_waves)
+
+    def origin(self, l):
+        """`(d, kv)` of that block's top-left corner."""
+        t = self.tile(l)
+        return (t % self.d_blocks) * self.d_step, (t // self.d_blocks) * self.kv_step
+
+    def overshoots(self, l):
+        """const_expr: can step `l` leave some waves with no block?
+
+        The tiling need not divide evenly across the waves; requiring it once
+        forced BLOCK_DMODEL 160 down to 4 waves and cost it 89.1 -> 70.0
+        TFLOPS. Only the final step or two can overshoot, so the earlier ones
+        emit no branch.
+        """
+        return self.needs_guard and (l + 1) * self.num_waves > self.tiles
+
+
+def read_transposed(aperture, tiling, read, col_extra=0):
+    """VRAM -> registers through the hardware transpose, one vector per block.
+
+    `col_extra` is the window offset (`chunk * VO_CHUNK_COLS` plus
+    `D_OFFSET`); LDS indices stay window-relative, so it is added here and
+    nowhere else.
+
+    Columns are made safe but not zeroed, for the `read_batches_unmasked`
+    reason -- and here there is a second one: after the transpose a lane's 8
+    elements run along kv at a single d, so a column mask could only be
+    whole-vector, not per element.
+    """
+    out = []
+    for l in range_constexpr(tiling.loads):
+        d_base, kv_base = tiling.origin(l)
+        col = d_base + tiling.load_d_off
+        if col_extra:
+            col = fx.Index(col_extra) + col
+        out.append(read(kv_base + tiling.load_kv_off, aperture.cols.safe(col)))
+    return out
+
+
+def publish_transposed(aperture, tiling, lds_ptr, vecs):
+    """Registers -> LDS for the transposed layout.
+
+    A tail wave with no block has still run its global load -- the address
+    closure clamped the row, so it read in bounds -- and is simply not
+    published.
+
+    8 wide because that is what the transposed load returns, the WMMA operand
+    shape, not because it is the cooperative-load width (§9.3).
+    """
+    def body(l):
+        d_base, kv_base = tiling.origin(l)
+        aperture.to_lds(
+            lds_ptr, vecs[l],
+            d_base + tiling.store_d_off, kv_base + tiling.store_kv_off, 8,
+        )
+
+    for l in range_constexpr(tiling.loads):
+        if tiling.overshoots(l):
+            if_op = _scf.IfOp(_to_raw(tiling.tile(l) < fx.Index(tiling.tiles)))
+            with kernels_common._if_then(if_op):
+                body(l)
+        else:
+            body(l)
 
 
 def write_v8(aperture, write, row, col, val):
