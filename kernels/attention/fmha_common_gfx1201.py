@@ -192,7 +192,7 @@ def bitcast_i32(value):
 def pack_bf16_pair(lo, hi, shift, mask):
     lo_i32 = bitcast_i32(lo)
     hi_i32 = bitcast_i32(hi)
-    return (hi_i32 & mask) | lo_i32.shrui(shift)
+    return (hi_i32 & mask) | arith.shrui(lo_i32, shift)
 
 def bf16_trunc_pack_v8(f32_vals, elem_dtype):
     """Pack 8 f32 values into v8bf16 via bitwise truncation (upper 16 bits).

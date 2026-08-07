@@ -1294,7 +1294,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         shuf_16_i32 = fx.Int32(16)
 
         def reduction_peer(v_f32):
-            return fx.Float32(v_f32).shuffle_xor(shuf_16_i32, width_i32)
+            return gpu.shuffle_xor(fx.Float32(v_f32), shuf_16_i32, width_i32)
 
         # Right edge of the visible band: key j is visible to query i only if
         # j <= i + _diag. This *is* `window_right` -- 0 for top-left,
