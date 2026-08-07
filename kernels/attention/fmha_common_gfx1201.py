@@ -343,15 +343,24 @@ class MaskedAxis:
         return fx.Index(self.extent) if isinstance(self.extent, int) else self.extent
 
     def valid(self, idx):
-        """i1: is this index inside the extent?
+        """`fx.Boolean`: is this index inside the extent?
 
-        A signed compare, on every axis. `fx.Index` is *unsigned*, so a plain
-        `idx < extent` emits `v_cmp_lt_u64`; the answer agrees here because
+        A signed compare, on every axis. Signedness is a property of the
+        *type* -- `_make_binop` reads each operand's class-level `signed` --
+        so `fx.Int64` is what makes `<` emit `slt` here, and it is also why
+        this cannot simply compare the `fx.Index` values it is handed:
+        `fx.Index` is unsigned and would give `ult`. The answer agrees, since
         every index and extent is non-negative, but the two are not the same
         code and mixing them per axis was a difference with no reason behind
-        it. Signed throughout, matching the rest of the file.
+        it.
+
+        Spelled with the operator rather than `arith.cmpi(CmpIPredicate.slt,
+        ...)` because `cmpi` is stable while `CmpIPredicate` is not, and
+        because the `fx.Boolean` this returns has a stable `select`. The
+        `index_cast` that `fx.Int64` inserts folds away -- index is already
+        64-bit here -- which was measured, not assumed.
         """
-        return arith.cmpi(arith.CmpIPredicate.slt, fx.as_ir_value(idx), fx.as_ir_value(self._bound()))
+        return fx.Int64(idx) < fx.Int64(self._bound())
 
     def mask(self, idx, width):
         """i1 vector, element j set iff `idx + j` is inside the extent.
@@ -360,7 +369,7 @@ class MaskedAxis:
         out of the KV loop and costs one vector select per access inside it.
         """
         return Vec.from_elements(
-            [ArithValue(self.valid(idx + fx.Index(j))) for j in range_constexpr(width)],
+            [self.valid(idx + fx.Index(j)) for j in range_constexpr(width)],
             fx.Boolean,
         )
 
@@ -376,7 +385,7 @@ class MaskedAxis:
             addressed = idx
         if not self.active:
             return addressed
-        return fx.Index(ArithValue(self.valid(idx)).select(addressed, fx.Index(0)))
+        return fx.Index(self.valid(idx).select(addressed, fx.Index(0)))
 
     def discard(self, vec, idx, width):
         """Zero the elements of `vec` whose index is past the extent."""
@@ -488,7 +497,7 @@ class Aperture:
         """
         raw = self.cols.discard(fetch(row, self.cols.safe(col)), col, 8)
         zeros = Vec.filled(8, 0.0, self.cols.elem_dtype).ir_value()
-        return ArithValue(row_ok).select(raw, zeros)
+        return row_ok.select(raw, zeros)
 
     def read_vec(self, fetch, row, col):
         """One cooperative-load vector at (row, col), columns masked.
