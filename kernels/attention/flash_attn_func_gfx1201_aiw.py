@@ -108,7 +108,6 @@ from flydsl.expr import (
 from flydsl.expr.typing import T, Vector as Vec
 import fmha_common_gfx1201 as fmha
 from philox import Philox, dropout_threshold
-from flydsl.expr.utils.arith import ArithValue
 
 from gfx1201_standalone import buffer_ops, utils as common_utils, wmma_ops
 
@@ -917,7 +916,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # this file had to be hand-written as an explicit `arith.cmpi(slt, ...)`
         # to get the signed predicate back. `fx.Int32` is signed, so `<` is
         # already the right thing.
-        _alive = ArithValue(fx.Int32(start_q) < seqlen_q_i32)
+        _alive = fx.Int32(start_q) < seqlen_q_i32
 
         # **The Q base must be clamped, not just the row within the tile.**
         # `q_tbase(start_q)` folds start_q into the 64-bit base, and the
@@ -932,7 +931,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # smaller overshoots land inside the allocation and are silently
         # harmless, which is exactly why the varlen tests did not catch it.
         _q_start_addr = fx.Index(
-            ArithValue(_alive).select(start_q, fx.Index(0))
+            _alive.select(start_q, fx.Index(0))
         )
 
         # MQA/GQA: Num_head_q / Num_head_k query heads share each KV head.
@@ -1383,10 +1382,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             )
             # Same empty-work clamp as the causal arm above.
             _full_end = fx.Index(
-                ArithValue(_alive).select(_full_end, fx.Index(0))
+                _alive.select(_full_end, fx.Index(0))
             )
             kv_upper = fx.Index(
-                ArithValue(_alive).select(kv_upper, fx.Index(0))
+                _alive.select(kv_upper, fx.Index(0))
             )
 
         # Tiles this workgroup will actually walk. Zero for a sequence with no
@@ -1707,21 +1706,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                             # w_left is "unbounded" (== seqlen_q), which is how
                             # plain causal maps onto this path with the left
                             # term inert.
-                            _dead = _dead | ArithValue(
-                                arith.cmpi(
-                                    arith.CmpIPredicate.sgt,
-                                    fx.as_ir_value(_col),
-                                    fx.as_ir_value(q_row_i32 + _wr_i32),
-                                )
-                            )
-                            _dead = _dead | ArithValue(
-                                arith.cmpi(
-                                    arith.CmpIPredicate.slt,
-                                    fx.as_ir_value(_col),
-                                    fx.as_ir_value(q_row_i32 - _wl_i32),
-                                )
-                            )
-                        s_raw[_i] = ArithValue(_dead).select(c_neg_inf, s_raw[_i])
+                            _dead = _dead | (_col > q_row_i32 + _wr_i32)
+                            _dead = _dead | (_col < q_row_i32 - _wl_i32)
+                        s_raw[_i] = _dead.select(c_neg_inf, s_raw[_i])
 
                 local_max = s_raw[0]
                 for r in range_constexpr(NUM_S_VALS - 1):
@@ -2011,18 +1998,15 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # with (b=batch, s=0, S=Max_seqlen_q) giving (B*H, S). Varlen will pass
         # (b=0, s=cu_seqlens_q_start, S=total) for (H, TotalS) without changing
         # anything here -- that is the point of computing the base on the host.
-        # Conditions are combined with arith.andi, not Python `and`/`not`:
-        # those call __bool__ on the MLIR value and are resolved at trace time,
+        # Conditions are combined with `&`, never Python `and`/`not`: those
+        # call `__bool__` on the MLIR value and are resolved at trace time,
         # which silently folded this whole block away on the first attempt.
+        # `&` on an `fx.Boolean` is the bitwise op and evaluates neither side
+        # at trace time.
         _f32_ty = ir.F32Type.get()
-        _l_valid = arith.cmpi(
-            arith.CmpIPredicate.ne, fx.as_ir_value(fx.Int64(fx.ptrtoint(L))), fx.as_ir_value(fx.Int64(0))
-        )
-        _lse_writer = arith.andi(
-            _l_valid,
-            arith.andi(
-                fx.as_ir_value(klane == fx.Index(0)), fx.as_ir_value(shard_id == fx.Index(0))
-            ),
+        _l_valid = fx.Int64(fx.ptrtoint(L)) != fx.Int64(0)
+        _lse_writer = (
+            _l_valid & (klane == fx.Index(0)) & (shard_id == fx.Index(0))
         )
         # Everything -- the log2, the scale, the address -- lives inside the
         # guard. Hoisting it out cost 8% at BLOCK_DMODEL 256 non-causal even though
@@ -2030,7 +2014,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # the epilogue and lengthen it for every wave, including the ones that
         # never store and the whole kernel when L is null.
         for qt in range_constexpr(ROW_SUBTILES):
-            _do_store = arith.andi(_lse_writer, fx.as_ir_value(q_in_bounds_all[qt]))
+            _do_store = _lse_writer & q_in_bounds_all[qt]
             if _do_store:
                 _m = loop_results[2 * qt]
                 _l = loop_results[2 * qt + 1]
@@ -2042,13 +2026,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # zero for exactly the rows that must contribute nothing.
                 # l is bit-exact 0 there, so test the bit pattern; integer
                 # compares lower predictably.
-                _lse = ArithValue(
-                    arith.cmpi(
-                        arith.CmpIPredicate.ne,
-                        fx.as_ir_value(fmha.bitcast_i32(fx.Float32(_l))),
-                        fx.as_ir_value(fx.Int32(0)),
-                    )
-                ).select(fx.Float32(_lse), fx.Float32(float("inf")))
+                _lse = (fmha.bitcast_i32(fx.Float32(_l)) != fx.Int32(0)).select(
+                    fx.Float32(_lse), fx.Float32(float("inf"))
+                )
                 # LSE_LAYOUT, VarlenBits bits 17:16. The *inputs* are Q's
                 # decode -- batch, row offset, length -- so the two layouts
                 # are the same indices arranged two ways, not two features
@@ -2063,12 +2043,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # Compact in both layouts, so the head pitch is exactly
                 # num_head_q and the token pitch is the decode's `tokens`.
                 _lse_off_th = (_q_batch_v * _tok + _row) * _nhq + head_q
-                _is_th = ArithValue(
-                    arith.cmpi(
-                        arith.CmpIPredicate.ne,
-                        fx.as_ir_value((fx.Int32(varlen_bits) >> fx.Int32(16)) & fx.Int32(3)),
-                        fx.as_ir_value(fx.Int32(0)),
-                    )
+                _is_th = ((fx.Int32(varlen_bits) >> fx.Int32(16)) & fx.Int32(3)) != fx.Int32(
+                    0
                 )
                 _lse_off = fx.Index(
                     _is_th.select(fx.Index(_lse_off_th), fx.Index(_lse_off_ht))

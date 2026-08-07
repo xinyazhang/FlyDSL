@@ -76,7 +76,6 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import scf as _scf
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector as Vec
-from flydsl.expr.utils.arith import ArithValue
 from gfx1201_standalone import buffer_ops, kernels_common, utils as common_utils
 
 __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
@@ -187,7 +186,7 @@ def global_load_tr_v8(base_i64, base64, off32, v8_type):
 
 
 def bitcast_i32(value):
-    return fx.Int32(ArithValue(value).bitcast(fx.Int32.ir_type))
+    return fx.Float32(value).bitcast(fx.Int32)
 
 def pack_bf16_pair(lo, hi, shift, mask):
     lo_i32 = bitcast_i32(lo)
@@ -962,14 +961,8 @@ def lse_token_pitch(varlen_bits, bits_shift, max_seqlen, s0, s1, num_seqlens):
     array = posmode == fx.Int32(2)
     zero = fx.Int32(0)
 
-    total_s0 = cond_load(
-        arith.andi(fx.as_ir_value(stacked), fx.as_ir_value(reuse)),
-        seqinfo_addr(s0, num_seqlens), zero,
-    )
-    total_s1 = cond_load(
-        arith.andi(fx.as_ir_value(stacked), fx.as_ir_value(array)),
-        seqinfo_addr(s1, num_seqlens), zero,
-    )
+    total_s0 = cond_load(stacked & reuse, seqinfo_addr(s0, num_seqlens), zero)
+    total_s1 = cond_load(stacked & array, seqinfo_addr(s1, num_seqlens), zero)
     return common_utils.ssel(
         stacked,
         common_utils.ssel(
@@ -1012,11 +1005,10 @@ def resolve_window(window_left, window_right, seqlen_q, seqlen_k):
     """
     left = fx.Int32(window_left)
     right = fx.Int32(window_right)
-    left_is_sentinel = arith.ori(
-        fx.as_ir_value(left == fx.Int32(WINDOW_TOPLEFT)),
-        fx.as_ir_value(left == fx.Int32(WINDOW_BOTRIGHT)),
+    left_is_sentinel = (left == fx.Int32(WINDOW_TOPLEFT)) | (
+        left == fx.Int32(WINDOW_BOTRIGHT)
     )
-    left = common_utils.ssel(ArithValue(left_is_sentinel), seqlen_q, left)
+    left = common_utils.ssel(left_is_sentinel, seqlen_q, left)
     right = common_utils.ssel(right == fx.Int32(WINDOW_TOPLEFT), fx.Int32(0), right)
     right = common_utils.ssel(
         fx.Int32(window_right) == fx.Int32(WINDOW_BOTRIGHT),
@@ -1241,16 +1233,12 @@ def make_addr_pair(
         """
         if not hoist:
             in_range = (ts + row_in_tile) < seqlen_k
-            row = fx.Index(
-                ArithValue(in_range).select(row_in_tile, seq_last - ts)
-            )
+            row = fx.Index(in_range.select(row_in_tile, seq_last - ts))
             return toff(row, col)
         # `ts < seqlen_k` always -- it is either start_k, which the
         # caller's branch tested, or seq_last -- so this cannot wrap.
         in_range = row_in_tile < (seqlen_k - ts)
-        return fx.Index(
-            ArithValue(in_range).select(toff(row_in_tile, col), col)
-        )
+        return fx.Index(in_range.select(toff(row_in_tile, col), col))
 
     def kv_addr(start_k, row_in_tile, col):
         """(uniform base, divergent offset) for a KV row, clamped in bounds.
@@ -1268,9 +1256,7 @@ def make_addr_pair(
         """
         if not clamp:
             return tbase(start_k), toff(row_in_tile, col)
-        ts = fx.Index(
-            ArithValue(start_k < seqlen_k).select(start_k, seq_last)
-        )
+        ts = fx.Index((start_k < seqlen_k).select(start_k, seq_last))
         return tbase(ts), kv_off(ts, row_in_tile, col)
 
     return tbase, toff, kv_addr
