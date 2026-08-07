@@ -1343,31 +1343,33 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             for qt in range_constexpr(ROW_SUBTILES)
         ]
         # Rows are bounded by the real Q length; a workgroup's last tile can
-        # hang past it. Unlike the column axes this is never inactive.
-        q_rows_axis = fmha.MaskedAxis(fx.Index(seqlen_q_i32))
+        # hang past it. Unlike the column axes this is never inactive. Q is
+        # read straight into registers, so its aperture has no LDS placement
+        # and no cooperative geometry.
+        q_ap = fmha.Aperture(qk_cols, rows=fmha.MaskedAxis(fx.Index(seqlen_q_i32)))
         q_tile_base = q_tbase(_q_start_addr)
-        c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
+
+        def fetch_q(row, col):
+            return load_global_v8f16(q_ptr, q_tile_base, q_toff(row, col))
 
         q_in_bounds_all = []
         q_b_packs_all = []
         for qt in range_constexpr(ROW_SUBTILES):
             # The index-typed row, deliberately, not `q_row_i32s[qt]`. The i32
-            # copy exists for the causal mask; testing against it here would
+            # copy exists for the causal mask; gating against it here would
             # start its live range early, and at the widest causal builds that
             # overlap spills -- BLOCK_DMODEL 384 causal paid 16 more bytes of
-            # scratch and 6% throughput. `MaskedAxis.valid` emits the signed
+            # scratch and 6% throughput. `MaskedAxis.gate` emits the signed
             # compare that `fx.Index` being unsigned would otherwise deny.
-            _in = q_rows_axis.valid(q_rows[qt])
-            _safe = q_rows_axis.safe(q_rows[qt], q_rows_in_tile[qt])
+            #
+            # Once per row, not once per column: that is the same live-range
+            # argument, and it is why `read_v8` takes the gate rather than
+            # recomputing it.
+            _in, _safe = q_ap.rows.gate(q_rows[qt], q_rows_in_tile[qt])
             _packs = []
             for ks in range_constexpr(K_STEPS_QK):
                 q_col = shard_qk_off + fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
-                raw = load_global_v8f16(
-                    q_ptr, q_tile_base,
-                    q_toff(_safe, qk_cols.safe(q_col)),
-                )
-                raw = qk_cols.discard(raw, q_col, 8)
-                _packs.append(ArithValue(_in).select(raw, c_zero_v8f16))
+                _packs.append(q_ap.read_v8(fetch_q, _safe, q_col, _in))
             q_in_bounds_all.append(_in)
             q_b_packs_all.append(_packs)
 

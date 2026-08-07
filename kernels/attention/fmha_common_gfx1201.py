@@ -387,6 +387,14 @@ class MaskedAxis:
         zeros = Vec.filled(width, 0.0, self.elem_dtype)
         return self.mask(idx, width).select(Vec(vec), zeros).ir_value()
 
+    def gate(self, idx, addressed=None):
+        """`(valid(idx), safe(idx, addressed))` -- the two halves together.
+
+        An out-of-range index needs both, always, and returning them as a pair
+        is what stops a caller taking the address and forgetting the flag.
+        """
+        return self.valid(idx), self.safe(idx, addressed)
+
 
 class Aperture:
     """The bounded region of one tensor this kernel may touch, and where it
@@ -465,6 +473,27 @@ class Aperture:
         """The 8 contiguous elements at (row, col) -- one WMMA operand."""
         v4 = Vec.make_type(4, self.cols.elem_dtype)
         return lds_load_v8(lds_ptr, self.lds_index(row, col), v4)
+
+    def read_v8(self, fetch, row, col, row_ok):
+        """One WMMA operand from VRAM at (row, col), fully masked.
+
+        All three of the maskings this kernel needs, and none of them
+        optional: the columns past `hdim` are zeroed per element, a row past
+        `seqlen` is replaced wholesale, and `col` is redirected before the
+        access so the address stays legal either way.
+
+        `row` must already be the *safe* row and `row_ok` its gate flag -- take
+        both from `rows.gate(...)`, once per row rather than once per column,
+        because starting that compare early has measured 6% at the widest
+        causal build.
+
+        `fetch(row, col)` issues the access. It stays the caller's: the
+        64-bit-base / 32-bit-offset split is per tensor, and its closure would
+        not survive the carry protocol if it lived here.
+        """
+        raw = self.cols.discard(fetch(row, self.cols.safe(col)), col, 8)
+        zeros = Vec.filled(8, 0.0, self.cols.elem_dtype).ir_value()
+        return ArithValue(row_ok).select(raw, zeros)
 
     # ---- carry protocol; see the module docstring ----
 
