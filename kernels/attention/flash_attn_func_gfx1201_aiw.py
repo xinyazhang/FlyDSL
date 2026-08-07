@@ -108,7 +108,7 @@ from flydsl.expr import (
 from flydsl.expr.typing import T, Vector as Vec
 import fmha_common_gfx1201 as fmha
 from philox import Philox, dropout_threshold
-from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
+from flydsl.expr.utils.arith import ArithValue
 
 from gfx1201_standalone import buffer_ops, utils as common_utils, wmma_ops
 
@@ -805,7 +805,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         elem_dtype = elem_numeric_cls
 
         def _to_global_ptr_i64(ptr):
-            return _raw(fx.Int64(fx.ptrtoint(ptr)))
+            return fx.as_ir_value(fx.Int64(fx.ptrtoint(ptr)))
 
         q_ptr = fmha.pointer_to_llvm_ptr(Q)
         k_ptr = fmha.pointer_to_llvm_ptr(K)
@@ -855,7 +855,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # f32 view of the V LDS region, for the cross-shard S reduction. The kv
         # array is elem_dtype (16-bit), so go through an addrspace(3) LLVM
         # pointer: ptrtoint on a shared pointer yields the 32-bit LDS offset.
-        _lds_byte_base = _raw(fx.ptrtoint(lds_kv))
+        _lds_byte_base = fx.as_ir_value(fx.ptrtoint(lds_kv))
         _RED_BYTE0 = (LDS_V_BASE if RED_ALIASES_V else LDS_KV_TOTAL_SIZE
                       - (RED_F32_TOTAL * 4 + 1) // 2) * 2
 
@@ -1483,10 +1483,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
         init_args = []
         for _ in range_constexpr(ROW_SUBTILES):
-            init_args.append(_raw(c_m_init))
-            init_args.append(_raw(c_zero_f))
+            init_args.append(fx.as_ir_value(c_m_init))
+            init_args.append(fx.as_ir_value(c_zero_f))
         for _ in range_constexpr(ROW_SUBTILES * O_ACCS):
-            init_args.append(_raw(c_zero_v8f32))
+            init_args.append(fx.as_ir_value(c_zero_v8f32))
         if const_expr(K_PREFETCH_DIST):
             for batch in range_constexpr(k_ap.num_batches):
                 init_args.append(_k_vecs_init[batch])
@@ -1545,7 +1545,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # accumulators: one LDS read serves ROW_SUBTILES WMMAs. That reuse is
             # the point of the knob.
             s_accs_all = [
-                [_raw(c_zero_v8f32) for _ in range(NUM_S_ACCS)]
+                [fx.as_ir_value(c_zero_v8f32) for _ in range(NUM_S_ACCS)]
                 for _ in range_constexpr(ROW_SUBTILES)
             ]
 
@@ -1710,15 +1710,15 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                             _dead = _dead | ArithValue(
                                 arith.cmpi(
                                     arith.CmpIPredicate.sgt,
-                                    _raw(_col),
-                                    _raw(q_row_i32 + _wr_i32),
+                                    fx.as_ir_value(_col),
+                                    fx.as_ir_value(q_row_i32 + _wr_i32),
                                 )
                             )
                             _dead = _dead | ArithValue(
                                 arith.cmpi(
                                     arith.CmpIPredicate.slt,
-                                    _raw(_col),
-                                    _raw(q_row_i32 - _wl_i32),
+                                    fx.as_ir_value(_col),
+                                    fx.as_ir_value(q_row_i32 - _wl_i32),
                                 )
                             )
                         s_raw[_i] = ArithValue(_dead).select(c_neg_inf, s_raw[_i])
@@ -1732,15 +1732,15 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
                 # m is already scaled, so no scale appears in either exponent.
                 corr = rocdl.exp2(
-                    ir.F32Type.get(), _raw(fastmath.sub(m_running, m_new_raw))
+                    ir.F32Type.get(), fx.as_ir_value(fastmath.sub(m_running, m_new_raw))
                 )
                 neg_m = fastmath.sub(c_zero_f, m_new_raw)
 
                 p_vals = []
-                local_sum = _raw(c_zero_f)
+                local_sum = fx.as_ir_value(c_zero_f)
                 for r in range_constexpr(NUM_S_VALS):
                     diff = fastmath.add(s_raw[r], neg_m)
-                    p = rocdl.exp2(ir.F32Type.get(), _raw(diff))
+                    p = rocdl.exp2(ir.F32Type.get(), fx.as_ir_value(diff))
                     p_vals.append(p)
                     local_sum = fastmath.add(local_sum, p)
 
@@ -1782,7 +1782,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         )
                         for _r in range_constexpr(8):
                             _i = _st * 8 + _r
-                            p_vals[_i] = _raw(
+                            p_vals[_i] = fx.as_ir_value(
                                 _keep[_r].select(
                                     fx.Float32(p_vals[_i]), fx.Float32(0.0)
                                 )
@@ -2016,12 +2016,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # which silently folded this whole block away on the first attempt.
         _f32_ty = ir.F32Type.get()
         _l_valid = arith.cmpi(
-            arith.CmpIPredicate.ne, _raw(fx.Int64(fx.ptrtoint(L))), _raw(fx.Int64(0))
+            arith.CmpIPredicate.ne, fx.as_ir_value(fx.Int64(fx.ptrtoint(L))), fx.as_ir_value(fx.Int64(0))
         )
         _lse_writer = arith.andi(
             _l_valid,
             arith.andi(
-                _raw(klane == fx.Index(0)), _raw(shard_id == fx.Index(0))
+                fx.as_ir_value(klane == fx.Index(0)), fx.as_ir_value(shard_id == fx.Index(0))
             ),
         )
         # Everything -- the log2, the scale, the address -- lives inside the
@@ -2030,12 +2030,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # the epilogue and lengthen it for every wave, including the ones that
         # never store and the whole kernel when L is null.
         for qt in range_constexpr(ROW_SUBTILES):
-            _do_store = arith.andi(_lse_writer, _raw(q_in_bounds_all[qt]))
+            _do_store = arith.andi(_lse_writer, fx.as_ir_value(q_in_bounds_all[qt]))
             if _do_store:
                 _m = loop_results[2 * qt]
                 _l = loop_results[2 * qt + 1]
                 _lse = fastmath.mul(
-                    fastmath.add(_m, rocdl.log(_f32_ty, _raw(_l))), fx.Float32(_LN2)
+                    fastmath.add(_m, rocdl.log(_f32_ty, fx.as_ir_value(_l))), fx.Float32(_LN2)
                 )
                 # A row with no live keys gets +inf, not -inf: the backward
                 # pass subtracts LSE from qk, so +inf makes exp(qk - inf)
@@ -2045,8 +2045,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 _lse = ArithValue(
                     arith.cmpi(
                         arith.CmpIPredicate.ne,
-                        _raw(fmha.bitcast_i32(fx.Float32(_l))),
-                        _raw(fx.Int32(0)),
+                        fx.as_ir_value(fmha.bitcast_i32(fx.Float32(_l))),
+                        fx.as_ir_value(fx.Int32(0)),
                     )
                 ).select(fx.Float32(_lse), fx.Float32(float("inf")))
                 # LSE_LAYOUT, VarlenBits bits 17:16. The *inputs* are Q's
@@ -2066,8 +2066,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 _is_th = ArithValue(
                     arith.cmpi(
                         arith.CmpIPredicate.ne,
-                        _raw((fx.Int32(varlen_bits) >> fx.Int32(16)) & fx.Int32(3)),
-                        _raw(fx.Int32(0)),
+                        fx.as_ir_value((fx.Int32(varlen_bits) >> fx.Int32(16)) & fx.Int32(3)),
+                        fx.as_ir_value(fx.Int32(0)),
                     )
                 )
                 _lse_off = fx.Index(
@@ -2111,7 +2111,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # `l` is deliberately *not* scaled -- it is the undropped sum,
                 # and the logsumexp written below is the undropped one, which
                 # is what the backward pass needs.
-                inv_l = _raw(fastmath.mul(fx.Float32(inv_l), dropout_scale))
+                inv_l = fx.as_ir_value(fastmath.mul(fx.Float32(inv_l), dropout_scale))
             inv_l_vec = (
                 Vec.from_elements([inv_l], fx.Float32).broadcast_to(8).ir_value()
             )
