@@ -73,10 +73,10 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import scf as _scf
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import ArithValue, _to_raw
-from gfx1201_standalone import utils as common_utils
+from gfx1201_standalone import buffer_ops, utils as common_utils
 
 __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
            "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8",

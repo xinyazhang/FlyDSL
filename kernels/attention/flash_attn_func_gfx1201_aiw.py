@@ -100,7 +100,6 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
-    buffer_ops,
     const_expr,
     gpu,
     range_constexpr,
@@ -111,7 +110,7 @@ import fmha_common_gfx1201 as fmha
 from philox import Philox, dropout_threshold
 from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
 
-from gfx1201_standalone import utils as common_utils, wmma_ops
+from gfx1201_standalone import buffer_ops, utils as common_utils, wmma_ops
 
 from dataclasses import fields
 
