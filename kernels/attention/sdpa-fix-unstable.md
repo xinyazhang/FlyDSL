@@ -1,5 +1,9 @@
 # Plan: reduce the gfx1201 SDPA kernel's unstable-API surface
 
+**Status: executed, `3f051d01..d0976d2a`, eight commits.** Every P1-P4 item
+landed except the two explicitly scoped to other owners. Unstable call sites in
+the two gfx1201 files went **146 -> 52**; see §9.
+
 Derived from the `api-stability` consumer audit against `docs/api_stability.md`
 at v0.3.0. **Revised after the `Aperture` refactor** (`sdpa-common-preload-
 executive.md`, `a40cd565..aed002ab`), which moved most of the memory-access
@@ -263,3 +267,89 @@ Gate configs, dump procedure and the three ISA-comparison rules are in
 `api-stability` skill at the end and record the delta in unstable **call
 sites**, which is the number this plan is trying to move: 54 `_to_raw` + 19
 `ArithValue` + 5 `FastMath` builders is the bulk of it.
+
+---
+
+## 9. Outcome
+
+| unstable use                                         | before | after |
+| ---------------------------------------------------- | -----: | ----: |
+| `_to_raw` / `_raw`                                   |     54 |     0 |
+| `ArithValue`                                         |     19 |     0 |
+| `arith.CmpIPredicate`                                |      6 |     0 |
+| `arith.andi` / `ori`                                 |      6 |     0 |
+| `arith.addf/subf/mulf/divf`, `MaxNumFOp`             |      5 |     0 |
+| deprecated (`index_cast`, `.shrui`, `.shuffle_xor`)  |      6 |     0 |
+| private-field write                                  |      1 |     0 |
+| `arith.addi`                                         |      3 |     3 |
+| `llvm.*` ops                                         |      8 |     7 |
+| `scf.*` ops                                          |      6 |     6 |
+| raw `ir.*`                                           |     32 |    32 |
+| `rocdl.*` ops                                        |      4 |     4 |
+| **total**                                            |    146 |    52 |
+
+Counted over `fmha_common_gfx1201.py` and `flash_attn_func_gfx1201_aiw.py`
+with comments and docstrings stripped, so the prose *about* unstable APIs is
+not counted as a use of one. **No v0.4 deprecation remains in either file.**
+
+392 tests pass. Every step was bitwise-gated and only one moved an
+instruction: `_dead | (...)` emits `v_or_b32 v97, v0, v97` where the
+hand-built `arith.ori` emitted `v97, v97, v0`. OR is commutative and the
+opcode histogram, register counts and scratch all match. The full ladder
+against `a40cd565` (which also includes the whole `Aperture` refactor) has a
+worst point of 0.990.
+
+### 9.1 What is left, and why
+
+- **`raw ir.*` (32)** is the largest remaining block and the least like the
+  others. 24 of them are `ir.StringAttr` / `ir.ArrayAttr` / `ir.IntegerAttr`
+  in the aiw kernel, building MLIR *attributes* by name -- `rocdl.WAVES_PER_EU`,
+  `amdgpu-flat-work-group-size`. That is not an API call with a stable
+  spelling to switch to; it is a dependency on MLIR attribute names, and
+  removing it needs FlyDSL to expose those launch bounds as first-class knobs.
+  The rest are `ir.F32Type.get()` and `ir.Type.parse`.
+- **`scf.*` (6) and `llvm.*` (7)** are contained by design, in `_over_batches`,
+  `publish_transposed`, `write_v8`, `cond_load`, `lds_f32_*` and
+  `pointer_to_llvm_ptr`. `lds_f32_*` needs the raw load/store because it
+  aliases f32 scratch over the 16-bit KV tile and there is no retyped view of
+  a shared pointer.
+- **`arith.addi` (3)** is pointer arithmetic inside `global_load_tr_v8` and
+  `lds_f32_ptr`, both already contained.
+- **`rocdl.*` (4)** are `log`, `exp2` and the RDNA transpose load. No stable
+  equivalent.
+
+### 9.2 Deliberately not done
+
+- **`kernels/common/mem_ops.py:66`** still has a v0.4 `index_cast`. It is
+  shared with GEMM and MoE; the one-line fix is `fx.Int64(x)`, verified here,
+  but the edit belongs to that file's owner. **This one has a deadline** --
+  raise it.
+- **`pa_metadata.py`** keeps its `maximumf` and `constant_vector`, same
+  deadline, same reason.
+- **`kernels/common/tensor_shim.py`** keeps `exe._cf`, and this is a stronger
+  "no" than the other two. There `_cf` is a de-facto public contract:
+  `tests/kernels/test_rmsnorm.py` asserts on `launcher._cf` in five places and
+  `kernels/norm/rmsnorm_kernel.py` documents it. Changing it needs a CDNA box
+  and its owner.
+
+### 9.3 Two findings worth keeping
+
+**The `_cf` cache is worth 157 us, not zero.** P3 opened with "check whether
+`flyc.compile` already caches, making the wrapper redundant". It does --
+`JitFunction._mem_cache`, keyed on the full argument signature -- so the
+tempting conclusion was to delete the wrapper. Measured against a plain
+`exe(*args)`: 63 us versus 227 us at (head_dim 64, N 512), 3.5x. The cache is
+about dispatch overhead, not recompilation, and only its *storage* was the
+problem.
+
+**Gate `FastMath` on the MLIR, not the ISA.** The risk there was a dropped or
+widened fastmath flag, which the ISA shows only indirectly. `00_origin.mlir`
+is byte-identical, with 169 float ops carrying the same flag set, and all
+three `fp_mode`s were checked by hand because none has test coverage:
+
+    noninf  fastmath<reassoc,nnan,nsz,arcp,contract,afn>   (default)
+    fast    fastmath<fast>
+    safe    fastmath<reassoc,nsz,arcp,contract,afn>
+
+"fast" carries `ninf`, which once silently deleted the KV tail mask, so a
+quiet widening there would be a correctness bug no test would catch.
