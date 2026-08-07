@@ -1164,21 +1164,22 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
         # ---- K staging ----
 
+        def fetch_k(start_k):
+            """`(row, col) -> one K vector`, for the aperture's masked reads."""
+            def read(row, col):
+                b64, o32 = k_addr(start_k, row, col)
+                return load_global_f16xN(k_ptr, b64, o32)
+            return read
+
         def coop_load_k_global(start_k):
             """Issue this thread's K global loads; results stay in registers."""
-            vecs = []
-            for batch in range_constexpr(k_ap.num_batches):
-                b64, o32 = k_addr(
-                    start_k, k_ap.batch_row(load_row_in_batch, batch),
-                    qk_cols.safe(load_col_base),
+            read = fetch_k(start_k)
+            return [
+                k_ap.read_vec(
+                    read, k_ap.batch_row(load_row_in_batch, batch), load_col_base
                 )
-                vecs.append(
-                    qk_cols.discard(
-                        load_global_f16xN(k_ptr, b64, o32),
-                        load_col_base, k_ap.vec_width,
-                    )
-                )
-            return vecs
+                for batch in range_constexpr(k_ap.num_batches)
+            ]
 
         def coop_store_k_lds(vecs):
             # A local alias; see `coop_load_store_k` below for why.
@@ -1216,32 +1217,21 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # path, which never runs that `if`. Binding a local before the
             # branch is the fix `ast_rewriter._check_local_var` recommends.
             ap = k_ap
+            read = fetch_k(start_k)
             for batch in range_constexpr(ap.num_batches):
                 lds_row = ap.batch_row(load_row_in_batch, batch)
                 if const_expr(ap.needs_guard):
                     row_valid = lds_row < fx.Index(BLOCK_N)
                     if row_valid:
-                        b64, o32 = k_addr(
-                            start_k, lds_row, ap.cols.safe(load_col_base)
-                        )
                         ap.to_lds(
                             lds_kv,
-                            ap.cols.discard(
-                                load_global_f16xN(k_ptr, b64, o32),
-                                load_col_base, ap.vec_width,
-                            ),
+                            ap.read_vec(read, lds_row, load_col_base),
                             lds_row, load_col_base, ap.vec_width,
                         )
                 else:
-                    b64, o32 = k_addr(
-                        start_k, lds_row, ap.cols.safe(load_col_base)
-                    )
                     ap.to_lds(
                         lds_kv,
-                        ap.cols.discard(
-                            load_global_f16xN(k_ptr, b64, o32),
-                            load_col_base, ap.vec_width,
-                        ),
+                        ap.read_vec(read, lds_row, load_col_base),
                         lds_row, load_col_base, ap.vec_width,
                     )
 
@@ -1277,6 +1267,17 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
             Columns are relative to the V/O window, so D_OFFSET is added here
             and only here -- LDS indices stay window-relative.
+
+            **`safe` but no `discard`, on either arm** -- so this does not go
+            through `Aperture.read_vec` the way K does. Under PADDED_HEAD the
+            columns past hdim_vo do load garbage, but V reaches only O, and an
+            O column past hdim_vo is dropped by the epilogue store. Zeroing it
+            would be work with no reader. The *address* still has to be
+            redirected, which is what `safe` is doing.
+
+            The transposed arm could not discard per element anyway: after the
+            8x8 transpose a lane's vector runs along kv, not d, so all 8
+            elements share one column and the mask would be whole-vector.
             """
             vecs = []
             if const_expr(V_TRANSPOSED):
@@ -1291,7 +1292,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         col = fx.Index(D_OFFSET) + col
                     b64, o32 = v_addr(
                         start_k, kv_base + _tr_kv_off,
-                        vo_cols.safe(col),
+                        v_ap.cols.safe(col),
                     )
                     vecs.append(fmha.global_load_tr_v8(v_ptr_i64, b64, o32, v8f16_type))
             else:
@@ -1301,7 +1302,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         col = fx.Index(D_OFFSET) + col
                     b64, o32 = v_addr(
                         start_k, v_ap.batch_row(v_row_in_batch, batch),
-                        vo_cols.safe(col),
+                        v_ap.cols.safe(col),
                     )
                     vecs.append(load_global_f16xN(v_ptr, b64, o32))
             return vecs

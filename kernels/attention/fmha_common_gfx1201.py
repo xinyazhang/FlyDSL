@@ -495,6 +495,19 @@ class Aperture:
         zeros = Vec.filled(8, 0.0, self.cols.elem_dtype).ir_value()
         return ArithValue(row_ok).select(raw, zeros)
 
+    def read_vec(self, fetch, row, col):
+        """One cooperative-load vector at (row, col), columns masked.
+
+        No row gate, unlike `read_v8`: for a tensor staged through LDS the
+        row bound lives in the address closure, which redirects an
+        out-of-range row to a live one rather than discarding it. What lands
+        in LDS is then garbage from a real row, and the S mask -- not this --
+        is what keeps it out of the answer.
+        """
+        return self.cols.discard(
+            fetch(row, self.cols.safe(col)), col, self.vec_width
+        )
+
     # ---- carry protocol; see the module docstring ----
 
     def __get_ir_types__(self):
