@@ -76,7 +76,7 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import scf as _scf
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector as Vec
-from gfx1201_standalone import buffer_ops, kernels_common, utils as common_utils
+from gfx1201_standalone import kernels_common, utils as common_utils
 
 __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
            "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8",
@@ -882,17 +882,39 @@ def cond_load(cond, addr, default):
     """
     if_op = _scf.IfOp(fx.as_ir_value(cond), results_=[T.i32], has_else=True)
     with ir.InsertionPoint(if_op.then_block):
-        _scf.YieldOp([_llvm.LoadOp(T.i32, addr).result])
+        _scf.YieldOp([fx.as_ir_value(fx.ptr_load(addr, fx.Int32))])
     with ir.InsertionPoint(if_op.else_block):
         _scf.YieldOp([fx.as_ir_value(default)])
     return fx.Int32(if_op.results[0])
 
 
-def seqinfo_addr(ptr, index):
-    """`&ptr[index]` for an i32 sequence-info array. No memory is touched."""
-    return buffer_ops.get_element_ptr(
-        pointer_to_llvm_ptr(ptr), fx.Int64(index), elem_type=T.i32
+def _i32_global_ptr_ty():
+    """An i32 pointer into global memory, alignment 4.
+
+    Spelled out rather than `fx.recast_iter(fx.Int32, ptr)`, which inherits the
+    source pointer's alignment: a kernel argument arrives as `u8` with
+    alignment 1, and the shorthand then raises "alignment must be a positive
+    multiple of element byte size (4), got 1". Same construction as
+    `kernels/moe/moe_a8w4_mxscale_gfx1250.py` and
+    `kernels/gemm/mxfp4_preshuffle.py`.
+
+    A function, not a module constant: `PointerType.get` needs an MLIR context,
+    and at import time there is none.
+    """
+    return fx.PointerType.get(
+        elem_ty=fx.Int32.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=4,
     )
+
+
+def seqinfo_addr(ptr, index):
+    """`&ptr[index]` for an i32 sequence-info array. No memory is touched.
+
+    A typed `!fly.ptr`, not an `!llvm.ptr`: that is what lets `cond_load` read
+    it with the stable `fx.ptr_load` instead of a raw `llvm.LoadOp`.
+    """
+    return fx.recast_iter(_i32_global_ptr_ty(), ptr) + fx.Int64(index)
 
 
 def decode_addressing(varlen_bits, bits_shift, max_seqlen, s0, s1, z, num_seqlens):
