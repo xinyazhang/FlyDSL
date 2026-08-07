@@ -2137,6 +2137,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 )
 
         # ---- Normalize and store O ----
+        # O's aperture: same columns as V, same rows as Q, and never staged.
+        o_ap = fmha.Aperture(vo_cols, rows=q_ap.rows)
+
+        def write_o(row, col, val):
+            _store_global_half(o_ptr, o_tbase(start_q), o_toff(row, col), val)
+
         for qt in range_constexpr(ROW_SUBTILES):
             l_final = loop_results[2 * qt + 1]
             # A row can legitimately see *no* keys: bottom-right causal with
@@ -2173,27 +2179,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         d_col = fx.Index(vc * VO_CHUNK_COLS) + d_col
                     if const_expr(D_OFFSET):
                         d_col = fx.Index(D_OFFSET) + d_col
-                    # The store is 8 columns wide, so under PADDED_HEAD its
-                    # last chunk can straddle hdim_vo. Only whole-chunk
-                    # skipping is available for a store, and that is exact
-                    # here: O is the caller's tensor, whose D pitch is a
-                    # 16-byte multiple, so columns in [hdim_vo,
-                    # ceil8(hdim_vo)) lie inside O's own allocation. They
-                    # receive computed-but-unused values, mirroring the pad
-                    # region of the inputs, which the caller slices off.
-                    def _emit_o_store():
-                        _store_global_half(
-                            o_ptr,
-                            o_tbase(start_q),
-                            o_toff(q_rows_in_tile[qt], d_col),
-                            o_trunc,
-                        )
-
-                    if const_expr(PADDED_HEAD):
-                        if d_col < _hdim_vo_i:
-                            _emit_o_store()
-                    else:
-                        _emit_o_store()
+                    fmha.write_v8(
+                        o_ap, write_o, q_rows_in_tile[qt], d_col, o_trunc
+                    )
 
     @flyc.jit
     def launch_flash_attn_aiw(

@@ -80,7 +80,7 @@ from gfx1201_standalone import buffer_ops, kernels_common, utils as common_utils
 __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
            "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8",
            "FastMath", "MaskedAxis", "Aperture",
-           "stage", "publish",
+           "stage", "publish", "write_v8",
            "lds_f32_ptr", "lds_f32_store", "lds_f32_load",
            "reduce_s_across_shards",
            "cond_load", "seqinfo_addr", "decode_addressing", "lse_token_pitch",
@@ -599,6 +599,33 @@ def publish(aperture, lds_ptr, vecs, base_row, col, block_rows):
         aperture.to_lds(lds_ptr, vecs[batch], row, col, aperture.vec_width)
 
     _over_batches(aperture, base_row, block_rows, body)
+
+
+def write_v8(aperture, write, row, col, val):
+    """Store one 8-wide chunk at (row, col), skipped if `col` is past `hdim`.
+
+    Whole-chunk skipping rather than per-element masking, and that is exact
+    rather than a compromise: the output's D pitch is a 16-byte multiple, so
+    a chunk that straddles `hdim` lies entirely inside the tensor's own
+    allocation. Columns in [hdim, ceil8(hdim)) receive computed-but-unused
+    values, mirroring the pad region of the inputs, which the caller slices
+    off. `col` is therefore *not* redirected the way a load's is -- inside the
+    guard it is already in range.
+
+    A free function and not an `Aperture` method, like `stage` and `publish`
+    and unlike `read_v8`: anything that emits a branch has to build the
+    `scf.IfOp` itself, which only module-level code may do. Writing
+    `fmha.write_v8(ap, ...)` also keeps `ap` out of
+    `_collect_assigned_vars` -- `ap.write_v8(...)` inside a dynamic `if`
+    would be collected as region state and make the enclosing `scf.if` yield
+    the aperture back.
+    """
+    if not aperture.cols.active:
+        write(row, col, val)
+        return
+    if_op = _scf.IfOp(_to_raw(aperture.cols.valid(col)))
+    with kernels_common._if_then(if_op):
+        write(row, col, val)
 
 
 # --------------------------------------------------------------------------
