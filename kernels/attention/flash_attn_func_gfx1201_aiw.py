@@ -805,7 +805,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         elem_dtype = elem_numeric_cls
 
         def _to_global_ptr_i64(ptr):
-            return arith.index_cast(T.i64, fx.ptrtoint(ptr))
+            return _raw(fx.Int64(fx.ptrtoint(ptr)))
 
         q_ptr = fmha.pointer_to_llvm_ptr(Q)
         k_ptr = fmha.pointer_to_llvm_ptr(K)

@@ -121,8 +121,8 @@ def pointer_to_llvm_ptr(ptr) -> ir.Value:
     for a thing that is not there. They would stay pointers and keep needing
     this.
     """
-    ptr_i64 = arith.index_cast(T.i64, fx.ptrtoint(ptr))
-    return _llvm.IntToPtrOp(llvm_ptr_ty(), ptr_i64).result
+    ptr_i64 = fx.Int64(fx.ptrtoint(ptr))
+    return _llvm.IntToPtrOp(llvm_ptr_ty(), _to_raw(ptr_i64)).result
 
 
 # --------------------------------------------------------------------------
@@ -179,8 +179,8 @@ def global_load_tr_v8(base_i64, base64, off32, v8_type):
     `stride_seq = 8388608`, whose 256th row is exactly 2**31. Narrowing it
     wrapped and read another allocation.
     """
-    base_bytes = arith.index_cast(T.i64, _to_raw(fx.Index(base64) * 2))
-    off_bytes = arith.index_cast(T.i64, _to_raw(fx.Index(off32) * 2))
+    base_bytes = _to_raw(fx.Int64(fx.Index(base64) * 2))
+    off_bytes = _to_raw(fx.Int64(fx.Index(off32) * 2))
     addr = arith.addi(arith.addi(base_i64, base_bytes), off_bytes)
     p = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), addr).result
     return rocdl.global_load_tr_b128(v8_type, p)
