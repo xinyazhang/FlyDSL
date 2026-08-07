@@ -50,6 +50,10 @@ worth doing as a shared routine rather than a Q-shaped one.
 
 ## 3. The interface
 
+Named `LoadedTile` / `load_tile`, not `Preloaded*`: "pre-" describes *when the
+caller runs it* -- before the KV loop -- which is the caller's business and not
+true of every use. `bwd_inner_dq` loads its operands inside the loop.
+
 The forward Q preload today is 40 lines producing four values, two of which
 are consumed 1000 lines away (`q_row_i32s` in the causal mask,
 `q_in_bounds_all` in the epilogue store). A naive extraction would take ten
@@ -60,20 +64,31 @@ The fix is to return **one object** and to stop returning what the caller can
 recompute:
 
     @dataclass(frozen=True, slots=True)
-    class PreloadedTile:
-        packs: list          # [row_tile][k_step] -> WMMA operand, masked
-        rows: list           # absolute row per row-tile, fx.Index
-        rows_i32: list       # the i32 copy, for masks that want signed
-        in_bounds: list      # per row-tile i1
+    class LoadedTile:
+        packs: list[list[fx.Vector]]  # [row_tile][k_step], masked WMMA operand
+        rows: list[fx.Index]          # absolute row per row-tile
+        rows_i32: list[fx.Int32]      # the same rows, signed, for the mask
+        in_bounds: list[ArithValue]   # i1 per row-tile
 
-    def preload_tile(
+    def load_tile(
         ptr, tile_base, toff, *,        # from make_addr_pair
         rows_axis, cols_axis,           # two MaskedAxis
-        rows, rows_in_tile,             # per row-tile, caller-computed
+        rows, rows_in_tile,             # list[fx.Index], caller-computed
         col_base, k_steps, k_step,      # column walk
         elem_dtype, width=8,
         transposed=False,
-    ) -> PreloadedTile
+    ) -> LoadedTile
+
+The types were read off a traced build rather than inferred. **`rows` and
+`rows_i32` are the same numbers at two widths, and both are needed**:
+addressing wants the 64-bit `fx.Index`, because `toff` multiplies it by
+`stride_seq` and that product does not fit in 32 bits on a non-compact tensor;
+the causal mask wants the signed `fx.Int32`, because `fx.Index` is unsigned and
+a negative bound would compare as enormous. Neither can be dropped in favour of
+a cast at the point of use -- see the live-range note below.
+
+`in_bounds` is an `ArithValue` and not a raw `ir.Value` because `MaskedAxis.valid`
+returns one; `packs` is `fx.Vector` because the masking select does.
 
 `rows` and `rows_in_tile` stay caller-computed: they encode the wave-to-row
 mapping, which is a *schedule* decision (`Q_ROW_TILES`, `wave_q_offset`,
@@ -94,7 +109,7 @@ Every one of these is a rule already paid for elsewhere in the session:
 - **No dynamic `if`.** The routine may branch only on `const_expr` values.
   The Q preload qualifies: its only conditionals are over `PADDED_HEAD` and
   the tile counts.
-- **No Python object live across an `scf.if`.** `PreloadedTile` is returned
+- **No Python object live across an `scf.if`.** `LoadedTile` is returned
   and unpacked immediately, like `CausalRegions`. The `MaskedAxis` arguments
   arrive as *factory calls* at the call site, not as captured variables.
 - **`width` is per-access, not per-axis.** The Q preload is 8 wide because
@@ -127,7 +142,7 @@ the live-range constraint in §3 has been violated and the fix is to move the
 Three commits, because the first two are mechanical and the third is where the
 risk is:
 
-1. `PreloadedTile` + `preload_tile` in the module, forward Q switched to it.
+1. `LoadedTile` + `load_tile` in the module, forward Q switched to it.
 2. Fold the K/V cooperative loads onto the same routine *if* they fit -- they
    differ by using LDS staging rather than register packing, so this may turn
    out to be a different routine that shares only `MaskedAxis`. Decide after
