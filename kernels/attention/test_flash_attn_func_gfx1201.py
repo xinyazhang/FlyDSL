@@ -209,11 +209,11 @@ def test_builder_rejects_unsupported_head_dim():
         )
 
 
-# The m32 variant gives each wave two Q row-tiles so one K/V operand feeds two
+# The m32 variant gives each wave two Q row sub-tiles so one K/V operand feeds two
 # WMMAs; BLOCK_M is unchanged and the wave count per workgroup halves. Allowed
 # up to head_dim 80 -- past that the doubled per-wave state exceeds the
 # 256-VGPR cap and spills. Whether it is *faster* is shape-dependent; see the
-# table at `_Q_ROW_TILES_2_HEAD_DIMS` in the interface.
+# table at `_ROW_SUBTILES_2_HEAD_DIMS` in the interface.
 _M32_SHAPES = [
     (1, 512, False, torch.float16),
     (2, 1024, False, torch.float16),
@@ -232,7 +232,7 @@ def test_m32_matches_sdpa(shape):
     _require_env()
     batch, seq, causal, dtype = shape
     q, k, v = _qkv(batch, seq, _NUM_HEADS, 64, dtype)
-    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, knobs=FmhaKnobs(q_row_tiles=2))
+    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, knobs=FmhaKnobs(row_subtiles=2))
     torch.cuda.synchronize()
     assert out.shape == q.shape and out.dtype == q.dtype
     rel, cos = _compare(out, _reference(q, k, v, causal))
@@ -245,7 +245,7 @@ def test_m32_rejects_head_dim_128():
     _require_env()
     q, k, v = _qkv(1, 256, _NUM_HEADS, 128, torch.float16)
     with pytest.raises(ValueError, match="head_dim <= 80"):
-        flydsl_flash_attn_func_gfx1201(q, k, v, causal=False, knobs=FmhaKnobs(q_row_tiles=2))
+        flydsl_flash_attn_func_gfx1201(q, k, v, causal=False, knobs=FmhaKnobs(row_subtiles=2))
 
 
 @pytest.mark.parametrize("head_dim", [16, 32, 48, 80])
@@ -258,7 +258,7 @@ def test_m32_accepted_below_the_spill_bound(head_dim):
     """
     _require_env()
     q, k, v = _qkv(1, 512, _NUM_HEADS, head_dim, torch.float16)
-    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=True, knobs=FmhaKnobs(q_row_tiles=2))
+    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=True, knobs=FmhaKnobs(row_subtiles=2))
     torch.cuda.synchronize()
     rel, cos = _compare(out, _reference(q, k, v, True))
     assert rel < _REL_TOL[torch.float16], f"max rel err {rel:.3e}"

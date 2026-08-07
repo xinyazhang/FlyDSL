@@ -48,7 +48,7 @@ _REPO = os.path.dirname(os.path.dirname(_HERE))
 
 # Tier 2.9: the fast screen. One sequence length, one masking mode, the head
 # dims that production actually uses plus the two that are structurally
-# interesting -- 80 is the only width taking q_row_tiles=2, 192 is the one that
+# interesting -- 80 is the only width taking row_subtiles=2, 192 is the one that
 # spills. Causal coverage is deliberately absent; that is what tier 3 is for.
 FAST_HEAD_DIMS = (64, 80, 128, 192, 256)
 FAST_N = 4096

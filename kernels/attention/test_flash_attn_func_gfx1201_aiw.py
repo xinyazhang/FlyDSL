@@ -843,8 +843,8 @@ def test_shard_resolution_respects_narrow_window():
             assert head_dim % s == 0 and (head_dim // s) % 16 == 0, (head_dim, vo, s)
 
 
-def test_block_m_is_invariant_to_q_row_tiles():
-    """q_row_tiles must change the wave count, not BLOCK_M.
+def test_block_m_is_invariant_to_row_subtiles():
+    """row_subtiles must change the wave count, not BLOCK_M.
 
     At 2, the same rows are covered by half as many waves each doing twice the
     work. If BLOCK_M doubled instead, per-wave register pressure would double on
@@ -854,10 +854,10 @@ def test_block_m_is_invariant_to_q_row_tiles():
     for head_dim in (64, 128):
         assert aiw_block_m(head_dim, 1) == aiw_block_m(head_dim, 1)
     exe1 = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16", q_row_tiles=1
+        num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16", row_subtiles=1
     )
     exe2 = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16", q_row_tiles=2
+        num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16", row_subtiles=2
     )
     assert exe1 is not exe2  # distinct builds, same BLOCK_M by construction
 
@@ -868,8 +868,8 @@ def test_block_m_is_invariant_to_q_row_tiles():
         (dict(head_dim=100), "BLOCK_DMODEL"),
         (dict(head_dim=128, block_n=64, causal=True), "BLOCK_N"),
         (dict(head_dim=128, v_lds_layout="row", shards=2), "cross-shard"),
-        (dict(head_dim=64, q_row_tiles=2, shards=2), "untested"),
-        (dict(head_dim=64, q_row_tiles=3), "Q_ROW_TILES"),
+        (dict(head_dim=64, row_subtiles=2, shards=2), "untested"),
+        (dict(head_dim=64, row_subtiles=3), "ROW_SUBTILES"),
         (dict(head_dim=128, k_prefetch_dist=2), "K_PREFETCH_DIST"),
         (dict(head_dim=128, v_prefetch_dist=2), "V_PREFETCH_DIST"),
         (dict(head_dim=128, head_dim_v=24), "BLOCK_DMODEL_V"),

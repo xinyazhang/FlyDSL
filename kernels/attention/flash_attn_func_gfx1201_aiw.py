@@ -9,7 +9,7 @@ so neither was usable. Please do not "fix" the spelling.
 
 This module unifies three previously separate gfx1201 kernels --
 ``flash_attn_func_gfx1201.py`` (baseline), ``..._bp.py`` (binding prefetch) and
-``..._m32.py`` (two Q row-tiles per wave) -- which were never three designs.
+``..._m32.py`` (two Q row sub-tiles per wave) -- which were never three designs.
 They were one design at three points in a knob space, plus drift. Each knob
 below is a ``const_expr`` switch resolved at trace time, so a given build emits
 exactly one variant's code with no runtime branching.
@@ -18,7 +18,7 @@ exactly one variant's code with no runtime branching.
     ---------------------------------------------------------------
     K_PREFETCH_DIST   0             1              1
     V_LDS_LAYOUT      "row"         "transposed"   "transposed"
-    Q_ROW_TILES       1             1              2
+    ROW_SUBTILES      1             1              2
     QK_SHARDS         1             bp_qk_shards() 1
     VO_CHUNKS         1             vo_chunks()    1
     VO_WIDTH          slice of D    head_dim       head_dim
@@ -57,13 +57,13 @@ scalar LDS reads per operand. ``"transposed"`` stages V^T[d][kv] filled with
 store stays contiguous instead of becoming a 16-way scatter. Worth +2.7% at
 N >= 4096.
 
-``Q_ROW_TILES`` -- Q row-tiles owned by each wave. At 2, one K or V operand
+``ROW_SUBTILES`` -- Q row sub-tiles owned by each wave. At 2, one K or V operand
 feeds two WMMAs instead of one (halving LDS reads per FLOP) and BLOCK_M
 doubles, halving the grid and with it K/V global traffic. Costs
 ``o_accs + q_b_packs + s_accs`` VGPRs, which scales with head_dim: +64 at
 head_dim 64 (fine), +112 at 128 (hits the 256-VGPR cap and spills, -27%).
 
-``QK_SHARDS`` -- waves cooperating on one Q row-tile, each reducing over its
+``QK_SHARDS`` -- waves cooperating on one Q row sub-tile, each reducing over its
 own head_dim slice in GEMM1 and owning the matching V/O column slice in GEMM2.
 Their partial S values are summed through LDS. Lets large head_dim spread its
 register cost across waves.
@@ -225,7 +225,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     V_LDS_LAYOUT = knobs.v_lds_layout
     STRIDES_CONSTEXPR = knobs.strides_constexpr
     PADDED_HEAD = knobs.padded_head
-    Q_ROW_TILES = knobs.q_row_tiles
+    ROW_SUBTILES = knobs.row_subtiles
     SHARDS = knobs.shards
     UNSAFE_FP_MATH = knobs.unsafe_fp_math
     FAST_FP_MATH = knobs.fast_fp_math
@@ -255,15 +255,15 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # KV columns spanned by one *pair* of S accumulators -- `2 * WMMA_N`.
     #
     # The pair, rather than the single accumulator, is the unit because it is
-    # where the two GEMMs meet. GEMM1 emits `NUM_S_ACCS = N_SUB_TILES * 2`
+    # where the two GEMMs meet. GEMM1 emits `NUM_S_ACCS = COL_SUBTILES * 2`
     # accumulators of `WMMA_N` columns each, and GEMM2 consumes the same span
-    # as `PV_K_STEPS = K_SUB_N // WMMA_K` steps of K. Both equal 2, so a
+    # as `PV_K_STEPS = COLS_PER_SUBTILE // WMMA_K` steps of K. Both equal 2, so a
     # sub-tile is exactly one GEMM1 output pair and one GEMM2 input pair.
     #
     # The mapping this implies is open-coded wherever accumulators are indexed
     # by column: accumulator `st` starts at KV column
-    # `(st // 2) * K_SUB_N + (st % 2) * WMMA_N`.
-    K_SUB_N = 2 * WMMA_N
+    # `(st // 2) * COLS_PER_SUBTILE + (st % 2) * WMMA_N`.
+    COLS_PER_SUBTILE = 2 * WMMA_N
 
     # K elements each lane holds of a WMMA A/B operand.
     #
@@ -290,12 +290,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     )
     V_TRANSPOSED = V_LDS_LAYOUT == "transposed"
 
-    ROWS_PER_WAVE = WMMA_M * Q_ROW_TILES
+    ROWS_PER_WAVE = WMMA_M * ROW_SUBTILES
 
     BLOCK_N = BLOCK_N_KNOB
 
-    N_SUB_TILES = BLOCK_N // K_SUB_N
-    NUM_S_ACCS = N_SUB_TILES * 2
+    COL_SUBTILES = BLOCK_N // COLS_PER_SUBTILE
+    NUM_S_ACCS = COL_SUBTILES * 2
     NUM_S_VALS = NUM_S_ACCS * 8
 
 
@@ -304,7 +304,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # (a staging pass's share of a window).
     VO_WIDTH = BLOCK_DMODEL_V
 
-    # Head-dimension sharding. QK_SHARDS waves cooperate on one Q row-tile,
+    # Head-dimension sharding. QK_SHARDS waves cooperate on one Q row sub-tile,
     # each reducing over its own BLOCK_DMODEL slice in GEMM1 and owning the matching
     # V/O column slice in GEMM2. QK_SHARDS == 1 is the unsharded kernel: every
     # sharded construct below is behind `const_expr(QK_SHARDS > 1)`.
@@ -312,7 +312,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # not inherit a shard count it cannot divide.
     if SHARDS is not None:
         QK_SHARDS = SHARDS
-    elif K_PREFETCH_DIST == 0 or Q_ROW_TILES > 1:
+    elif K_PREFETCH_DIST == 0 or ROW_SUBTILES > 1:
         QK_SHARDS = 1
     else:
         QK_SHARDS = resolve_shards(BLOCK_DMODEL, VO_WIDTH, BLOCK_N)
@@ -343,11 +343,13 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     assert V_LDS_LAYOUT in ("row", "transposed"), (
         f"V_LDS_LAYOUT must be 'row' or 'transposed', got {V_LDS_LAYOUT!r}"
     )
-    assert Q_ROW_TILES in (1, 2), f"Q_ROW_TILES must be 1 or 2, got {Q_ROW_TILES}"
+    assert ROW_SUBTILES in (1, 2), f"ROW_SUBTILES must be 1 or 2, got {ROW_SUBTILES}"
 
     # BLOCK_N. The power of two is load-bearing: `_sdiv_rd` in the kernel is an
     # arithmetic shift, which is only a floor-division when BLOCK_N is one.
-    assert BLOCK_N % K_SUB_N == 0, f"BLOCK_N ({BLOCK_N}) must be a multiple of K_SUB_N ({K_SUB_N})"
+    assert (
+        BLOCK_N % COLS_PER_SUBTILE == 0
+    ), f"BLOCK_N ({BLOCK_N}) must be a multiple of COLS_PER_SUBTILE ({COLS_PER_SUBTILE})"
     assert BLOCK_N & (BLOCK_N - 1) == 0, f"BLOCK_N ({BLOCK_N}) must be a power of two"
 
     # The V/output window, and how it divides.
@@ -379,14 +381,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         )
     if VO_CHUNKS > 1:
         assert V_PREFETCH_DIST, "chunked V staging requires V_PREFETCH_DIST=1"
-    if Q_ROW_TILES > 1:
-        assert QK_SHARDS == 1, "Q_ROW_TILES > 1 with qk_shards > 1 is untested; pick one"
+    if ROW_SUBTILES > 1:
+        assert QK_SHARDS == 1, "ROW_SUBTILES > 1 with qk_shards > 1 is untested; pick one"
     if causal:
         # The causal mask indexes s_accs as a flat 16, which an unrolled loop
         # over a longer list walks off the end of -- an IndexError at trace
         # time rather than a wrong answer. (Dies with the interval work.)
         assert NUM_S_VALS == 16, (
-            f"causal masking requires BLOCK_N == {K_SUB_N} (NUM_S_VALS == 16), "
+            f"causal masking requires BLOCK_N == {COLS_PER_SUBTILE} (NUM_S_VALS == 16), "
             f"got BLOCK_N={BLOCK_N} (NUM_S_VALS={NUM_S_VALS})"
         )
     # These combinations are not implemented rather than not expressible. Fail
@@ -404,21 +406,21 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         Q_TILES_PER_BLOCK = BLOCK_M // ROWS_PER_WAVE
         NUM_WAVES = Q_TILES_PER_BLOCK
     else:
-        # Keep the workgroup at TARGET_WAVES by trading Q row-tiles for SHARDS,
+        # Keep the workgroup at TARGET_WAVES by trading Q row sub-tiles for SHARDS,
         # so BLOCK_M shrinks as QK_SHARDS grows.
         #
-        # Divide by Q_ROW_TILES so BLOCK_M is *invariant* to that knob and only
-        # the wave count changes: at Q_ROW_TILES=2 the same rows are covered by
+        # Divide by ROW_SUBTILES so BLOCK_M is *invariant* to that knob and only
+        # the wave count changes: at ROW_SUBTILES=2 the same rows are covered by
         # half as many waves, each doing twice the work, which is the whole
         # point (one K/V operand feeds two WMMAs). Without the division a
-        # Q_ROW_TILES=2 build would silently double BLOCK_M as well, doubling
+        # ROW_SUBTILES=2 build would silently double BLOCK_M as well, doubling
         # per-wave register pressure on top of the knob's own cost.
         #
         # Note this is invisible to a bitwise output comparison -- each Q row's
         # arithmetic is identical however rows are grouped into blocks -- so
         # only the benchmark catches it.
         Q_TILES_PER_BLOCK = max(
-            1, q_tiles_per_block(BLOCK_DMODEL, QK_SHARDS) // Q_ROW_TILES
+            1, q_tiles_per_block(BLOCK_DMODEL, QK_SHARDS) // ROW_SUBTILES
         )
         BLOCK_M = ROWS_PER_WAVE * Q_TILES_PER_BLOCK
         NUM_WAVES = Q_TILES_PER_BLOCK * QK_SHARDS
@@ -449,7 +451,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     O_ACCS = VO_CHUNKS * D_CHUNKS           # accs live across the KV loop, per Q tile
 
     PV_K_STEP = WMMA_K
-    PV_K_STEPS = K_SUB_N // PV_K_STEP
+    PV_K_STEPS = COLS_PER_SUBTILE // PV_K_STEP
 
     if sm_scale is None:
         sm_scale = 1.0 / host_math.sqrt(BLOCK_DMODEL)
@@ -1325,16 +1327,17 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         )
 
         # ---- Q preload ----
-        # One row-tile per Q_ROW_TILES; at 1 this is the single-tile mapping.
+        # One row per row sub-tile; at ROW_SUBTILES == 1 this is the
+        # single-tile mapping.
         q_rows = [
             start_q + wave_q_offset + fx.Index(qt * WMMA_M) + lane16
-            for qt in range_constexpr(Q_ROW_TILES)
+            for qt in range_constexpr(ROW_SUBTILES)
         ]
         q_row_i32s = [fx.Int32(r) for r in q_rows]
         # Intra-tile Q rows, bounded by BLOCK_M so the 32-bit offset stays small.
         q_rows_in_tile = [
             wave_q_offset + fx.Index(qt * WMMA_M) + lane16
-            for qt in range_constexpr(Q_ROW_TILES)
+            for qt in range_constexpr(ROW_SUBTILES)
         ]
         # Rows are bounded by the real Q length; a workgroup's last tile can
         # hang past it. Unlike the column axes this is never inactive. A
@@ -1346,7 +1349,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
         q_in_bounds_all = []
         q_b_packs_all = []
-        for qt in range_constexpr(Q_ROW_TILES):
+        for qt in range_constexpr(ROW_SUBTILES):
             # The index-typed row, deliberately, not `q_row_i32s[qt]`. The i32
             # copy exists for the causal mask; testing against it here would
             # start its live range early, and at the widest causal builds that
@@ -1560,19 +1563,19 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _v_vecs_init = [_pf[_off + _i] for _i in range_constexpr(V_LOADS)]
 
         # Loop-carried state layout:
-        #   [0 .. 2*Q_ROW_TILES)             m/l per Q row-tile, interleaved
-        #   [_ML .. _ML + Q_ROW_TILES*O_ACCS) O accumulators per Q row-tile
+        #   [0 .. 2*ROW_SUBTILES)             m/l per Q row sub-tile, interleaved
+        #   [_ML .. _ML + ROW_SUBTILES*O_ACCS) O accumulators per Q row sub-tile
         #   [_OFF ..)                         K vectors (distance 1 only), then V
-        _ML = 2 * Q_ROW_TILES
-        _OFF = _ML + Q_ROW_TILES * O_ACCS
+        _ML = 2 * ROW_SUBTILES
+        _OFF = _ML + ROW_SUBTILES * O_ACCS
         _KOFF = _OFF
         _VOFF = _OFF + (NUM_BATCHES_K if K_PREFETCH_DIST else 0)
 
         init_args = []
-        for _ in range_constexpr(Q_ROW_TILES):
+        for _ in range_constexpr(ROW_SUBTILES):
             init_args.append(_raw(c_m_init))
             init_args.append(_raw(c_zero_f))
-        for _ in range_constexpr(Q_ROW_TILES * O_ACCS):
+        for _ in range_constexpr(ROW_SUBTILES * O_ACCS):
             init_args.append(_raw(c_zero_v8f32))
         if const_expr(K_PREFETCH_DIST):
             for batch in range_constexpr(NUM_BATCHES_K):
@@ -1593,14 +1596,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             disjoint runs, so it passes the piecewise successor explicitly --
             getting that wrong fetches the wrong tile and is invisible to a
             correctness test whenever the value is overwritten before use."""
-            m_run = [inner_iter_args[2 * qt] for qt in range_constexpr(Q_ROW_TILES)]
-            l_run = [inner_iter_args[2 * qt + 1] for qt in range_constexpr(Q_ROW_TILES)]
+            m_run = [inner_iter_args[2 * qt] for qt in range_constexpr(ROW_SUBTILES)]
+            l_run = [inner_iter_args[2 * qt + 1] for qt in range_constexpr(ROW_SUBTILES)]
             o_accs_all = [
                 [
                     inner_iter_args[_ML + qt * O_ACCS + i]
                     for i in range_constexpr(O_ACCS)
                 ]
-                for qt in range_constexpr(Q_ROW_TILES)
+                for qt in range_constexpr(ROW_SUBTILES)
             ]
             if const_expr(K_PREFETCH_DIST):
                 _k_vecs_cur = [
@@ -1629,19 +1632,19 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             k_base = k_buf_base(0)
 
             # ==== GEMM1: S = K @ Q^T ====
-            # At Q_ROW_TILES > 1 each K pack feeds every row-tile's S
-            # accumulators: one LDS read serves Q_ROW_TILES WMMAs. That reuse is
+            # At ROW_SUBTILES > 1 each K pack feeds every row sub-tile's S
+            # accumulators: one LDS read serves ROW_SUBTILES WMMAs. That reuse is
             # the point of the knob.
             s_accs_all = [
                 [_raw(c_zero_v8f32) for _ in range(NUM_S_ACCS)]
-                for _ in range_constexpr(Q_ROW_TILES)
+                for _ in range_constexpr(ROW_SUBTILES)
             ]
 
             for ks in range_constexpr(K_STEPS_QK):
                 k_col = shard_qk_off + fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
 
-                for st_idx in range_constexpr(N_SUB_TILES):
-                    st_base_row = st_idx * K_SUB_N
+                for st_idx in range_constexpr(COL_SUBTILES):
+                    st_base_row = st_idx * COLS_PER_SUBTILE
 
                     k_row_a = lane16 + fx.Index(st_base_row)
                     k_pack_a = fmha.lds_load_v8(lds_kv, k_base + k_row_a * K_STRIDE + k_col, v4f16_type)
@@ -1651,7 +1654,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
                     acc_idx_a = st_idx * 2
                     acc_idx_b = st_idx * 2 + 1
-                    for qt in range_constexpr(Q_ROW_TILES):
+                    for qt in range_constexpr(ROW_SUBTILES):
                         s_accs_all[qt][acc_idx_a] = wmma_acc(
                             k_pack_a, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_a]
                         )
@@ -1665,7 +1668,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # measured 54 vs 1055 WMMA-equivalents, see
             # kernels/microbench/lds_reduce.py.
             if const_expr(QK_SHARDS > 1):
-                for qt in range_constexpr(Q_ROW_TILES):
+                for qt in range_constexpr(ROW_SUBTILES):
                     s_accs_all[qt] = fmha.reduce_s_across_shards(
                         s_accs_all[qt],
                         lds_byte_base=_lds_byte_base,
@@ -1680,11 +1683,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         fastmath=fastmath,
                     )
 
-            # ==== Online softmax, per Q row-tile ====
-            # Each row-tile keeps its own running max/sum and its own O
+            # ==== Online softmax, per Q row sub-tile ====
+            # Each row sub-tile keeps its own running max/sum and its own O
             # accumulators.
             m_new_all, l_new_all, p_vals_all = [], [], []
-            for qt in range_constexpr(Q_ROW_TILES):
+            for qt in range_constexpr(ROW_SUBTILES):
                 s_accs = s_accs_all[qt]
                 q_row_i32 = q_row_i32s[qt]
                 m_running = m_run[qt]
@@ -1880,12 +1883,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 l_new_all.append(l_new)
                 p_vals_all.append(p_vals)
 
-            # ==== Build P packs, per Q row-tile ====
+            # ==== Build P packs, per Q row sub-tile ====
             p_packs_all_qt = []
-            for qt in range_constexpr(Q_ROW_TILES):
+            for qt in range_constexpr(ROW_SUBTILES):
                 p_vals = p_vals_all[qt]
                 p_packs_all = []
-                for st_idx in range_constexpr(N_SUB_TILES):
+                for st_idx in range_constexpr(COL_SUBTILES):
                     p_packs_st = []
                     for pks in range_constexpr(PV_K_STEPS):
                         acc_idx = st_idx * 2 + pks
@@ -1935,8 +1938,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # Software pipeline: preload the first V pack, then prefetch the
                 # next one while the current WMMA runs.
                 cur_v_packs = []
-                for st_idx in range_constexpr(N_SUB_TILES):
-                    cur_v_packs.append(_load_v(st_idx * K_SUB_N, 0, 0))
+                for st_idx in range_constexpr(COL_SUBTILES):
+                    cur_v_packs.append(_load_v(st_idx * COLS_PER_SUBTILE, 0, 0))
 
                 for pks in range_constexpr(PV_K_STEPS):
                     for dc in range_constexpr(D_CHUNKS):
@@ -1949,15 +1952,15 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
                         next_v_packs = []
                         if const_expr(has_next):
-                            for st_idx in range_constexpr(N_SUB_TILES):
+                            for st_idx in range_constexpr(COL_SUBTILES):
                                 next_v_packs.append(
-                                    _load_v(st_idx * K_SUB_N, next_pks, next_dc)
+                                    _load_v(st_idx * COLS_PER_SUBTILE, next_pks, next_dc)
                                 )
 
-                        # One V operand, Q_ROW_TILES WMMAs: this is what halves
-                        # the V LDS reads per FLOP at Q_ROW_TILES > 1.
-                        for st_idx in range_constexpr(N_SUB_TILES):
-                            for qt in range_constexpr(Q_ROW_TILES):
+                        # One V operand, ROW_SUBTILES WMMAs: this is what halves
+                        # the V LDS reads per FLOP at ROW_SUBTILES > 1.
+                        for st_idx in range_constexpr(COL_SUBTILES):
+                            for qt in range_constexpr(ROW_SUBTILES):
                                 o_accs_all[qt][_vc * D_CHUNKS + dc] = wmma_acc(
                                     cur_v_packs[st_idx],
                                     p_packs_all_qt[qt][st_idx][pks],
@@ -2001,10 +2004,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         gpu.barrier()
 
             _yield_args = []
-            for qt in range_constexpr(Q_ROW_TILES):
+            for qt in range_constexpr(ROW_SUBTILES):
                 _yield_args.append(m_new_all[qt])
                 _yield_args.append(l_new_all[qt])
-            for qt in range_constexpr(Q_ROW_TILES):
+            for qt in range_constexpr(ROW_SUBTILES):
                 for i in range_constexpr(O_ACCS):
                     _yield_args.append(o_accs_all[qt][i])
             if const_expr(K_PREFETCH_DIST):
@@ -2116,7 +2119,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # the store itself was still predicated: the values stay live across
         # the epilogue and lengthen it for every wave, including the ones that
         # never store and the whole kernel when L is null.
-        for qt in range_constexpr(Q_ROW_TILES):
+        for qt in range_constexpr(ROW_SUBTILES):
             _do_store = arith.andi(_lse_writer, _raw(q_in_bounds_all[qt]))
             if _do_store:
                 _m = loop_results[2 * qt]
@@ -2170,7 +2173,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 )
 
         # ---- Normalize and store O ----
-        for qt in range_constexpr(Q_ROW_TILES):
+        for qt in range_constexpr(ROW_SUBTILES):
             l_final = loop_results[2 * qt + 1]
             # A row can legitimately see *no* keys: bottom-right causal with
             # seqlen_q > seqlen_k leaves the leading seqlen_q - seqlen_k rows

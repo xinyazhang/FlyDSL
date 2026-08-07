@@ -90,16 +90,16 @@ def flydsl_flash_attn_func_gfx1201(
         schedule: ``None`` uses the measured tuning policy for this shape. An
             ``FmhaKnobs`` with some fields set pins those and lets policy
             resolve the rest -- and a pinned knob participates in deriving the
-            ones downstream of it, so ``FmhaKnobs(q_row_tiles=2)`` also
-            forces the prefetch distance two row-tiles require.
+            ones downstream of it, so ``FmhaKnobs(row_subtiles=2)`` also
+            forces the prefetch distance two row sub-tiles require.
 
             This replaces the former ``use_binding_prefetch`` and
             ``variant="m32"`` flags, which were the same idea spelled twice:
             ``use_binding_prefetch=True`` is ``FmhaKnobs(k_prefetch_dist=1)``
-            and ``variant="m32"`` is ``FmhaKnobs(q_row_tiles=2)``. Both now
+            and ``variant="m32"`` is ``FmhaKnobs(row_subtiles=2)``. Both now
             say what they do rather than naming a historical kernel variant.
             Whether either helps is strongly shape-dependent -- see the
-            ``_Q_ROW_TILES_2_HEAD_DIMS`` table in ``fmha_tuning_gfx1201``.
+            ``_ROW_SUBTILES_2_HEAD_DIMS`` table in ``fmha_tuning_gfx1201``.
 
     Returns:
         Output tensor with the same shape and dtype as ``q``.

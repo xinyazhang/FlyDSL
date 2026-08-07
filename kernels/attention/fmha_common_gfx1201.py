@@ -215,7 +215,7 @@ def bf16_trunc_pack_v8(f32_vals, elem_dtype):
     already at exact parity. Switching to round-to-nearest-even --
     `x += 0x7FFF + ((x >> 16) & 1)` before the shift -- closes that gap
     exactly (2.79e-3) but costs 2-3% at distance 1 and 2.7-5.4% at
-    Q_ROW_TILES=2, so it is deliberately not done. Truncation by
+    ROW_SUBTILES=2, so it is deliberately not done. Truncation by
     decision, not oversight.
     """
     _c16 = fx.Int32(16)
@@ -411,7 +411,7 @@ def reduce_s_across_shards(
     warp_size,
     fastmath,
 ):
-    """Sum one Q row-tile's S accumulators across the QK shards, through LDS.
+    """Sum one Q row sub-tile's S accumulators across the QK shards, through LDS.
 
     Each shard-wave holds a partial sum over its own slice of BLOCK_DMODEL;
     the full S is their sum. Returns the reduced accumulators, same shape in.

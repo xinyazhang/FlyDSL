@@ -158,12 +158,12 @@ def default_prefetch_dist(head_dim):
 
 
 def qk_shards(head_dim):
-    """Waves cooperating on one Q row-tile at this head_dim."""
+    """Waves cooperating on one Q row sub-tile at this head_dim."""
     return _SHARDS_BY_HEAD_DIM.get(head_dim, max(1, head_dim // 128))
 
 
 def q_tiles_per_block(head_dim, shards=None):
-    """Q row-tiles per workgroup: TARGET_WAVES traded against the shard count.
+    """Q row sub-tiles per workgroup: TARGET_WAVES traded against the shard count.
 
     The V transpose tiling does not have to divide evenly across the waves --
     tail tiles are guarded at the LDS store -- so this is otherwise free.
@@ -245,14 +245,14 @@ def default_block_n(head_dim, causal, prefetch_dist=None):
 _BP_MIN_HEAD_DIM = 48
 
 
-# Q row-tiles per wave. At 2, each wave owns two Q row-tiles, so one K or V
+# Q row sub-tiles per wave. At 2, each wave owns two of them, so one K or V
 # operand feeds two WMMAs. BLOCK_M is *unchanged* -- the kernel divides
 # Q_TILES_PER_BLOCK by this knob, see its comment -- so the grid is identical
 # and what halves is the wave count per workgroup. The trade is therefore
 # operand reuse per wave against waves available to hide latency with, which is
 # why the answer depends on the shape and not only on the width.
 #
-# Ratio of q_row_tiles=2 over 1, f16, B=1 H=8 across N in {512, 1024, 2048,
+# Ratio of row_subtiles=2 over 1, f16, B=1 H=8 across N in {512, 1024, 2048,
 # 4096, 8192} plus (B=4, N=512) and (B=2, N=1024), best of 5 alternating reps:
 #
 #   head_dim  causal    worst   best  |  head_dim  causal    worst   best
@@ -264,17 +264,17 @@ _BP_MIN_HEAD_DIM = 48
 #   48        either     0.94   1.06  |
 #
 # head_dim 80 is the only width that wins at *every* shape measured, so it is
-# the only one that takes two row-tiles by default. The rest are not left on
+# the only one that takes two row sub-tiles by default. The rest are not left on
 # the table by oversight. Their gains are real but jagged in N -- head_dim 32
 # causal is 0.92 at N=2048 and 1.33 at N=4096 -- and that is not a threshold to
 # key on: a policy fitted to that curve at one (B, H) would regress on every
 # shape it was not fitted to. `variant="m32"` remains for callers who have
 # measured their own shape. The full table is in `sdpa_lore_gfx1201.md`.
-_Q_ROW_TILES_2_HEAD_DIMS = frozenset({80})
+_ROW_SUBTILES_2_HEAD_DIMS = frozenset({80})
 
-# Two row-tiles double the per-wave o_accs + q_b_packs + s_accs. Past this width
-# that crosses the 256-VGPR cap and spills (-27% measured at head_dim 128).
-_Q_ROW_TILES_2_MAX_HEAD_DIM = 80
+# Two row sub-tiles double the per-wave o_accs + q_b_packs + s_accs. Past this
+# width that crosses the 256-VGPR cap and spills (-27% measured at head_dim 128).
+_ROW_SUBTILES_2_MAX_HEAD_DIM = 80
 
 
 # How the kernel forms the clamped KV address: hoist `row * stride_seq` out of
@@ -337,29 +337,29 @@ def _kv_addr_hoist(head_dim: int, causal: bool) -> bool:
     return head_dim in _KV_ADDR_HOIST_HEAD_DIMS
 
 
-def _q_row_tiles(head_dim: int, variant: str) -> int:
-    """Q row-tiles per wave: the tuning policy, or 2 where the caller forces it."""
+def _row_subtiles(head_dim: int, variant: str) -> int:
+    """Q row sub-tiles per wave: the tuning policy, or 2 where the caller forces it."""
     if variant == "m32":
-        if head_dim > _Q_ROW_TILES_2_MAX_HEAD_DIM:
+        if head_dim > _ROW_SUBTILES_2_MAX_HEAD_DIM:
             raise ValueError(
-                f"variant='m32' (q_row_tiles=2) requires head_dim <= "
-                f"{_Q_ROW_TILES_2_MAX_HEAD_DIM}, got {head_dim}"
+                f"variant='m32' (row_subtiles=2) requires head_dim <= "
+                f"{_ROW_SUBTILES_2_MAX_HEAD_DIM}, got {head_dim}"
             )
         return 2
-    return 2 if head_dim in _Q_ROW_TILES_2_HEAD_DIMS else 1
+    return 2 if head_dim in _ROW_SUBTILES_2_HEAD_DIMS else 1
 
 
 def _use_bp(head_dim: int, use_binding_prefetch: bool, variant: str) -> bool:
     """Whether K is staged one tile ahead.
 
-    Two row-tiles require it, so that case answers here rather than being
+    Two row sub-tiles require it, so that case answers here rather than being
     patched up afterwards. Keeping the coupling in one place matters beyond the
     knob dict: this result is also an `lru_cache` key for `_get_kernel` and the
     prefetch distance the caller feeds to `aiw_block_m`, and the three
     disagreeing is the kind of thing that stays latent until some head_dim makes
     `block_m` depend on the distance.
     """
-    if _q_row_tiles(head_dim, variant) == 2:
+    if _row_subtiles(head_dim, variant) == 2:
         return True
     return use_binding_prefetch or head_dim >= _BP_MIN_HEAD_DIM
 
@@ -374,7 +374,7 @@ def _aiw_knobs(head_dim: int, use_bp: bool, variant: str) -> dict:
     return {
         "k_prefetch_dist": dist,
         "v_lds_layout": "transposed" if dist else "row",
-        "q_row_tiles": _q_row_tiles(head_dim, variant),
+        "row_subtiles": _row_subtiles(head_dim, variant),
     }
 
 
@@ -461,7 +461,7 @@ class FmhaKnobs:
     k_prefetch_dist: int | None = None
     v_prefetch_dist: int | None = None
     v_lds_layout: str | None = None
-    q_row_tiles: int | None = None
+    row_subtiles: int | None = None
     waves_per_eu: int | None = None
     kv_addr_hoist: bool | None = None
 
@@ -541,14 +541,14 @@ def resolve_knobs(
     """The complete measured configuration for `meta`.
 
     The ordering below is the reason this function exists. `k_prefetch_dist`
-    feeds `block_n`, and `q_row_tiles` feeds `k_prefetch_dist`, so a caller
+    feeds `block_n`, and `row_subtiles` feeds `k_prefetch_dist`, so a caller
     assembling a schedule by hand has to know the dependency order to get the
     same answer -- and until now the interface was the thing that knew it.
 
     `overrides` is applied *first*, so a pinned knob participates in deriving
     the ones downstream of it rather than being stamped on afterwards. Pinning
-    `q_row_tiles=2` therefore also forces the prefetch distance it requires,
-    which is what a caller asking for two row-tiles means.
+    `row_subtiles=2` therefore also forces the prefetch distance it requires,
+    which is what a caller asking for two row sub-tiles means.
     """
     s = _KNOBS_FALLBACK.merge(overrides)
     # The compiled widths come first: everything below is keyed on the width
@@ -561,21 +561,21 @@ def resolve_knobs(
         s = replace(s, block_dmodel_v=meta.head_dim_v)
     hd = s.block_dmodel
 
-    if s.q_row_tiles is None:
-        s = replace(s, q_row_tiles=2 if hd in _Q_ROW_TILES_2_HEAD_DIMS else 1)
-    if s.q_row_tiles == 2 and hd > _Q_ROW_TILES_2_MAX_HEAD_DIM:
+    if s.row_subtiles is None:
+        s = replace(s, row_subtiles=2 if hd in _ROW_SUBTILES_2_HEAD_DIMS else 1)
+    if s.row_subtiles == 2 and hd > _ROW_SUBTILES_2_MAX_HEAD_DIM:
         raise ValueError(
-            f"q_row_tiles=2 requires head_dim <= {_Q_ROW_TILES_2_MAX_HEAD_DIM}, "
+            f"row_subtiles=2 requires head_dim <= {_ROW_SUBTILES_2_MAX_HEAD_DIM}, "
             f"got {hd}"
         )
     if s.kv_addr_hoist is None:
         s = replace(s, kv_addr_hoist=_kv_addr_hoist(hd, meta.causal))
     if s.k_prefetch_dist is None:
-        # Two row-tiles require the prefetched, transposed V layout.
+        # Two row sub-tiles require the prefetched, transposed V layout.
         s = replace(
             s,
             k_prefetch_dist=(
-                1 if s.q_row_tiles == 2 or hd >= _BP_MIN_HEAD_DIM
+                1 if s.row_subtiles == 2 or hd >= _BP_MIN_HEAD_DIM
                 else default_prefetch_dist(hd)
             ),
         )
@@ -593,7 +593,7 @@ def resolve_knobs(
         # separately computing its own copy for sequence padding and the grid
         # -- two values that agreed only because `default_block_m` happens not
         # to depend on the prefetch distance at any current head_dim.
-        # BLOCK_M is invariant to q_row_tiles by construction; see the
+        # BLOCK_M is invariant to row_subtiles by construction; see the
         # Q_TILES_PER_BLOCK comment in the kernel.
         s = replace(s, block_m=default_block_m(hd, s.k_prefetch_dist))
     return s
