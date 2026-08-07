@@ -262,20 +262,38 @@ class FastMath:
         else:
             raise ValueError(f"unknown fp_mode {fp_mode!r}; expected fast/noninf/safe")
 
+    # The four operators go through `arith.fastmath`, a stable context manager,
+    # rather than `arith.addf` / `subf` / `mulf` / `divf`, none of which is in
+    # `arith.__all__`. It ends in the same call: `ArithValue._binary_op` reads
+    # `current_fastmath()` and passes it as the `fastmath=` this class used to
+    # pass by hand.
+    #
+    # Operands may be `ArithValue`, `Float32` or `Vector`, and all three reach
+    # that path -- `Vector` because it subclasses `ArithValue`. Which is why
+    # these take an operator rather than a scalar builder: `mul` is called on
+    # v8f32 accumulators as well as on scalars.
+
     def div(self, a, b):
-        return arith.divf(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=self.flags)
+        with arith.fastmath(self.flags):
+            return a / b
 
     def add(self, a, b):
-        return arith.addf(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=self.flags)
+        with arith.fastmath(self.flags):
+            return a + b
 
     def sub(self, a, b):
-        return arith.subf(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=self.flags)
+        with arith.fastmath(self.flags):
+            return a - b
 
     def mul(self, a, b):
-        return arith.mulf(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=self.flags)
+        with arith.fastmath(self.flags):
+            return a * b
 
     def max(self, a, b):
-        return arith.MaxNumFOp(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=self.flags).result
+        # `arith.maxnumf` is stable and takes the flags directly. No context
+        # around it: the raw builders do not consult one -- only the operators
+        # do, via `_binary_op`.
+        return arith.maxnumf(a, b, fastmath=self.flags)
 
 
 class MaskedAxis:
