@@ -79,7 +79,7 @@ from gfx1201_standalone import buffer_ops, utils as common_utils
 
 __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
            "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8",
-           "FastMath", "MaskedAxis",
+           "FastMath", "MaskedAxis", "Aperture",
            "lds_f32_ptr", "lds_f32_store", "lds_f32_load",
            "reduce_s_across_shards",
            "cond_load", "seqinfo_addr", "decode_addressing", "lse_token_pitch",
@@ -386,6 +386,101 @@ class MaskedAxis:
             return vec
         zeros = Vec.filled(width, 0.0, self.elem_dtype)
         return self.mask(idx, width).select(Vec(vec), zeros).ir_value()
+
+
+class Aperture:
+    """The bounded region of one tensor this kernel may touch, and where it
+    lands on chip.
+
+    An aperture is the opening, not the light through it: it says which rows
+    and columns exist and where a staged copy goes, never what was read. One
+    instance per tensor, built once and handed to the movement helpers, so an
+    access cannot be spelled without also naming its bounds.
+
+    Fields are optional because the tensors are not staged the same way, and an
+    absent field is a statement rather than a gap:
+
+    `rows=None`      the row bound is inside the address closure instead. K and
+                     V are like this: `make_addr_pair` was given `seqlen_k` and
+                     redirects an out-of-range row itself, so a `rows` axis
+                     here would be the same bound stated twice. It would also
+                     not be free -- an IR-backed field crosses every dynamic
+                     `if` this object is live across, and this kernel has
+                     measured 6% swings from one extra value's live range.
+    `lds_base=None`  never staged through LDS. Q and O go straight between VRAM
+                     and registers.
+    `num_batches=0`  not read cooperatively. Same two.
+
+    The address closures are deliberately *not* fields. They capture traced
+    values, so an aperture holding one could not implement the carry protocol
+    below, and K's aperture has to cross `coop_load_store_k`'s row guard.
+
+    Only the axes are IR-backed; every other field is `const_expr`, so the
+    geometry costs nothing to carry.
+    """
+
+    __slots__ = (
+        "cols", "rows", "lds_base", "lds_stride",
+        "vec_width", "threads_per_row", "rows_per_batch", "num_batches",
+        "needs_guard",
+    )
+
+    def __init__(
+        self, cols, rows=None, lds_base=None, lds_stride=None,
+        vec_width=0, threads_per_row=0, rows_per_batch=0, num_batches=0,
+        needs_guard=False,
+    ):
+        self.cols = cols
+        self.rows = rows
+        self.lds_base = lds_base
+        self.lds_stride = lds_stride
+        # The cooperative-load geometry, from `_load_geom` on *this* tensor's
+        # width. K's and V's are computed from different widths and are not
+        # interchangeable; holding each on its owner is what stops one
+        # tensor's flag being read for the other.
+        self.vec_width = vec_width
+        self.threads_per_row = threads_per_row
+        self.rows_per_batch = rows_per_batch
+        self.num_batches = num_batches
+        self.needs_guard = needs_guard
+
+    def lds_index(self, row, col):
+        """Element index of (row, col) within the LDS tile."""
+        return self.lds_base + row * self.lds_stride + col
+
+    def batch_row(self, base_row, batch):
+        """The row `base_row` maps to in cooperative-load batch `batch`."""
+        return base_row + batch * self.rows_per_batch
+
+    # ---- carry protocol; see the module docstring ----
+
+    def __get_ir_types__(self):
+        return [v.type for v in self.__extract_to_ir_values__()]
+
+    def __extract_to_ir_values__(self):
+        vals = list(self.cols.__extract_to_ir_values__())
+        if self.rows is not None:
+            vals += self.rows.__extract_to_ir_values__()
+        return vals
+
+    @classmethod
+    def __construct_from_ir_values__(cls, values, exemplar=None):
+        if exemplar is None:
+            raise TypeError("Aperture needs an exemplar to restore its const_expr fields")
+        n = len(exemplar.cols.__extract_to_ir_values__())
+        cols = MaskedAxis.__construct_from_ir_values__(values[:n], exemplar.cols)
+        rows = exemplar.rows
+        if rows is not None:
+            rows = MaskedAxis.__construct_from_ir_values__(values[n:], rows)
+        return cls(
+            cols, rows,
+            lds_base=exemplar.lds_base, lds_stride=exemplar.lds_stride,
+            vec_width=exemplar.vec_width,
+            threads_per_row=exemplar.threads_per_row,
+            rows_per_batch=exemplar.rows_per_batch,
+            num_batches=exemplar.num_batches,
+            needs_guard=exemplar.needs_guard,
+        )
 
 
 # --------------------------------------------------------------------------
