@@ -60,14 +60,14 @@ def _require_env():
 def _qkv(batch, seq, heads, head_dim, dtype, seed=0):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     return tuple(
-        torch.randn(batch, seq, heads, head_dim, dtype=dtype, device="cuda", generator=gen) for _ in range(3)
+        torch.randn(batch, heads, seq, head_dim, dtype=dtype, device="cuda", generator=gen) for _ in range(3)
     )
 
 
 def _reference(q, k, v, causal):
-    """fp32 BSHD reference via PyTorch SDPA."""
-    qb, kb, vb = (x.transpose(1, 2).float() for x in (q, k, v))
-    return F.scaled_dot_product_attention(qb, kb, vb, is_causal=causal).transpose(1, 2)
+    """fp32 BHSD reference via PyTorch SDPA."""
+    qb, kb, vb = (x.float() for x in (q, k, v))
+    return F.scaled_dot_product_attention(qb, kb, vb, is_causal=causal)
 
 
 def _compare(got, ref):
@@ -271,7 +271,7 @@ def test_shape_and_dtype_validation():
     q, k, v = _qkv(1, 256, _NUM_HEADS, 128, torch.float16)
 
     with pytest.raises(ValueError, match="must share"):
-        flydsl_flash_attn_func_gfx1201(q, k[:, :128], v[:, :128], causal=True)
+        flydsl_flash_attn_func_gfx1201(q, k[:, :, :128], v[:, :, :128], causal=True)
     with pytest.raises(ValueError, match="dtype must match"):
         flydsl_flash_attn_func_gfx1201(q, k.to(torch.bfloat16), v, causal=True)
     with pytest.raises(ValueError, match="rank"):
@@ -335,7 +335,7 @@ def test_head_dim_off_ladder(head_dim, causal):
     pitch = (head_dim + 7) // 8 * 8
     gen = torch.Generator(device="cuda").manual_seed(0)
     q, k, v = (
-        torch.randn(1, 256, 2, pitch, dtype=torch.float16, device="cuda", generator=gen)[
+        torch.randn(1, 2, 256, pitch, dtype=torch.float16, device="cuda", generator=gen)[
             ..., :head_dim
         ]
         for _ in range(3)

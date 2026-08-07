@@ -16,13 +16,13 @@ BATCH, H, N, D = 1, 4, 1024, 128
 
 
 def reference(q, k, v, causal):
-    q64, k64, v64 = (t.to(torch.float64).transpose(1, 2) for t in (q, k, v))
+    q64, k64, v64 = (t.to(torch.float64) for t in (q, k, v))
     s = q64 @ k64.transpose(-1, -2) / (D**0.5)
     if causal:
         n = s.shape[-1]
         mask = torch.triu(torch.ones(n, n, dtype=torch.bool, device=s.device), 1)
         s = s.masked_fill(mask, float("-inf"))
-    return (torch.softmax(s, -1) @ v64).transpose(1, 2)
+    return (torch.softmax(s, -1) @ v64)
 
 
 def stats(out, ref):
@@ -43,8 +43,8 @@ def main():
             ref = reference(q, k, v, causal)
             fly = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal)
             sdpa = torch.nn.functional.scaled_dot_product_attention(
-                *(t.transpose(1, 2) for t in (q, k, v)), is_causal=causal
-            ).transpose(1, 2)
+                q, k, v, is_causal=causal
+            )
             for label, out in (("flydsl", fly), ("torch-sdpa", sdpa)):
                 b, r = stats(out, ref)
                 print(

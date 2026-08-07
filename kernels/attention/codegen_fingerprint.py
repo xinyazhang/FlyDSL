@@ -14,7 +14,7 @@ def child(hd, causal):
     import torch
     from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201 as F
     torch.manual_seed(0)
-    q, k, v = (torch.randn(1, 512, 8, hd, dtype=torch.float16, device="cuda")
+    q, k, v = (torch.randn(1, 8, 512, hd, dtype=torch.float16, device="cuda")
                for _ in range(3))
     F(q, k, v, causal=causal)
     torch.cuda.synchronize()

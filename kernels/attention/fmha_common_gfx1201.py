@@ -1184,7 +1184,9 @@ def make_addr_pair(
     # **64-bit base** rather than the 32-bit per-lane offset: on a
     # packed tensor it is a whole-batch quantity and overflows 32 bits
     # at realistic token counts (sdpa-varlen-plan.md section 5).
-    s_batch, s_seq, s_head = strides
+    # BHSD slot order: batch, head, sequence. See `_strides_of` in the kernel
+    # for why the order is the ABI rather than a convenience.
+    s_batch, s_head, s_seq = strides
     bh = batch_index * s_batch + head * s_head + row_off * s_seq
 
     def tbase(seq_start):

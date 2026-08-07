@@ -85,7 +85,8 @@ WMMA 16x16x16, wave32:
   - A/B operand: v8f16 per lane (lane16 = row/col, klane*8 = K-offset)
   - C/D result:  v8f32 per lane, element si = C[klane*8+si][lane16]
 
-Layout: Q/K/V/O are 1D flattened from BSHD (batch, seq_len, num_heads, head_dim).
+Shape:  Q/K/V/O are BHSD (batch, num_heads, seq_len, head_dim); the memory
+        layout is free so long as D is innermost. See `_strides_of`.
 Grid:   (batch * num_q_tiles * num_heads,)
 """
 
@@ -510,10 +511,20 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # be able to measure against the folded form -- and is not a shipping
     # configuration.
     #
-    # Naming is numeric (`stride_q0/q1/q2`), not by axis letter. The suffixed forms
-    # inherited from the maths (`stride_qz/qh/qm`) read badly and have caused
-    # real mix-ups during AOTriton's kernel development. Axis 3 is `D`, which is
-    # contiguous by contract, so it is never passed.
+    # Strides arrive in **BHSD slot order**: batch, head, sequence. Axis 3 is
+    # `D`, contiguous by contract, so it is never passed.
+    #
+    # Named for the axis, not the slot. An earlier version used `stride_q0/1/2`
+    # deliberately, because the letters inherited from the maths
+    # (`stride_qz/qh/qm`) read badly and caused real mix-ups during AOTriton's
+    # kernel development -- but that objection was to *cryptic* letters, and
+    # numeric slots trade one unreadable convention for another. Nothing at
+    # runtime distinguishes a head stride from a sequence stride, so a caller
+    # that swaps them gets finite garbage rather than an error; spelling the
+    # axis out is the only check there is.
+    #
+    # Bias already used this order (`stride_b0/1/2` are batch, head, Sq), so
+    # this makes the five tensors agree rather than introducing a convention.
     #
     # Longest-processing-time-first dispatch for causal. Under causal masking
     # a workgroup's cost grows with its q_tile (tile 0 walks one KV block, tile
@@ -809,18 +820,18 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
-        stride_q0: fx.Int64,
-        stride_q1: fx.Int64,
-        stride_q2: fx.Int64,
-        stride_k0: fx.Int64,
-        stride_k1: fx.Int64,
-        stride_k2: fx.Int64,
-        stride_v0: fx.Int64,
-        stride_v1: fx.Int64,
-        stride_v2: fx.Int64,
-        stride_o0: fx.Int64,
-        stride_o1: fx.Int64,
-        stride_o2: fx.Int64,
+        stride_q_batch: fx.Int64,
+        stride_q_head: fx.Int64,
+        stride_q_seq: fx.Int64,
+        stride_k_batch: fx.Int64,
+        stride_k_head: fx.Int64,
+        stride_k_seq: fx.Int64,
+        stride_v_batch: fx.Int64,
+        stride_v_head: fx.Int64,
+        stride_v_seq: fx.Int64,
+        stride_o_batch: fx.Int64,
+        stride_o_head: fx.Int64,
+        stride_o_seq: fx.Int64,
         stride_b0: fx.Int64,
         stride_b1: fx.Int64,
         stride_b2: fx.Int64,
@@ -1010,16 +1021,19 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # Diagnostic arm only, and valid solely when seqlen_q == seqlen_k.
             # Dense-only: it derives the layout from the shape, which varlen
             # invalidates outright. The host rejects the combination.
-            _stq = (fx.Index(max_seqlen_q) * STRIDE_TOKEN, STRIDE_TOKEN, HEAD_DIM)
-            _stk = (fx.Index(max_seqlen_k) * STRIDE_TOKEN, STRIDE_TOKEN, HEAD_DIM)
+            # BHSD compact: (batch, head, seq).
+            _stq = (fx.Index(max_seqlen_q) * STRIDE_TOKEN,
+                    fx.Index(max_seqlen_q) * HEAD_DIM, HEAD_DIM)
+            _stk = (fx.Index(max_seqlen_k) * STRIDE_TOKEN,
+                    fx.Index(max_seqlen_k) * HEAD_DIM, HEAD_DIM)
             q_st = o_st = _stq
             k_st = v_st = _stk
             sm_log2e = fx.Float32(sm_scale * _LOG2E)
         else:
-            q_st = (fx.Index(stride_q0), fx.Index(stride_q1), fx.Index(stride_q2))
-            k_st = (fx.Index(stride_k0), fx.Index(stride_k1), fx.Index(stride_k2))
-            v_st = (fx.Index(stride_v0), fx.Index(stride_v1), fx.Index(stride_v2))
-            o_st = (fx.Index(stride_o0), fx.Index(stride_o1), fx.Index(stride_o2))
+            q_st = (fx.Index(stride_q_batch), fx.Index(stride_q_head), fx.Index(stride_q_seq))
+            k_st = (fx.Index(stride_k_batch), fx.Index(stride_k_head), fx.Index(stride_k_seq))
+            v_st = (fx.Index(stride_v_batch), fx.Index(stride_v_head), fx.Index(stride_v_seq))
+            o_st = (fx.Index(stride_o_batch), fx.Index(stride_o_head), fx.Index(stride_o_seq))
             sm_log2e = fastmath.mul(sm_scale_arg, fx.Float32(_LOG2E))
 
         # Q and O are indexed by the query head; K and V by the KV head they
@@ -1108,7 +1122,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         #                         chunk containing hdim ends at ceil8(hdim),
         #                         which is <= pitch by the contract), but the
         #                         contents are not guaranteed zero.
-        #   [ceil8(hdim), tile)   past the row entirely. In BSHD these bytes
+        #   [ceil8(hdim), tile)   past the row entirely. In BHSD these bytes
         #                         belong to head h+1, and at the last head of
         #                         the last token they are past the allocation.
         #                         Must not be addressed.
@@ -2157,18 +2171,18 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
-        stride_q0: fx.Int64,
-        stride_q1: fx.Int64,
-        stride_q2: fx.Int64,
-        stride_k0: fx.Int64,
-        stride_k1: fx.Int64,
-        stride_k2: fx.Int64,
-        stride_v0: fx.Int64,
-        stride_v1: fx.Int64,
-        stride_v2: fx.Int64,
-        stride_o0: fx.Int64,
-        stride_o1: fx.Int64,
-        stride_o2: fx.Int64,
+        stride_q_batch: fx.Int64,
+        stride_q_head: fx.Int64,
+        stride_q_seq: fx.Int64,
+        stride_k_batch: fx.Int64,
+        stride_k_head: fx.Int64,
+        stride_k_seq: fx.Int64,
+        stride_v_batch: fx.Int64,
+        stride_v_head: fx.Int64,
+        stride_v_seq: fx.Int64,
+        stride_o_batch: fx.Int64,
+        stride_o_head: fx.Int64,
+        stride_o_seq: fx.Int64,
         stride_b0: fx.Int64,
         stride_b1: fx.Int64,
         stride_b2: fx.Int64,
@@ -2198,10 +2212,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             philox_seed, philox_offset_base, idropout_p, dropout_scale,
             num_head_q, num_head_k,
             hdim_qk, hdim_vo,
-            stride_q0, stride_q1, stride_q2,
-            stride_k0, stride_k1, stride_k2,
-            stride_v0, stride_v1, stride_v2,
-            stride_o0, stride_o1, stride_o2,
+            stride_q_batch, stride_q_head, stride_q_seq,
+            stride_k_batch, stride_k_head, stride_k_seq,
+            stride_v_batch, stride_v_head, stride_v_seq,
+            stride_o_batch, stride_o_head, stride_o_seq,
             stride_b0, stride_b1, stride_b2,
             sm_scale_v,
         )
@@ -2288,11 +2302,22 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         return t
 
     def _strides_of(t, name):
-        """The three leading strides of a rank-4 tensor, in elements.
+        """`(batch, head, seq)` strides of a rank-4 BHSD tensor, in elements.
 
-        Read from the tensor, never derived from its shape: the shape says
-        BHSD/BSHD but the memory can be any `xxxD` permutation, and the two are
-        not related (see sdpa-close-gap-plan1.md section 0).
+        **Shape and layout are different things**, and this reads the second.
+        *Shape* is `t.shape`, and the kernel requires it to be BHSD --
+        `(batch, num_heads, seq_len, head_dim)` -- because that is what fixes
+        which axis each of the three returned slots describes. *Layout* is how
+        the data actually sits in memory, and any permutation is accepted so
+        long as D is innermost, which is what `stride(3) == 1` checks. A BSHD
+        *layout* is therefore fine; pass it as `t.transpose(1, 2)`, which has
+        BHSD shape.
+
+        The order is the ABI. AOTriton dispatches the compiled hsaco directly
+        rather than through the Python wrapper, so these three slots are the
+        contract, and a caller that fills them from a BSHD shape swaps head
+        with sequence -- reading heads where the kernel means tokens, which
+        produces finite garbage and never faults.
         """
         if not hasattr(t, "stride"):
             raise TypeError(
@@ -2622,14 +2647,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         st = []
         for t, name in ((Q, "Q"), (K, "K"), (V, "V"), (O, "O")):
             st.extend(_strides_of(t, name))
-        # BSHD: axis 2 is the head axis. Read rather than assumed -- under
-        # MQA/GQA K and V carry fewer heads than Q.
-        nhq, nhk = Q.shape[2], K.shape[2]
+        # BHSD: axis 1 is heads, axis 2 the sequence. Read rather than
+        # assumed -- under MQA/GQA K and V carry fewer heads than Q.
+        nhq, nhk = Q.shape[1], K.shape[1]
         hqk, hvo = Q.shape[3], V.shape[3]
-        if V.shape[2] != nhk:
-            raise ValueError(f"K and V must share num_heads, got {nhk} and {V.shape[2]}")
-        if O.shape[2] != nhq:
-            raise ValueError(f"O and Q must share num_heads, got {O.shape[2]} and {nhq}")
+        if V.shape[1] != nhk:
+            raise ValueError(f"K and V must share num_heads, got {nhk} and {V.shape[1]}")
+        if O.shape[1] != nhq:
+            raise ValueError(f"O and Q must share num_heads, got {O.shape[1]} and {nhq}")
         if nhq % nhk:
             raise ValueError(
                 f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})"

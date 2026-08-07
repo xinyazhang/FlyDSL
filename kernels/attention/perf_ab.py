@@ -86,7 +86,7 @@ def _worker() -> int:
         if key not in cache:
             torch.manual_seed(0)
             cache[key] = tuple(
-                torch.randn(B, n, H, hd, dtype=torch.float16, device="cuda")
+                torch.randn(B, H, n, hd, dtype=torch.float16, device="cuda")
                 for _ in range(3)
             )
             q, k, v = cache[key]

@@ -11,8 +11,9 @@ single function, ``flydsl_flash_attn_func_gfx1201(q, k, v, ...)``:
   Both are frozen dataclasses precisely so they can be that key: an earlier
   version listed six of the fields by hand, which is how the tuning env vars
   managed to change the emitted kernel without changing the key.
-- BSHD (``[B, S, H, D]``) input/output convention, matching upstream
-  flash-attention layout.
+- BHSD (``[B, H, S, D]``) input/output *shape* convention, matching AOTriton's
+  ``attn_fwd``. Only the shape is fixed -- any memory layout with D innermost
+  is accepted, so a BSHD-laid-out tensor is passed as ``t.transpose(1, 2)``.
 - Automatic seq_len padding to the kernel's ``BLOCK_M`` tile (128).
 - Non-causal padding-ratio safety guard: padded K/V tokens produce
   ``QK^T = 0``, but ``exp(0) = 1`` still contributes to the softmax
@@ -79,9 +80,11 @@ def flydsl_flash_attn_func_gfx1201(
     """Run FlyDSL Flash Attention on RDNA4 (gfx1201).
 
     Args:
-        q, k, v: tensors with shape ``[batch, seq_len, num_heads, head_dim]``
-            (BSHD). All three must share dtype, batch, num_heads, head_dim,
-            and seq_len. Must reside on a CUDA/HIP device. ``head_dim`` must be
+        q, k, v: tensors with shape ``[batch, num_heads, seq_len, head_dim]``
+            (BHSD), matching AOTriton's ``attn_fwd``. Only the *shape* is
+            fixed; any memory layout with D innermost is accepted, so a
+            BSHD-laid-out tensor is passed as ``t.transpose(1, 2)``. All three
+            must share dtype, batch, num_heads, head_dim, and seq_len. Must reside on a CUDA/HIP device. ``head_dim`` must be
             a multiple of 16 and at most 512; above 256 it is computed in
             128-wide V column slices and so must be a multiple of 128.
         causal: apply causal masking when ``True``.
@@ -126,22 +129,22 @@ def flydsl_flash_attn_func_gfx1201(
     if q.dim() == 4 and k.dim() == 4:
         # MQA/GQA: several query heads share one KV head. Everything except the
         # head axis must still agree -- this is self-attention, so Lq == Lk.
-        if q.shape[0] != k.shape[0] or q.shape[1] != k.shape[1] or q.shape[3] != k.shape[3]:
+        if q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2] or q.shape[3] != k.shape[3]:
             raise ValueError(
                 "q/k must share batch, seq_len and head_dim; only num_heads may "
                 f"differ (GQA). Got q={tuple(q.shape)} k={tuple(k.shape)}"
             )
-        if q.shape[2] % k.shape[2]:
+        if q.shape[1] % k.shape[1]:
             raise ValueError(
-                f"num_heads_q ({q.shape[2]}) must be divisible by num_heads_k "
-                f"({k.shape[2]})"
+                f"num_heads_q ({q.shape[1]}) must be divisible by num_heads_k "
+                f"({k.shape[1]})"
             )
     if not (q.dtype == k.dtype == v.dtype):
         raise ValueError(f"q/k/v dtype must match: {q.dtype}/{k.dtype}/{v.dtype}")
     if q.dim() != 4:
-        raise ValueError(f"expected 4D BSHD tensor, got rank {q.dim()} ({tuple(q.shape)})")
+        raise ValueError(f"expected 4D BHSD tensor, got rank {q.dim()} ({tuple(q.shape)})")
 
-    batch, seq_len_real, num_heads, head_dim = q.shape
+    batch, num_heads, seq_len_real, head_dim = q.shape
     dtype_str = _torch_dtype_to_str(q.dtype)
     # One call for the whole build configuration: the tile width is a build
     # axis and the real extent rides along as a runtime argument, but which
@@ -169,7 +172,7 @@ def flydsl_flash_attn_func_gfx1201(
         # columns wide, so the chunk containing `head_dim` runs to
         # ceil8(head_dim); an 8-aligned pitch guarantees that lands inside the
         # tensor's own padding. A tightly-packed tensor -- e.g. contiguous
-        # (B, S, H, 100), pitch 100 -- has no such padding, and the store at
+        # (B, H, S, 100), pitch 100 -- has no such padding, and the store at
         # column 96 would write columns 100..103 of the *next head*.
         for name, t in (("q", q), ("k", k), ("v", v)):
             if t.stride(2) % 8:
@@ -202,11 +205,11 @@ def flydsl_flash_attn_func_gfx1201(
     _o_pitch = (head_dim + 7) // 8 * 8
     if _o_pitch == head_dim:
         o_p = torch.empty(
-            batch, seq_len_pad, num_heads, head_dim, dtype=q.dtype, device=q.device
+            batch, num_heads, seq_len_pad, head_dim, dtype=q.dtype, device=q.device
         )
     else:
         o_p = torch.empty(
-            batch, seq_len_pad, num_heads, _o_pitch, dtype=q.dtype, device=q.device
+            batch, num_heads, seq_len_pad, _o_pitch, dtype=q.dtype, device=q.device
         )[..., :head_dim]
 
     # logsumexp, (B*H, S_pad) fp32 -- AOTriton's non-varlen layout. Sliced back
@@ -233,7 +236,7 @@ def flydsl_flash_attn_func_gfx1201(
             stream=launch_stream, lse=lse_p)
 
     out = (
-        o_p[:, :seq_len_real, :, :].contiguous()
+        o_p[:, :, :seq_len_real, :].contiguous()
         if seq_len_pad != seq_len_real
         else o_p
     )

@@ -18,7 +18,7 @@ dtype = {"f16": torch.float16, "bf16": torch.bfloat16}[
 d, kw = VARIANTS[name]
 BATCH, H, N = 2, 12, 4096
 torch.manual_seed(0)
-q, k, v = (torch.randn((BATCH, N, H, d), dtype=dtype, device="cuda") for _ in range(3))
+q, k, v = (torch.randn((BATCH, H, N, d), dtype=dtype, device="cuda") for _ in range(3))
 fn = lambda: flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, **kw)  # noqa: E731
 fn()
 torch.cuda.synchronize()

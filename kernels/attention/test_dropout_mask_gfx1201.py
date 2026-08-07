@@ -167,7 +167,7 @@ def test_attention_matches_math_backend_given_the_mask(p, head_dim):
     seed, off = 20250805, 3
     torch.manual_seed(0)
     q, k, v = (
-        torch.randn(B, SQ, H, head_dim, dtype=torch.float16, device="cuda")
+        torch.randn(B, H, SQ, head_dim, dtype=torch.float16, device="cuda")
         for _ in range(3)
     )
     o = torch.empty_like(q)
@@ -178,11 +178,11 @@ def test_attention_matches_math_backend_given_the_mask(p, head_dim):
 
     keep = _keep_from_raw(dropout_mask(B, H, SQ, SK, seed, off), p)
     ref, _ = torch.ops.aten._scaled_dot_product_attention_math(
-        *(t.transpose(1, 2).float() for t in (q, k, v)),
+        *(t.float() for t in (q, k, v)),
         dropout_p=p,
         dropout_mask=keep,
     )
-    ref = ref.transpose(1, 2).half()
+    ref = ref.half()
 
     err = (o.float() - ref.float()).abs().max().item()
     scale = ref.float().abs().max().item()
@@ -203,7 +203,7 @@ def test_mask_kernel_disagreeing_is_detected():
     B, H, SQ, head_dim, p = 1, 8, 256, 64, 0.5
     torch.manual_seed(0)
     q, k, v = (
-        torch.randn(B, SQ, H, head_dim, dtype=torch.float16, device="cuda")
+        torch.randn(B, H, SQ, head_dim, dtype=torch.float16, device="cuda")
         for _ in range(3)
     )
     o = torch.empty_like(q)
@@ -214,11 +214,11 @@ def test_mask_kernel_disagreeing_is_detected():
 
     keep = _keep_from_raw(dropout_mask(B, H, SQ, SQ, 2, 0), p)   # wrong seed
     ref, _ = torch.ops.aten._scaled_dot_product_attention_math(
-        *(t.transpose(1, 2).float() for t in (q, k, v)),
+        *(t.float() for t in (q, k, v)),
         dropout_p=p,
         dropout_mask=keep,
     )
-    ref = ref.transpose(1, 2).half()
+    ref = ref.half()
     err = (o.float() - ref.float()).abs().max().item()
     assert err > 4e-2 * max(ref.float().abs().max().item(), 1.0), (
         "a mask from the wrong seed still passed -- the tolerance is too loose"

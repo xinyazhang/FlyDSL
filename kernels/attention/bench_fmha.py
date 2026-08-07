@@ -92,9 +92,9 @@ def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, causal, mode, provider, dtype
     if mode == "bwd":
         assert False, f"Dont support {mode=}"
     if provider == "flydsl":
-        q = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device=device, requires_grad=True)
-        k = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device=device, requires_grad=True)
-        v = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+        q = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=device, requires_grad=True)
         fn = lambda: flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal)  # noqa: E731
         ms = do_bench(fn, warmup=warmup, rep=rep)
     flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * D_HEAD

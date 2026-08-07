@@ -57,7 +57,7 @@ def main():
         for causal in (False, True):
             torch.manual_seed(0)
             q, k, v = (
-                torch.randn((BATCH, N, H, d), dtype=dtype, device="cuda")
+                torch.randn((BATCH, H, N, d), dtype=dtype, device="cuda")
                 for _ in range(3)
             )
             ms = sorted(measure(q, k, v, causal) for _ in range(REPS))
