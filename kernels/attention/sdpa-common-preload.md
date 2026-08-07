@@ -362,7 +362,7 @@ reason rather than a deduplication one.
 | 3 | `load_lds_tile` / `store_lds_tile` | `lds_load_v8`, `lds_store_vx`, `_v_store_row_major`, `_v_store_transposed` | bitwise; needs V_TRANSPOSED both ways -- hd64 vs hd384 |
 | 4 | `load_tile` for Q | the §3 preload | five configs, §5 |
 | 5 | `load_tile` for K and V | `coop_load_k_global`, `coop_load_v_global`, `load_global_f16xN`, `load_global_v8f16` | hd16 (guard), hd100 (padded), hd384 (chunked V) |
-| 6 | `stage_vram_to_lds` | `coop_load_store_k` | hd16, where KV_NEEDS_GUARD makes it a dynamic `if` |
+| 6 | `stage_vram_to_lds` | `coop_load_store_k` | hd16, where the row guard is emitted -- see §13.4 |
 | 7 | `store_tile` | `_store_global_half` | hd100 padded (column masking on the store) |
 | 8 | `map_subtiles` for the (a) sites | 5 of 15 `qt` loops | bitwise |
 
@@ -370,6 +370,32 @@ Steps 2-3 are LDS-only and cannot affect global addressing; 4-7 each touch one
 residence pair. Every step is independently revertible, which matters because
 step 6 is the one that runs into the dynamic-`if` rule and may have to keep a
 hand-written form.
+
+### 13.4 Where the dynamic `if`s actually are
+
+Worth stating precisely, because the two are easy to conflate and the
+distinction decides which steps are risky.
+
+`KV_NEEDS_GUARD`, `V_NEEDS_GUARD` and `V_TR_NEEDS_GUARD` are all **const_expr**.
+They are compile-time selectors -- they choose whether a guarded form is
+emitted at all -- and they cause no trouble whatever. What they guard is a
+*traced* predicate, and that is the `scf.if`:
+
+| static selector     | traced predicate inside it                        | site |
+| ------------------- | ------------------------------------------------- | ---- |
+| `KV_NEEDS_GUARD`    | `row_valid = lds_row < BLOCK_N`                   | `coop_load_store_k`, `coop_store_k_lds` |
+| `V_NEEDS_GUARD`     | `row_valid = v_row_in_batch + off < BLOCK_N`      | `coop_store_v_lds`, row-major arm |
+| `V_TR_NEEDS_GUARD`  | `tile_ok = wave_id + l * NUM_WAVES < V_TR_TILES`  | `coop_store_v_lds`, transposed arm |
+
+All three depend on the thread id, so all three lower to `scf.if`, and a Python
+object may not be live across any of them. That is why steps 3 and 6 are the
+risky ones and steps 2, 4 and 8 are not: 3 and 6 touch code that sits inside
+one of these, and the rest does not.
+
+It also means the risk is not confined to one head_dim. `_load_geom` sets these
+independently for the QK and V/O widths, so a config can need the V guard
+without the K one. Step 3's gate has to cover both, which hd16 and hd384 do
+between them.
 
 ### 13.3 What this plan does not do
 
