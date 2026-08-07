@@ -90,6 +90,7 @@ Grid:   (batch * num_q_tiles * num_heads,)
 """
 
 import math as host_math
+import weakref
 
 from torch import float32 as torch_f32
 
@@ -149,14 +150,39 @@ def dtype_to_elem_type(dtype_str: str):
     raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', or 'bf16')")
 
 
+# Compiled-function cache, keyed by the `@flyc.jit` launcher it belongs to.
+#
+# A `WeakKeyDictionary` beside the function rather than an `exe._cf` attribute
+# on it: that attribute is not one FlyDSL defines, so writing it mutates a
+# FlyDSL-owned object and is a higher-severity finding than merely *reading*
+# an unstable API. Weak keys so an entry dies with its launcher instead of
+# pinning one compiled artifact -- and the GPU code object it owns -- per
+# configuration for the life of the process.
+_COMPILED = weakref.WeakKeyDictionary()
+
+
 def _run_compiled(exe, *args):
     """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+
+    `flyc.compile` does cache internally -- `JitFunction._mem_cache`, keyed on
+    the full argument signature -- so this is not about avoiding recompilation.
+    It is about dispatch overhead, and that is not small: measured against a
+    plain `exe(*args)`, this saves **157 us per call** at
+    (head_dim 64, N 512), where the whole call is 63 us with the cache and
+    220 us without. The gap closes as the kernel grows (5 us at N 4096).
+
+    One `CompiledFunction` per launcher is correct here because the launcher is
+    itself per-configuration -- `build_flash_attn_func_aiw_module` is
+    `lru_cache`d on `(FmhaInputMetadata, FmhaKnobs)` -- and every argument that
+    varies within a configuration is a runtime pointer or scalar, which
+    `CompiledFunction` accepts. A `const_expr` argument added later would
+    invalidate that, since this cache has one slot per launcher while
+    `flyc.compile`'s has one per argument signature.
     """
-    cf = getattr(exe, "_cf", None)
+    cf = _COMPILED.get(exe)
     if cf is None:
-        cf = flyc.compile(exe, *args)
-        exe._cf = cf
+        _COMPILED[exe] = flyc.compile(exe, *args)
     else:
         cf(*args)
 
