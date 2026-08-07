@@ -1076,7 +1076,35 @@ next to the geometry they constrain, and several depend on values (`VO_SLICE`,
 
 ---
 
-## 13. Future: accept BHSD shape, not BSHD
+## 13. Accept BHSD shape, not BSHD -- **done** (`cb5a5b7b`)
+
+> Landed as described, plus two things the section did not anticipate.
+>
+> **`_prep` also read the shape.** §13 scoped the change to `_addr_pair`'s
+> unpack and the launch parameters, but the host shim took `num_heads` from
+> `Q.shape[2]` -- the sequence axis under BHSD. That is what made a
+> half-applied migration *fault* rather than merely disagree, and it is the
+> second shape read (with the interface's) that had to move with the strides.
+>
+> **Bias was already BHSD-ordered.** `stride_b0/1/2` were batch, head, Sq all
+> along, so this made the five tensors agree rather than introducing a
+> convention -- and the numeric names §13 wanted renamed were, for bias,
+> already carrying the right order.
+>
+> The stride parameters are now `stride_?_batch/_head/_seq`. The comment
+> defending numeric slots is replaced: its objection was to *cryptic letters*
+> (`qz/qh/qm`), and numeric slots trade one unreadable convention for another.
+>
+> `test_stride_slots_are_batch_head_seq` is the guard this section asked for,
+> and it was verified to bite -- swapping the unpack back to BSHD fails it with
+> rel=1.0. That check needed `FLYDSL_RUNTIME_ENABLE_CACHE=0`: `make_addr_pair`
+> lives in a helper module outside the traced closure, so the JIT disk cache
+> does not invalidate on it and the first attempt passed against a stale
+> kernel.
+>
+> The 30 `transpose(1, 2)` calls did disappear, as predicted.
+
+### 13.0 Original text
 
 Requested for AOTriton integration -- its `attn_fwd` takes BHSD, and matching
 it removes a transpose (or a shape reinterpretation) at every call site of the
