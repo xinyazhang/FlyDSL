@@ -25,11 +25,11 @@ Both of AOTriton's encodings are emitted: raw `int32`, which is what the
 threshold compare actually sees, and `float32` in `[0, 1)` for reading.
 """
 
+from philox import Philox, to_uniform_f32
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
-
-from philox import Philox, to_uniform_f32
 
 THREADS = 256
 
@@ -58,9 +58,7 @@ def build_dropout_mask_module(
     COLGRPS = block_n // RN
     SLOTS = block_m * COLGRPS
     if SLOTS % THREADS:
-        raise ValueError(
-            f"block_m * block_n / {RN} ({SLOTS}) must be a multiple of {THREADS}"
-        )
+        raise ValueError(f"block_m * block_n / {RN} ({SLOTS}) must be a multiple of {THREADS}")
     ITERS = SLOTS // THREADS
     IS_RAW = encoding == "raw"
 
@@ -95,9 +93,7 @@ def build_dropout_mask_module(
         off_h = plane - off_z * num_head_q
         tid = fx.Int32(fx.Index(gpu.thread_idx.x))
 
-        base, row_stride = PHILOX.grid_plane(
-            philox_offset_base, plane, max_seqlen_q, max_seqlen_k
-        )
+        base, row_stride = PHILOX.grid_plane(philox_offset_base, plane, max_seqlen_q, max_seqlen_k)
         plane_addr = fx.Int64(off_z) * stride_rz + fx.Int64(off_h) * stride_rh
 
         for it in range_constexpr(ITERS):
@@ -108,9 +104,7 @@ def build_dropout_mask_module(
             row = m_tile * fx.Int32(block_m) + row_in
             col = n_tile * fx.Int32(block_n) + colgrp * fx.Int32(RN)
 
-            vals = PHILOX.u32(
-                philox_seed, PHILOX.grid_offset(base, row_stride, row, col)
-            )
+            vals = PHILOX.u32(philox_seed, PHILOX.grid_offset(base, row_stride, row, col))
             row_addr = plane_addr + fx.Int64(row) * stride_rm
 
             if row < max_seqlen_q:
@@ -137,9 +131,15 @@ def build_dropout_mask_module(
         n_tiles = (fx.Index(max_seqlen_k) + (block_n - 1)) // block_n
         planes = fx.Index(batch_size) * fx.Index(num_head_q)
         mask_kernel(
-            R, stride_rz, stride_rh, stride_rm,
-            max_seqlen_q, max_seqlen_k,
-            philox_seed, philox_offset_base, num_head_q,
+            R,
+            stride_rz,
+            stride_rh,
+            stride_rm,
+            max_seqlen_q,
+            max_seqlen_k,
+            philox_seed,
+            philox_offset_base,
+            num_head_q,
         ).launch(
             grid=(m_tiles, n_tiles, planes),
             block=(THREADS, 1, 1),
@@ -172,18 +172,24 @@ def dropout_mask(
     import torch
 
     dtype = torch.int32 if encoding == "raw" else torch.float32
-    r = torch.zeros(
-        batch, num_heads, max_seqlen_q, max_seqlen_k, dtype=dtype, device=device
-    )
+    r = torch.zeros(batch, num_heads, max_seqlen_q, max_seqlen_k, dtype=dtype, device=device)
     exe = build_dropout_mask_module(
-        block_m=block_m, block_n=block_n,
-        philox_width=philox_width, encoding=encoding,
+        block_m=block_m,
+        block_n=block_n,
+        philox_width=philox_width,
+        encoding=encoding,
     )
     exe(
         flyc.from_c_void_p(fx.Uint8, r.data_ptr()),
-        r.stride(0), r.stride(1), r.stride(2),
-        batch, num_heads, max_seqlen_q, max_seqlen_k,
-        int(philox_seed), int(philox_offset),
+        r.stride(0),
+        r.stride(1),
+        r.stride(2),
+        batch,
+        num_heads,
+        max_seqlen_q,
+        max_seqlen_k,
+        int(philox_seed),
+        int(philox_offset),
         fx.Stream(None),
     )
     torch.cuda.synchronize()

@@ -92,7 +92,24 @@ Grid:   (batch * num_q_tiles * num_heads,)
 
 import math as host_math
 import weakref
+from dataclasses import fields
 
+import fmha_common_gfx1201 as fmha
+from fmha_tuning_gfx1201 import (  # noqa: F401
+    FmhaInputMetadata,
+    FmhaKnobs,
+    default_block_m,
+    default_block_n,
+    default_prefetch_dist,
+    q_tiles_per_block,
+    qk_shards,
+    resolve_knobs,
+    resolve_shards,
+    vo_chunks,
+)
+from gfx1201_standalone import buffer_ops, wmma_ops
+from gfx1201_standalone import utils as common_utils
+from philox import Philox, dropout_threshold
 from torch import float32 as torch_f32
 
 import flydsl.compiler as flyc
@@ -101,32 +118,13 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
-    arith,
     const_expr,
     gpu,
     range_constexpr,
     rocdl,
 )
-from flydsl.expr.typing import T, Vector as Vec
-import fmha_common_gfx1201 as fmha
-from philox import Philox, dropout_threshold
-
-from gfx1201_standalone import buffer_ops, utils as common_utils, wmma_ops
-
-from dataclasses import fields
-
-from fmha_tuning_gfx1201 import (  # noqa: F401
-    FmhaInputMetadata,
-    FmhaKnobs,
-    resolve_knobs,
-    default_block_m,
-    default_block_n,
-    default_prefetch_dist,
-    q_tiles_per_block,
-    qk_shards,
-    resolve_shards,
-    vo_chunks,
-)
+from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 KERNEL_NAME = "flash_attn_func_gfx1201_aiw_kernel"
 _LOG2E = host_math.log2(host_math.e)
@@ -212,7 +210,6 @@ _WINDOW_TOPLEFT = fmha.WINDOW_TOPLEFT
 _WINDOW_BOTRIGHT = fmha.WINDOW_BOTRIGHT
 
 
-
 def build_flash_attn_func_aiw_module_primary(meta, knobs):
     """Build the unified gfx1201 flash-attention kernel.
 
@@ -261,7 +258,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     UNSAFE_NO_KV_CLAMP = knobs.unsafe_no_kv_clamp
     KV_ADDR_HOIST = knobs.kv_addr_hoist
     FP_MODE = knobs.fp_mode
-    PATH_TAG = knobs.path_tag
     """Build the unified gfx1201 flash-attention kernel.
 
     See the module docstring for what each knob selects and which of the three
@@ -301,7 +297,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # See the operand-layout note in the module docstring.
     WMMA_LANE_K = WMMA_K // (WARP_SIZE // WMMA_M)
 
-
     # ---- Knob resolution ----
     K_PREFETCH_DIST = K_PREFETCH_DIST_KNOB
     # K and V prefetch distances are INDEPENDENT. The baseline kernel is
@@ -309,11 +304,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # registers exactly as bp does, and only K is staged at distance 0. Folding
     # the two into one knob produces a (K=0, V=0) schedule that exists in none
     # of the originals and costs 9.6% at BLOCK_DMODEL 32 non-causal.
-    V_LDS_LAYOUT = (
-        ("transposed" if K_PREFETCH_DIST else "row")
-        if V_LDS_LAYOUT is None
-        else V_LDS_LAYOUT
-    )
+    V_LDS_LAYOUT = ("transposed" if K_PREFETCH_DIST else "row") if V_LDS_LAYOUT is None else V_LDS_LAYOUT
     V_TRANSPOSED = V_LDS_LAYOUT == "transposed"
 
     ROWS_PER_WAVE = WMMA_M * ROW_SUBTILES
@@ -323,7 +314,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     COL_SUBTILES = BLOCK_N // COLS_PER_SUBTILE
     NUM_S_ACCS = COL_SUBTILES * 2
     NUM_S_VALS = NUM_S_ACCS * 8
-
 
     # V/O column *window*: the slice of the output width this build computes.
     # Distinct from VO_SLICE (a wave's share of a window) and from VO_CHUNK_COLS
@@ -342,12 +332,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         QK_SHARDS = 1
     else:
         QK_SHARDS = resolve_shards(BLOCK_DMODEL, VO_WIDTH, BLOCK_N)
-    QK_SLICE = BLOCK_DMODEL // QK_SHARDS      # head-dim columns per wave in GEMM1
+    QK_SLICE = BLOCK_DMODEL // QK_SHARDS  # head-dim columns per wave in GEMM1
 
     VO_CHUNKS = vo_chunks(VO_WIDTH, BLOCK_N, QK_SHARDS) if V_TRANSPOSED else 1
-    VO_CHUNK_COLS = VO_WIDTH // VO_CHUNKS   # V columns resident per pass
-    VO_SLICE = VO_CHUNK_COLS // QK_SHARDS   # V/O columns per wave per pass
-
+    VO_CHUNK_COLS = VO_WIDTH // VO_CHUNKS  # V columns resident per pass
+    VO_SLICE = VO_CHUNK_COLS // QK_SHARDS  # V/O columns per wave per pass
 
     # ---- Validity predicate over the knob space ----
     #
@@ -360,15 +349,13 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # subset of the knob space can be read in one place.
 
     # Shapes and enumerations.
-    assert BLOCK_DMODEL % 16 == 0 and 16 <= BLOCK_DMODEL <= 512, (
-        f"aiw needs 16 <= BLOCK_DMODEL <= 512 and BLOCK_DMODEL % 16 == 0, got {BLOCK_DMODEL}"
-    )
+    assert (
+        BLOCK_DMODEL % 16 == 0 and 16 <= BLOCK_DMODEL <= 512
+    ), f"aiw needs 16 <= BLOCK_DMODEL <= 512 and BLOCK_DMODEL % 16 == 0, got {BLOCK_DMODEL}"
     assert dtype_str in ("f16", "bf16"), f"aiw supports f16/bf16, got {dtype_str!r}"
     assert K_PREFETCH_DIST in (0, 1), f"K_PREFETCH_DIST must be 0 or 1, got {K_PREFETCH_DIST}"
     assert V_PREFETCH_DIST in (0, 1), f"V_PREFETCH_DIST must be 0 or 1, got {V_PREFETCH_DIST}"
-    assert V_LDS_LAYOUT in ("row", "transposed"), (
-        f"V_LDS_LAYOUT must be 'row' or 'transposed', got {V_LDS_LAYOUT!r}"
-    )
+    assert V_LDS_LAYOUT in ("row", "transposed"), f"V_LDS_LAYOUT must be 'row' or 'transposed', got {V_LDS_LAYOUT!r}"
     assert ROW_SUBTILES in (1, 2), f"ROW_SUBTILES must be 1 or 2, got {ROW_SUBTILES}"
 
     # BLOCK_N. The power of two is load-bearing: `_sdiv_rd` in the kernel is an
@@ -379,12 +366,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     assert BLOCK_N & (BLOCK_N - 1) == 0, f"BLOCK_N ({BLOCK_N}) must be a power of two"
 
     # The V/output window, and how it divides.
-    assert VO_WIDTH % 16 == 0 and 0 < VO_WIDTH <= BLOCK_DMODEL, (
-        f"BLOCK_DMODEL_V must be a positive multiple of 16 and <= BLOCK_DMODEL, got {VO_WIDTH}"
-    )
-    assert D_OFFSET % 16 == 0 and D_OFFSET + VO_WIDTH <= BLOCK_DMODEL, (
-        f"D_OFFSET {D_OFFSET} + BLOCK_DMODEL_V {VO_WIDTH} must fit in BLOCK_DMODEL {BLOCK_DMODEL}"
-    )
+    assert (
+        VO_WIDTH % 16 == 0 and 0 < VO_WIDTH <= BLOCK_DMODEL
+    ), f"BLOCK_DMODEL_V must be a positive multiple of 16 and <= BLOCK_DMODEL, got {VO_WIDTH}"
+    assert (
+        D_OFFSET % 16 == 0 and D_OFFSET + VO_WIDTH <= BLOCK_DMODEL
+    ), f"D_OFFSET {D_OFFSET} + BLOCK_DMODEL_V {VO_WIDTH} must fit in BLOCK_DMODEL {BLOCK_DMODEL}"
     assert VO_SLICE % WMMA_N == 0, f"V/O slice {VO_SLICE} must be a multiple of WMMA_N={WMMA_N}"
 
     # Sharding. A slice not a multiple of WMMA_K would silently drop part of the
@@ -399,12 +386,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # rather than negated conjunctions -- `not (not V_TRANSPOSED and ...)` is
     # a sentence nobody can read twice the same way.
     if not V_TRANSPOSED:
-        assert QK_SHARDS == 1, (
-            "V_LDS_LAYOUT='row' does not implement cross-shard reduction; use 'transposed'"
-        )
-        assert VO_CHUNKS == 1, (
-            "V_LDS_LAYOUT='row' does not implement chunked V staging; use 'transposed'"
-        )
+        assert QK_SHARDS == 1, "V_LDS_LAYOUT='row' does not implement cross-shard reduction; use 'transposed'"
+        assert VO_CHUNKS == 1, "V_LDS_LAYOUT='row' does not implement chunked V staging; use 'transposed'"
     if VO_CHUNKS > 1:
         assert V_PREFETCH_DIST, "chunked V staging requires V_PREFETCH_DIST=1"
     if ROW_SUBTILES > 1:
@@ -426,9 +409,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         BLOCK_M = BLOCK_M_KNOB
         # Stays here rather than in the section above: BLOCK_M only exists on
         # this branch, and on the other one it is derived rather than given.
-        assert BLOCK_M % ROWS_PER_WAVE == 0, (
-            f"BLOCK_M ({BLOCK_M}) must be a multiple of {ROWS_PER_WAVE}"
-        )
+        assert BLOCK_M % ROWS_PER_WAVE == 0, f"BLOCK_M ({BLOCK_M}) must be a multiple of {ROWS_PER_WAVE}"
         Q_TILES_PER_BLOCK = BLOCK_M // ROWS_PER_WAVE
         NUM_WAVES = Q_TILES_PER_BLOCK
     else:
@@ -445,9 +426,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # Note this is invisible to a bitwise output comparison -- each Q row's
         # arithmetic is identical however rows are grouped into blocks -- so
         # only the benchmark catches it.
-        Q_TILES_PER_BLOCK = max(
-            1, q_tiles_per_block(BLOCK_DMODEL, QK_SHARDS) // ROW_SUBTILES
-        )
+        Q_TILES_PER_BLOCK = max(1, q_tiles_per_block(BLOCK_DMODEL, QK_SHARDS) // ROW_SUBTILES)
         BLOCK_M = ROWS_PER_WAVE * Q_TILES_PER_BLOCK
         NUM_WAVES = Q_TILES_PER_BLOCK * QK_SHARDS
 
@@ -470,11 +449,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     )
 
     K_STEP_QK = WMMA_K
-    K_STEPS_QK = QK_SLICE // K_STEP_QK      # GEMM1 K-steps for this wave's slice
+    K_STEPS_QK = QK_SLICE // K_STEP_QK  # GEMM1 K-steps for this wave's slice
 
     D_CHUNK = WMMA_N
-    D_CHUNKS = VO_SLICE // D_CHUNK          # accs per wave per chunk
-    O_ACCS = VO_CHUNKS * D_CHUNKS           # accs live across the KV loop, per Q tile
+    D_CHUNKS = VO_SLICE // D_CHUNK  # accs per wave per chunk
+    O_ACCS = VO_CHUNKS * D_CHUNKS  # accs live across the KV loop, per Q tile
 
     PV_K_STEP = WMMA_K
     PV_K_STEPS = COLS_PER_SUBTILE // PV_K_STEP
@@ -644,9 +623,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     if HOST_CAUSAL_TYPE not in (0, 1, 2, 3):
         raise ValueError(f"causal_type must be 0, 1, 2 or 3, got {HOST_CAUSAL_TYPE}")
     if bool(HOST_CAUSAL_TYPE) != bool(causal):
-        raise ValueError(
-            f"causal={causal} disagrees with causal_type={HOST_CAUSAL_TYPE}"
-        )
+        raise ValueError(f"causal={causal} disagrees with causal_type={HOST_CAUSAL_TYPE}")
     # **The kernel only ever sees 0 or 3.** 1 and 2 are host-side conveniences
     # that resolve to a window before dispatch, which is what AOTriton ships
     # (`@ati.scalar('CAUSAL_TYPE', options=[0, 3])`). Keeping them in the
@@ -688,12 +665,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # gets which offset -- because that is layout-specific.
     ENABLE_DROPOUT = bool(dropout)
     PHILOX = Philox.for_arch() if philox_width is None else Philox(width=philox_width)
-    RN_PER_OFFSET = PHILOX.randoms_per_offset
 
-    # Mask KV columns past seqlen_k. Required whenever seqlen need not divide
-    # BLOCK_N -- i.e. always, now that the interface no longer pads. The guard
-    # inside is dynamic, so interior tiles cost one scalar compare.
-    NEEDS_KV_TAIL_MASK = True
+    # KV columns past seqlen_k are always masked: seqlen need not divide
+    # BLOCK_N now that the interface no longer pads. The guard is dynamic, so
+    # interior tiles cost one scalar compare.
 
     # ---- LDS layout ----
     # K is padded rather than XOR-swizzled (a swizzle was implemented and
@@ -705,7 +680,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # 18 dwords, so lane16*18 mod 32 hits 16 distinct banks (conflict-free)
     # while staying 8-byte aligned.
     VT_STRIDE = BLOCK_N + _LDS_PAD
-    V_STRIDE = VO_WIDTH + _LDS_PAD          # row-major V
+    V_STRIDE = VO_WIDTH + _LDS_PAD  # row-major V
 
     # Cooperative-load vector width, in elements. 8 == 16 bytes.
     #
@@ -768,9 +743,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     V_LOADS = V_TR_LOADS if V_TRANSPOSED else NUM_BATCHES_V
 
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
-    LDS_V_TILE_SIZE = (
-        VO_CHUNK_COLS * VT_STRIDE if V_TRANSPOSED else BLOCK_N * V_STRIDE
-    )
+    LDS_V_TILE_SIZE = VO_CHUNK_COLS * VT_STRIDE if V_TRANSPOSED else BLOCK_N * V_STRIDE
     LDS_K_TOTAL_SIZE = LDS_K_TILE_SIZE
     LDS_V_BASE = LDS_K_TOTAL_SIZE
     LDS_V_TOTAL_SIZE = LDS_V_TILE_SIZE
@@ -879,9 +852,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         seqlen_k_i32, k_row_off, k_batch = fmha.decode_addressing(
             varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32, num_seqlens
         )
-        lse_tokens = fmha.lse_token_pitch(
-            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, num_seqlens
-        )
+        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, num_seqlens)
 
         seqlen_k_v = fx.Index(seqlen_k_i32)
 
@@ -892,8 +863,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # array is elem_dtype (16-bit), so go through an addrspace(3) LLVM
         # pointer: ptrtoint on a shared pointer yields the 32-bit LDS offset.
         _lds_byte_base = fx.as_ir_value(fx.ptrtoint(lds_kv))
-        _RED_BYTE0 = (LDS_V_BASE if RED_ALIASES_V else LDS_KV_TOTAL_SIZE
-                      - (RED_F32_TOTAL * 4 + 1) // 2) * 2
+        _RED_BYTE0 = (LDS_V_BASE if RED_ALIASES_V else LDS_KV_TOTAL_SIZE - (RED_F32_TOTAL * 4 + 1) // 2) * 2
 
         tid = fx.Index(gpu.thread_idx.x)
 
@@ -909,8 +879,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         wave_q_offset = q_tile_in_block * ROWS_PER_WAVE
 
         # Column origins of this wave's slices. Both are 0 at QK_SHARDS == 1.
-        shard_qk_off = shard_id * fx.Index(QK_SLICE)   # into Q/K BLOCK_DMODEL
-        shard_vo_off = shard_id * fx.Index(VO_SLICE)   # into the V/O window
+        shard_qk_off = shard_id * fx.Index(QK_SLICE)  # into Q/K BLOCK_DMODEL
+        shard_vo_off = shard_id * fx.Index(VO_SLICE)  # into the V/O window
 
         # 3D grid: (head_q, q_tile, batch). A flat grid would need two integer
         # divisions here to recover these, and with num_heads runtime neither
@@ -967,9 +937,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # unmapped page. It is a *read*, and one whose result is discarded, so
         # smaller overshoots land inside the allocation and are silently
         # harmless, which is exactly why the varlen tests did not catch it.
-        _q_start_addr = fx.Index(
-            _alive.select(start_q, fx.Index(0))
-        )
+        _q_start_addr = fx.Index(_alive.select(start_q, fx.Index(0)))
 
         # MQA/GQA: Num_head_q / Num_head_k query heads share each KV head.
         # The ratio is uniform and computed once, so the scalar divide is
@@ -1022,10 +990,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # Dense-only: it derives the layout from the shape, which varlen
             # invalidates outright. The host rejects the combination.
             # BHSD compact: (batch, head, seq).
-            _stq = (fx.Index(max_seqlen_q) * STRIDE_TOKEN,
-                    fx.Index(max_seqlen_q) * HEAD_DIM, HEAD_DIM)
-            _stk = (fx.Index(max_seqlen_k) * STRIDE_TOKEN,
-                    fx.Index(max_seqlen_k) * HEAD_DIM, HEAD_DIM)
+            _stq = (fx.Index(max_seqlen_q) * STRIDE_TOKEN, fx.Index(max_seqlen_q) * HEAD_DIM, HEAD_DIM)
+            _stk = (fx.Index(max_seqlen_k) * STRIDE_TOKEN, fx.Index(max_seqlen_k) * HEAD_DIM, HEAD_DIM)
             q_st = o_st = _stq
             k_st = v_st = _stk
             sm_log2e = fx.Float32(sm_scale * _LOG2E)
@@ -1050,9 +1016,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         if const_expr(BIAS_TYPE):
             _b_ptr = fmha.pointer_to_llvm_ptr(Bias)
             _b_base = (
-                _q_batch_v * fx.Index(stride_b0)
-                + head_q * fx.Index(stride_b1)
-                + _q_row_off_v * fx.Index(stride_b2)
+                _q_batch_v * fx.Index(stride_b0) + head_q * fx.Index(stride_b1) + _q_row_off_v * fx.Index(stride_b2)
             )
 
         if const_expr(ENABLE_DROPOUT):
@@ -1073,9 +1037,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # shared with the debug mask kernel -- see the comment there. This
             # kernel supplies only which plane a workgroup is on.
             _off_zh = fx.Int32(z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
-            _ph_base, _ph_stride = PHILOX.grid_plane(
-                philox_offset_base, _off_zh, max_seqlen_q, max_seqlen_k
-            )
+            _ph_base, _ph_stride = PHILOX.grid_plane(philox_offset_base, _off_zh, max_seqlen_q, max_seqlen_k)
 
         # `clamp` is const_expr: with both prefetch distances 0 and neither
         # load guard, there is no over-read, so the clamp is not emitted.
@@ -1088,30 +1050,18 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # it stops a future V width that does not divide BLOCK_N from silently
         # losing V's clamp.
         _KV_CLAMP = not (
-            _NO_KV_CLAMP
-            or (
-                K_PREFETCH_DIST == 0
-                and V_PREFETCH_DIST == 0
-                and not K_NEEDS_GUARD
-                and not V_NEEDS_GUARD
-            )
+            _NO_KV_CLAMP or (K_PREFETCH_DIST == 0 and V_PREFETCH_DIST == 0 and not K_NEEDS_GUARD and not V_NEEDS_GUARD)
         )
         _addr_kw = dict(
-            seqlen_k=seqlen_k_v, seq_last=seq_last,
-            hoist=KV_ADDR_HOIST, clamp=_KV_CLAMP,
+            seqlen_k=seqlen_k_v,
+            seq_last=seq_last,
+            hoist=KV_ADDR_HOIST,
+            clamp=_KV_CLAMP,
         )
-        q_tbase, q_toff, _ = fmha.make_addr_pair(
-            q_st, head_q, _q_batch_v, _q_row_off_v, **_addr_kw
-        )
-        _, _, k_addr = fmha.make_addr_pair(
-            k_st, head_k, _k_batch_v, _k_row_off_v, **_addr_kw
-        )
-        _, _, v_addr = fmha.make_addr_pair(
-            v_st, head_k, _k_batch_v, _k_row_off_v, **_addr_kw
-        )
-        o_tbase, o_toff, _ = fmha.make_addr_pair(
-            o_st, head_q, _q_batch_v, _q_row_off_v, **_addr_kw
-        )
+        q_tbase, q_toff, _ = fmha.make_addr_pair(q_st, head_q, _q_batch_v, _q_row_off_v, **_addr_kw)
+        _, _, k_addr = fmha.make_addr_pair(k_st, head_k, _k_batch_v, _k_row_off_v, **_addr_kw)
+        _, _, v_addr = fmha.make_addr_pair(v_st, head_k, _k_batch_v, _k_row_off_v, **_addr_kw)
+        o_tbase, o_toff, _ = fmha.make_addr_pair(o_st, head_q, _q_batch_v, _q_row_off_v, **_addr_kw)
 
         # ---- PADDED_HEAD column handling ----
         #
@@ -1154,16 +1104,23 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # behind the same interface; until then they would be objects with no
         # reader.
         k_ap = fmha.Aperture(
-            qk_cols, lds_base=0, lds_stride=K_STRIDE,
-            vec_width=VEC_WIDTH, threads_per_row=K_TPR_LOAD,
-            rows_per_batch=K_ROWS_PER_BATCH, num_batches=NUM_BATCHES_K,
+            qk_cols,
+            lds_base=0,
+            lds_stride=K_STRIDE,
+            vec_width=VEC_WIDTH,
+            threads_per_row=K_TPR_LOAD,
+            rows_per_batch=K_ROWS_PER_BATCH,
+            num_batches=NUM_BATCHES_K,
             needs_guard=K_NEEDS_GUARD,
         )
         v_ap = fmha.Aperture(
-            vo_cols, lds_base=LDS_V_BASE,
+            vo_cols,
+            lds_base=LDS_V_BASE,
             lds_stride=VT_STRIDE if V_TRANSPOSED else V_STRIDE,
-            vec_width=VEC_WIDTH, threads_per_row=V_TPR_LOAD,
-            rows_per_batch=V_ROWS_PER_BATCH, num_batches=NUM_BATCHES_V,
+            vec_width=VEC_WIDTH,
+            threads_per_row=V_TPR_LOAD,
+            rows_per_batch=V_ROWS_PER_BATCH,
+            num_batches=NUM_BATCHES_V,
             needs_guard=V_NEEDS_GUARD,
         )
 
@@ -1203,30 +1160,34 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # of them has to know that V^T uses a different instruction from V.
         fetch_k = fmha.reader(k_addr, lambda b, o: load_global_f16xN(k_ptr, b, o))
         fetch_v = fmha.reader(v_addr, lambda b, o: load_global_f16xN(v_ptr, b, o))
-        fetch_v_tr = fmha.reader(
-            v_addr, lambda b, o: fmha.global_load_tr_v8(v_ptr_i64, b, o, v8f16_type)
-        )
+        fetch_v_tr = fmha.reader(v_addr, lambda b, o: fmha.global_load_tr_v8(v_ptr_i64, b, o, v8f16_type))
 
         # ---- K staging ----
 
         def coop_load_k_global(start_k):
             """Issue this thread's K global loads; results stay in registers."""
-            return fmha.read_batches(
-                k_ap, fetch_k(start_k), load_row_in_batch, load_col_base
-            )
+            return fmha.read_batches(k_ap, fetch_k(start_k), load_row_in_batch, load_col_base)
 
         def coop_store_k_lds(vecs):
             """Distance-1 K staging: publish the tile loaded last iteration."""
             fmha.publish(
-                k_ap, lds_kv, vecs, load_row_in_batch, load_col_base,
+                k_ap,
+                lds_kv,
+                vecs,
+                load_row_in_batch,
+                load_col_base,
                 fx.Index(BLOCK_N),
             )
 
         def coop_load_store_k(start_k):
             """Distance-0 K staging: load and store inside a single guard."""
             fmha.stage(
-                k_ap, lds_kv, fetch_k(start_k), load_row_in_batch,
-                load_col_base, fx.Index(BLOCK_N),
+                k_ap,
+                lds_kv,
+                fetch_k(start_k),
+                load_row_in_batch,
+                load_col_base,
+                fx.Index(BLOCK_N),
             )
 
         # ---- V staging ----
@@ -1243,9 +1204,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # picks the kv row and the group index picks the 8-wide d half. The
         # *store* pair is where the lane's transposed result then belongs.
         v_tr = fmha.TransposedTiling(
-            d_blocks=V_TR_D_BLOCKS, tiles=_V_TR_TILES, loads=V_TR_LOADS,
-            needs_guard=V_TR_NEEDS_GUARD, num_waves=NUM_WAVES,
-            d_step=WMMA_N, kv_step=WMMA_K, wave_id=wave_id,
+            d_blocks=V_TR_D_BLOCKS,
+            tiles=_V_TR_TILES,
+            loads=V_TR_LOADS,
+            needs_guard=V_TR_NEEDS_GUARD,
+            num_waves=NUM_WAVES,
+            d_step=WMMA_N,
+            kv_step=WMMA_K,
+            wave_id=wave_id,
             load_d_off=((lane // 8) % 2) * WMMA_LANE_K,
             load_kv_off=(lane // 16) * WMMA_LANE_K + (lane % 8),
             store_d_off=lane16,
@@ -1256,38 +1222,36 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             """V columns [chunk*VO_CHUNK_COLS, +VO_CHUNK_COLS) of this KV tile."""
             if const_expr(V_TRANSPOSED):
                 return fmha.read_transposed(
-                    v_ap, v_tr, fetch_v_tr(start_k),
+                    v_ap,
+                    v_tr,
+                    fetch_v_tr(start_k),
                     chunk * VO_CHUNK_COLS + D_OFFSET,
                 )
             col = v_col_base
             if const_expr(D_OFFSET):
                 col = fx.Index(D_OFFSET) + col
-            return fmha.read_batches_unmasked(
-                v_ap, fetch_v(start_k), v_row_in_batch, col
-            )
+            return fmha.read_batches_unmasked(v_ap, fetch_v(start_k), v_row_in_batch, col)
 
         def coop_store_v_lds(vecs):
             if const_expr(V_TRANSPOSED):
                 fmha.publish_transposed(v_ap, v_tr, lds_kv, vecs)
             else:
                 fmha.publish(
-                    v_ap, lds_kv, vecs, v_row_in_batch, v_col_base,
+                    v_ap,
+                    lds_kv,
+                    vecs,
+                    v_row_in_batch,
+                    v_col_base,
                     fx.Index(BLOCK_N),
                 )
 
         # ---- Q preload ----
         # One row per row sub-tile; at ROW_SUBTILES == 1 this is the
         # single-tile mapping.
-        q_rows = [
-            start_q + wave_q_offset + fx.Index(qt * WMMA_M) + lane16
-            for qt in range_constexpr(ROW_SUBTILES)
-        ]
+        q_rows = [start_q + wave_q_offset + fx.Index(qt * WMMA_M) + lane16 for qt in range_constexpr(ROW_SUBTILES)]
         q_row_i32s = [fx.Int32(r) for r in q_rows]
         # Intra-tile Q rows, bounded by BLOCK_M so the 32-bit offset stays small.
-        q_rows_in_tile = [
-            wave_q_offset + fx.Index(qt * WMMA_M) + lane16
-            for qt in range_constexpr(ROW_SUBTILES)
-        ]
+        q_rows_in_tile = [wave_q_offset + fx.Index(qt * WMMA_M) + lane16 for qt in range_constexpr(ROW_SUBTILES)]
         # Rows are bounded by the real Q length; a workgroup's last tile can
         # hang past it. Unlike the column axes this is never inactive. Q is
         # read straight into registers, so its aperture has no LDS placement
@@ -1349,9 +1313,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # `fmha.resolve_window`. Everything derived from a window stays
             # i32 from here down: bounds go negative, and `fx.Index` is
             # unsigned.
-            _wl_i32, _wr_i32 = fmha.resolve_window(
-                window_left, window_right, seqlen_q_i32, seqlen_k_i32
-            )
+            _wl_i32, _wr_i32 = fmha.resolve_window(window_left, window_right, seqlen_q_i32, seqlen_k_i32)
 
         # ---- Split the KV range into full and masked regions ----
         #
@@ -1400,8 +1362,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # for every row -- worst case the largest row on the left and the
             # smallest on the right.
             _regions = fmha.decompose_causal_regions(
-                start_q, seqlen_q_i32, seqlen_k_i32,
-                _wl_i32, _wr_i32, BLOCK_M, BLOCK_N, _alive,
+                start_q,
+                seqlen_q_i32,
+                seqlen_k_i32,
+                _wl_i32,
+                _wr_i32,
+                BLOCK_M,
+                BLOCK_N,
+                _alive,
             )
             _BN_I32 = fx.Int32(BLOCK_N)
             _n_l, _n_f, _n_r = _regions.n_left, _regions.n_full, _regions.n_right
@@ -1416,17 +1384,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # BLOCK_N 32 the kernel attended to only the first 32 keys, which
             # is wrong for every row rather than just the tail.
             _full_end = (seqlen_k_v // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N)
-            kv_upper = fx.Index(
-                ((seqlen_k_v + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N))
-                * fx.Index(BLOCK_N)
-            )
+            kv_upper = fx.Index(((seqlen_k_v + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N))
             # Same empty-work clamp as the causal arm above.
-            _full_end = fx.Index(
-                _alive.select(_full_end, fx.Index(0))
-            )
-            kv_upper = fx.Index(
-                _alive.select(kv_upper, fx.Index(0))
-            )
+            _full_end = fx.Index(_alive.select(_full_end, fx.Index(0)))
+            kv_upper = fx.Index(_alive.select(kv_upper, fx.Index(0)))
 
         # Tiles this workgroup will actually walk. Zero for a sequence with no
         # keys and for every workgroup the varlen grid dispatches past the end
@@ -1450,7 +1411,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 common_utils.smax(
                     common_utils.ssel(
                         (_n_f > fx.Int32(0)),
-                        _f_col0, _m_col0,
+                        _f_col0,
+                        _m_col0,
                     ),
                     fx.Int32(0),
                 )
@@ -1478,7 +1440,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         _pf_n = fx.Index(
             common_utils.ssel(
                 (_kv_tiles_i32 > fx.Int32(0)),
-                fx.Int32(1), fx.Int32(0),
+                fx.Int32(1),
+                fx.Int32(0),
             )
         )
         _pf_init = []
@@ -1534,8 +1497,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 init_args.append(_v_vecs_init[batch])
 
         loop_results = init_args
-        def kv_loop_body(kv_block_start, inner_iter_args, _MASK_STEPS,
-                     next_kv_start=None):
+
+        def kv_loop_body(kv_block_start, inner_iter_args, _MASK_STEPS, next_kv_start=None):
             """One KV tile. `_MASK_STEPS` is a Python bool resolved at trace
             time, so the masked and unmasked regions emit different code.
 
@@ -1548,20 +1511,13 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             m_run = [inner_iter_args[2 * qt] for qt in range_constexpr(ROW_SUBTILES)]
             l_run = [inner_iter_args[2 * qt + 1] for qt in range_constexpr(ROW_SUBTILES)]
             o_accs_all = [
-                [
-                    inner_iter_args[_ML + qt * O_ACCS + i]
-                    for i in range_constexpr(O_ACCS)
-                ]
+                [inner_iter_args[_ML + qt * O_ACCS + i] for i in range_constexpr(O_ACCS)]
                 for qt in range_constexpr(ROW_SUBTILES)
             ]
             if const_expr(K_PREFETCH_DIST):
-                _k_vecs_cur = [
-                    inner_iter_args[_KOFF + b] for b in range_constexpr(k_ap.num_batches)
-                ]
+                _k_vecs_cur = [inner_iter_args[_KOFF + b] for b in range_constexpr(k_ap.num_batches)]
             if const_expr(V_PREFETCH_DIST):
-                _v_vecs_cur = [
-                    inner_iter_args[_VOFF + b] for b in range_constexpr(V_LOADS)
-                ]
+                _v_vecs_cur = [inner_iter_args[_VOFF + b] for b in range_constexpr(V_LOADS)]
 
             if const_expr(next_kv_start is None):
                 next_kv_start = kv_block_start + fx.Index(BLOCK_N_OUT)
@@ -1584,8 +1540,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # accumulators: one LDS read serves ROW_SUBTILES WMMAs. That reuse is
             # the point of the knob.
             s_accs_all = [
-                [fx.as_ir_value(c_zero_v8f32) for _ in range(NUM_S_ACCS)]
-                for _ in range_constexpr(ROW_SUBTILES)
+                [fx.as_ir_value(c_zero_v8f32) for _ in range(NUM_S_ACCS)] for _ in range_constexpr(ROW_SUBTILES)
             ]
 
             for ks in range_constexpr(K_STEPS_QK):
@@ -1603,12 +1558,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     acc_idx_a = st_idx * 2
                     acc_idx_b = st_idx * 2 + 1
                     for qt in range_constexpr(ROW_SUBTILES):
-                        s_accs_all[qt][acc_idx_a] = wmma_acc(
-                            k_pack_a, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_a]
-                        )
-                        s_accs_all[qt][acc_idx_b] = wmma_acc(
-                            k_pack_b, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_b]
-                        )
+                        s_accs_all[qt][acc_idx_a] = wmma_acc(k_pack_a, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_a])
+                        s_accs_all[qt][acc_idx_b] = wmma_acc(k_pack_b, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_b])
 
             # ==== Cross-shard S reduction ====
             # Each shard-wave holds a partial sum over its own BLOCK_DMODEL slice;
@@ -1691,8 +1642,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         _c0 = (_st // 2) * 32 + (_st % 2) * 16
                         _bv = load_global_v8f16(
                             _b_ptr,
-                            _b_row + fx.Index(kv_block_start) + fx.Index(_c0)
-                            + klane * fx.Index(8),
+                            _b_row + fx.Index(kv_block_start) + fx.Index(_c0) + klane * fx.Index(8),
                             fx.Index(0),
                         )
                         for _r in range_constexpr(8):
@@ -1734,11 +1684,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     _klane_off = fx.Int32(klane) * fx.Int32(8)
                     _seq_i32 = seqlen_k_i32
                     for _i in range_constexpr(NUM_S_VALS):
-                        _col = (
-                            _kv_i32
-                            + fx.Int32((_i // 16) * 32 + ((_i // 8) % 2) * 16 + _i % 8)
-                            + _klane_off
-                        )
+                        _col = _kv_i32 + fx.Int32((_i // 16) * 32 + ((_i // 8) % 2) * 16 + _i % 8) + _klane_off
                         _dead = _col >= _seq_i32
                         if const_expr(CAUSAL):
                             # Both edges of the band. Signed throughout:
@@ -1758,9 +1704,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 m_new_raw = fastmath.max(m_running, row_max)
 
                 # m is already scaled, so no scale appears in either exponent.
-                corr = rocdl.exp2(
-                    ir.F32Type.get(), fx.as_ir_value(fastmath.sub(m_running, m_new_raw))
-                )
+                corr = rocdl.exp2(ir.F32Type.get(), fx.as_ir_value(fastmath.sub(m_running, m_new_raw)))
                 neg_m = fastmath.sub(c_zero_f, m_new_raw)
 
                 p_vals = []
@@ -1776,9 +1720,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 l_corr = fastmath.mul(corr, l_running)
                 l_new = fastmath.add(l_corr, tile_sum)
 
-                corr_vec = (
-                    Vec.from_elements([corr], fx.Float32).broadcast_to(8).ir_value()
-                )
+                corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(8).ir_value()
                 for dc in range_constexpr(O_ACCS):
                     o_accs_all[qt][dc] = fastmath.mul(o_accs_all[qt][dc], corr_vec)
 
@@ -1796,24 +1738,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     # each group is one span of the stream.
                     for _st in range_constexpr(NUM_S_ACCS):
                         _c0 = (_st // 2) * 32 + (_st % 2) * 16
-                        _bcol = (
-                            fx.Int64(kv_block_start)
-                            + fx.Int64(_c0)
-                            + fx.Int64(fx.Int32(klane) * fx.Int32(8))
-                        )
-                        _first = PHILOX.grid_offset(
-                            _ph_base, _ph_stride, q_rows[qt], _bcol
-                        )
-                        _keep = PHILOX.keep_span(
-                            philox_seed, _first, 8, idropout_p
-                        )
+                        _bcol = fx.Int64(kv_block_start) + fx.Int64(_c0) + fx.Int64(fx.Int32(klane) * fx.Int32(8))
+                        _first = PHILOX.grid_offset(_ph_base, _ph_stride, q_rows[qt], _bcol)
+                        _keep = PHILOX.keep_span(philox_seed, _first, 8, idropout_p)
                         for _r in range_constexpr(8):
                             _i = _st * 8 + _r
-                            p_vals[_i] = fx.as_ir_value(
-                                _keep[_r].select(
-                                    fx.Float32(p_vals[_i]), fx.Float32(0.0)
-                                )
-                            )
+                            p_vals[_i] = fx.as_ir_value(_keep[_r].select(fx.Float32(p_vals[_i]), fx.Float32(0.0)))
 
                 m_new_all.append(m_new_raw)
                 l_new_all.append(l_new)
@@ -1837,9 +1767,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                             elem_list = []
                             for j in range_constexpr(8):
                                 elem_list.append(fx.Float32(p_slice[j]).to(elem_dtype))
-                            p_packs_st.append(
-                                Vec.from_elements(elem_list, elem_dtype).ir_value()
-                            )
+                            p_packs_st.append(Vec.from_elements(elem_list, elem_dtype).ir_value())
                     p_packs_all.append(p_packs_st)
                 p_packs_all_qt.append(p_packs_all)
 
@@ -1852,24 +1780,13 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         # contiguous, so this is one vector read instead of 8
                         # strided scalar loads.
                         d_pos = shard_vo_off + fx.Index(dc_val * D_CHUNK) + lane16
-                        kv0 = (
-                            fx.Index(st_kv_base_val + pks_val * PV_K_STEP)
-                            + klane * WMMA_LANE_K
-                        )
+                        kv0 = fx.Index(st_kv_base_val + pks_val * PV_K_STEP) + klane * WMMA_LANE_K
                         return v_ap.from_lds(lds_kv, d_pos, kv0)
                     d_pos = fx.Index(dc_val * D_CHUNK) + lane16
                     v_elems = []
                     for k_sub in range_constexpr(8):
-                        kv_row = (
-                            fx.Index(st_kv_base_val + pks_val * PV_K_STEP)
-                            + klane * WMMA_LANE_K
-                            + fx.Index(k_sub)
-                        )
-                        v_elems.append(
-                            fx.ptr_load(
-                                lds_kv + fx.Int32(v_ap.lds_index(kv_row, d_pos))
-                            )
-                        )
+                        kv_row = fx.Index(st_kv_base_val + pks_val * PV_K_STEP) + klane * WMMA_LANE_K + fx.Index(k_sub)
+                        v_elems.append(fx.ptr_load(lds_kv + fx.Int32(v_ap.lds_index(kv_row, d_pos))))
                     return Vec.from_elements(v_elems, elem_dtype).ir_value()
 
                 # Software pipeline: preload the first V pack, then prefetch the
@@ -1890,9 +1807,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         next_v_packs = []
                         if const_expr(has_next):
                             for st_idx in range_constexpr(COL_SUBTILES):
-                                next_v_packs.append(
-                                    _load_v(st_idx * COLS_PER_SUBTILE, next_pks, next_dc)
-                                )
+                                next_v_packs.append(_load_v(st_idx * COLS_PER_SUBTILE, next_pks, next_dc))
 
                         # One V operand, ROW_SUBTILES WMMAs: this is what halves
                         # the V LDS reads per FLOP at ROW_SUBTILES > 1.
@@ -1973,8 +1888,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # have been just as correct and would have lost that property --
             # which is the property that licensed deleting CAUSAL_TYPE 1/2.
             for kv_block_start, inner_iter_args in range(
-                fx.Index(_f_col0), fx.Index(_f_col0 + _n_f * _BN_I32),
-                BLOCK_N_OUT, init=init_args,
+                fx.Index(_f_col0),
+                fx.Index(_f_col0 + _n_f * _BN_I32),
+                BLOCK_N_OUT,
+                init=init_args,
             ):
                 # The successor of the last full tile is the first masked one,
                 # which is only the adjacent tile when the left run is empty.
@@ -1985,9 +1902,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         _m_col0,
                     )
                 )
-                loop_results = yield kv_loop_body(
-                    kv_block_start, inner_iter_args, False, next_kv_start=_nxt
-                )
+                loop_results = yield kv_loop_body(kv_block_start, inner_iter_args, False, next_kv_start=_nxt)
 
             def _masked_col(i_idx):
                 """Tile column for masked iteration i: the left run, then the
@@ -2000,9 +1915,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     _r_col0 + (_i - _n_l) * _BN_I32,
                 )
 
-            for _mi, inner_iter_args in range(
-                fx.Index(0), _n_masked, 1, init=loop_results
-            ):
+            for _mi, inner_iter_args in range(fx.Index(0), _n_masked, 1, init=loop_results):
                 loop_results = yield kv_loop_body(
                     fx.Index(_masked_col(_mi)),
                     inner_iter_args,
@@ -2011,16 +1924,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 )
         else:
             # Region 1: tiles that are wholly live -- no masking emitted at all.
-            for kv_block_start, inner_iter_args in range(
-                fx.Index(0), _full_end, BLOCK_N_OUT, init=init_args
-            ):
+            for kv_block_start, inner_iter_args in range(fx.Index(0), _full_end, BLOCK_N_OUT, init=init_args):
                 loop_results = yield kv_loop_body(kv_block_start, inner_iter_args, False)
 
             # Region 2: the tail, where columns can be past seqlen_k or past the
             # causal diagonal.
-            for kv_block_start, inner_iter_args in range(
-                _full_end, kv_upper, BLOCK_N_OUT, init=loop_results
-            ):
+            for kv_block_start, inner_iter_args in range(_full_end, kv_upper, BLOCK_N_OUT, init=loop_results):
                 loop_results = yield kv_loop_body(kv_block_start, inner_iter_args, True)
 
         # ---- logsumexp ----
@@ -2045,9 +1954,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # at trace time.
         _f32_ty = ir.F32Type.get()
         _l_valid = fx.Int64(fx.ptrtoint(L)) != fx.Int64(0)
-        _lse_writer = (
-            _l_valid & (klane == fx.Index(0)) & (shard_id == fx.Index(0))
-        )
+        _lse_writer = _l_valid & (klane == fx.Index(0)) & (shard_id == fx.Index(0))
         # Everything -- the log2, the scale, the address -- lives inside the
         # guard. Hoisting it out cost 8% at BLOCK_DMODEL 256 non-causal even though
         # the store itself was still predicated: the values stay live across
@@ -2058,9 +1965,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             if _do_store:
                 _m = loop_results[2 * qt]
                 _l = loop_results[2 * qt + 1]
-                _lse = fastmath.mul(
-                    fastmath.add(_m, rocdl.log(_f32_ty, fx.as_ir_value(_l))), fx.Float32(_LN2)
-                )
+                _lse = fastmath.mul(fastmath.add(_m, rocdl.log(_f32_ty, fx.as_ir_value(_l))), fx.Float32(_LN2))
                 # A row with no live keys gets +inf, not -inf: the backward
                 # pass subtracts LSE from qk, so +inf makes exp(qk - inf)
                 # zero for exactly the rows that must contribute nothing.
@@ -2083,12 +1988,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # Compact in both layouts, so the head pitch is exactly
                 # num_head_q and the token pitch is the decode's `tokens`.
                 _lse_off_th = (_q_batch_v * _tok + _row) * _nhq + head_q
-                _is_th = ((fx.Int32(varlen_bits) >> fx.Int32(16)) & fx.Int32(3)) != fx.Int32(
-                    0
-                )
-                _lse_off = fx.Index(
-                    _is_th.select(fx.Index(_lse_off_th), fx.Index(_lse_off_ht))
-                )
+                _is_th = ((fx.Int32(varlen_bits) >> fx.Int32(16)) & fx.Int32(3)) != fx.Int32(0)
+                _lse_off = fx.Index(_is_th.select(fx.Index(_lse_off_th), fx.Index(_lse_off_ht)))
                 _pointer_store(
                     _lse,
                     buffer_ops.get_element_ptr(
@@ -2128,9 +2029,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # and the logsumexp written below is the undropped one, which
                 # is what the backward pass needs.
                 inv_l = fx.as_ir_value(fastmath.mul(fx.Float32(inv_l), dropout_scale))
-            inv_l_vec = (
-                Vec.from_elements([inv_l], fx.Float32).broadcast_to(8).ir_value()
-            )
+            inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(8).ir_value()
             if q_in_bounds_all[qt]:
                 for _oi in range_constexpr(O_ACCS):
                     vc, dc = _oi // D_CHUNKS, _oi % D_CHUNKS
@@ -2141,9 +2040,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         d_col = fx.Index(vc * VO_CHUNK_COLS) + d_col
                     if const_expr(D_OFFSET):
                         d_col = fx.Index(D_OFFSET) + d_col
-                    fmha.write_v8(
-                        o_ap, write_o, q_rows_in_tile[qt], d_col, o_trunc
-                    )
+                    fmha.write_v8(o_ap, write_o, q_rows_in_tile[qt], d_col, o_trunc)
 
     @flyc.jit
     def launch_flash_attn_aiw(
@@ -2205,18 +2102,45 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # Always forwarded: with STRIDES_CONSTEXPR the kernel simply does not
         # read them, which is what keeps the two arms directly comparable.
         launcher = flash_attn_func_aiw_kernel(
-            Q, K, V, O, L, Bias,
-            seqinfo_q0, seqinfo_q1, seqinfo_k0, seqinfo_k1,
-            varlen_bits, batch_size, max_seqlen_q, max_seqlen_k,
-            window_left, window_right,
-            philox_seed, philox_offset_base, idropout_p, dropout_scale,
-            num_head_q, num_head_k,
-            hdim_qk, hdim_vo,
-            stride_q_batch, stride_q_head, stride_q_seq,
-            stride_k_batch, stride_k_head, stride_k_seq,
-            stride_v_batch, stride_v_head, stride_v_seq,
-            stride_o_batch, stride_o_head, stride_o_seq,
-            stride_b0, stride_b1, stride_b2,
+            Q,
+            K,
+            V,
+            O,
+            L,
+            Bias,
+            seqinfo_q0,
+            seqinfo_q1,
+            seqinfo_k0,
+            seqinfo_k1,
+            varlen_bits,
+            batch_size,
+            max_seqlen_q,
+            max_seqlen_k,
+            window_left,
+            window_right,
+            philox_seed,
+            philox_offset_base,
+            idropout_p,
+            dropout_scale,
+            num_head_q,
+            num_head_k,
+            hdim_qk,
+            hdim_vo,
+            stride_q_batch,
+            stride_q_head,
+            stride_q_seq,
+            stride_k_batch,
+            stride_k_head,
+            stride_k_seq,
+            stride_v_batch,
+            stride_v_head,
+            stride_v_seq,
+            stride_o_batch,
+            stride_o_head,
+            stride_o_seq,
+            stride_b0,
+            stride_b1,
+            stride_b2,
             sm_scale_v,
         )
 
@@ -2225,9 +2149,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             if const_expr(_wpe >= 1):
                 for op in ctx.gpu_module_body.operations:
                     if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                        op.attributes["rocdl.WAVES_PER_EU"] = ir.IntegerAttr.get(
-                            T.i32, _wpe
-                        )
+                        op.attributes["rocdl.WAVES_PER_EU"] = ir.IntegerAttr.get(T.i32, _wpe)
         if const_expr(FLAT_WORK_GROUP_SIZE is not None):
             _fwgs = int(FLAT_WORK_GROUP_SIZE)
             if const_expr(_fwgs >= 1):
@@ -2262,14 +2184,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             )
             if const_expr(FP_MODE == "fast"):
                 passthrough_entries.append(
-                    ir.ArrayAttr.get(
-                        [ir.StringAttr.get("no-nans-fp-math"), ir.StringAttr.get("true")]
-                    )
+                    ir.ArrayAttr.get([ir.StringAttr.get("no-nans-fp-math"), ir.StringAttr.get("true")])
                 )
                 passthrough_entries.append(
-                    ir.ArrayAttr.get(
-                        [ir.StringAttr.get("unsafe-fp-math"), ir.StringAttr.get("true")]
-                    )
+                    ir.ArrayAttr.get([ir.StringAttr.get("unsafe-fp-math"), ir.StringAttr.get("true")])
                 )
         for op in ctx.gpu_module_body.operations:
             if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
@@ -2293,11 +2211,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         if hasattr(t, "data_ptr"):
             type_name = type(t).__name__
             module_name = type(t).__module__
-            ptr = (
-                0
-                if type_name == "FakeTensor" or "fake_tensor" in module_name
-                else t.data_ptr()
-            )
+            ptr = 0 if type_name == "FakeTensor" or "fake_tensor" in module_name else t.data_ptr()
             return flyc.from_c_void_p(fx.Uint8, ptr)
         return t
 
@@ -2320,17 +2234,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         produces finite garbage and never faults.
         """
         if not hasattr(t, "stride"):
-            raise TypeError(
-                f"{name} must be a rank-4 tensor so its strides can be read, "
-                f"got {type(t).__name__}"
-            )
+            raise TypeError(f"{name} must be a rank-4 tensor so its strides can be read, " f"got {type(t).__name__}")
         if t.dim() != 4:
             raise ValueError(f"{name} must be rank 4, got shape {tuple(t.shape)}")
         if t.stride(3) != 1:
-            raise ValueError(
-                f"{name} must have a contiguous last dimension, got "
-                f"stride(3)={t.stride(3)}"
-            )
+            raise ValueError(f"{name} must have a contiguous last dimension, got " f"stride(3)={t.stride(3)}")
         return t.stride(0), t.stride(1), t.stride(2)
 
     def _lse_args(lse, seq_len, varlen, num_head_q):
@@ -2363,16 +2271,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # sync for a validation.
             want_last = int(seq_len) if varlen is None else varlen.get("lse_tokens")
             if want_last is not None and lse.shape[1] != int(want_last):
-                raise ValueError(
-                    f"VARLEN_LSE_LAYOUT_HT wants (*, {int(want_last)}), got "
-                    f"{tuple(lse.shape)}"
-                )
+                raise ValueError(f"VARLEN_LSE_LAYOUT_HT wants (*, {int(want_last)}), got " f"{tuple(lse.shape)}")
         else:
             if lse.shape[1] != num_head_q:
-                raise ValueError(
-                    f"VARLEN_LSE_LAYOUT_TH wants (*, {num_head_q}), got "
-                    f"{tuple(lse.shape)}"
-                )
+                raise ValueError(f"VARLEN_LSE_LAYOUT_TH wants (*, {num_head_q}), got " f"{tuple(lse.shape)}")
         return _ptr_arg(lse)
 
     # Causal alignment is expressed as a *sentinel* window, resolved in the
@@ -2390,8 +2292,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # Resolving in one place removes the class of bug rather than the
     # instance.
     _CAUSAL_SENTINEL = {
-        1: _WINDOW_TOPLEFT,      # j <= i
-        2: _WINDOW_BOTRIGHT,     # j <= i + (seqlen_k - seqlen_q)
+        1: _WINDOW_TOPLEFT,  # j <= i
+        2: _WINDOW_BOTRIGHT,  # j <= i + (seqlen_k - seqlen_q)
     }
 
     # ---- VarlenBits, sdpa-varlen-plan.md section 2 ----
@@ -2400,7 +2302,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # the LSE layout in byte 2. `0` is BHSD / MAX / IMPLIED on both sides with
     # an (H, T) logsumexp -- the conventional dense case, and the default.
     VARLEN_STACKED = 1
-    VARLEN_LENGTH_MAX = 0 << 1
+    VARLEN_LENGTH_MAX = 0 << 1  # noqa: F841  (the table is the wire spec)
     VARLEN_LENGTH_CUMULATIVE = 1 << 1
     VARLEN_LENGTH_INDIVIDUAL = 2 << 1
     VARLEN_POSITION_IMPLIED = 0 << 3
@@ -2409,7 +2311,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # `_HT` is AOTriton's and this kernel's default: shape (H, T), T
     # contiguous. `_TH` is Transformer Engine's (T, H).
     VARLEN_LSE_LAYOUT_HT = 0 << 16
-    VARLEN_LSE_LAYOUT_TH = 1 << 16
+    VARLEN_LSE_LAYOUT_TH = 1 << 16  # noqa: F841  (ditto)
 
     def varlen_bits(q_side=0, k_side=0, lse_layout=VARLEN_LSE_LAYOUT_HT):
         """Assemble VarlenBits from per-side bytes."""
@@ -2420,32 +2322,24 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # REUSE takes a *position* out of the length array, which is
                 # only a position when the lengths are cumulative.
                 raise ValueError(
-                    f"{name}={b:#04x}: POSITION=REUSE requires "
-                    f"LENGTH=CUMULATIVE (plan section 1, axis C)"
+                    f"{name}={b:#04x}: POSITION=REUSE requires " f"LENGTH=CUMULATIVE (plan section 1, axis C)"
                 )
             if (b >> 1) & 3 == 3 or (b >> 3) & 3 == 3:
                 raise ValueError(f"{name}={b:#04x} uses a reserved code")
         return q_side | (k_side << 8) | lse_layout
 
-    VARLEN_DENSE = 0
-    VARLEN_COMPACT_SIDE = (
-        VARLEN_STACKED | VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_REUSE
-    )                                                              # 0x0B
+    VARLEN_DENSE = 0  # noqa: F841  (ditto)
+    VARLEN_COMPACT_SIDE = VARLEN_STACKED | VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_REUSE  # 0x0B
     VARLEN_PADDED_SIDE = VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_IMPLIED
-                                                                   # 0x02
+    # 0x02
 
-    VARLEN_STRIDED_SIDE = (
-        VARLEN_STACKED | VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_ARRAY
-    )                                                              # 0x13
-    VARLEN_SEQUSED_PACKED_SIDE = (
-        VARLEN_STACKED | VARLEN_LENGTH_INDIVIDUAL | VARLEN_POSITION_ARRAY
-    )                                                              # 0x15
-    VARLEN_SEQUSED_CACHE_SIDE = (
-        VARLEN_LENGTH_INDIVIDUAL | VARLEN_POSITION_IMPLIED
-    )                                                              # 0x04
+    VARLEN_STRIDED_SIDE = VARLEN_STACKED | VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_ARRAY  # 0x13
+    VARLEN_SEQUSED_PACKED_SIDE = VARLEN_STACKED | VARLEN_LENGTH_INDIVIDUAL | VARLEN_POSITION_ARRAY  # 0x15
+    VARLEN_SEQUSED_CACHE_SIDE = VARLEN_LENGTH_INDIVIDUAL | VARLEN_POSITION_IMPLIED  # 0x04
 
-    def varlen_compact(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                       lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT):
+    def varlen_compact(
+        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT
+    ):
         """Classical packed varlen: 1THD tensors, `cu_seqlens` for both roles.
 
         `seqinfo_?1` is deliberately **not** passed: `POSITION = REUSE` takes
@@ -2454,26 +2348,40 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         """
         return dict(
             bits=varlen_bits(VARLEN_COMPACT_SIDE, VARLEN_COMPACT_SIDE, lse_layout),
-            seqinfo_q0=cu_seqlens_q, seqinfo_q1=None,
-            seqinfo_k0=cu_seqlens_k, seqinfo_k1=None,
-            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            seqinfo_q0=cu_seqlens_q,
+            seqinfo_q1=None,
+            seqinfo_k0=cu_seqlens_k,
+            seqinfo_k1=None,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             lse_tokens=lse_tokens,
         )
 
-    def varlen_padded(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                      lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT):
+    def varlen_padded(
+        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT
+    ):
         """BHSD tensors whose sequences are short: lengths only, no positions."""
         return dict(
             bits=varlen_bits(VARLEN_PADDED_SIDE, VARLEN_PADDED_SIDE, lse_layout),
-            seqinfo_q0=cu_seqlens_q, seqinfo_q1=None,
-            seqinfo_k0=cu_seqlens_k, seqinfo_k1=None,
-            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            seqinfo_q0=cu_seqlens_q,
+            seqinfo_q1=None,
+            seqinfo_k0=cu_seqlens_k,
+            seqinfo_k1=None,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             lse_tokens=lse_tokens,
         )
 
-    def varlen_strided(cu_seqlens_q, cu_seqlens_k, seq_strides_q, seq_strides_k,
-                       max_seqlen_q, max_seqlen_k,
-                       lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT):
+    def varlen_strided(
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seq_strides_q,
+        seq_strides_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        lse_tokens=None,
+        lse_layout=VARLEN_LSE_LAYOUT_HT,
+    ):
         """Packed tensors with padding *between* sequences (TE's layout).
 
         Differs from `varlen_compact` in one thing only: positions come from a
@@ -2484,15 +2392,25 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         """
         return dict(
             bits=varlen_bits(VARLEN_STRIDED_SIDE, VARLEN_STRIDED_SIDE, lse_layout),
-            seqinfo_q0=cu_seqlens_q, seqinfo_q1=seq_strides_q,
-            seqinfo_k0=cu_seqlens_k, seqinfo_k1=seq_strides_k,
-            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            seqinfo_q0=cu_seqlens_q,
+            seqinfo_q1=seq_strides_q,
+            seqinfo_k0=cu_seqlens_k,
+            seqinfo_k1=seq_strides_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             lse_tokens=lse_tokens,
         )
 
-    def varlen_seqused_k(cu_seqlens_q, cu_seqlens_k, seqused_k,
-                         max_seqlen_q, max_seqlen_k, k_is_cache=False,
-                         lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT):
+    def varlen_seqused_k(
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        k_is_cache=False,
+        lse_tokens=None,
+        lse_layout=VARLEN_LSE_LAYOUT_HT,
+    ):
         """Packed Q against a KV cache with per-sequence *used* lengths.
 
         `torch.nn.attention.varlen`'s `seqused_k`, and the configuration no
@@ -2504,14 +2422,15 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         `cu_seqlens_k` at all, where the position is implied by the batch
         index.
         """
-        k_side = (VARLEN_SEQUSED_CACHE_SIDE if k_is_cache
-                  else VARLEN_SEQUSED_PACKED_SIDE)
+        k_side = VARLEN_SEQUSED_CACHE_SIDE if k_is_cache else VARLEN_SEQUSED_PACKED_SIDE
         return dict(
             bits=varlen_bits(VARLEN_COMPACT_SIDE, k_side, lse_layout),
-            seqinfo_q0=cu_seqlens_q, seqinfo_q1=None,
+            seqinfo_q0=cu_seqlens_q,
+            seqinfo_q1=None,
             seqinfo_k0=seqused_k,
             seqinfo_k1=None if k_is_cache else cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             lse_tokens=lse_tokens,
         )
 
@@ -2542,8 +2461,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         if HOST_CAUSAL_TYPE in _CAUSAL_SENTINEL:
             if window is not None:
                 raise ValueError(
-                    f"causal_type={HOST_CAUSAL_TYPE} already fixes the window; "
-                    "pass causal_type=3 to choose one"
+                    f"causal_type={HOST_CAUSAL_TYPE} already fixes the window; " "pass causal_type=3 to choose one"
                 )
             _s = _CAUSAL_SENTINEL[HOST_CAUSAL_TYPE]
             wl, wr = _s, _s
@@ -2589,10 +2507,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         if bias.dim() != 4:
             raise ValueError(f"bias must be rank 4 (B, H, Sq, Sk), got {tuple(bias.shape)}")
         if bias.stride(3) != 1:
-            raise ValueError(
-                f"bias must have a contiguous last (Sk) dimension, got "
-                f"stride(3)={bias.stride(3)}"
-            )
+            raise ValueError(f"bias must have a contiguous last (Sk) dimension, got " f"stride(3)={bias.stride(3)}")
         return (_ptr_arg(bias), bias.stride(0), bias.stride(1), bias.stride(2))
 
     def _resolve_scale(Q, scale):
@@ -2618,8 +2533,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         rather than selects -- see the prologue.
         """
         if varlen is None:
-            return (0, _NULL_PTR, _NULL_PTR, _NULL_PTR, _NULL_PTR,
-                    int(seqlen_q), int(seqlen_k))
+            return (0, _NULL_PTR, _NULL_PTR, _NULL_PTR, _NULL_PTR, int(seqlen_q), int(seqlen_k))
         if STRIDES_CONSTEXPR:
             raise ValueError(
                 "STRIDES_CONSTEXPR derives the layout from the shape, which "
@@ -2634,8 +2548,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _ptr_arg(varlen[k]) if varlen.get(k) is not None else _NULL_PTR
             for k in ("seqinfo_q0", "seqinfo_q1", "seqinfo_k0", "seqinfo_k1")
         )
-        return (bits,) + got + (int(varlen["max_seqlen_q"]),
-                                int(varlen["max_seqlen_k"]))
+        return (bits,) + got + (int(varlen["max_seqlen_q"]), int(varlen["max_seqlen_k"]))
 
     def _prep(Q, K, V, O):  # noqa: E741
         """Pointers, head counts and the twelve strides, in launch order.
@@ -2656,21 +2569,34 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         if O.shape[1] != nhq:
             raise ValueError(f"O and Q must share num_heads, got {O.shape[1]} and {nhq}")
         if nhq % nhk:
-            raise ValueError(
-                f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})"
-            )
+            raise ValueError(f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})")
         return [_ptr_arg(t) for t in (Q, K, V, O)], (nhq, nhk, hqk, hvo), st
 
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
-    def _launch(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None, bias=None, dropout_p=None, philox_seed=0, philox_offset=0):  # noqa: E741
+    def _launch(
+        Q,
+        K,
+        V,
+        O,  # noqa: E741
+        batch_size,
+        seqlen_q,
+        seqlen_k=None,
+        scale=None,
+        stream=None,
+        lse=None,
+        window=None,
+        varlen=None,
+        bias=None,
+        dropout_p=None,
+        philox_seed=0,
+        philox_offset=0,
+    ):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
         _lse_p = _lse_args(lse, seqlen_q, varlen, meta[0])
         _wl, _wr = _resolve_window(window, seqlen_q, seqlen_k)
-        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(
-            varlen, seqlen_q, seqlen_k
-        )
+        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(varlen, seqlen_q, seqlen_k)
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
         _ps, _po, _ip, _dsc = _dropout_args(dropout_p, philox_seed, philox_offset)
         _run_compiled(
@@ -2678,29 +2604,52 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             *ptrs,
             _lse_p,
             _bp,
-            _sq0, _sq1, _sk0, _sk1,
+            _sq0,
+            _sq1,
+            _sk0,
+            _sk1,
             batch_size,
             _vb,
             _mq,
             _mk,
             _wl,
             _wr,
-            _ps, _po, _ip, _dsc,
+            _ps,
+            _po,
+            _ip,
+            _dsc,
             *meta,
             *st,
-            _sb0, _sb1, _sb2,
+            _sb0,
+            _sb1,
+            _sb2,
             _resolve_scale(Q, scale),
             stream if stream is not None else fx.Stream(None),
         )
 
-    def _compile(Q, K, V, O, batch_size, seqlen_q, seqlen_k=None, scale=None, stream=None, lse=None, window=None, varlen=None, bias=None, dropout_p=None, philox_seed=0, philox_offset=0):  # noqa: E741
+    def _compile(
+        Q,
+        K,
+        V,
+        O,  # noqa: E741
+        batch_size,
+        seqlen_q,
+        seqlen_k=None,
+        scale=None,
+        stream=None,
+        lse=None,
+        window=None,
+        varlen=None,
+        bias=None,
+        dropout_p=None,
+        philox_seed=0,
+        philox_offset=0,
+    ):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
         _lse_p = _lse_args(lse, seqlen_q, varlen, meta[0])
         _wl, _wr = _resolve_window(window, seqlen_q, seqlen_k)
-        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(
-            varlen, seqlen_q, seqlen_k
-        )
+        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(varlen, seqlen_q, seqlen_k)
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
         _ps, _po, _ip, _dsc = _dropout_args(dropout_p, philox_seed, philox_offset)
         return flyc.compile(
@@ -2708,17 +2657,25 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             *ptrs,
             _lse_p,
             _bp,
-            _sq0, _sq1, _sk0, _sk1,
+            _sq0,
+            _sq1,
+            _sk0,
+            _sk1,
             batch_size,
             _vb,
             _mq,
             _mk,
             _wl,
             _wr,
-            _ps, _po, _ip, _dsc,
+            _ps,
+            _po,
+            _ip,
+            _dsc,
             *meta,
             *st,
-            _sb0, _sb1, _sb2,
+            _sb0,
+            _sb1,
+            _sb2,
             _resolve_scale(Q, scale),
             fx.Stream(stream),
         )
@@ -2732,6 +2689,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     _launch.varlen_strided = varlen_strided
     _launch.varlen_seqused_k = varlen_seqused_k
     return _launch
+
 
 def build_flash_attn_func_aiw_module(**kwargs):
     """Keyword front end: name a problem, get the policy's schedule.

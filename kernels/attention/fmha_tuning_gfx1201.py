@@ -30,7 +30,6 @@ deciding whether a change needs a benchmark or a correctness argument:
 
 from dataclasses import dataclass, fields, replace
 
-
 # ---------------------------------------------------------------------------
 # Tuning policy
 #
@@ -115,8 +114,7 @@ _ROWS_PER_Q_TILE = 16
 # 48/80/96/160 were swept at the same time and are unchanged; 192 is already
 # at its optimum.
 _SHARDS_BY_HEAD_DIM = {224: 1, 256: 1, 384: 2}
-_Q_TILES_BY_HEAD_DIM = {48: 8, 64: 16, 80: 16, 96: 16, 128: 8, 160: 16,
-                        192: 8, 224: 16, 256: 16, 384: 4, 512: 2}
+_Q_TILES_BY_HEAD_DIM = {48: 8, 64: 16, 80: 16, 96: 16, 128: 8, 160: 16, 192: 8, 224: 16, 256: 16, 384: 4, 512: 2}
 
 # BLOCK_M for the distance-0 schedule. Per-wave register use is dominated by
 # two head_dim-proportional terms -- o_accs = VO_WIDTH/2 VGPRs and
@@ -185,7 +183,7 @@ def vo_chunks(vo_width, block_n, shards, pad=4):
         if vo_width % nc:
             continue
         cols = vo_width // nc
-        if cols % (shards * 16):        # each wave needs whole 16-col chunks
+        if cols % (shards * 16):  # each wave needs whole 16-col chunks
             continue
         if block_n * (vo_width + pad) * 2 + cols * (block_n + pad) * 2 <= 65536:
             return nc
@@ -399,10 +397,7 @@ def _round_to_ladder(head_dim: int) -> int:
     for w in _BLOCK_DMODEL_LADDER:
         if w >= head_dim:
             return w
-    raise ValueError(
-        f"head_dim {head_dim} exceeds the largest compiled tile "
-        f"({_BLOCK_DMODEL_LADDER[-1]})"
-    )
+    raise ValueError(f"head_dim {head_dim} exceeds the largest compiled tile " f"({_BLOCK_DMODEL_LADDER[-1]})")
 
 
 MAX_HEAD_DIM = _BLOCK_DMODEL_LADDER[-1]
@@ -421,6 +416,7 @@ MAX_HEAD_DIM = _BLOCK_DMODEL_LADDER[-1]
 # Both frozen: a schedule is used as part of a build-cache key, and a mutable
 # key is a bug waiting for a second caller.
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class FmhaInputMetadata:
@@ -509,11 +505,7 @@ class FmhaKnobs:
         """`other`'s set fields win; its `None`s leave this one's alone."""
         if other is None:
             return self
-        set_fields = {
-            f.name: getattr(other, f.name)
-            for f in fields(other)
-            if getattr(other, f.name) is not None
-        }
+        set_fields = {f.name: getattr(other, f.name) for f in fields(other) if getattr(other, f.name) is not None}
         return replace(self, **set_fields)
 
 
@@ -535,9 +527,7 @@ _KNOBS_FALLBACK = FmhaKnobs(
 )
 
 
-def resolve_knobs(
-    meta: FmhaInputMetadata, overrides: "FmhaKnobs | None" = None
-) -> FmhaKnobs:
+def resolve_knobs(meta: FmhaInputMetadata, overrides: "FmhaKnobs | None" = None) -> FmhaKnobs:
     """The complete measured configuration for `meta`.
 
     The ordering below is the reason this function exists. `k_prefetch_dist`
@@ -564,20 +554,14 @@ def resolve_knobs(
     if s.row_subtiles is None:
         s = replace(s, row_subtiles=2 if hd in _ROW_SUBTILES_2_HEAD_DIMS else 1)
     if s.row_subtiles == 2 and hd > _ROW_SUBTILES_2_MAX_HEAD_DIM:
-        raise ValueError(
-            f"row_subtiles=2 requires head_dim <= {_ROW_SUBTILES_2_MAX_HEAD_DIM}, "
-            f"got {hd}"
-        )
+        raise ValueError(f"row_subtiles=2 requires head_dim <= {_ROW_SUBTILES_2_MAX_HEAD_DIM}, " f"got {hd}")
     if s.kv_addr_hoist is None:
         s = replace(s, kv_addr_hoist=_kv_addr_hoist(hd, meta.causal))
     if s.k_prefetch_dist is None:
         # Two row sub-tiles require the prefetched, transposed V layout.
         s = replace(
             s,
-            k_prefetch_dist=(
-                1 if s.row_subtiles == 2 or hd >= _BP_MIN_HEAD_DIM
-                else default_prefetch_dist(hd)
-            ),
+            k_prefetch_dist=(1 if s.row_subtiles == 2 or hd >= _BP_MIN_HEAD_DIM else default_prefetch_dist(hd)),
         )
     if s.v_lds_layout is None:
         s = replace(s, v_lds_layout="transposed" if s.k_prefetch_dist else "row")
@@ -635,9 +619,7 @@ def plan(request: FmhaInputMetadata, overrides: FmhaKnobs | None = None) -> Fmha
         raise ValueError(f"kernel requires 1 <= head_dim <= {MAX_HEAD_DIM}, got {head_dim}")
     block_dmodel = _round_to_ladder(head_dim)
     knobs = replace(
-        resolve_knobs(
-            request, (overrides or FmhaKnobs()).merge(FmhaKnobs(block_dmodel=block_dmodel))
-        ),
+        resolve_knobs(request, (overrides or FmhaKnobs()).merge(FmhaKnobs(block_dmodel=block_dmodel))),
         padded_head=block_dmodel != head_dim,
     )
     return FmhaPlan(request, knobs)

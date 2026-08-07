@@ -24,7 +24,6 @@ and the result is not dropout at all.
 import numpy as np
 import pytest
 import torch
-
 from dropout_mask_gfx1201 import dropout_mask
 from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module
 from philox import PHILOX_WIDTHS, dropout_threshold, randoms_per_offset
@@ -75,7 +74,7 @@ def test_mask_matches_cpu_philox(width):
             for m in range(SQ):
                 for c0 in range(0, SK, rn):
                     vals = _ref_u32(seed, base + m * row_stride + c0 // rn, width)
-                    want[z, h, m, c0:c0 + rn] = vals[: min(rn, SK - c0)]
+                    want[z, h, m, c0 : c0 + rn] = vals[: min(rn, SK - c0)]
     # The kernel stores int32; the reference is unsigned.
     assert np.array_equal(r.astype(np.int64) & 0xFFFFFFFF, want)
 
@@ -107,7 +106,7 @@ def test_mask_is_tiling_invariant(width, block_m, block_n):
     its forward.
     """
     _require_env()
-    B, H, SQ, SK = 2, 2, 200, 300     # deliberately not a multiple of any tile
+    B, H, SQ, SK = 2, 2, 200, 300  # deliberately not a multiple of any tile
     kw = dict(philox_seed=0xDEAD_BEEF_CAFE, philox_offset=77, philox_width=width)
     ref = dropout_mask(B, H, SQ, SK, block_m=64, block_n=32, **kw)
     got = dropout_mask(B, H, SQ, SK, block_m=block_m, block_n=block_n, **kw)
@@ -139,8 +138,7 @@ def test_seed_and_offset_are_64_bit(field):
     _require_env()
     lo = dict(philox_seed=1, philox_offset=1)
     hi = dict(lo, **{f"philox_{field}": (1 << 40) + 1})
-    assert not torch.equal(dropout_mask(1, 1, 64, 64, **lo),
-                           dropout_mask(1, 1, 64, 64, **hi))
+    assert not torch.equal(dropout_mask(1, 1, 64, 64, **lo), dropout_mask(1, 1, 64, 64, **hi))
 
 
 # ---------------------------------------------------------------------------
@@ -166,14 +164,11 @@ def test_attention_matches_math_backend_given_the_mask(p, head_dim):
     B, H, SQ, SK = 1, 8, 256, 256
     seed, off = 20250805, 3
     torch.manual_seed(0)
-    q, k, v = (
-        torch.randn(B, H, SQ, head_dim, dtype=torch.float16, device="cuda")
-        for _ in range(3)
-    )
+    q, k, v = (torch.randn(B, H, SQ, head_dim, dtype=torch.float16, device="cuda") for _ in range(3))
     o = torch.empty_like(q)
-    build_flash_attn_func_aiw_module(
-        num_heads=H, head_dim=head_dim, causal=False, dtype_str="f16", dropout=True
-    )(q, k, v, o, B, SQ, dropout_p=p, philox_seed=seed, philox_offset=off)
+    build_flash_attn_func_aiw_module(num_heads=H, head_dim=head_dim, causal=False, dtype_str="f16", dropout=True)(
+        q, k, v, o, B, SQ, dropout_p=p, philox_seed=seed, philox_offset=off
+    )
     torch.cuda.synchronize()
 
     keep = _keep_from_raw(dropout_mask(B, H, SQ, SK, seed, off), p)
@@ -187,8 +182,7 @@ def test_attention_matches_math_backend_given_the_mask(p, head_dim):
     err = (o.float() - ref.float()).abs().max().item()
     scale = ref.float().abs().max().item()
     assert err <= 4e-2 * max(scale, 1.0), (
-        f"attention and the mask kernel disagree about the mask: "
-        f"max|diff| = {err:.4f} against |ref| = {scale:.4f}"
+        f"attention and the mask kernel disagree about the mask: " f"max|diff| = {err:.4f} against |ref| = {scale:.4f}"
     )
 
 
@@ -202,17 +196,14 @@ def test_mask_kernel_disagreeing_is_detected():
     _require_env()
     B, H, SQ, head_dim, p = 1, 8, 256, 64, 0.5
     torch.manual_seed(0)
-    q, k, v = (
-        torch.randn(B, H, SQ, head_dim, dtype=torch.float16, device="cuda")
-        for _ in range(3)
-    )
+    q, k, v = (torch.randn(B, H, SQ, head_dim, dtype=torch.float16, device="cuda") for _ in range(3))
     o = torch.empty_like(q)
-    build_flash_attn_func_aiw_module(
-        num_heads=H, head_dim=head_dim, causal=False, dtype_str="f16", dropout=True
-    )(q, k, v, o, B, SQ, dropout_p=p, philox_seed=1, philox_offset=0)
+    build_flash_attn_func_aiw_module(num_heads=H, head_dim=head_dim, causal=False, dtype_str="f16", dropout=True)(
+        q, k, v, o, B, SQ, dropout_p=p, philox_seed=1, philox_offset=0
+    )
     torch.cuda.synchronize()
 
-    keep = _keep_from_raw(dropout_mask(B, H, SQ, SQ, 2, 0), p)   # wrong seed
+    keep = _keep_from_raw(dropout_mask(B, H, SQ, SQ, 2, 0), p)  # wrong seed
     ref, _ = torch.ops.aten._scaled_dot_product_attention_math(
         *(t.float() for t in (q, k, v)),
         dropout_p=p,
@@ -220,6 +211,6 @@ def test_mask_kernel_disagreeing_is_detected():
     )
     ref = ref.half()
     err = (o.float() - ref.float()).abs().max().item()
-    assert err > 4e-2 * max(ref.float().abs().max().item(), 1.0), (
-        "a mask from the wrong seed still passed -- the tolerance is too loose"
-    )
+    assert err > 4e-2 * max(
+        ref.float().abs().max().item(), 1.0
+    ), "a mask from the wrong seed still passed -- the tolerance is too loose"

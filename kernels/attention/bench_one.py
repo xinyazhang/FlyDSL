@@ -2,7 +2,10 @@
 
 Usage: python3 bench_one.py <baseline|bp|m32> <0|1> [f16|bf16]
 """
-import sys, torch
+
+import sys
+
+import torch
 from bench_shim import do_bench
 from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
 
@@ -12,9 +15,7 @@ VARIANTS = {
     "m32": (64, {"variant": "m32"}),
 }
 name, causal = sys.argv[1], bool(int(sys.argv[2]))
-dtype = {"f16": torch.float16, "bf16": torch.bfloat16}[
-    sys.argv[3] if len(sys.argv) > 3 else "f16"
-]
+dtype = {"f16": torch.float16, "bf16": torch.bfloat16}[sys.argv[3] if len(sys.argv) > 3 else "f16"]
 d, kw = VARIANTS[name]
 BATCH, H, N = 2, 12, 4096
 torch.manual_seed(0)

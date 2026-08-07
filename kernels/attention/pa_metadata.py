@@ -51,11 +51,11 @@ from kernels.common.kernels_common import get_warp_size
 from kernels.common.tensor_shim import _run_compiled
 from kernels.common.utils import (
     exp2_f32_fast,
-    ssel,
     global_load_i64x2,
     global_ptr_from_addr,
     is_pow2,
     rcp_f32,
+    ssel,
     udiv_const,
     unflatten_k,
     urem_const,

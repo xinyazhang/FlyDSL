@@ -4,7 +4,16 @@ Cheap enough to run on every commit. It does not measure performance; it
 decides *whether performance can have changed*. An unchanged fingerprint means
 the emitted code is identical, so no A/B is needed. A changed one means run it.
 """
-import glob, hashlib, json, os, re, subprocess, sys, tempfile
+
+import glob
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
 HERE = "/home/xinyazha/dockerhome/meff/FlyDSL/kernels/attention"
 sys.path.insert(0, HERE)
 CONFIGS = [(64, False), (128, True), (256, True)]
@@ -13,9 +22,9 @@ CONFIGS = [(64, False), (128, True), (256, True)]
 def child(hd, causal):
     import torch
     from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201 as F
+
     torch.manual_seed(0)
-    q, k, v = (torch.randn(1, 8, 512, hd, dtype=torch.float16, device="cuda")
-               for _ in range(3))
+    q, k, v = (torch.randn(1, 8, 512, hd, dtype=torch.float16, device="cuda") for _ in range(3))
     F(q, k, v, causal=causal)
     torch.cuda.synchronize()
     return 0
@@ -23,22 +32,23 @@ def child(hd, causal):
 
 def fingerprint(hd, causal):
     with tempfile.TemporaryDirectory() as d:
-        env = dict(os.environ, FLYDSL_DUMP_IR="1", FLYDSL_DUMP_DIR=d,
-                   FLYDSL_RUNTIME_ENABLE_CACHE="0")
-        r = subprocess.run([sys.executable, __file__, "--child", str(hd), str(int(causal))],
-                           env=env, capture_output=True, timeout=1800)
+        env = dict(os.environ, FLYDSL_DUMP_IR="1", FLYDSL_DUMP_DIR=d, FLYDSL_RUNTIME_ENABLE_CACHE="0")
+        r = subprocess.run(
+            [sys.executable, __file__, "--child", str(hd), str(int(causal))], env=env, capture_output=True, timeout=1800
+        )
         if r.returncode != 0:
             return {"error": r.stderr.decode()[-200:]}
         for f in glob.glob(os.path.join(d, "*", "21_final_isa.s")):
             t = open(f).read()
-            body = "\n".join(l for l in t.split("\n")
-                             if l.strip() and not l.strip().startswith((".", ";", "//")))
+            body = "\n".join(ln for ln in t.split("\n") if ln.strip() and not ln.strip().startswith((".", ";", "//")))
             v = re.search(r"\.vgpr_count:\s*(\d+)", t)
             sc = re.search(r"\.private_segment_fixed_size:\s*(\d+)", t)
-            return {"vgpr": int(v.group(1)) if v else None,
-                    "scratch": int(sc.group(1)) if sc else 0,
-                    "insts": len(body.split("\n")),
-                    "isa_sha": hashlib.sha256(body.encode()).hexdigest()[:12]}
+            return {
+                "vgpr": int(v.group(1)) if v else None,
+                "scratch": int(sc.group(1)) if sc else 0,
+                "insts": len(body.split("\n")),
+                "isa_sha": hashlib.sha256(body.encode()).hexdigest()[:12],
+            }
     return {"error": "no isa"}
 
 
@@ -57,10 +67,12 @@ def main() -> int:
         diffs = [k for k in base if base[k] != out.get(k)]
         for k in diffs:
             b, a = base[k], out.get(k, {})
-            print(f"{k}: vgpr {b.get('vgpr')}->{a.get('vgpr')} "
-                  f"scratch {b.get('scratch')}->{a.get('scratch')} "
-                  f"insts {b.get('insts')}->{a.get('insts')} "
-                  f"sha {b.get('isa_sha')}->{a.get('isa_sha')}")
+            print(
+                f"{k}: vgpr {b.get('vgpr')}->{a.get('vgpr')} "
+                f"scratch {b.get('scratch')}->{a.get('scratch')} "
+                f"insts {b.get('insts')}->{a.get('insts')} "
+                f"sha {b.get('isa_sha')}->{a.get('isa_sha')}"
+            )
         print("UNCHANGED" if not diffs else f"CHANGED ({len(diffs)}/{len(base)})")
         return 1 if diffs else 0
 

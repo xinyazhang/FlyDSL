@@ -65,7 +65,8 @@ from typing import Literal, TypeAlias
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import arith
-from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
+from flydsl.expr.utils.arith import ArithValue
+from flydsl.expr.utils.arith import _to_raw as _raw
 
 __all__ = [
     "PHILOX_WIDTHS",
@@ -89,7 +90,7 @@ PhiloxWidth: TypeAlias = Literal[32, 64]
 """Lane width. Selects *which PRNG*, not just how it is computed: the two
 widths have different round constants and produce different streams."""
 
-Word: TypeAlias 
+Word: TypeAlias
 """One PRNG lane, at whatever width is in play: `fx.Int32` at 32, `fx.Int64`
 at 64. Counter and key words are `Word`; the *outputs* are always `fx.Int32`
 however wide the lanes were, because callers consume u32."""
@@ -143,14 +144,13 @@ def default_width(arch: str | None = None) -> PhiloxWidth:
     base = str(arch).split(":")[0]
     return _WIDTH_BY_ARCH.get(base, _FALLBACK_WIDTH)
 
+
 # Weyl-sequence key increments and round multipliers. The 32-bit values are the
 # original Philox-4x32 constants (golden ratio / sqrt(3) fractions); the 64-bit
 # ones are their 64-bit counterparts. Both match Triton's table.
 _CONSTS = {
-    32: dict(KEY_A=0x9E3779B9, KEY_B=0xBB67AE85,
-             MUL_A=0xD2511F53, MUL_B=0xCD9E8D57),
-    64: dict(KEY_A=0x9E3779B97F4A7C15, KEY_B=0xBB67AE8584CAA73B,
-             MUL_A=0xD2E7470EE14C6C93, MUL_B=0xCA5A826395121157),
+    32: dict(KEY_A=0x9E3779B9, KEY_B=0xBB67AE85, MUL_A=0xD2511F53, MUL_B=0xCD9E8D57),
+    64: dict(KEY_A=0x9E3779B97F4A7C15, KEY_B=0xBB67AE8584CAA73B, MUL_A=0xD2E7470EE14C6C93, MUL_B=0xCA5A826395121157),
 }
 
 
@@ -202,8 +202,12 @@ def _add(a: Word, b: Word, width: PhiloxWidth) -> Word:
 
 
 def philox_4x(
-    c0: Word, c1: Word, c2: Word, c3: Word,
-    k0: Word, k1: Word,
+    c0: Word,
+    c1: Word,
+    c2: Word,
+    c3: Word,
+    k0: Word,
+    k1: Word,
     width: PhiloxWidth = 32,
     n_rounds: int = DEFAULT_ROUNDS,
 ) -> tuple[Word, Word, Word, Word]:
@@ -259,8 +263,7 @@ def philox_u32(
         klo, khi = _split64(seed64)
         zero = fx.Int32(0)
         return list(philox_4x(lo, hi, zero, zero, klo, khi, 32, n_rounds))
-    words = philox_4x(off64, fx.Int64(0), fx.Int64(0), fx.Int64(0),
-                      seed64, fx.Int64(0), 64, n_rounds)
+    words = philox_4x(off64, fx.Int64(0), fx.Int64(0), fx.Int64(0), seed64, fx.Int64(0), 64, n_rounds)
     out = []
     for w in words:
         w_lo, w_hi = _split64(w)
@@ -279,7 +282,7 @@ def philox_u32(
 # What stays with the caller is the *offset scheme* -- which element gets which
 # offset. That is layout-specific and belongs where the layout is.
 
-_U32_SCALE = 2.3283064365386963e-10   # 2**-32, exact
+_U32_SCALE = 2.3283064365386963e-10  # 2**-32, exact
 
 
 def dropout_threshold(p: float) -> int:
@@ -297,7 +300,7 @@ def dropout_threshold(p: float) -> int:
     if not 0.0 <= p <= 1.0:
         raise ValueError(f"dropout p must be in [0, 1], got {p}")
     t = int((p - 0.5) * 0xFFFFFFFF)
-    return max(-(2 ** 31), min(2 ** 31 - 1, t))
+    return max(-(2**31), min(2**31 - 1, t))
 
 
 def keep_mask(vals: list[fx.Int32], threshold: int | fx.Int32) -> list[ArithValue]:
@@ -316,12 +319,7 @@ def keep_mask(vals: list[fx.Int32], threshold: int | fx.Int32) -> list[ArithValu
     module rather than each caller should own which way they are read.
     """
     thr = fx.Int32(threshold)
-    return [
-        ArithValue(
-            arith.cmpi(arith.CmpIPredicate.sgt, _raw(fx.Int32(v)), _raw(thr))
-        )
-        for v in vals
-    ]
+    return [ArithValue(arith.cmpi(arith.CmpIPredicate.sgt, _raw(fx.Int32(v)), _raw(thr))) for v in vals]
 
 
 def to_uniform_f32(v: fx.Int32) -> fx.Float32:
@@ -332,10 +330,7 @@ def to_uniform_f32(v: fx.Int32) -> fx.Float32:
     what a human reads.
     """
     f = fx.Float32(ArithValue(arith.sitofp(fx.Float32.ir_type, _raw(fx.Int32(v)))))
-    return fx.Float32(
-        ArithValue(arith.addf(_raw(_fmul32(f, fx.Float32(_U32_SCALE))),
-                              _raw(fx.Float32(0.5))))
-    )
+    return fx.Float32(ArithValue(arith.addf(_raw(_fmul32(f, fx.Float32(_U32_SCALE))), _raw(fx.Float32(0.5)))))
 
 
 def _fmul32(a: fx.Float32, b: fx.Float32) -> fx.Float32:
@@ -388,9 +383,7 @@ class Philox:
         """`randoms_per_offset` uniform u32 values from a 64-bit seed/offset."""
         return philox_u32(seed, offset, self.width, self.n_rounds)
 
-    def words(
-        self, c0: Word, c1: Word, c2: Word, c3: Word, k0: Word, k1: Word
-    ) -> tuple[Word, Word, Word, Word]:
+    def words(self, c0: Word, c1: Word, c2: Word, c3: Word, k0: Word, k1: Word) -> tuple[Word, Word, Word, Word]:
         """The raw round function, for callers packing the counter themselves."""
         return philox_4x(c0, c1, c2, c3, k0, k1, self.width, self.n_rounds)
 
@@ -409,18 +402,14 @@ class Philox:
         """
         rn = self.randoms_per_offset
         if count % rn:
-            raise ValueError(
-                f"count must be a multiple of randoms_per_offset ({rn}), got {count}"
-            )
+            raise ValueError(f"count must be a multiple of randoms_per_offset ({rn}), got {count}")
         out: list[fx.Int32] = []
         base = fx.Int64(first_offset)
         for k in range(count // rn):
             out.extend(self.u32(seed, base + fx.Int64(k)))
         return out
 
-    def keep_span(
-        self, seed: U64, first_offset: U64, count: int, threshold: int | fx.Int32
-    ) -> list[ArithValue]:
+    def keep_span(self, seed: U64, first_offset: U64, count: int, threshold: int | fx.Int32) -> list[ArithValue]:
         """`span_u32` and `keep_mask` together: the dropout mask for a run."""
         return keep_mask(self.span_u32(seed, first_offset, count), threshold)
 
@@ -437,8 +426,11 @@ class Philox:
     # `randoms_per_offset` to an offset along the row.
 
     def grid_plane(
-        self, offset_base: U64, plane: fx.Int32 | int,
-        n_rows: fx.Int32 | int, n_cols: fx.Int32 | int,
+        self,
+        offset_base: U64,
+        plane: fx.Int32 | int,
+        n_rows: fx.Int32 | int,
+        n_cols: fx.Int32 | int,
     ) -> tuple[U64, U64]:
         """`(first offset of this plane, offsets per row)`.
 
@@ -449,15 +441,16 @@ class Philox:
         (`sdpa-dropout-plan.md` §3.2).
         """
         rn = self.randoms_per_offset
-        row_stride = fx.Int64(
-            (fx.Int32(n_cols) + fx.Int32(rn - 1)) // fx.Int32(rn)
-        )
+        row_stride = fx.Int64((fx.Int32(n_cols) + fx.Int32(rn - 1)) // fx.Int32(rn))
         base = fx.Int64(offset_base) + fx.Int64(plane) * fx.Int64(n_rows) * row_stride
         return base, row_stride
 
     def grid_offset(
-        self, plane_base: U64, row_stride: U64,
-        row: fx.Int32 | fx.Int64 | int, col: fx.Int32 | fx.Int64 | int,
+        self,
+        plane_base: U64,
+        row_stride: U64,
+        row: fx.Int32 | fx.Int64 | int,
+        col: fx.Int32 | fx.Int64 | int,
     ) -> U64:
         """The offset holding element `(row, col)` of a plane.
 

@@ -95,9 +95,7 @@ def build_wmma_peak(nacc: int, dtype_str: str = "f16"):
         grid: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        wmma_peak_kernel(OUT, iters).launch(
-            grid=(fx.Index(grid), 1, 1), block=(BLOCK, 1, 1), stream=stream
-        )
+        wmma_peak_kernel(OUT, iters).launch(grid=(fx.Index(grid), 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     def run(out, iters, grid, stream=None):
         ptr = flyc.from_c_void_p(fx.Float32, out.data_ptr())

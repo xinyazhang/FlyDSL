@@ -26,7 +26,6 @@ delta there below ~10% needs at least three alternating runs.
 import sys
 
 import torch
-
 from bench_shim import do_bench
 from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
 
@@ -56,10 +55,7 @@ def main():
     for d in LADDER:
         for causal in (False, True):
             torch.manual_seed(0)
-            q, k, v = (
-                torch.randn((BATCH, H, N, d), dtype=dtype, device="cuda")
-                for _ in range(3)
-            )
+            q, k, v = (torch.randn((BATCH, H, N, d), dtype=dtype, device="cuda") for _ in range(3))
             ms = sorted(measure(q, k, v, causal) for _ in range(REPS))
             m = ms[len(ms) // 2]
             print(f"{d:5} {int(causal):6} {tflops(m, d, causal):8.1f} {m:9.4f}")

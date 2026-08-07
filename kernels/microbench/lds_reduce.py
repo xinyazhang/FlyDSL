@@ -39,24 +39,24 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith, llvm as _llvm
+from flydsl._mlir.dialects import arith
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T, Vector as Vec
+from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 WARP_SIZE = 32
-SHARDS = 4          # waves cooperating on one Q-tile's head-dim reduction
-Q_TILES = 2         # Q-tiles per workgroup
+SHARDS = 4  # waves cooperating on one Q-tile's head-dim reduction
+Q_TILES = 2  # Q-tiles per workgroup
 WAVES = SHARDS * Q_TILES
 BLOCK = WAVES * WARP_SIZE
 
-TILE_F32 = 16       # f32 per lane in one 16x32 S tile (16*32/32 lanes)
+TILE_F32 = 16  # f32 per lane in one 16x32 S tile (16*32/32 lanes)
 SLOTS = Q_TILES * SHARDS
 LDS_F32 = SLOTS * TILE_F32 * WARP_SIZE
 
 WMMA_M = WMMA_N = WMMA_K = 16
 VARIANTS = ("none", "expl", "atomic", "wmma")
-
 
 
 def build(variant: str, wmma_count: int = 32):
@@ -144,9 +144,7 @@ def build(variant: str, wmma_count: int = 32):
                     s = p[e]
                     for k in range_constexpr(SHARDS - 1):
                         peer = slot_base(q_tile * SHARDS + (shard + k + 1) % SHARDS)
-                        s = s + fx.ptr_load(
-                            buf + fx.Int32(addr(peer, e)), result_type=ir.F32Type.get()
-                        )
+                        s = s + fx.ptr_load(buf + fx.Int32(addr(peer, e)), result_type=ir.F32Type.get())
                     out.append(s)
                 gpu.barrier()
 
@@ -183,9 +181,7 @@ def build(variant: str, wmma_count: int = 32):
         grid: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        reduce_kernel(OUT, iters).launch(
-            grid=(fx.Index(grid), 1, 1), block=(BLOCK, 1, 1), stream=stream
-        )
+        reduce_kernel(OUT, iters).launch(grid=(fx.Index(grid), 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     def run(out, iters, grid, stream=None):
         ptr = flyc.from_c_void_p(fx.Float32, out.data_ptr())
@@ -215,7 +211,7 @@ def measure(variant, iters, grid, reps, wmma_count=32):
         torch.cuda.synchronize()
         times.append(s.elapsed_time(e))
     ms = min(times)
-    reductions = grid * Q_TILES * iters      # one per Q-tile per iteration
+    reductions = grid * Q_TILES * iters  # one per Q-tile per iteration
     return ms * 1e6 / reductions, out[0].item()
 
 
@@ -224,8 +220,7 @@ def main():
     ap.add_argument("--iters", type=int, default=2000)
     ap.add_argument("--grid", type=int, default=512, help=f"workgroups ({BLOCK} thr each)")
     ap.add_argument("--reps", type=int, default=5)
-    ap.add_argument("--wmma-count", type=int, default=32,
-                    help="WMMAs per iteration for the 'wmma' yardstick")
+    ap.add_argument("--wmma-count", type=int, default=32, help="WMMAs per iteration for the 'wmma' yardstick")
     ap.add_argument("--variants", nargs="+", default=list(VARIANTS), choices=VARIANTS)
     args = ap.parse_args()
 

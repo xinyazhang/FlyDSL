@@ -36,9 +36,9 @@ from __future__ import annotations
 from functools import lru_cache
 
 import torch
-
 from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module_primary
-from fmha_tuning_gfx1201 import FmhaInputMetadata, FmhaKnobs, plan as _plan_build
+from fmha_tuning_gfx1201 import FmhaInputMetadata, FmhaKnobs
+from fmha_tuning_gfx1201 import plan as _plan_build
 
 __all__ = ["flydsl_flash_attn_func_gfx1201"]
 
@@ -135,10 +135,7 @@ def flydsl_flash_attn_func_gfx1201(
                 f"differ (GQA). Got q={tuple(q.shape)} k={tuple(k.shape)}"
             )
         if q.shape[1] % k.shape[1]:
-            raise ValueError(
-                f"num_heads_q ({q.shape[1]}) must be divisible by num_heads_k "
-                f"({k.shape[1]})"
-            )
+            raise ValueError(f"num_heads_q ({q.shape[1]}) must be divisible by num_heads_k ({k.shape[1]})")
     if not (q.dtype == k.dtype == v.dtype):
         raise ValueError(f"q/k/v dtype must match: {q.dtype}/{k.dtype}/{v.dtype}")
     if q.dim() != 4:
@@ -158,9 +155,7 @@ def flydsl_flash_attn_func_gfx1201(
         ),
         knobs,
     )
-    block_dmodel = _plan.knobs.block_dmodel
     padded_head = _plan.knobs.padded_head
-    block_m = _plan.knobs.block_m
     if padded_head:
         # The D-axis pitch must be a multiple of 16 bytes -- 8 elements at
         # f16/bf16. This is the alignment contract (see sdpa-close-gap-plan1.md
@@ -204,20 +199,14 @@ def flydsl_flash_attn_func_gfx1201(
     # head. See the pitch check above.
     _o_pitch = (head_dim + 7) // 8 * 8
     if _o_pitch == head_dim:
-        o_p = torch.empty(
-            batch, num_heads, seq_len_pad, head_dim, dtype=q.dtype, device=q.device
-        )
+        o_p = torch.empty(batch, num_heads, seq_len_pad, head_dim, dtype=q.dtype, device=q.device)
     else:
-        o_p = torch.empty(
-            batch, num_heads, seq_len_pad, _o_pitch, dtype=q.dtype, device=q.device
-        )[..., :head_dim]
+        o_p = torch.empty(batch, num_heads, seq_len_pad, _o_pitch, dtype=q.dtype, device=q.device)[..., :head_dim]
 
     # logsumexp, (B*H, S_pad) fp32 -- AOTriton's non-varlen layout. Sliced back
     # to the real seq_len on return, like O.
     if return_lse:
-        lse_p = torch.empty(
-            batch * num_heads, seq_len_pad, dtype=torch.float32, device=q.device
-        )
+        lse_p = torch.empty(batch * num_heads, seq_len_pad, dtype=torch.float32, device=q.device)
     else:
         lse_p = None
 
@@ -232,14 +221,9 @@ def flydsl_flash_attn_func_gfx1201(
         # Whole tensors, not `.reshape(-1)`: the kernel reads strides, and
         # flattening materialises a copy for any non-contiguous input, which
         # would silently defeat the point of reading them.
-        exe(q_p, k_p, v_p, o_p, batch, seq_len_pad,
-            stream=launch_stream, lse=lse_p)
+        exe(q_p, k_p, v_p, o_p, batch, seq_len_pad, stream=launch_stream, lse=lse_p)
 
-    out = (
-        o_p[:, :, :seq_len_real, :].contiguous()
-        if seq_len_pad != seq_len_real
-        else o_p
-    )
+    out = o_p[:, :, :seq_len_real, :].contiguous() if seq_len_pad != seq_len_real else o_p
     if not return_lse:
         return out
     lse = lse_p.view(batch, num_heads, seq_len_pad)[:, :, :seq_len_real]

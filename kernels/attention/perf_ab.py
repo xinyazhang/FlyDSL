@@ -70,7 +70,6 @@ def _worker() -> int:
     """Read `hd causal N` lines on stdin, print `tflops` per line."""
     sys.path.insert(0, os.path.join(os.environ["FLYDSL_AB_ROOT"], "kernels", "attention"))
     import torch
-
     from bench_shim import do_bench
     from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201 as F
 
@@ -85,16 +84,12 @@ def _worker() -> int:
         key = (hd, causal, n)
         if key not in cache:
             torch.manual_seed(0)
-            cache[key] = tuple(
-                torch.randn(B, H, n, hd, dtype=torch.float16, device="cuda")
-                for _ in range(3)
-            )
+            cache[key] = tuple(torch.randn(B, H, n, hd, dtype=torch.float16, device="cuda") for _ in range(3))
             q, k, v = cache[key]
-            F(q, k, v, causal=causal)          # warm the JIT before timing
+            F(q, k, v, causal=causal)  # warm the JIT before timing
             torch.cuda.synchronize()
         q, k, v = cache[key]
-        ms = do_bench(lambda: F(q, k, v, causal=causal),
-                      warmup=25, rep=100, return_mode="median")
+        ms = do_bench(lambda: F(q, k, v, causal=causal), warmup=25, rep=100, return_mode="median")
         fl = 2.0 * B * H * n * n * hd * 2 * (0.5 if causal else 1.0)
         print(f"{fl / ms * 1e-9:.4f}", flush=True)
     return 0
@@ -104,11 +99,13 @@ class Worker:
     """A checkout pinned to a GPU, kept alive across configs."""
 
     def __init__(self, root: str, gpu: int):
-        env = dict(os.environ, FLYDSL_AB_ROOT=root, HIP_VISIBLE_DEVICES=str(gpu),
-                   CUDA_VISIBLE_DEVICES=str(gpu))
+        env = dict(os.environ, FLYDSL_AB_ROOT=root, HIP_VISIBLE_DEVICES=str(gpu), CUDA_VISIBLE_DEVICES=str(gpu))
         self.p = subprocess.Popen(
             [sys.executable, os.path.join(_HERE, "perf_ab.py"), "--worker"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            env=env,
+            text=True,
             bufsize=1,
         )
         line = self.p.stdout.readline().strip()
@@ -138,8 +135,7 @@ def _checkout(rev: str, into: str) -> str:
     """A detached worktree at `rev`, or the live tree when `rev` is None."""
     if rev is None:
         return _REPO
-    subprocess.run(["git", "-C", _REPO, "worktree", "add", "--detach", into, rev],
-                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", _REPO, "worktree", "add", "--detach", into, rev], check=True, capture_output=True)
     return into
 
 
@@ -147,7 +143,7 @@ def _shard(configs, gpu, base_root, head_root, results):
     a = Worker(base_root, gpu)
     b = Worker(head_root, gpu)
     try:
-        for (hd, causal, n) in configs:
+        for hd, causal, n in configs:
             got_a, got_b = [], []
             for _ in range(REPS):
                 # Alternate, so the two sides see the same board state.
@@ -193,18 +189,21 @@ def main() -> int:
             shards = [configs[i::ngpu] for i in range(ngpu)]
             results: dict = {}
             with ThreadPoolExecutor(max_workers=ngpu) as ex:
-                list(ex.map(
-                    lambda i: _shard(shards[i], i, base_root, head_root, results),
-                    [i for i in range(ngpu) if shards[i]],
-                ))
+                list(
+                    ex.map(
+                        lambda i: _shard(shards[i], i, base_root, head_root, results),
+                        [i for i in range(ngpu) if shards[i]],
+                    )
+                )
         finally:
             for root in (base_root, head_root):
                 if root != _REPO:
-                    subprocess.run(["git", "-C", _REPO, "worktree", "remove", "--force", root],
-                                   capture_output=True)
+                    subprocess.run(["git", "-C", _REPO, "worktree", "remove", "--force", root], capture_output=True)
 
-    print(f"\ntier {tier}   base={args.base}   head={args.head or 'working tree'}   "
-          f"{ngpu} GPUs   {len(configs)} configs\n")
+    print(
+        f"\ntier {tier}   base={args.base}   head={args.head or 'working tree'}   "
+        f"{ngpu} GPUs   {len(configs)} configs\n"
+    )
     print(f"{'hd':>5} {'causal':>7} {'N':>6} {'base':>9} {'head':>9} {'ratio':>7}")
     worst = (None, 1e9)
     for key in sorted(results):
@@ -217,8 +216,7 @@ def main() -> int:
             worst = (key, r)
     print(f"\nworst: {worst[0]} at {worst[1]:.3f}")
     if args.json:
-        json.dump({f"{k[0]}|{k[1]}|{k[2]}": v for k, v in results.items()},
-                  open(args.json, "w"), indent=1)
+        json.dump({f"{k[0]}|{k[1]}|{k[2]}": v for k, v in results.items()}, open(args.json, "w"), indent=1)
     return 0 if worst[1] >= 0.97 else 1
 
 

@@ -29,10 +29,9 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
-
 from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module
-from fmha_tuning_gfx1201 import FmhaKnobs
 from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
+from fmha_tuning_gfx1201 import FmhaKnobs
 
 # Relative-error tolerance against an fp32 reference. The kernel accumulates in
 # fp32 but rounds Q/K/V and the P matrix to the input dtype, so the floor is set
@@ -59,9 +58,7 @@ def _require_env():
 
 def _qkv(batch, seq, heads, head_dim, dtype, seed=0):
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    return tuple(
-        torch.randn(batch, heads, seq, head_dim, dtype=dtype, device="cuda", generator=gen) for _ in range(3)
-    )
+    return tuple(torch.randn(batch, heads, seq, head_dim, dtype=dtype, device="cuda", generator=gen) for _ in range(3))
 
 
 def _reference(q, k, v, causal):
@@ -101,7 +98,9 @@ def test_matches_sdpa(shape, use_binding_prefetch):
     batch, seq, head_dim, causal, dtype = shape
     q, k, v = _qkv(batch, seq, _NUM_HEADS, head_dim, dtype)
 
-    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal, knobs=FmhaKnobs(k_prefetch_dist=1 if use_binding_prefetch else None))
+    out = flydsl_flash_attn_func_gfx1201(
+        q, k, v, causal=causal, knobs=FmhaKnobs(k_prefetch_dist=1 if use_binding_prefetch else None)
+    )
     torch.cuda.synchronize()
 
     assert out.shape == q.shape
@@ -144,7 +143,9 @@ def test_causal_seqlen_not_multiple_of_block(use_binding_prefetch):
     assert seq % _KERNEL_BLOCK_M != 0
     q, k, v = _qkv(1, seq, _NUM_HEADS, 128, torch.float16)
 
-    out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=True, knobs=FmhaKnobs(k_prefetch_dist=1 if use_binding_prefetch else None))
+    out = flydsl_flash_attn_func_gfx1201(
+        q, k, v, causal=True, knobs=FmhaKnobs(k_prefetch_dist=1 if use_binding_prefetch else None)
+    )
     torch.cuda.synchronize()
 
     assert out.shape == q.shape
@@ -204,9 +205,7 @@ def test_builder_rejects_unsupported_head_dim():
     path at small head_dim.
     """
     with pytest.raises(AssertionError, match="BLOCK_DMODEL"):
-        build_flash_attn_func_aiw_module(
-            num_heads=_NUM_HEADS, head_dim=100, causal=False, dtype_str="f16"
-        )
+        build_flash_attn_func_aiw_module(num_heads=_NUM_HEADS, head_dim=100, causal=False, dtype_str="f16")
 
 
 # The m32 variant gives each wave two Q row sub-tiles so one K/V operand feeds two
@@ -302,7 +301,7 @@ def test_head_dim_ladder(head_dim, causal):
 def test_head_dim_requires_aligned_pitch():
     """An off-ladder head_dim needs an 8-element-aligned D pitch."""
     _require_env()
-    q, k, v = _qkv(1, 256, 2, 100, torch.float16)   # contiguous, pitch 100
+    q, k, v = _qkv(1, 256, 2, 100, torch.float16)  # contiguous, pitch 100
     with pytest.raises(ValueError, match="pitch"):
         flydsl_flash_attn_func_gfx1201(q, k, v, causal=False)
 
@@ -335,9 +334,7 @@ def test_head_dim_off_ladder(head_dim, causal):
     pitch = (head_dim + 7) // 8 * 8
     gen = torch.Generator(device="cuda").manual_seed(0)
     q, k, v = (
-        torch.randn(1, 2, 256, pitch, dtype=torch.float16, device="cuda", generator=gen)[
-            ..., :head_dim
-        ]
+        torch.randn(1, 2, 256, pitch, dtype=torch.float16, device="cuda", generator=gen)[..., :head_dim]
         for _ in range(3)
     )
     out = flydsl_flash_attn_func_gfx1201(q, k, v, causal=causal)

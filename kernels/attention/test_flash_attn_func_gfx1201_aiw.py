@@ -38,12 +38,12 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
-
-from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
-from fmha_tuning_gfx1201 import default_block_m as aiw_block_m, resolve_shards
 from flash_attn_func_gfx1201_aiw import (
     build_flash_attn_func_aiw_module,
 )
+from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
+from fmha_tuning_gfx1201 import default_block_m as aiw_block_m
+from fmha_tuning_gfx1201 import resolve_shards
 
 _NUM_HEADS = 2
 
@@ -64,10 +64,7 @@ def _require_env():
 def _qkv(batch, seq, head_dim, dtype, seed=0):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     return tuple(
-        torch.randn(
-            batch, _NUM_HEADS, seq, head_dim, dtype=dtype, device="cuda", generator=gen
-        )
-        for _ in range(3)
+        torch.randn(batch, _NUM_HEADS, seq, head_dim, dtype=dtype, device="cuda", generator=gen) for _ in range(3)
     )
 
 
@@ -104,9 +101,7 @@ def test_ladder_matches_sdpa(head_dim, causal):
     """
     _require_env()
     q, k, v = _qkv(1, 256, head_dim, torch.float16)
-    exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16"
-    )
+    exe = build_flash_attn_func_aiw_module(num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16")
     got = _run(exe, q, k, v, 1, 256)
     assert torch.isfinite(got).all(), f"head_dim={head_dim} causal={causal} not finite"
     rel = _rel(got, _reference(q, k, v, causal))
@@ -160,18 +155,16 @@ def test_stride_slots_are_batch_head_seq():
     heads, seq, head_dim = 4, 64, 64
     gen = torch.Generator(device="cuda").manual_seed(3)
     q, k, v = (
-        torch.randn(1, heads, seq, head_dim, dtype=torch.float16,
-                    device="cuda", generator=gen)
-        for _ in range(3)
+        torch.randn(1, heads, seq, head_dim, dtype=torch.float16, device="cuda", generator=gen) for _ in range(3)
     )
     # Make every head distinguishable, so reading the wrong axis cannot match.
     for h in range(heads):
         k[:, h] *= float(h + 1)
 
     o = torch.empty_like(q)
-    build_flash_attn_func_aiw_module(
-        num_heads=heads, head_dim=head_dim, causal=False, dtype_str="f16"
-    )(q, k, v, o, 1, seq)
+    build_flash_attn_func_aiw_module(num_heads=heads, head_dim=head_dim, causal=False, dtype_str="f16")(
+        q, k, v, o, 1, seq
+    )
     torch.cuda.synchronize()
 
     for h in range(heads):
@@ -181,10 +174,7 @@ def test_stride_slots_are_batch_head_seq():
             v[:, h].unsqueeze(1).float(),
         ).squeeze(1)
         rel = (o[:, h].float() - ref).abs().max().item() / ref.abs().max().item()
-        assert rel < 5e-3, (
-            f"head {h} is wrong (rel={rel:.3e}): the stride slots are not "
-            f"(batch, head, seq)"
-        )
+        assert rel < 5e-3, f"head {h} is wrong (rel={rel:.3e}): the stride slots are not " f"(batch, head, seq)"
 
 
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
@@ -208,19 +198,20 @@ def test_storage_flip_matches_contiguous(head_dim, causal):
         gen = torch.Generator(device="cuda").manual_seed(seed)
         # (B, S, H, D) allocation viewed as (B, H, S, D)
         return torch.randn(
-            1, seq, _NUM_HEADS, head_dim,
-            dtype=torch.float16, device="cuda", generator=gen,
+            1,
+            seq,
+            _NUM_HEADS,
+            head_dim,
+            dtype=torch.float16,
+            device="cuda",
+            generator=gen,
         ).transpose(1, 2)
 
     q, k, v = (_flipped(s) for s in range(3))
     assert not q.is_contiguous(), "test would be vacuous on a contiguous tensor"
-    o = torch.empty(
-        1, seq, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda"
-    ).transpose(1, 2)
+    o = torch.empty(1, seq, _NUM_HEADS, head_dim, dtype=torch.float16, device="cuda").transpose(1, 2)
 
-    exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16"
-    )
+    exe = build_flash_attn_func_aiw_module(num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16")
     _run(exe, q, k, v, 1, seq, out=o)
 
     # Same values in a contiguous tensor: the answer must not depend on layout.
@@ -239,9 +230,7 @@ def test_rejects_non_rank4_and_ragged_last_dim():
     """Strides can only be read from a rank-4, D-contiguous tensor."""
     _require_env()
     q, k, v = _qkv(1, 256, 64, torch.float16)
-    exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16"
-    )
+    exe = build_flash_attn_func_aiw_module(num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16")
     with pytest.raises(ValueError, match="rank 4"):
         exe(q.reshape(-1), k, v, torch.empty_like(q), 1, 256)
     # D non-contiguous: transpose the last two axes.
@@ -271,17 +260,26 @@ def test_softmax_is_exact_for_large_inputs(mag):
     head_dim, seq = 128, aiw_block_m(128, 1)
     gen = torch.Generator(device="cuda").manual_seed(0)
     q, k, v = (
-        torch.randn(1, _NUM_HEADS, seq, head_dim,
-            dtype=torch.float16, device="cuda", generator=gen,
-        ) * mag
+        torch.randn(
+            1,
+            _NUM_HEADS,
+            seq,
+            head_dim,
+            dtype=torch.float16,
+            device="cuda",
+            generator=gen,
+        )
+        * mag
         for _ in range(3)
     )
     assert torch.isfinite(q).all(), "inputs overflowed f16; pick a smaller mag"
     got = _run(
-        build_flash_attn_func_aiw_module(
-            num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16"
-        ),
-        q, k, v, 1, seq,
+        build_flash_attn_func_aiw_module(num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16"),
+        q,
+        k,
+        v,
+        1,
+        seq,
     )
     qb, kb, vb = (x.double() for x in (q, k, v))
     ref = F.scaled_dot_product_attention(qb, kb, vb, is_causal=True)
@@ -290,8 +288,7 @@ def test_softmax_is_exact_for_large_inputs(mag):
 
 
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-@pytest.mark.parametrize("nhq,nhk", [(8, 8), (8, 2), (8, 1), (10, 2)],
-                         ids=["mha", "gqa4", "mqa", "gqa5"])
+@pytest.mark.parametrize("nhq,nhk", [(8, 8), (8, 2), (8, 1), (10, 2)], ids=["mha", "gqa4", "mqa", "gqa5"])
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_mqa_gqa_matches_sdpa(head_dim, nhq, nhk, causal):
     """Several query heads may share one KV head.
@@ -305,23 +302,17 @@ def test_mqa_gqa_matches_sdpa(head_dim, nhq, nhk, causal):
     gen = torch.Generator(device="cuda").manual_seed(0)
 
     def _t(h):
-        return torch.randn(
-            1, h, seq, head_dim, dtype=torch.float16, device="cuda", generator=gen
-        )
+        return torch.randn(1, h, seq, head_dim, dtype=torch.float16, device="cuda", generator=gen)
 
     q, k, v = _t(nhq), _t(nhk), _t(nhk)
     o = torch.empty_like(q)
-    exe = build_flash_attn_func_aiw_module(
-        num_heads=nhq, head_dim=head_dim, causal=causal, dtype_str="f16"
-    )
+    exe = build_flash_attn_func_aiw_module(num_heads=nhq, head_dim=head_dim, causal=causal, dtype_str="f16")
     exe(q, k, v, o, 1, seq)
     torch.cuda.synchronize()
 
     # enable_gqa broadcasts the KV heads across each query-head group.
     qb, kb, vb = (x.float() for x in (q, k, v))
-    ref = F.scaled_dot_product_attention(
-        qb, kb, vb, is_causal=causal, enable_gqa=(nhq != nhk)
-    )
+    ref = F.scaled_dot_product_attention(qb, kb, vb, is_causal=causal, enable_gqa=(nhq != nhk))
 
     assert torch.isfinite(o).all(), f"nhq={nhq} nhk={nhk} produced non-finite output"
     rel = _rel(o, ref)
@@ -346,9 +337,9 @@ def test_gqa_head_mapping_is_grouped_not_strided():
     v[:, 1] += 4.0
 
     o = torch.empty_like(q)
-    build_flash_attn_func_aiw_module(
-        num_heads=nhq, head_dim=head_dim, causal=False, dtype_str="f16"
-    )(q, k, v, o, 1, seq)
+    build_flash_attn_func_aiw_module(num_heads=nhq, head_dim=head_dim, causal=False, dtype_str="f16")(
+        q, k, v, o, 1, seq
+    )
     torch.cuda.synchronize()
 
     def _one_head(x, h):
@@ -357,10 +348,8 @@ def test_gqa_head_mapping_is_grouped_not_strided():
 
     ratio = nhq // nhk
     for h in range(nhq):
-        kh = h // ratio          # grouped, not h % nhk
-        ref = F.scaled_dot_product_attention(
-            _one_head(q, h), _one_head(k, kh), _one_head(v, kh)
-        ).squeeze(1)
+        kh = h // ratio  # grouped, not h % nhk
+        ref = F.scaled_dot_product_attention(_one_head(q, h), _one_head(k, kh), _one_head(v, kh)).squeeze(1)
         got = o[:, h].float()
         rel = (got - ref).abs().max().item() / ref.abs().max().item()
         assert rel < 5e-3, f"query head {h} did not read KV head {kh} (rel={rel:.3e})"
@@ -377,9 +366,7 @@ def _poisoned(hdim, tile, seq, heads, poison, gen):
     allocation is padded, and the caller slices back to the real extent.
     """
     full = torch.full((1, heads, seq, tile), poison, dtype=torch.float16, device="cuda")
-    full[..., :hdim] = torch.randn(
-        1, heads, seq, hdim, dtype=torch.float16, device="cuda", generator=gen
-    )
+    full[..., :hdim] = torch.randn(1, heads, seq, hdim, dtype=torch.float16, device="cuda", generator=gen)
     return full[..., :hdim]
 
 
@@ -400,12 +387,13 @@ def test_padded_head_never_reads_the_pad(hdim, tile, causal, poison):
     seq, heads = 256, 4
     gen = torch.Generator(device="cuda").manual_seed(0)
     q, k, v = (_poisoned(hdim, tile, seq, heads, poison, gen) for _ in range(3))
-    o = torch.full(
-        (1, heads, seq, tile), poison, dtype=torch.float16, device="cuda"
-    )[..., :hdim]
+    o = torch.full((1, heads, seq, tile), poison, dtype=torch.float16, device="cuda")[..., :hdim]
 
     exe = build_flash_attn_func_aiw_module(
-        num_heads=heads, head_dim=tile, causal=causal, dtype_str="f16",
+        num_heads=heads,
+        head_dim=tile,
+        causal=causal,
+        dtype_str="f16",
         padded_head=True,
     )
     exe(q, k, v, o, 1, seq)
@@ -437,11 +425,12 @@ def test_padded_head_is_independent_of_pad_contents(hdim, tile):
     for poison in (float("nan"), 1e4, -7.5):
         gen = torch.Generator(device="cuda").manual_seed(0)
         q, k, v = (_poisoned(hdim, tile, seq, heads, poison, gen) for _ in range(3))
-        o = torch.full(
-            (1, heads, seq, tile), poison, dtype=torch.float16, device="cuda"
-        )[..., :hdim]
+        o = torch.full((1, heads, seq, tile), poison, dtype=torch.float16, device="cuda")[..., :hdim]
         build_flash_attn_func_aiw_module(
-            num_heads=heads, head_dim=tile, causal=False, dtype_str="f16",
+            num_heads=heads,
+            head_dim=tile,
+            causal=False,
+            dtype_str="f16",
             padded_head=True,
         )(q, k, v, o, 1, seq)
         torch.cuda.synchronize()
@@ -475,9 +464,9 @@ def test_logsumexp_matches_torch(head_dim, causal):
     q, k, v = _qkv(batch, seq, head_dim, torch.float16)
     o = torch.empty_like(q)
     lse = torch.zeros(batch * _NUM_HEADS, seq, dtype=torch.float32, device="cuda")
-    build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16"
-    )(q, k, v, o, batch, seq, lse=lse)
+    build_flash_attn_func_aiw_module(num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16")(
+        q, k, v, o, batch, seq, lse=lse
+    )
     torch.cuda.synchronize()
 
     assert torch.isfinite(lse).all(), "logsumexp is not finite"
@@ -495,9 +484,7 @@ def test_logsumexp_null_pointer_is_a_noop():
     _require_env()
     seq = 256
     q, k, v = _qkv(1, seq, 64, torch.float16)
-    exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16"
-    )
+    exe = build_flash_attn_func_aiw_module(num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16")
     o_without = _run(exe, q, k, v, 1, seq)
     o_with = torch.empty_like(q)
     lse = torch.zeros(_NUM_HEADS, seq, dtype=torch.float32, device="cuda")
@@ -514,25 +501,21 @@ def test_logsumexp_with_gqa():
     gen = torch.Generator(device="cuda").manual_seed(0)
 
     def _t(h):
-        return torch.randn(
-            1, h, seq, head_dim, dtype=torch.float16, device="cuda", generator=gen
-        )
+        return torch.randn(1, h, seq, head_dim, dtype=torch.float16, device="cuda", generator=gen)
 
     q, k, v = _t(nhq), _t(nhk), _t(nhk)
     o = torch.empty_like(q)
     lse = torch.zeros(nhq, seq, dtype=torch.float32, device="cuda")
-    build_flash_attn_func_aiw_module(
-        num_heads=nhq, head_dim=head_dim, causal=False, dtype_str="f16"
-    )(q, k, v, o, 1, seq, lse=lse)
+    build_flash_attn_func_aiw_module(num_heads=nhq, head_dim=head_dim, causal=False, dtype_str="f16")(
+        q, k, v, o, 1, seq, lse=lse
+    )
     torch.cuda.synchronize()
 
     ratio = nhq // nhk
     for h in range(nhq):
         qb = q[:, h].unsqueeze(1).double()
         kb = k[:, h // ratio].unsqueeze(1).double()
-        ref = torch.logsumexp(
-            (qb @ kb.transpose(-1, -2)) / math.sqrt(head_dim), dim=-1
-        ).squeeze()
+        ref = torch.logsumexp((qb @ kb.transpose(-1, -2)) / math.sqrt(head_dim), dim=-1).squeeze()
         err = (lse[h].double() - ref).abs().max().item()
         assert err < 2e-2, f"query head {h}: max|lse-ref|={err:.3e}"
 
@@ -553,9 +536,7 @@ def test_logsumexp_validation(lse_factory, match):
     _require_env()
     seq = 256
     q, k, v = _qkv(1, seq, 64, torch.float16)
-    exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16"
-    )
+    exe = build_flash_attn_func_aiw_module(num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16")
     with pytest.raises(ValueError, match=match):
         exe(q, k, v, torch.empty_like(q), 1, seq, lse=lse_factory(seq))
 
@@ -567,8 +548,7 @@ def _causal_mask(Lq, Lk, ctype):
     return j <= i + (0 if ctype == 1 else Lk - Lq)
 
 
-_XATTN_SHAPES = [(256, 256), (256, 512), (512, 256), (200, 300), (300, 200),
-                 (11, 31), (523, 337), (1033, 571)]
+_XATTN_SHAPES = [(256, 256), (256, 512), (512, 256), (200, 300), (300, 200), (11, 31), (523, 337), (1033, 571)]
 
 
 @pytest.mark.parametrize("ctype", [0, 1, 2], ids=["full", "topleft", "botright"])
@@ -585,14 +565,16 @@ def test_seqlen_q_ne_seqlen_k(head_dim, Lq, Lk, ctype):
     gen = torch.Generator(device="cuda").manual_seed(0)
 
     def _t(n):
-        return torch.randn(1, _NUM_HEADS, n, head_dim, dtype=torch.float16, device="cuda", generator=gen
-        )
+        return torch.randn(1, _NUM_HEADS, n, head_dim, dtype=torch.float16, device="cuda", generator=gen)
 
     q, k, v = _t(Lq), _t(Lk), _t(Lk)
     o = torch.empty_like(q)
     build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=bool(ctype),
-        causal_type=ctype, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=bool(ctype),
+        causal_type=ctype,
+        dtype_str="f16",
     )(q, k, v, o, 1, Lq, Lk)
     torch.cuda.synchronize()
 
@@ -632,14 +614,17 @@ def test_alignments_differ_when_lengths_differ():
     for ctype in (1, 2):
         o = torch.empty_like(q)
         build_flash_attn_func_aiw_module(
-            num_heads=_NUM_HEADS, head_dim=head_dim, causal=True,
-            causal_type=ctype, dtype_str="f16",
+            num_heads=_NUM_HEADS,
+            head_dim=head_dim,
+            causal=True,
+            causal_type=ctype,
+            dtype_str="f16",
         )(q, k, v, o, 1, Lq, Lk)
         torch.cuda.synchronize()
         outs.append(o.clone())
-    assert not torch.allclose(outs[0], outs[1], atol=1e-2), (
-        "top-left and bottom-right produced the same result at Lq != Lk"
-    )
+    assert not torch.allclose(
+        outs[0], outs[1], atol=1e-2
+    ), "top-left and bottom-right produced the same result at Lq != Lk"
 
 
 # ---------------------------------------------------------------------------
@@ -683,22 +668,17 @@ def test_causal_type_maps_to_documented_window(Lq, Lk, ctype):
     gen = torch.Generator(device="cuda").manual_seed(0)
 
     def _t(n):
-        return torch.randn(1, _NUM_HEADS, n, head_dim, dtype=torch.float16, device="cuda", generator=gen
-        )
+        return torch.randn(1, _NUM_HEADS, n, head_dim, dtype=torch.float16, device="cuda", generator=gen)
 
     q, k, v = _t(Lq), _t(Lk), _t(Lk)
     common = dict(num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16")
 
     o_causal = torch.empty_like(q)
-    build_flash_attn_func_aiw_module(causal_type=ctype, **common)(
-        q, k, v, o_causal, 1, Lq, Lk
-    )
+    build_flash_attn_func_aiw_module(causal_type=ctype, **common)(q, k, v, o_causal, 1, Lq, Lk)
 
     def _window_run(w):
         o = torch.empty_like(q)
-        build_flash_attn_func_aiw_module(causal_type=3, **common)(
-            q, k, v, o, 1, Lq, Lk, window=w
-        )
+        build_flash_attn_func_aiw_module(causal_type=3, **common)(q, k, v, o, 1, Lq, Lk, window=w)
         return o
 
     w_left = Lq
@@ -721,28 +701,29 @@ def test_causal_type_maps_to_documented_window(Lq, Lk, ctype):
 def test_causal_type_1_2_reject_an_explicit_window():
     """The alignment already fixes the window; two sources would disagree."""
     _require_env()
-    q, k, v = (
-        torch.randn(1, _NUM_HEADS, 64, 64, dtype=torch.float16, device="cuda")
-        for _ in range(3)
-    )
+    q, k, v = (torch.randn(1, _NUM_HEADS, 64, 64, dtype=torch.float16, device="cuda") for _ in range(3))
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=64, causal=True, causal_type=1, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=64,
+        causal=True,
+        causal_type=1,
+        dtype_str="f16",
     )
     with pytest.raises(ValueError, match="already fixes the window"):
         exe(q, k, v, torch.empty_like(q), 1, 64, 64, window=(16, 0))
 
 
 _SWA_WINDOWS = [
-    (0, 0),        # the diagonal alone
-    (1, 1),        # narrower than any BLOCK_N -- no full tiles exist
+    (0, 0),  # the diagonal alone
+    (1, 1),  # narrower than any BLOCK_N -- no full tiles exist
     (16, 0),
     (64, 64),
-    (0, 64),       # anti-causal: only keys ahead of the query
-    (-16, 64),     # band shifted off the diagonal, left bound negative
-    (64, -16),     # ... and the other way
-    (-128, 256),   # left bound past a whole BLOCK_N: the *leading* masked run
-                   # spans several tiles, not just a clipped tile 0
-    (-256, 300),   # ... and further still
+    (0, 64),  # anti-causal: only keys ahead of the query
+    (-16, 64),  # band shifted off the diagonal, left bound negative
+    (64, -16),  # ... and the other way
+    (-128, 256),  # left bound past a whole BLOCK_N: the *leading* masked run
+    # spans several tiles, not just a clipped tile 0
+    (-256, 300),  # ... and further still
     (10_000, 10_000),  # wider than seqlen_k: degenerates to no masking
 ]
 
@@ -758,13 +739,17 @@ def test_window_on_a_non_causal_build_is_rejected():
     q, k, v = _qkv(1, 256, 64, torch.float16)
     with pytest.raises(ValueError, match="requires a causal build"):
         build_flash_attn_func_aiw_module(
-            num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16",
+            num_heads=_NUM_HEADS,
+            head_dim=64,
+            causal=False,
+            dtype_str="f16",
         )(q, k, v, torch.empty_like(q), 1, 256, window=(-16, 64))
 
 
 @pytest.mark.parametrize("w_left,w_right", _SWA_WINDOWS, ids=[f"{a}_{b}" for a, b in _SWA_WINDOWS])
-@pytest.mark.parametrize("Lq,Lk", [(256, 256), (200, 300), (300, 200), (523, 337)],
-                         ids=["256x256", "200x300", "300x200", "523x337"])
+@pytest.mark.parametrize(
+    "Lq,Lk", [(256, 256), (200, 300), (300, 200), (523, 337)], ids=["256x256", "200x300", "300x200", "523x337"]
+)
 def test_sliding_window(Lq, Lk, w_left, w_right):
     """The band, including negative bounds on either side.
 
@@ -778,13 +763,15 @@ def test_sliding_window(Lq, Lk, w_left, w_right):
     gen = torch.Generator(device="cuda").manual_seed(0)
 
     def _t(n):
-        return torch.randn(1, _NUM_HEADS, n, head_dim, dtype=torch.float16, device="cuda", generator=gen
-        )
+        return torch.randn(1, _NUM_HEADS, n, head_dim, dtype=torch.float16, device="cuda", generator=gen)
 
     q, k, v = _t(Lq), _t(Lk), _t(Lk)
     o = torch.empty_like(q)
     build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, causal_type=3,
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=True,
+        causal_type=3,
         dtype_str="f16",
     )(q, k, v, o, 1, Lq, Lk, window=(w_left, w_right))
     torch.cuda.synchronize()
@@ -816,12 +803,14 @@ def test_window_wider_than_seqlen_is_unmasked():
     head_dim = 64
     gen = torch.Generator(device="cuda").manual_seed(0)
     q, k, v = (
-        torch.randn(1, _NUM_HEADS, n, head_dim, dtype=torch.float16, device="cuda", generator=gen)
-        for n in (Lq, Lk, Lk)
+        torch.randn(1, _NUM_HEADS, n, head_dim, dtype=torch.float16, device="cuda", generator=gen) for n in (Lq, Lk, Lk)
     )
     o = torch.empty_like(q)
     build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, causal_type=3,
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=True,
+        causal_type=3,
         dtype_str="f16",
     )(q, k, v, o, 1, Lq, Lk, window=(Lk, Lk))
     torch.cuda.synchronize()
@@ -834,12 +823,13 @@ def test_window_wider_than_seqlen_is_unmasked():
 def test_window_requires_explicit_bounds():
     """causal_type=3 with no window is a caller error, not a silent default."""
     _require_env()
-    q, k, v = (
-        torch.randn(1, _NUM_HEADS, 64, 64, dtype=torch.float16, device="cuda")
-        for _ in range(3)
-    )
+    q, k, v = (torch.randn(1, _NUM_HEADS, 64, 64, dtype=torch.float16, device="cuda") for _ in range(3))
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=64, causal=True, causal_type=3, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=64,
+        causal=True,
+        causal_type=3,
+        dtype_str="f16",
     )
     with pytest.raises(ValueError, match="requires window"):
         exe(q, k, v, torch.empty_like(q), 1, 64, 64)
@@ -860,11 +850,14 @@ def test_logsumexp_is_plus_inf_for_rows_with_no_keys():
     o = torch.empty_like(q)
     lse = torch.zeros(_NUM_HEADS, Lq, dtype=torch.float32, device="cuda")
     build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, causal_type=2,
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=True,
+        causal_type=2,
         dtype_str="f16",
     )(q, k, v, o, 1, Lq, Lk, lse=lse)
     torch.cuda.synchronize()
-    dead = Lq - Lk          # rows 0 .. dead-1 see no keys
+    dead = Lq - Lk  # rows 0 .. dead-1 see no keys
     assert torch.isinf(lse[:, :dead]).all() and (lse[:, :dead] > 0).all()
     assert torch.isfinite(lse[:, dead:]).all()
 
@@ -937,6 +930,7 @@ def test_knob_validity_predicate(kwargs, match):
     with pytest.raises(AssertionError, match=match):
         build_flash_attn_func_aiw_module(**base)
 
+
 # ---------------------------------------------------------------------------
 # Variable-length sequences (VarlenBits)
 # ---------------------------------------------------------------------------
@@ -958,8 +952,7 @@ _LSE_LAYOUT_TH = 1 << 16
 
 
 def _cu(lens):
-    return torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(),
-                        dtype=torch.int32, device="cuda")
+    return torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), dtype=torch.int32, device="cuda")
 
 
 def _packed_qkv(lens_q, lens_k, head_dim, seed=0):
@@ -970,36 +963,33 @@ def _packed_qkv(lens_q, lens_k, head_dim, seed=0):
 
     def _t(n):
         # A zero-length batch still needs a valid allocation.
-        return torch.randn(1, _NUM_HEADS, max(n, 1), head_dim,
-                           dtype=torch.float16, device="cuda", generator=gen)
+        return torch.randn(1, _NUM_HEADS, max(n, 1), head_dim, dtype=torch.float16, device="cuda", generator=gen)
 
     return _t(Tq), _t(Tk), _t(Tk), cq, ck
 
 
-def _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck,
-                                 label, lse=None, dense_lse=True):
+def _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck, label, lse=None, dense_lse=True):
     """Every sequence must match its own dense call, bit for bit."""
     for z, (lq, lk) in enumerate(zip(lens_q, lens_k)):
         if lq == 0:
             continue
         qs, ks = int(cq[z]), int(ck[z])
-        qz = q[:, :, qs:qs + lq].contiguous()
-        kz = k[:, :, ks:ks + lk].contiguous()
-        vz = v[:, :, ks:ks + lk].contiguous()
+        qz = q[:, :, qs : qs + lq].contiguous()
+        kz = k[:, :, ks : ks + lk].contiguous()
+        vz = v[:, :, ks : ks + lk].contiguous()
         ref = torch.empty_like(qz)
-        ref_lse = (torch.zeros(_NUM_HEADS, lq, dtype=torch.float32, device="cuda")
-                   if lse is not None else None)
+        ref_lse = torch.zeros(_NUM_HEADS, lq, dtype=torch.float32, device="cuda") if lse is not None else None
         exe(qz, kz, vz, ref, 1, lq, lk, lse=ref_lse)
         torch.cuda.synchronize()
-        got = o[:, :, qs:qs + lq]
+        got = o[:, :, qs : qs + lq]
         assert torch.equal(ref, got), (
             f"{label} sequence {z} (Lq={lq}, Lk={lk}) differs from its dense "
             f"call: max |delta| {(ref.float() - got.float()).abs().max():.3e}"
         )
         if lse is not None:
-            assert torch.equal(ref_lse, lse[:, qs:qs + lq]), (
-                f"{label} sequence {z} logsumexp differs from its dense call"
-            )
+            assert torch.equal(
+                ref_lse, lse[:, qs : qs + lq]
+            ), f"{label} sequence {z} logsumexp differs from its dense call"
 
 
 _VARLEN_LENGTHS = [
@@ -1035,15 +1025,16 @@ def test_varlen_compact_lengths(lens_q, label, ctype):
     q, k, v, cq, ck = _packed_qkv(lens_q, lens_k, head_dim)
     o = torch.zeros_like(q)
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=bool(ctype),
-        causal_type=ctype or None, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=bool(ctype),
+        causal_type=ctype or None,
+        dtype_str="f16",
     )
     mq, mk = max(lens_q), max(lens_k)
-    exe(q, k, v, o, N, mq, mk,
-        varlen=exe.varlen_compact(cq, ck, mq, mk))
+    exe(q, k, v, o, N, mq, mk, varlen=exe.varlen_compact(cq, ck, mq, mk))
     torch.cuda.synchronize()
-    _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck,
-                                 f"compact/{label}/ctype={ctype}")
+    _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck, f"compact/{label}/ctype={ctype}")
 
 
 def test_varlen_bottom_right_diagonal_is_per_sequence():
@@ -1063,19 +1054,21 @@ def test_varlen_bottom_right_diagonal_is_per_sequence():
     _require_env()
     head_dim = 64
     lens_q = [64, 96, 40]
-    lens_k = [64 + 5, 96 + 40, 40 + 3]   # differences 5, 40, 3; batch-wide 40
+    lens_k = [64 + 5, 96 + 40, 40 + 3]  # differences 5, 40, 3; batch-wide 40
     N = len(lens_q)
     q, k, v, cq, ck = _packed_qkv(lens_q, lens_k, head_dim)
     o = torch.zeros_like(q)
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, causal_type=2,
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=True,
+        causal_type=2,
         dtype_str="f16",
     )
     mq, mk = max(lens_q), max(lens_k)
     exe(q, k, v, o, N, mq, mk, varlen=exe.varlen_compact(cq, ck, mq, mk))
     torch.cuda.synchronize()
-    _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck,
-                                 "bottom-right/varlen")
+    _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck, "bottom-right/varlen")
 
 
 _GRID_WASTE_LENGTHS = [
@@ -1115,13 +1108,15 @@ def test_varlen_dead_workgroups_do_not_read_past_the_tensor(lens, label, causal)
     q, k, v, cq, ck = _packed_qkv(lens, lens, head_dim)
     o = torch.empty_like(q)
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=causal,
+        dtype_str="f16",
     )
     exe(q, k, v, o, N, mq, mq, varlen=exe.varlen_compact(cq, ck, mq, mq))
     torch.cuda.synchronize()
     assert torch.isfinite(o).all()
-    _assert_varlen_matches_dense(exe, q, k, v, o, lens, lens, cq, ck,
-                                 f"grid-waste/{label}")
+    _assert_varlen_matches_dense(exe, q, k, v, o, lens, lens, cq, ck, f"grid-waste/{label}")
 
 
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
@@ -1141,21 +1136,22 @@ def test_varlen_sequence_with_no_keys(causal):
     _require_env()
     head_dim = 64
     lens_q = [64, 96, 40]
-    lens_k = [64, 0, 40]          # sequence 1 has queries and no keys
+    lens_k = [64, 0, 40]  # sequence 1 has queries and no keys
     N = len(lens_q)
     q, k, v, cq, ck = _packed_qkv(lens_q, lens_k, head_dim)
     o = torch.full_like(q, float("nan"))
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=causal,
+        dtype_str="f16",
     )
-    exe(q, k, v, o, N, max(lens_q), max(lens_k),
-        varlen=exe.varlen_compact(cq, ck, max(lens_q), max(lens_k)))
+    exe(q, k, v, o, N, max(lens_q), max(lens_k), varlen=exe.varlen_compact(cq, ck, max(lens_q), max(lens_k)))
     torch.cuda.synchronize()
     s0, e0 = int(cq[1]), int(cq[1]) + lens_q[1]
     assert (o[:, s0:e0] == 0).all(), "rows with no keys must be exactly zero"
     # The sequences that do have keys are unaffected by their neighbour.
-    _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck,
-                                 "no-keys neighbour")
+    _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck, "no-keys neighbour")
 
 
 def test_varlen_zero_length_writes_nothing():
@@ -1173,20 +1169,21 @@ def test_varlen_zero_length_writes_nothing():
     q, k, v, cq, ck = _packed_qkv(lens_q, lens_k, head_dim)
     poison = float("nan")
     o = torch.full_like(q, poison)
-    lse = torch.full((_NUM_HEADS, max(int(cq[-1]), 1)), poison,
-                     dtype=torch.float32, device="cuda")
+    lse = torch.full((_NUM_HEADS, max(int(cq[-1]), 1)), poison, dtype=torch.float32, device="cuda")
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=True,
+        dtype_str="f16",
     )
     mq, mk = max(lens_q), max(lens_k)
-    exe(q, k, v, o, N, mq, mk, lse=lse,
-        varlen=exe.varlen_compact(cq, ck, mq, mk))
+    exe(q, k, v, o, N, mq, mk, lse=lse, varlen=exe.varlen_compact(cq, ck, mq, mk))
     torch.cuda.synchronize()
     # Rows belonging to real sequences were written; there are no rows
     # belonging to the empty ones, so nothing else may have been touched.
     written = torch.zeros(int(cq[-1]), dtype=torch.bool, device="cuda")
     for z, lq in enumerate(lens_q):
-        written[int(cq[z]):int(cq[z]) + lq] = True
+        written[int(cq[z]) : int(cq[z]) + lq] = True
     assert torch.isfinite(o[:, :, written]).all(), "live rows were not written"
     assert torch.isfinite(lse[:, written]).all(), "live logsumexp not written"
 
@@ -1210,22 +1207,22 @@ def test_varlen_padded_matches_dense(ctype):
     v = torch.randn(N, _NUM_HEADS, mk, head_dim, dtype=torch.float16, device="cuda", generator=gen)
     o = torch.zeros_like(q)
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=bool(ctype),
-        causal_type=ctype or None, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=bool(ctype),
+        causal_type=ctype or None,
+        dtype_str="f16",
     )
-    exe(q, k, v, o, N, mq, mk,
-        varlen=exe.varlen_padded(_cu(lens_q), _cu(lens_k), mq, mk))
+    exe(q, k, v, o, N, mq, mk, varlen=exe.varlen_padded(_cu(lens_q), _cu(lens_k), mq, mk))
     torch.cuda.synchronize()
     for z, (lq, lk) in enumerate(zip(lens_q, lens_k)):
-        qz = q[z:z + 1, :, :lq].contiguous()
-        kz = k[z:z + 1, :, :lk].contiguous()
-        vz = v[z:z + 1, :, :lk].contiguous()
+        qz = q[z : z + 1, :, :lq].contiguous()
+        kz = k[z : z + 1, :, :lk].contiguous()
+        vz = v[z : z + 1, :, :lk].contiguous()
         ref = torch.empty_like(qz)
         exe(qz, kz, vz, ref, 1, lq, lk)
         torch.cuda.synchronize()
-        assert torch.equal(ref, o[z:z + 1, :, :lq]), (
-            f"padded sequence {z} differs from its dense call"
-        )
+        assert torch.equal(ref, o[z : z + 1, :, :lq]), f"padded sequence {z} differs from its dense call"
 
 
 def test_varlen_single_sequence_reduces_to_dense():
@@ -1242,13 +1239,15 @@ def test_varlen_single_sequence_reduces_to_dense():
     k = torch.randn(1, _NUM_HEADS, L, head_dim, dtype=torch.float16, device="cuda", generator=gen)
     v = torch.randn(1, _NUM_HEADS, L, head_dim, dtype=torch.float16, device="cuda", generator=gen)
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=True,
+        dtype_str="f16",
     )
     o_dense = torch.empty_like(q)
     exe(q, k, v, o_dense, 1, L, L)
     o_varlen = torch.empty_like(q)
-    exe(q, k, v, o_varlen, 1, L, L,
-        varlen=exe.varlen_compact(_cu([L]), _cu([L]), L, L))
+    exe(q, k, v, o_varlen, 1, L, L, varlen=exe.varlen_compact(_cu([L]), _cu([L]), L, L))
     torch.cuda.synchronize()
     assert torch.equal(o_dense, o_varlen)
 
@@ -1269,20 +1268,28 @@ def test_varlen_lse_layout_th_transposes():
     q, k, v, cq, ck = _packed_qkv(lens_q, lens_k, head_dim)
     Tq = int(cq[-1])
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=True,
+        dtype_str="f16",
     )
     o = torch.empty_like(q)
     lse_ht = torch.zeros(_NUM_HEADS, Tq, dtype=torch.float32, device="cuda")
-    exe(q, k, v, o, N, mq, mk, lse=lse_ht,
-        varlen=exe.varlen_compact(cq, ck, mq, mk))
+    exe(q, k, v, o, N, mq, mk, lse=lse_ht, varlen=exe.varlen_compact(cq, ck, mq, mk))
     lse_th = torch.zeros(Tq, _NUM_HEADS, dtype=torch.float32, device="cuda")
-    exe(q, k, v, o, N, mq, mk, lse=lse_th,
-        varlen=exe.varlen_compact(cq, ck, mq, mk, lse_tokens=Tq,
-                                  lse_layout=_LSE_LAYOUT_TH))
-    torch.cuda.synchronize()
-    assert torch.equal(lse_ht, lse_th.t().contiguous()), (
-        "TH layout is not the transpose of HT"
+    exe(
+        q,
+        k,
+        v,
+        o,
+        N,
+        mq,
+        mk,
+        lse=lse_th,
+        varlen=exe.varlen_compact(cq, ck, mq, mk, lse_tokens=Tq, lse_layout=_LSE_LAYOUT_TH),
     )
+    torch.cuda.synchronize()
+    assert torch.equal(lse_ht, lse_th.t().contiguous()), "TH layout is not the transpose of HT"
 
 
 def _strided_layout(lens, gaps):
@@ -1296,8 +1303,7 @@ def _strided_layout(lens, gaps):
     for ln, gap in zip(lens, gaps):
         pos.append(at)
         at += ln + gap
-    return (torch.tensor(pos + [at], dtype=torch.int32, device="cuda"),
-            _cu(lens), at)
+    return (torch.tensor(pos + [at], dtype=torch.int32, device="cuda"), _cu(lens), at)
 
 
 @pytest.mark.parametrize("ctype", [0, 1], ids=["full", "causal"])
@@ -1317,7 +1323,7 @@ def test_varlen_strided_reads_the_position_array(ctype):
     head_dim = 64
     lens_q = [96, 40, 133]
     lens_k = [x + 7 for x in lens_q]
-    gaps_q = [11, 64, 3]          # per-sequence, not uniform
+    gaps_q = [11, 64, 3]  # per-sequence, not uniform
     gaps_k = [5, 32, 17]
     N = len(lens_q)
     sst_q, cq, Tq_pad = _strided_layout(lens_q, gaps_q)
@@ -1325,38 +1331,42 @@ def test_varlen_strided_reads_the_position_array(ctype):
     gen = torch.Generator(device="cuda").manual_seed(0)
 
     def _t(n):
-        return torch.randn(1, _NUM_HEADS, n, head_dim, dtype=torch.float16,
-                           device="cuda", generator=gen)
+        return torch.randn(1, _NUM_HEADS, n, head_dim, dtype=torch.float16, device="cuda", generator=gen)
 
     q, k, v = _t(Tq_pad), _t(Tk_pad), _t(Tk_pad)
     o = torch.zeros_like(q)
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=bool(ctype),
-        causal_type=ctype or None, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=bool(ctype),
+        causal_type=ctype or None,
+        dtype_str="f16",
     )
     mq, mk = max(lens_q), max(lens_k)
-    exe(q, k, v, o, N, mq, mk,
-        varlen=exe.varlen_strided(cq, ck, sst_q, sst_k, mq, mk))
+    exe(q, k, v, o, N, mq, mk, varlen=exe.varlen_strided(cq, ck, sst_q, sst_k, mq, mk))
     torch.cuda.synchronize()
 
     for z, (lq, lk) in enumerate(zip(lens_q, lens_k)):
         qs, ks = int(sst_q[z]), int(sst_k[z])
         ref = torch.empty(1, _NUM_HEADS, lq, head_dim, dtype=torch.float16, device="cuda")
-        exe(q[:, :, qs:qs + lq].contiguous(), k[:, :, ks:ks + lk].contiguous(),
-            v[:, :, ks:ks + lk].contiguous(), ref, 1, lq, lk)
-        torch.cuda.synchronize()
-        assert torch.equal(ref, o[:, :, qs:qs + lq]), (
-            f"strided sequence {z} differs from its dense call"
+        exe(
+            q[:, :, qs : qs + lq].contiguous(),
+            k[:, :, ks : ks + lk].contiguous(),
+            v[:, :, ks : ks + lk].contiguous(),
+            ref,
+            1,
+            lq,
+            lk,
         )
+        torch.cuda.synchronize()
+        assert torch.equal(ref, o[:, :, qs : qs + lq]), f"strided sequence {z} differs from its dense call"
 
     # Negative control: the same buffer read as if it were gapless.
     o_compact = torch.zeros_like(q)
-    exe(q, k, v, o_compact, N, mq, mk,
-        varlen=exe.varlen_compact(cq, ck, mq, mk))
+    exe(q, k, v, o_compact, N, mq, mk, varlen=exe.varlen_compact(cq, ck, mq, mk))
     torch.cuda.synchronize()
     assert not torch.equal(o, o_compact), (
-        "strided produced the same result as the gapless reading of the same "
-        "buffer -- seqinfo_?1 is not being read"
+        "strided produced the same result as the gapless reading of the same " "buffer -- seqinfo_?1 is not being read"
     )
 
 
@@ -1373,16 +1383,15 @@ def test_varlen_seqused_k_shortens_only_k(k_is_cache):
     _require_env()
     head_dim = 64
     lens_q = [96, 40, 128]
-    alloc_k = [x + 64 for x in lens_q]      # cache slots, larger than used
-    used_k = [x + 7 for x in lens_q]        # what actually participates
+    alloc_k = [x + 64 for x in lens_q]  # cache slots, larger than used
+    used_k = [x + 7 for x in lens_q]  # what actually participates
     N, mq = len(lens_q), max(lens_q)
     mk = max(alloc_k)
     cq = _cu(lens_q)
     ck = _cu(alloc_k)
     su = torch.tensor(used_k, dtype=torch.int32, device="cuda")
     gen = torch.Generator(device="cuda").manual_seed(0)
-    q = torch.randn(1, _NUM_HEADS, int(cq[-1]), head_dim, dtype=torch.float16,
-                    device="cuda", generator=gen)
+    q = torch.randn(1, _NUM_HEADS, int(cq[-1]), head_dim, dtype=torch.float16, device="cuda", generator=gen)
     if k_is_cache:
         kv_shape = (N, _NUM_HEADS, mk, head_dim)
     else:
@@ -1391,37 +1400,43 @@ def test_varlen_seqused_k_shortens_only_k(k_is_cache):
     v = torch.randn(*kv_shape, dtype=torch.float16, device="cuda", generator=gen)
     o = torch.zeros_like(q)
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=False,
+        dtype_str="f16",
     )
-    exe(q, k, v, o, N, mq, mk,
-        varlen=exe.varlen_seqused_k(cq, ck, su, mq, mk, k_is_cache=k_is_cache))
+    exe(q, k, v, o, N, mq, mk, varlen=exe.varlen_seqused_k(cq, ck, su, mq, mk, k_is_cache=k_is_cache))
     torch.cuda.synchronize()
 
     for z, lq in enumerate(lens_q):
         qs = int(cq[z])
-        qz = q[:, :, qs:qs + lq].contiguous()
+        qz = q[:, :, qs : qs + lq].contiguous()
         if k_is_cache:
-            kz_full, vz_full = k[z:z + 1], v[z:z + 1]
+            kz_full, vz_full = k[z : z + 1], v[z : z + 1]
         else:
             ks = int(ck[z])
-            kz_full = k[:, :, ks:ks + alloc_k[z]]
-            vz_full = v[:, :, ks:ks + alloc_k[z]]
+            kz_full = k[:, :, ks : ks + alloc_k[z]]
+            vz_full = v[:, :, ks : ks + alloc_k[z]]
         ref = torch.empty_like(qz)
-        exe(qz, kz_full[:, :used_k[z]].contiguous(),
-            vz_full[:, :used_k[z]].contiguous(), ref, 1, lq, used_k[z])
+        exe(qz, kz_full[:, : used_k[z]].contiguous(), vz_full[:, : used_k[z]].contiguous(), ref, 1, lq, used_k[z])
         torch.cuda.synchronize()
-        assert torch.equal(ref, o[:, :, qs:qs + lq]), (
-            f"seqused_k sequence {z} differs from a dense call on the "
-            f"truncated K"
+        assert torch.equal(ref, o[:, :, qs : qs + lq]), (
+            f"seqused_k sequence {z} differs from a dense call on the " f"truncated K"
         )
         # Negative control: the untruncated cache must give something else.
         ref_full = torch.empty_like(qz)
-        exe(qz, kz_full[:, :alloc_k[z]].contiguous(),
-            vz_full[:, :alloc_k[z]].contiguous(), ref_full, 1, lq, alloc_k[z])
+        exe(
+            qz,
+            kz_full[:, : alloc_k[z]].contiguous(),
+            vz_full[:, : alloc_k[z]].contiguous(),
+            ref_full,
+            1,
+            lq,
+            alloc_k[z],
+        )
         torch.cuda.synchronize()
-        assert not torch.equal(ref_full, o[:, :, qs:qs + lq]), (
-            f"seqused_k sequence {z} matched the *full* cache -- the used "
-            f"length is being ignored"
+        assert not torch.equal(ref_full, o[:, :, qs : qs + lq]), (
+            f"seqused_k sequence {z} matched the *full* cache -- the used " f"length is being ignored"
         )
 
 
@@ -1464,9 +1479,13 @@ def _suite_b_case(mode, head_dim, n_head_k):
 
     def packed_slicer(q, k, v, qpos, kpos, klens):
         def _s(z):
-            return (q[:, :, qpos[z]:qpos[z] + lq[z]].contiguous(),
-                    k[:, :, kpos[z]:kpos[z] + klens[z]].contiguous(),
-                    v[:, :, kpos[z]:kpos[z] + klens[z]].contiguous(), klens[z])
+            return (
+                q[:, :, qpos[z] : qpos[z] + lq[z]].contiguous(),
+                k[:, :, kpos[z] : kpos[z] + klens[z]].contiguous(),
+                v[:, :, kpos[z] : kpos[z] + klens[z]].contiguous(),
+                klens[z],
+            )
+
         return _s
 
     if mode == "dense_k":
@@ -1474,19 +1493,39 @@ def _suite_b_case(mode, head_dim, n_head_k):
         q = rnd(1, _NUM_HEADS, int(cq[-1]), head_dim)
         k = rnd(N, n_head_k, mk, head_dim)
         v = rnd(N, n_head_k, mk, head_dim)
-        bits = None  # assembled by the caller below
-        return q, k, v, ("mixed", cq, ck, mq, mk), (
-            lambda z: (q[:, :, int(cq[z]):int(cq[z]) + lq[z]].contiguous(),
-                       k[z:z + 1].contiguous(), v[z:z + 1].contiguous(), mk))
+        return (
+            q,
+            k,
+            v,
+            ("mixed", cq, ck, mq, mk),
+            (
+                lambda z: (
+                    q[:, :, int(cq[z]) : int(cq[z]) + lq[z]].contiguous(),
+                    k[z : z + 1].contiguous(),
+                    v[z : z + 1].contiguous(),
+                    mk,
+                )
+            ),
+        )
 
     if mode == "padded":
         q = rnd(N, _NUM_HEADS, mq, head_dim)
         k = rnd(N, n_head_k, mk, head_dim)
         v = rnd(N, n_head_k, mk, head_dim)
-        return q, k, v, ("padded", cq, ck, mq, mk), (
-            lambda z: (q[z:z + 1, :, :lq[z]].contiguous(),
-                       k[z:z + 1, :, :lk[z]].contiguous(),
-                       v[z:z + 1, :, :lk[z]].contiguous(), lk[z]))
+        return (
+            q,
+            k,
+            v,
+            ("padded", cq, ck, mq, mk),
+            (
+                lambda z: (
+                    q[z : z + 1, :, : lq[z]].contiguous(),
+                    k[z : z + 1, :, : lk[z]].contiguous(),
+                    v[z : z + 1, :, : lk[z]].contiguous(),
+                    lk[z],
+                )
+            ),
+        )
 
     if mode == "strided":
         gq = [7, 3, 64, 1, 40, 5, 11][:N]
@@ -1494,8 +1533,13 @@ def _suite_b_case(mode, head_dim, n_head_k):
         sst_q, _, Tq = _strided_layout(lq, gq)
         sst_k, _, Tk = _strided_layout(lk, gk)
         q, k, v = rnd(1, _NUM_HEADS, Tq, head_dim), rnd(1, n_head_k, Tk, head_dim), rnd(1, n_head_k, Tk, head_dim)
-        return q, k, v, ("strided", cq, ck, sst_q, sst_k, mq, mk), packed_slicer(
-            q, k, v, [int(x) for x in sst_q], [int(x) for x in sst_k], lk)
+        return (
+            q,
+            k,
+            v,
+            ("strided", cq, ck, sst_q, sst_k, mq, mk),
+            packed_slicer(q, k, v, [int(x) for x in sst_q], [int(x) for x in sst_k], lk),
+        )
 
     if mode in ("seqused_packed", "seqused_cache"):
         alloc = [x + 48 if x else 0 for x in lq]
@@ -1508,9 +1552,12 @@ def _suite_b_case(mode, head_dim, n_head_k):
         su = torch.tensor(used, dtype=torch.int32, device="cuda")
         tag = ("seqused", cq, ca, su, mq, max(alloc), cache)
         if cache:
-            sl = lambda z: (q[:, :, int(cq[z]):int(cq[z]) + lq[z]].contiguous(),
-                            k[z:z + 1, :, :used[z]].contiguous(),
-                            v[z:z + 1, :, :used[z]].contiguous(), used[z])
+            sl = lambda z: (
+                q[:, :, int(cq[z]) : int(cq[z]) + lq[z]].contiguous(),
+                k[z : z + 1, :, : used[z]].contiguous(),
+                v[z : z + 1, :, : used[z]].contiguous(),
+                used[z],
+            )
         else:
             sl = packed_slicer(q, k, v, [int(x) for x in cq], [int(x) for x in ca], used)
         return q, k, v, tag, sl
@@ -1518,12 +1565,10 @@ def _suite_b_case(mode, head_dim, n_head_k):
     # compact
     q = rnd(1, _NUM_HEADS, int(cq[-1]), head_dim)
     k, v = rnd(1, n_head_k, int(ck[-1]), head_dim), rnd(1, n_head_k, int(ck[-1]), head_dim)
-    return q, k, v, ("compact", cq, ck, mq, mk), packed_slicer(
-        q, k, v, [int(x) for x in cq], [int(x) for x in ck], lk)
+    return q, k, v, ("compact", cq, ck, mq, mk), packed_slicer(q, k, v, [int(x) for x in cq], [int(x) for x in ck], lk)
 
 
-_SUITE_B_MODES = ["compact", "strided", "padded", "seqused_packed",
-                  "seqused_cache", "dense_k"]
+_SUITE_B_MODES = ["compact", "strided", "padded", "seqused_packed", "seqused_cache", "dense_k"]
 
 
 @pytest.mark.parametrize("gqa", [False, True], ids=["mha", "gqa"])
@@ -1545,7 +1590,10 @@ def test_varlen_suite_b_all_modes(mode, gqa):
     q, k, v, tag, slicer = _suite_b_case(mode, head_dim, n_head_k)
     N, mq = len(_SUITE_B_Q), max(_SUITE_B_Q)
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=True, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=head_dim,
+        causal=True,
+        dtype_str="f16",
     )
     if tag[0] == "compact":
         _, cq, ck, _mq, mk = tag
@@ -1563,8 +1611,13 @@ def test_varlen_suite_b_all_modes(mode, gqa):
         _, cq, ck, _mq, mk = tag
         varlen = dict(
             bits=exe.varlen_bits(0x0B, 0x00),
-            seqinfo_q0=cq, seqinfo_q1=None, seqinfo_k0=None, seqinfo_k1=None,
-            max_seqlen_q=mq, max_seqlen_k=mk, lse_tokens=int(cq[-1]),
+            seqinfo_q0=cq,
+            seqinfo_q1=None,
+            seqinfo_k0=None,
+            seqinfo_k1=None,
+            max_seqlen_q=mq,
+            max_seqlen_k=mk,
+            lse_tokens=int(cq[-1]),
         )
     o = torch.zeros_like(q)
     exe(q, k, v, o, N, mq, mk, varlen=varlen)
@@ -1578,15 +1631,14 @@ def test_varlen_suite_b_all_modes(mode, gqa):
         exe(qz, kz, vz, ref, 1, lq_z, lk_z)
         torch.cuda.synchronize()
         if tag[0] == "padded":
-            got = o[z:z + 1, :, :lq_z]
+            got = o[z : z + 1, :, :lq_z]
         elif tag[0] == "strided":
             base = int(tag[3][z])
-            got = o[:, :, base:base + lq_z]
+            got = o[:, :, base : base + lq_z]
         else:
-            got = o[:, :, int(tag[1][z]):int(tag[1][z]) + lq_z]
+            got = o[:, :, int(tag[1][z]) : int(tag[1][z]) + lq_z]
         assert torch.equal(ref, got), (
-            f"{mode}{'/gqa' if gqa else ''} sequence {z} (Lq={lq_z}, "
-            f"Lk={lk_z}) differs from its dense call"
+            f"{mode}{'/gqa' if gqa else ''} sequence {z} (Lq={lq_z}, " f"Lk={lk_z}) differs from its dense call"
         )
 
 
@@ -1599,18 +1651,22 @@ def test_varlen_rejects_meaningless_configurations():
     """
     _require_env()
     exe = build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=64, causal=False, dtype_str="f16",
+        num_heads=_NUM_HEADS,
+        head_dim=64,
+        causal=False,
+        dtype_str="f16",
     )
     with pytest.raises(ValueError, match="REUSE requires"):
-        exe.varlen_bits(0x0D, 0x0D)          # INDIVIDUAL length + REUSE position
+        exe.varlen_bits(0x0D, 0x0D)  # INDIVIDUAL length + REUSE position
     with pytest.raises(ValueError, match="REUSE requires"):
-        exe.varlen_bits(0x09, 0x09)          # MAX length + REUSE position
+        exe.varlen_bits(0x09, 0x09)  # MAX length + REUSE position
     with pytest.raises(ValueError, match="reserved"):
-        exe.varlen_bits(0x06, 0x00)          # LENGTH == 3
+        exe.varlen_bits(0x06, 0x00)  # LENGTH == 3
     with pytest.raises(ValueError, match="reserved"):
-        exe.varlen_bits(0x18, 0x00)          # POSITION == 3
+        exe.varlen_bits(0x18, 0x00)  # POSITION == 3
     with pytest.raises(ValueError, match="fit in a byte"):
         exe.varlen_bits(0x100, 0x00)
+
 
 # ---------------------------------------------------------------------------
 # Bias tensor (BIAS_TYPE)
@@ -1619,16 +1675,13 @@ def test_varlen_rejects_meaningless_configurations():
 
 def _bias_build(head_dim, causal=False, **kw):
     return build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal,
-        dtype_str="f16", bias=True, **kw
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=causal, dtype_str="f16", bias=True, **kw
     )
 
 
 def _bias_ref(q, k, v, bias):
     qb, kb, vb = (x.float() for x in (q, k, v))
-    return F.scaled_dot_product_attention(
-        qb, kb, vb, attn_mask=bias.float()
-    )
+    return F.scaled_dot_product_attention(qb, kb, vb, attn_mask=bias.float())
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -1643,8 +1696,7 @@ def test_bias_matches_reference(head_dim, seq):
     _require_env()
     q, k, v = _qkv(1, seq, head_dim, torch.float16)
     gen = torch.Generator(device="cuda").manual_seed(7)
-    bias = torch.randn(1, _NUM_HEADS, seq, seq, dtype=torch.float16,
-                       device="cuda", generator=gen)
+    bias = torch.randn(1, _NUM_HEADS, seq, seq, dtype=torch.float16, device="cuda", generator=gen)
     o = torch.empty_like(q)
     _bias_build(head_dim)(q, k, v, o, 1, seq, bias=bias)
     torch.cuda.synchronize()
@@ -1669,9 +1721,9 @@ def test_zero_bias_matches_no_bias():
     head_dim, seq = 64, 256
     q, k, v = _qkv(1, seq, head_dim, torch.float16)
     o_none = torch.empty_like(q)
-    build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16"
-    )(q, k, v, o_none, 1, seq)
+    build_flash_attn_func_aiw_module(num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16")(
+        q, k, v, o_none, 1, seq
+    )
     o_zero = torch.empty_like(q)
     zeros = torch.zeros(1, _NUM_HEADS, seq, seq, dtype=torch.float16, device="cuda")
     _bias_build(head_dim)(q, k, v, o_zero, 1, seq, bias=zeros)
@@ -1722,7 +1774,7 @@ def test_bias_minus_inf_first_tile_does_not_produce_nan():
     head_dim, seq = 64, 256
     q, k, v = _qkv(1, seq, head_dim, torch.float16)
     bias = torch.zeros(1, _NUM_HEADS, seq, seq, dtype=torch.float16, device="cuda")
-    bias[:, :, :, :32] = float("-inf")      # the whole first KV tile
+    bias[:, :, :, :32] = float("-inf")  # the whole first KV tile
     o = torch.empty_like(q)
     _bias_build(head_dim)(q, k, v, o, 1, seq, bias=bias)
     torch.cuda.synchronize()
@@ -1737,9 +1789,8 @@ def test_bias_shared_plane_via_zero_stride():
     head_dim, seq = 64, 256
     q, k, v = _qkv(2, seq, head_dim, torch.float16)
     gen = torch.Generator(device="cuda").manual_seed(3)
-    plane = torch.randn(1, _NUM_HEADS, seq, seq, dtype=torch.float16,
-                        device="cuda", generator=gen)
-    shared = plane.expand(2, _NUM_HEADS, seq, seq)      # stride(0) == 0
+    plane = torch.randn(1, _NUM_HEADS, seq, seq, dtype=torch.float16, device="cuda", generator=gen)
+    shared = plane.expand(2, _NUM_HEADS, seq, seq)  # stride(0) == 0
     assert shared.stride(0) == 0
     o = torch.empty_like(q)
     _bias_build(head_dim)(q, k, v, o, 2, seq, bias=shared)
@@ -1765,10 +1816,10 @@ def test_bias_requires_contiguous_last_dim():
     _require_env()
     head_dim, seq = 64, 256
     q, k, v = _qkv(1, seq, head_dim, torch.float16)
-    bad = torch.zeros(1, _NUM_HEADS, seq, seq, dtype=torch.float16,
-                      device="cuda").transpose(2, 3)
+    bad = torch.zeros(1, _NUM_HEADS, seq, seq, dtype=torch.float16, device="cuda").transpose(2, 3)
     with pytest.raises(ValueError, match="contiguous"):
         _bias_build(head_dim)(q, k, v, torch.empty_like(q), 1, seq, bias=bad)
+
 
 # ---------------------------------------------------------------------------
 # Dropout (ENABLE_DROPOUT)
@@ -1777,8 +1828,7 @@ def test_bias_requires_contiguous_last_dim():
 
 def _drop_build(head_dim, **kw):
     return build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False,
-        dtype_str="f16", dropout=True, **kw
+        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16", dropout=True, **kw
     )
 
 
@@ -1794,9 +1844,9 @@ def test_dropout_p0_is_bit_identical_to_no_dropout():
     head_dim, seq = 64, 256
     q, k, v = _qkv(1, seq, head_dim, torch.float16)
     o_off = torch.empty_like(q)
-    build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16"
-    )(q, k, v, o_off, 1, seq)
+    build_flash_attn_func_aiw_module(num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16")(
+        q, k, v, o_off, 1, seq
+    )
     o_p0 = torch.empty_like(q)
     _drop_build(head_dim)(q, k, v, o_p0, 1, seq, dropout_p=0.0, philox_seed=7)
     torch.cuda.synchronize()
@@ -1829,16 +1879,15 @@ def test_dropout_leaves_logsumexp_undropped(p):
     q, k, v = _qkv(1, seq, head_dim, torch.float16)
     o = torch.empty_like(q)
     lse_drop = torch.zeros(_NUM_HEADS, seq, dtype=torch.float32, device="cuda")
-    _drop_build(head_dim)(q, k, v, o, 1, seq, dropout_p=p, philox_seed=1234,
-                          lse=lse_drop)
+    _drop_build(head_dim)(q, k, v, o, 1, seq, dropout_p=p, philox_seed=1234, lse=lse_drop)
     lse_ref = torch.zeros(_NUM_HEADS, seq, dtype=torch.float32, device="cuda")
-    build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16"
-    )(q, k, v, torch.empty_like(q), 1, seq, lse=lse_ref)
-    torch.cuda.synchronize()
-    assert torch.allclose(lse_drop, lse_ref, atol=1e-5), (
-        "logsumexp moved with dropout -- l was accumulated after the mask"
+    build_flash_attn_func_aiw_module(num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16")(
+        q, k, v, torch.empty_like(q), 1, seq, lse=lse_ref
     )
+    torch.cuda.synchronize()
+    assert torch.allclose(
+        lse_drop, lse_ref, atol=1e-5
+    ), "logsumexp moved with dropout -- l was accumulated after the mask"
 
 
 def test_dropout_is_reproducible_from_seed_alone():
@@ -1901,9 +1950,9 @@ def test_dropout_expectation_is_preserved(p):
     q, k, v = _qkv(1, seq, head_dim, torch.float16)
     v = v.abs()
     o_ref = torch.empty_like(q)
-    build_flash_attn_func_aiw_module(
-        num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16"
-    )(q, k, v, o_ref, 1, seq)
+    build_flash_attn_func_aiw_module(num_heads=_NUM_HEADS, head_dim=head_dim, causal=False, dtype_str="f16")(
+        q, k, v, o_ref, 1, seq
+    )
     exe = _drop_build(head_dim)
     acc = torch.zeros_like(q, dtype=torch.float32)
     n = 8
@@ -1929,19 +1978,19 @@ def test_dropout_requires_p():
 # 64-bit addressing
 # ---------------------------------------------------------------------------
 
-_I32_MAX = 2 ** 31 - 1
+_I32_MAX = 2**31 - 1
 
 # (shape, strides) whose *named* axis has a stride crossing 2^31, with every
 # other axis packed. Only two slices along that axis exist, so the allocation
 # is `big + a few kB` rather than the tensor the strides imply.
-_BIG = 2 ** 31
+_BIG = 2**31
 _FAR_LAYOUTS = {
     #        B  H   S  D            b_str  h_str  s_str  d
     "batch": ((2, 2, 64, 64), (_BIG, 64, 128, 1)),
-    "head":  ((1, 2, 64, 64), (_BIG, _BIG, 128, 1)),
+    "head": ((1, 2, 64, 64), (_BIG, _BIG, 128, 1)),
     # Kept, and expected to fail: this documents the boundary of what the
     # kernel can address rather than hiding it. See the xfail reason below.
-    "seq":   ((1, 2, 2, 64), (_BIG, 64, _BIG, 1)),
+    "seq": ((1, 2, 2, 64), (_BIG, 64, _BIG, 1)),
 }
 
 
@@ -1978,8 +2027,7 @@ def test_element_offsets_past_2gi(axis):
     assert span > _I32_MAX, "the layout does not actually cross 2^31"
 
     gen = torch.Generator(device="cuda").manual_seed(0)
-    ref = [torch.randn(*shape, dtype=torch.float16, device="cuda", generator=gen)
-           for _ in range(3)]
+    ref = [torch.randn(*shape, dtype=torch.float16, device="cuda", generator=gen) for _ in range(3)]
     far = []
     try:
         for r in ref:
@@ -1991,10 +2039,8 @@ def test_element_offsets_past_2gi(axis):
         want = flydsl_flash_attn_func_gfx1201(*ref, causal=True)
         torch.cuda.synchronize()
         assert torch.equal(got, want.to(got.dtype)), (
-            f"a {axis}-axis stride past 2^31 changed the result: an offset "
-            f"product was formed in 32 bits"
+            f"a {axis}-axis stride past 2^31 changed the result: an offset " f"product was formed in 32 bits"
         )
     finally:
         far.clear()
         torch.cuda.empty_cache()
-

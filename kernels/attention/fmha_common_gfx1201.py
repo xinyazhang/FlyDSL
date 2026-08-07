@@ -70,25 +70,52 @@ own warning.
 
 from dataclasses import dataclass
 
+from gfx1201_standalone import kernels_common
+from gfx1201_standalone import utils as common_utils
+
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import scf as _scf
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T, Vector as Vec
-from gfx1201_standalone import kernels_common, utils as common_utils
+from flydsl.expr import arith, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
-__all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
-           "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8",
-           "FastMath", "MaskedAxis", "Aperture",
-           "stage", "publish", "write_v8",
-           "read_batches", "read_batches_unmasked",
-           "TransposedTiling", "read_transposed", "publish_transposed",
-           "lds_f32_ptr", "lds_f32_store", "lds_f32_load",
-           "reduce_s_across_shards",
-           "cond_load", "seqinfo_addr", "decode_addressing", "lse_token_pitch",
-           "WINDOW_TOPLEFT", "WINDOW_BOTRIGHT", "resolve_window",
-           "CausalRegions", "decompose_causal_regions", "make_addr_pair"]
+__all__ = [
+    "llvm_ptr_ty",
+    "pointer_to_llvm_ptr",
+    "lds_load_v8",
+    "lds_store_vx",
+    "global_load_tr_v8",
+    "bitcast_i32",
+    "pack_bf16_pair",
+    "bf16_trunc_pack_v8",
+    "FastMath",
+    "MaskedAxis",
+    "Aperture",
+    "stage",
+    "publish",
+    "write_v8",
+    "read_batches",
+    "read_batches_unmasked",
+    "TransposedTiling",
+    "read_transposed",
+    "publish_transposed",
+    "lds_f32_ptr",
+    "lds_f32_store",
+    "lds_f32_load",
+    "reduce_s_across_shards",
+    "cond_load",
+    "seqinfo_addr",
+    "decode_addressing",
+    "lse_token_pitch",
+    "WINDOW_TOPLEFT",
+    "WINDOW_BOTRIGHT",
+    "resolve_window",
+    "CausalRegions",
+    "decompose_causal_regions",
+    "make_addr_pair",
+]
 
 
 def llvm_ptr_ty() -> ir.Type:
@@ -188,10 +215,12 @@ def global_load_tr_v8(base_i64, base64, off32, v8_type):
 def bitcast_i32(value):
     return fx.Float32(value).bitcast(fx.Int32)
 
+
 def pack_bf16_pair(lo, hi, shift, mask):
     lo_i32 = bitcast_i32(lo)
     hi_i32 = bitcast_i32(hi)
     return (hi_i32 & mask) | arith.shrui(lo_i32, shift)
+
 
 def bf16_trunc_pack_v8(f32_vals, elem_dtype):
     """Pack 8 f32 values into v8bf16 via bitwise truncation (upper 16 bits).
@@ -225,9 +254,7 @@ def bf16_trunc_pack_v8(f32_vals, elem_dtype):
     _cmask = fx.Int32(0xFFFF0000)
     pairs = []
     for j in range_constexpr(4):
-        pairs.append(
-            pack_bf16_pair(f32_vals[j * 2], f32_vals[j * 2 + 1], _c16, _cmask)
-        )
+        pairs.append(pack_bf16_pair(f32_vals[j * 2], f32_vals[j * 2 + 1], _c16, _cmask))
     return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
 
 
@@ -431,14 +458,27 @@ class Aperture:
     """
 
     __slots__ = (
-        "cols", "rows", "lds_base", "lds_stride",
-        "vec_width", "threads_per_row", "rows_per_batch", "num_batches",
+        "cols",
+        "rows",
+        "lds_base",
+        "lds_stride",
+        "vec_width",
+        "threads_per_row",
+        "rows_per_batch",
+        "num_batches",
         "needs_guard",
     )
 
     def __init__(
-        self, cols, rows=None, lds_base=None, lds_stride=None,
-        vec_width=0, threads_per_row=0, rows_per_batch=0, num_batches=0,
+        self,
+        cols,
+        rows=None,
+        lds_base=None,
+        lds_stride=None,
+        vec_width=0,
+        threads_per_row=0,
+        rows_per_batch=0,
+        num_batches=0,
         needs_guard=False,
     ):
         self.cols = cols
@@ -507,9 +547,7 @@ class Aperture:
         in LDS is then garbage from a real row, and the S mask -- not this --
         is what keeps it out of the answer.
         """
-        return self.cols.discard(
-            fetch(row, self.cols.safe(col)), col, self.vec_width
-        )
+        return self.cols.discard(fetch(row, self.cols.safe(col)), col, self.vec_width)
 
 
 # --------------------------------------------------------------------------
@@ -556,9 +594,13 @@ def stage(aperture, lds_ptr, read, base_row, col, block_rows):
     it has to exist unconditionally, and the load and the store are guarded
     separately by `read_batches` and `publish`.
     """
+
     def body(_batch, row):
         aperture.to_lds(
-            lds_ptr, aperture.read_vec(read, row, col), row, col,
+            lds_ptr,
+            aperture.read_vec(read, row, col),
+            row,
+            col,
             aperture.vec_width,
         )
 
@@ -567,6 +609,7 @@ def stage(aperture, lds_ptr, read, base_row, col, block_rows):
 
 def publish(aperture, lds_ptr, vecs, base_row, col, block_rows):
     """Registers -> LDS: the store half, for a tile already in flight."""
+
     def body(batch, row):
         aperture.to_lds(lds_ptr, vecs[batch], row, col, aperture.vec_width)
 
@@ -584,11 +627,14 @@ def reader(addr, load):
     Not an `Aperture` field: an aperture is placement, which is the same on
     every iteration, while this closes over the tile origin, which is not.
     """
+
     def at(start):
         def read(row, col):
             base64, off32 = addr(start, row, col)
             return load(base64, off32)
+
         return read
+
     return at
 
 
@@ -650,14 +696,35 @@ class TransposedTiling:
     """
 
     __slots__ = (
-        "d_blocks", "tiles", "loads", "needs_guard", "num_waves",
-        "d_step", "kv_step", "wave_id",
-        "load_d_off", "load_kv_off", "store_d_off", "store_kv_off",
+        "d_blocks",
+        "tiles",
+        "loads",
+        "needs_guard",
+        "num_waves",
+        "d_step",
+        "kv_step",
+        "wave_id",
+        "load_d_off",
+        "load_kv_off",
+        "store_d_off",
+        "store_kv_off",
     )
 
-    def __init__(self, d_blocks, tiles, loads, needs_guard, num_waves,
-                 d_step, kv_step, wave_id,
-                 load_d_off, load_kv_off, store_d_off, store_kv_off):
+    def __init__(
+        self,
+        d_blocks,
+        tiles,
+        loads,
+        needs_guard,
+        num_waves,
+        d_step,
+        kv_step,
+        wave_id,
+        load_d_off,
+        load_kv_off,
+        store_d_off,
+        store_kv_off,
+    ):
         self.d_blocks = d_blocks
         self.tiles = tiles
         self.loads = loads
@@ -671,16 +738,16 @@ class TransposedTiling:
         self.store_d_off = store_d_off
         self.store_kv_off = store_kv_off
 
-    def tile(self, l):
+    def tile(self, step):
         """Which V^T block this wave handles on step `l`."""
-        return self.wave_id + fx.Index(l * self.num_waves)
+        return self.wave_id + fx.Index(step * self.num_waves)
 
-    def origin(self, l):
+    def origin(self, step):
         """`(d, kv)` of that block's top-left corner."""
-        t = self.tile(l)
+        t = self.tile(step)
         return (t % self.d_blocks) * self.d_step, (t // self.d_blocks) * self.kv_step
 
-    def overshoots(self, l):
+    def overshoots(self, step):
         """const_expr: can step `l` leave some waves with no block?
 
         The tiling need not divide evenly across the waves; requiring it once
@@ -688,7 +755,7 @@ class TransposedTiling:
         TFLOPS. Only the final step or two can overshoot, so the earlier ones
         emit no branch.
         """
-        return self.needs_guard and (l + 1) * self.num_waves > self.tiles
+        return self.needs_guard and (step + 1) * self.num_waves > self.tiles
 
 
 def read_transposed(aperture, tiling, read, col_extra=0):
@@ -704,8 +771,8 @@ def read_transposed(aperture, tiling, read, col_extra=0):
     whole-vector, not per element.
     """
     out = []
-    for l in range_constexpr(tiling.loads):
-        d_base, kv_base = tiling.origin(l)
+    for step in range_constexpr(tiling.loads):
+        d_base, kv_base = tiling.origin(step)
         col = d_base + tiling.load_d_off
         if col_extra:
             col = fx.Index(col_extra) + col
@@ -723,20 +790,24 @@ def publish_transposed(aperture, tiling, lds_ptr, vecs):
     8 wide because that is what the transposed load returns, the WMMA operand
     shape, not because it is the cooperative-load width (§9.3).
     """
-    def body(l):
-        d_base, kv_base = tiling.origin(l)
+
+    def body(step):
+        d_base, kv_base = tiling.origin(step)
         aperture.to_lds(
-            lds_ptr, vecs[l],
-            d_base + tiling.store_d_off, kv_base + tiling.store_kv_off, 8,
+            lds_ptr,
+            vecs[step],
+            d_base + tiling.store_d_off,
+            kv_base + tiling.store_kv_off,
+            8,
         )
 
-    for l in range_constexpr(tiling.loads):
-        if tiling.overshoots(l):
-            if_op = _scf.IfOp(fx.as_ir_value(tiling.tile(l) < fx.Index(tiling.tiles)))
+    for step in range_constexpr(tiling.loads):
+        if tiling.overshoots(step):
+            if_op = _scf.IfOp(fx.as_ir_value(tiling.tile(step) < fx.Index(tiling.tiles)))
             with kernels_common._if_then(if_op):
-                body(l)
+                body(step)
         else:
-            body(l)
+            body(step)
 
 
 def write_v8(aperture, write, row, col, val):
@@ -831,31 +902,23 @@ def reduce_s_across_shards(
 
     own = wave_id * fx.Index(f32_per_wave)
     for e in range_constexpr(len(s_flat)):
-        lds_f32_store(
-            lds_byte_base, byte0, own + fx.Index(e * warp_size) + lane, s_flat[e]
-        )
+        lds_f32_store(lds_byte_base, byte0, own + fx.Index(e * warp_size) + lane, s_flat[e])
     gpu.barrier()
 
     base_group = q_tile_in_block * fx.Index(num_shards * f32_per_wave)
     for e in range_constexpr(len(s_flat)):
         acc = s_flat[e]
         for k in range_constexpr(num_shards - 1):
-            peer = base_group + (
-                (shard_id + fx.Index(k + 1)) % fx.Index(num_shards)
-            ) * fx.Index(f32_per_wave)
+            peer = base_group + ((shard_id + fx.Index(k + 1)) % fx.Index(num_shards)) * fx.Index(f32_per_wave)
             acc = fastmath.add(
                 acc,
-                lds_f32_load(
-                    lds_byte_base, byte0, peer + fx.Index(e * warp_size) + lane
-                ),
+                lds_f32_load(lds_byte_base, byte0, peer + fx.Index(e * warp_size) + lane),
             )
         s_flat[e] = acc
     gpu.barrier()
 
     return [
-        Vec.from_elements(
-            [fx.Float32(s_flat[st * 8 + r]) for r in range_constexpr(8)], fx.Float32
-        ).ir_value()
+        Vec.from_elements([fx.Float32(s_flat[st * 8 + r]) for r in range_constexpr(8)], fx.Float32).ir_value()
         for st in range_constexpr(len(s_accs))
     ]
 
@@ -940,8 +1003,8 @@ def decode_addressing(varlen_bits, bits_shift, max_seqlen, s0, s1, z, num_seqlen
 
     cumulative = lenmode == fx.Int32(1)
     individual = lenmode == fx.Int32(2)
-    reuse = posmode == fx.Int32(1)      # position already read as `cur`
-    array = posmode == fx.Int32(2)      # position from its own array
+    reuse = posmode == fx.Int32(1)  # position already read as `cur`
+    array = posmode == fx.Int32(2)  # position from its own array
     zero = fx.Int32(0)
 
     cur = cond_load(lenmode != zero, seqinfo_addr(s0, z), zero)
@@ -949,13 +1012,16 @@ def decode_addressing(varlen_bits, bits_shift, max_seqlen, s0, s1, z, num_seqlen
     pos = cond_load(array, seqinfo_addr(s1, z), zero)
 
     seqlen = common_utils.ssel(
-        cumulative, nxt - cur,
+        cumulative,
+        nxt - cur,
         common_utils.ssel(individual, cur, fx.Int32(max_seqlen)),
     )
     row_off = common_utils.ssel(
-        array, pos,
+        array,
+        pos,
         common_utils.ssel(
-            reuse, cur,
+            reuse,
+            cur,
             common_utils.ssel(stacked, z * fx.Int32(max_seqlen), zero),
         ),
     )
@@ -988,10 +1054,9 @@ def lse_token_pitch(varlen_bits, bits_shift, max_seqlen, s0, s1, num_seqlens):
     return common_utils.ssel(
         stacked,
         common_utils.ssel(
-            reuse, total_s0,
-            common_utils.ssel(
-                array, total_s1, fx.Int32(num_seqlens) * fx.Int32(max_seqlen)
-            ),
+            reuse,
+            total_s0,
+            common_utils.ssel(array, total_s1, fx.Int32(num_seqlens) * fx.Int32(max_seqlen)),
         ),
         fx.Int32(max_seqlen),
     )
@@ -1001,7 +1066,7 @@ def lse_token_pitch(varlen_bits, bits_shift, max_seqlen, s0, s1, num_seqlens):
 # Sliding-window attention: resolving the window, and cutting the KV range
 # --------------------------------------------------------------------------
 
-WINDOW_TOPLEFT = -2147483647   # 0x80000001
+WINDOW_TOPLEFT = -2147483647  # 0x80000001
 WINDOW_BOTRIGHT = -2147483646  # 0x80000002
 
 
@@ -1027,9 +1092,7 @@ def resolve_window(window_left, window_right, seqlen_q, seqlen_k):
     """
     left = fx.Int32(window_left)
     right = fx.Int32(window_right)
-    left_is_sentinel = (left == fx.Int32(WINDOW_TOPLEFT)) | (
-        left == fx.Int32(WINDOW_BOTRIGHT)
-    )
+    left_is_sentinel = (left == fx.Int32(WINDOW_TOPLEFT)) | (left == fx.Int32(WINDOW_BOTRIGHT))
     left = common_utils.ssel(left_is_sentinel, seqlen_q, left)
     right = common_utils.ssel(right == fx.Int32(WINDOW_TOPLEFT), fx.Int32(0), right)
     right = common_utils.ssel(
@@ -1057,18 +1120,16 @@ class CausalRegions:
     it is safe here.
     """
 
-    n_left: fx.Int32      # masked tiles before the full run
-    n_full: fx.Int32      # tiles with no mask at all
-    n_right: fx.Int32     # masked tiles after it
-    left_col0: fx.Int32   # first KV column of each run
+    n_left: fx.Int32  # masked tiles before the full run
+    n_full: fx.Int32  # tiles with no mask at all
+    n_right: fx.Int32  # masked tiles after it
+    left_col0: fx.Int32  # first KV column of each run
     full_col0: fx.Int32
     right_col0: fx.Int32
     masked_col0: fx.Int32  # first column of the masked run, whichever side
 
 
-def decompose_causal_regions(
-    start_q, q_len, k_len, window_left, window_right, block_m, block_n, alive
-):
+def decompose_causal_regions(start_q, q_len, k_len, window_left, window_right, block_m, block_n, alive):
     """Cut this Q block's visited KV range into `[masked][full][masked]`.
 
     **Three regions, not two.** A left window kills columns at the *start* of
@@ -1117,27 +1178,19 @@ def decompose_causal_regions(
 
     # The visited range: outside it every column is dead for every row in this
     # Q block, so those tiles are not walked at all.
-    v_lo = common_utils.smax(
-        common_utils.sdiv_rd_pow2(q_start - window_left, block_n), zero
-    )
-    v_hi = common_utils.smin(
-        blk_last, common_utils.sdiv_rd_pow2(q_last + window_right, block_n)
-    )
+    v_lo = common_utils.smax(common_utils.sdiv_rd_pow2(q_start - window_left, block_n), zero)
+    v_hi = common_utils.smin(blk_last, common_utils.sdiv_rd_pow2(q_last + window_right, block_n))
     v_hi = common_utils.ssel(alive, v_hi, v_lo - one)
 
     # Rounded *up* on the left: a block is fully live only once its first
     # column clears the leftmost row's window. Rounding down would send a
     # partly-masked tile through the unmasked loop body -- invisible to a
     # tolerance test, not to the bitwise one.
-    l_first_full = common_utils.sdiv_rd_pow2(
-        q_last - window_left + fx.Int32(block_n - 1), block_n
-    )
+    l_first_full = common_utils.sdiv_rd_pow2(q_last - window_left + fx.Int32(block_n - 1), block_n)
     r_first_mask = common_utils.sdiv_rd_pow2(q_start + window_right + one, block_n)
 
     fb_lo = common_utils.smax(l_first_full, v_lo)
-    fb_hi = common_utils.smin(
-        common_utils.smin(r_first_mask - one, blk_last_whole), v_hi
-    )
+    fb_hi = common_utils.smin(common_utils.smin(r_first_mask - one, blk_last_whole), v_hi)
     fb_empty = fb_lo > fb_hi
 
     # Cut [v_lo, v_hi] at the full region. With no full region the whole range
@@ -1158,17 +1211,11 @@ def decompose_causal_regions(
     # empty. Clamped, because with a window admitting no key at all every run
     # is empty and `rb_lo` sits below zero -- and this value still reaches the
     # prologue's address computation.
-    masked_col0 = common_utils.smax(
-        common_utils.ssel(n_left > zero, left_col0, right_col0), zero
-    )
-    return CausalRegions(
-        n_left, n_full, n_right, left_col0, full_col0, right_col0, masked_col0
-    )
+    masked_col0 = common_utils.smax(common_utils.ssel(n_left > zero, left_col0, right_col0), zero)
+    return CausalRegions(n_left, n_full, n_right, left_col0, full_col0, right_col0, masked_col0)
 
 
-def make_addr_pair(
-    strides, head, batch_index, row_off, *, seqlen_k, seq_last, hoist, clamp
-):
+def make_addr_pair(strides, head, batch_index, row_off, *, seqlen_k, seq_last, hoist, clamp):
     """Address builders for one tensor: `(tbase, toff, kv_addr)`.
 
     Q, K, V and O each get their own. They genuinely differ: K and V are

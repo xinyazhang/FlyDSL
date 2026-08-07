@@ -25,12 +25,11 @@ be built.
 import numpy as np
 import pytest
 import torch
+from philox import DEFAULT_ROUNDS, PHILOX_WIDTHS, philox_u32, randoms_per_offset
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
-
-from philox import DEFAULT_ROUNDS, PHILOX_WIDTHS, philox_u32, randoms_per_offset
 
 pytestmark = pytest.mark.parametrize("width", PHILOX_WIDTHS, ids=["u32", "u64"])
 
@@ -43,11 +42,15 @@ _SKIP = pytest.mark.skipif(not _ARCH_OK, reason="requires a GPU")
 # ---------------------------------------------------------------------------
 
 _C = {
-    32: dict(KEY_A=0x9E3779B9, KEY_B=0xBB67AE85,
-             MUL_A=0xD2511F53, MUL_B=0xCD9E8D57, MASK=(1 << 32) - 1, BITS=32),
-    64: dict(KEY_A=0x9E3779B97F4A7C15, KEY_B=0xBB67AE8584CAA73B,
-             MUL_A=0xD2E7470EE14C6C93, MUL_B=0xCA5A826395121157,
-             MASK=(1 << 64) - 1, BITS=64),
+    32: dict(KEY_A=0x9E3779B9, KEY_B=0xBB67AE85, MUL_A=0xD2511F53, MUL_B=0xCD9E8D57, MASK=(1 << 32) - 1, BITS=32),
+    64: dict(
+        KEY_A=0x9E3779B97F4A7C15,
+        KEY_B=0xBB67AE8584CAA73B,
+        MUL_A=0xD2E7470EE14C6C93,
+        MUL_B=0xCA5A826395121157,
+        MASK=(1 << 64) - 1,
+        BITS=64,
+    ),
 }
 
 
@@ -91,10 +94,8 @@ def _run_device(seeds, offsets, width, n_rounds=DEFAULT_ROUNDS):
 
     @flyc.kernel(known_block_size=[64, 1, 1])
     def k(SEED: fx.Pointer, OFF: fx.Pointer, OUT: fx.Pointer):
-        i64p = fx.PointerType.get(elem_ty=fx.Int64.ir_type,
-                                  address_space=fx.AddressSpace.Global, alignment=8)
-        i32p = fx.PointerType.get(elem_ty=fx.Int32.ir_type,
-                                  address_space=fx.AddressSpace.Global, alignment=4)
+        i64p = fx.PointerType.get(elem_ty=fx.Int64.ir_type, address_space=fx.AddressSpace.Global, alignment=8)
+        i32p = fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4)
         z = fx.Int32(fx.Index(gpu.block_idx.x))
         seed = fx.ptr_load(fx.recast_iter(i64p, SEED) + fx.Int64(z))
         off = fx.ptr_load(fx.recast_iter(i64p, OFF) + fx.Int64(z))
@@ -107,8 +108,7 @@ def _run_device(seeds, offsets, width, n_rounds=DEFAULT_ROUNDS):
             fx.ptr_store(fx.Int32(vals[j]), out + fx.Int64(z * fx.Int32(rn) + fx.Int32(j)))
 
     @flyc.jit
-    def launch(SEED: fx.Pointer, OFF: fx.Pointer, OUT: fx.Pointer,
-               stream: fx.Stream = fx.Stream(None)):
+    def launch(SEED: fx.Pointer, OFF: fx.Pointer, OUT: fx.Pointer, stream: fx.Stream = fx.Stream(None)):
         k(SEED, OFF, OUT).launch(grid=(fx.Index(n), 1, 1), block=(64, 1, 1), stream=stream)
 
     ts = torch.tensor(seeds, dtype=torch.int64, device="cuda")
@@ -146,8 +146,7 @@ def test_matches_cpu_reference(width):
     for i, (s, o) in enumerate(_CASES):
         want = _ref_u32(s, o, width)
         assert list(got[i]) == want, (
-            f"width={width} seed={s:#x} offset={o:#x}\n  got  {list(got[i])}\n"
-            f"  want {want}"
+            f"width={width} seed={s:#x} offset={o:#x}\n  got  {list(got[i])}\n" f"  want {want}"
         )
 
 
@@ -177,12 +176,13 @@ def test_rounds_are_applied(width):
 # Random123 `kat_vectors`, philox4x32 at 10 rounds. Independent of Triton and
 # of this module: they come from the algorithm's reference implementation.
 _KAT_4X32_10 = [
-    ([0, 0, 0, 0], [0, 0],
-     [0x6627E8D5, 0xE169C58D, 0xBC57AC4C, 0x9B00DBD8]),
-    ([0xFFFFFFFF] * 4, [0xFFFFFFFF] * 2,
-     [0x408F276D, 0x41C83B0E, 0xA20BC7C6, 0x6D5451FD]),
-    ([0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344], [0xA4093822, 0x299F31D0],
-     [0xD16CFE09, 0x94FDCCEB, 0x5001E420, 0x24126EA1]),
+    ([0, 0, 0, 0], [0, 0], [0x6627E8D5, 0xE169C58D, 0xBC57AC4C, 0x9B00DBD8]),
+    ([0xFFFFFFFF] * 4, [0xFFFFFFFF] * 2, [0x408F276D, 0x41C83B0E, 0xA20BC7C6, 0x6D5451FD]),
+    (
+        [0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344],
+        [0xA4093822, 0x299F31D0],
+        [0xD16CFE09, 0x94FDCCEB, 0x5001E420, 0x24126EA1],
+    ),
 ]
 
 
@@ -203,12 +203,10 @@ def test_matches_random123_known_answers(width):
 
     @flyc.kernel(known_block_size=[64, 1, 1])
     def k(IN: fx.Pointer, OUT: fx.Pointer):
-        i32p = fx.PointerType.get(elem_ty=fx.Int32.ir_type,
-                                  address_space=fx.AddressSpace.Global, alignment=4)
+        i32p = fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4)
         z = fx.Int32(fx.Index(gpu.block_idx.x))
         src = fx.recast_iter(i32p, IN)
-        w = [fx.Int32(fx.ptr_load(src + fx.Int64(z * fx.Int32(6) + fx.Int32(j))))
-             for j in range_constexpr(6)]
+        w = [fx.Int32(fx.ptr_load(src + fx.Int64(z * fx.Int32(6) + fx.Int32(j)))) for j in range_constexpr(6)]
         r = philox_4x(w[0], w[1], w[2], w[3], w[4], w[5], 32, DEFAULT_ROUNDS)
         out = fx.recast_iter(i32p, OUT)
         for j in range_constexpr(4):
@@ -221,8 +219,7 @@ def test_matches_random123_known_answers(width):
     flat = []
     for ctr, key, _ in _KAT_4X32_10:
         flat.extend(ctr + key)
-    ti = torch.tensor(np.array(flat, dtype=np.uint32).astype(np.int32),
-                      dtype=torch.int32, device="cuda")
+    ti = torch.tensor(np.array(flat, dtype=np.uint32).astype(np.int32), dtype=torch.int32, device="cuda")
     out = torch.zeros(n * 4, dtype=torch.int32, device="cuda")
     p = lambda t: flyc.from_c_void_p(fx.Uint8, t.data_ptr())  # noqa: E731
     exe = flyc.compile(launch, p(ti), p(out), fx.Stream(None))
@@ -230,9 +227,7 @@ def test_matches_random123_known_answers(width):
     torch.cuda.synchronize()
     got = out.cpu().numpy().astype(np.uint32).reshape(n, 4)
     for i, (ctr, key, want) in enumerate(_KAT_4X32_10):
-        assert list(got[i]) == want, (
-            f"KAT {i}: got {[hex(x) for x in got[i]]} want {[hex(x) for x in want]}"
-        )
+        assert list(got[i]) == want, f"KAT {i}: got {[hex(x) for x in got[i]]} want {[hex(x) for x in want]}"
 
 
 @_SKIP
@@ -248,7 +243,9 @@ def test_matches_triton(width):
         pytest.skip("tl.randint4x has no 64-bit lane variant to compare against")
     triton = pytest.importorskip("triton")
     tl = pytest.importorskip("triton.language")
-    import sysconfig, os
+    import os
+    import sysconfig
+
     if not os.path.isfile(os.path.join(sysconfig.get_paths()["include"], "Python.h")):
         # Triton's HIP backend compiles a utility module at import time.
         # Without the dev headers it cannot, which is an environment gap
@@ -279,8 +276,7 @@ def test_matches_triton(width):
     got = _run_device(seeds, offs, width)
     for i, (s, o) in enumerate(_CASES):
         assert list(got[i]) == list(want[i]), (
-            f"diverged from Triton at seed={s:#x} offset={o:#x}\n"
-            f"  ours   {list(got[i])}\n  triton {list(want[i])}"
+            f"diverged from Triton at seed={s:#x} offset={o:#x}\n" f"  ours   {list(got[i])}\n  triton {list(want[i])}"
         )
 
 
@@ -324,10 +320,10 @@ def test_dropout_threshold_keeps_the_right_fraction(width):
 
     for p in (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0):
         t = dropout_threshold(p)
-        kept = (2 ** 31 - 1 - t) / 2 ** 32
+        kept = (2**31 - 1 - t) / 2**32
         assert abs(kept - (1.0 - p)) < 1e-3, f"p={p} keeps {kept:.4f}"
-    assert dropout_threshold(0.0) < -(2 ** 31) + 2, "p=0 must keep everything"
-    assert dropout_threshold(1.0) > 2 ** 31 - 2, "p=1 must keep nothing"
+    assert dropout_threshold(0.0) < -(2**31) + 2, "p=0 must keep everything"
+    assert dropout_threshold(1.0) > 2**31 - 2, "p=1 must keep nothing"
     with pytest.raises(ValueError):
         dropout_threshold(1.5)
 
@@ -346,10 +342,10 @@ def test_keep_mask_compares_signed(width):
     """
     from philox import dropout_threshold, keep_mask
 
-    thr = dropout_threshold(0.25)          # negative
+    thr = dropout_threshold(0.25)  # negative
     assert thr < 0
     # as i32: -2**31 (lowest) must drop, +2**31-1 (highest) must keep
-    vals_i32 = [-(2 ** 31), thr - 1, thr, thr + 1, 2 ** 31 - 1]
+    vals_i32 = [-(2**31), thr - 1, thr, thr + 1, 2**31 - 1]
     want = [v > thr for v in vals_i32]
     assert want == [False, False, False, True, True], "test's own model is wrong"
 
@@ -357,21 +353,17 @@ def test_keep_mask_compares_signed(width):
 
     @flyc.kernel(known_block_size=[64, 1, 1])
     def k(IN: fx.Pointer, OUT: fx.Pointer, threshold: fx.Int32):
-        i32p = fx.PointerType.get(elem_ty=fx.Int32.ir_type,
-                                  address_space=fx.AddressSpace.Global, alignment=4)
+        i32p = fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4)
         src = fx.recast_iter(i32p, IN)
         dst = fx.recast_iter(i32p, OUT)
         z = fx.Int32(fx.Index(gpu.block_idx.x))
         v = fx.Int32(fx.ptr_load(src + fx.Int64(z)))
         keep = keep_mask([v], threshold)[0]
-        fx.ptr_store(fx.Int32(keep.select(fx.Int32(1), fx.Int32(0))),
-                     dst + fx.Int64(z))
+        fx.ptr_store(fx.Int32(keep.select(fx.Int32(1), fx.Int32(0))), dst + fx.Int64(z))
 
     @flyc.jit
-    def launch(IN: fx.Pointer, OUT: fx.Pointer, threshold: fx.Int32,
-               stream: fx.Stream = fx.Stream(None)):
-        k(IN, OUT, threshold).launch(grid=(fx.Index(n), 1, 1), block=(64, 1, 1),
-                                     stream=stream)
+    def launch(IN: fx.Pointer, OUT: fx.Pointer, threshold: fx.Int32, stream: fx.Stream = fx.Stream(None)):
+        k(IN, OUT, threshold).launch(grid=(fx.Index(n), 1, 1), block=(64, 1, 1), stream=stream)
 
     ti = torch.tensor(vals_i32, dtype=torch.int32, device="cuda")
     out = torch.zeros(n, dtype=torch.int32, device="cuda")
@@ -410,16 +402,14 @@ def _run_span(seed, first_offset, count, width):
 
     @flyc.kernel(known_block_size=[64, 1, 1])
     def k(OUT: fx.Pointer, s: fx.Int64, o: fx.Int64):
-        i32p = fx.PointerType.get(elem_ty=fx.Int32.ir_type,
-                                  address_space=fx.AddressSpace.Global, alignment=4)
+        i32p = fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4)
         vals = rng.span_u32(s, o, count)
         dst = fx.recast_iter(i32p, OUT)
         for j in range_constexpr(count):
             fx.ptr_store(fx.Int32(vals[j]), dst + fx.Int64(fx.Int32(j)))
 
     @flyc.jit
-    def launch(OUT: fx.Pointer, s: fx.Int64, o: fx.Int64,
-               stream: fx.Stream = fx.Stream(None)):
+    def launch(OUT: fx.Pointer, s: fx.Int64, o: fx.Int64, stream: fx.Stream = fx.Stream(None)):
         k(OUT, s, o).launch(grid=(fx.Index(1), 1, 1), block=(64, 1, 1), stream=stream)
 
     out = torch.zeros(count, dtype=torch.int32, device="cuda")

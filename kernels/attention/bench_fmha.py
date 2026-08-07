@@ -40,7 +40,6 @@ the ``triton.testing`` API this harness was written against.
 import os
 
 import torch
-
 from bench_shim import Benchmark, do_bench, perf_report
 from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
 
