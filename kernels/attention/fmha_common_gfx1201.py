@@ -76,7 +76,7 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import scf as _scf
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector as Vec
-from flydsl.expr.utils.arith import ArithValue, _to_raw
+from flydsl.expr.utils.arith import ArithValue
 from gfx1201_standalone import buffer_ops, kernels_common, utils as common_utils
 
 __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
@@ -122,7 +122,7 @@ def pointer_to_llvm_ptr(ptr) -> ir.Value:
     this.
     """
     ptr_i64 = fx.Int64(fx.ptrtoint(ptr))
-    return _llvm.IntToPtrOp(llvm_ptr_ty(), _to_raw(ptr_i64)).result
+    return _llvm.IntToPtrOp(llvm_ptr_ty(), fx.as_ir_value(ptr_i64)).result
 
 
 # --------------------------------------------------------------------------
@@ -179,8 +179,8 @@ def global_load_tr_v8(base_i64, base64, off32, v8_type):
     `stride_seq = 8388608`, whose 256th row is exactly 2**31. Narrowing it
     wrapped and read another allocation.
     """
-    base_bytes = _to_raw(fx.Int64(fx.Index(base64) * 2))
-    off_bytes = _to_raw(fx.Int64(fx.Index(off32) * 2))
+    base_bytes = fx.as_ir_value(fx.Int64(fx.Index(base64) * 2))
+    off_bytes = fx.as_ir_value(fx.Int64(fx.Index(off32) * 2))
     addr = arith.addi(arith.addi(base_i64, base_bytes), off_bytes)
     p = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), addr).result
     return rocdl.global_load_tr_b128(v8_type, p)
@@ -263,19 +263,19 @@ class FastMath:
             raise ValueError(f"unknown fp_mode {fp_mode!r}; expected fast/noninf/safe")
 
     def div(self, a, b):
-        return arith.divf(_to_raw(a), _to_raw(b), fastmath=self.flags)
+        return arith.divf(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=self.flags)
 
     def add(self, a, b):
-        return arith.addf(_to_raw(a), _to_raw(b), fastmath=self.flags)
+        return arith.addf(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=self.flags)
 
     def sub(self, a, b):
-        return arith.subf(_to_raw(a), _to_raw(b), fastmath=self.flags)
+        return arith.subf(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=self.flags)
 
     def mul(self, a, b):
-        return arith.mulf(_to_raw(a), _to_raw(b), fastmath=self.flags)
+        return arith.mulf(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=self.flags)
 
     def max(self, a, b):
-        return arith.MaxNumFOp(_to_raw(a), _to_raw(b), fastmath=self.flags).result
+        return arith.MaxNumFOp(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=self.flags).result
 
 
 class MaskedAxis:
@@ -333,7 +333,7 @@ class MaskedAxis:
         code and mixing them per axis was a difference with no reason behind
         it. Signed throughout, matching the rest of the file.
         """
-        return arith.cmpi(arith.CmpIPredicate.slt, _to_raw(idx), _to_raw(self._bound()))
+        return arith.cmpi(arith.CmpIPredicate.slt, fx.as_ir_value(idx), fx.as_ir_value(self._bound()))
 
     def mask(self, idx, width):
         """i1 vector, element j set iff `idx + j` is inside the extent.
@@ -508,7 +508,7 @@ def _over_batches(aperture, base_row, block_rows, body):
     for batch in range_constexpr(aperture.num_batches):
         row = aperture.batch_row(base_row, batch)
         if aperture.needs_guard:
-            if_op = _scf.IfOp(_to_raw(row < block_rows))
+            if_op = _scf.IfOp(fx.as_ir_value(row < block_rows))
             with kernels_common._if_then(if_op):
                 body(batch, row)
         else:
@@ -706,7 +706,7 @@ def publish_transposed(aperture, tiling, lds_ptr, vecs):
 
     for l in range_constexpr(tiling.loads):
         if tiling.overshoots(l):
-            if_op = _scf.IfOp(_to_raw(tiling.tile(l) < fx.Index(tiling.tiles)))
+            if_op = _scf.IfOp(fx.as_ir_value(tiling.tile(l) < fx.Index(tiling.tiles)))
             with kernels_common._if_then(if_op):
                 body(l)
         else:
@@ -735,7 +735,7 @@ def write_v8(aperture, write, row, col, val):
     if not aperture.cols.active:
         write(row, col, val)
         return
-    if_op = _scf.IfOp(_to_raw(aperture.cols.valid(col)))
+    if_op = _scf.IfOp(fx.as_ir_value(aperture.cols.valid(col)))
     with kernels_common._if_then(if_op):
         write(row, col, val)
 
@@ -759,12 +759,12 @@ def write_v8(aperture, write, row, col, val):
 def lds_f32_ptr(lds_byte_base, byte0, index):
     """`!llvm.ptr<3>` at f32 element `index` of the scratch starting at `byte0`."""
     off = fx.Int32(byte0) + fx.Int32(index) * fx.Int32(4)
-    addr = arith.addi(lds_byte_base, _to_raw(off))
+    addr = arith.addi(lds_byte_base, fx.as_ir_value(off))
     return _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<3>"), addr).result
 
 
 def lds_f32_store(lds_byte_base, byte0, index, value):
-    _llvm.StoreOp(_to_raw(value), lds_f32_ptr(lds_byte_base, byte0, index))
+    _llvm.StoreOp(fx.as_ir_value(value), lds_f32_ptr(lds_byte_base, byte0, index))
 
 
 def lds_f32_load(lds_byte_base, byte0, index):
@@ -801,7 +801,7 @@ def reduce_s_across_shards(
     and never reaches here -- worth knowing when gating a change to it, since
     the usual 128 build does not execute a line of this.
     """
-    s_flat = [_to_raw(Vec(a)[r]) for a in s_accs for r in range_constexpr(8)]
+    s_flat = [fx.as_ir_value(Vec(a)[r]) for a in s_accs for r in range_constexpr(8)]
 
     own = wave_id * fx.Index(f32_per_wave)
     for e in range_constexpr(len(s_flat)):
@@ -854,11 +854,11 @@ def cond_load(cond, addr, default):
     `addr` is computed by the caller and may be derived from a null pointer --
     address arithmetic touches no memory.
     """
-    if_op = _scf.IfOp(_to_raw(cond), results_=[T.i32], has_else=True)
+    if_op = _scf.IfOp(fx.as_ir_value(cond), results_=[T.i32], has_else=True)
     with ir.InsertionPoint(if_op.then_block):
         _scf.YieldOp([_llvm.LoadOp(T.i32, addr).result])
     with ir.InsertionPoint(if_op.else_block):
-        _scf.YieldOp([_to_raw(default)])
+        _scf.YieldOp([fx.as_ir_value(default)])
     return fx.Int32(if_op.results[0])
 
 
@@ -936,11 +936,11 @@ def lse_token_pitch(varlen_bits, bits_shift, max_seqlen, s0, s1, num_seqlens):
     zero = fx.Int32(0)
 
     total_s0 = cond_load(
-        arith.andi(_to_raw(stacked), _to_raw(reuse)),
+        arith.andi(fx.as_ir_value(stacked), fx.as_ir_value(reuse)),
         seqinfo_addr(s0, num_seqlens), zero,
     )
     total_s1 = cond_load(
-        arith.andi(_to_raw(stacked), _to_raw(array)),
+        arith.andi(fx.as_ir_value(stacked), fx.as_ir_value(array)),
         seqinfo_addr(s1, num_seqlens), zero,
     )
     return common_utils.ssel(
@@ -986,8 +986,8 @@ def resolve_window(window_left, window_right, seqlen_q, seqlen_k):
     left = fx.Int32(window_left)
     right = fx.Int32(window_right)
     left_is_sentinel = arith.ori(
-        _to_raw(left == fx.Int32(WINDOW_TOPLEFT)),
-        _to_raw(left == fx.Int32(WINDOW_BOTRIGHT)),
+        fx.as_ir_value(left == fx.Int32(WINDOW_TOPLEFT)),
+        fx.as_ir_value(left == fx.Int32(WINDOW_BOTRIGHT)),
     )
     left = common_utils.ssel(ArithValue(left_is_sentinel), seqlen_q, left)
     right = common_utils.ssel(right == fx.Int32(WINDOW_TOPLEFT), fx.Int32(0), right)
