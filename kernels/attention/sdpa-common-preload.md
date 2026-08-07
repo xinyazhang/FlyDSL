@@ -280,3 +280,101 @@ instead of it.
 
 Steps 3-5 are the `Tile` design proper and each is independently gateable.
 Step 1 first because every later step reads better in the new names.
+
+
+# Part III: does FlyDSL's own tile fit, and the migration plan
+
+## 12. `fx.make_tile` is layout algebra, not a data container
+
+Surveyed. `fx.make_tile` builds a **Tiler** -- a shape descriptor consumed by
+`tiled_divide` / `tiled_product` / `tile_to_shape` -- in the CuTe sense. It
+names a partitioning of an index space. It does not represent on-chip data,
+has no notion of residence, and holds no values. It is not the `Tile` this
+design needs.
+
+The part of that API that *would* replace load/store is `TiledCopy` /
+`copy_atom_call`, and **it does not lower on gfx1201**:
+
+    lib/Dialect/FlyROCDL/CDNA3/CopyAtom.cpp
+    lib/Dialect/FlyROCDL/CDNA4/CopyAtom.cpp
+    lib/Dialect/FlyROCDL/GFX1250/CopyAtom.cpp
+    (no GFX11/RDNA implementation)
+
+`MmaAtom` exists for GFX11, so the WMMA side is served; the copy side is not.
+This re-confirms P4.3 from a second direction, and it is a compiler-level fact
+rather than a preference.
+
+**What is worth borrowing anyway:** the pure index math -- `tiled_divide`,
+`crd2idx`/`idx2crd` -- lowers to nothing but arithmetic and has no atom
+dependency. `kernels/common/layout_utils.py` already exposes those. If the
+per-lane row/column derivations in this kernel ever get their own commit, that
+is the vocabulary to reach for. It is not part of this plan.
+
+**Conclusion: roll our own `TileInfo`, per Part II.** Do not build on
+`fx.Tile`; the name collision is unfortunate and the docstring should say so.
+
+## 13. Migration plan: every load/store site
+
+Current inventory, by call count:
+
+| function                | calls | residence      | disposition |
+| ----------------------- | ----- | -------------- | ----------- |
+| `coop_load_v_global`    | 6     | vram -> vgpr   | -> `TileInfo` + `load_tile` (V) |
+| `load_global_f16xN`     | 5     | vram -> vgpr   | absorbed by `load_tile` |
+| `fmha.lds_store_vx`     | 5     | vgpr -> lds    | absorbed by `store_lds_tile` |
+| `k_buf_base`            | 4     | lds addressing | -> `TileInfo.lds_base` |
+| `coop_store_v_lds`      | 4     | vgpr -> lds    | -> `store_lds_tile` (V) |
+| `v_buf_base`            | 3     | lds addressing | -> `TileInfo.lds_base` |
+| `load_global_v8f16`     | 3     | vram -> vgpr   | absorbed by `load_tile` |
+| `fmha.lds_load_v8`      | 3     | lds -> vgpr    | -> `load_lds_tile` |
+| `coop_load_k_global`    | 3     | vram -> vgpr   | -> `load_tile` (K) |
+| `_v_store_transposed`   | 3     | vgpr -> lds    | -> `store_lds_tile(transposed=True)` |
+| `_v_store_row_major`    | 3     | vgpr -> lds    | -> `store_lds_tile` |
+| `_split_ptr`            | 3     | addressing     | stays private; `load_tile` internal |
+| `_load_global_half_vec` | 3     | vram -> vgpr   | absorbed |
+| `coop_store_k_lds`      | 2     | vgpr -> lds    | -> `store_lds_tile` (K) |
+| `coop_load_store_k`     | 2     | vram -> lds    | -> `stage_vram_to_lds` |
+| `_store_global_half`    | 2     | vgpr -> vram   | -> `store_tile` (O epilogue) |
+| `fmha.global_load_tr_v8`| 1     | vram -> vgpr   | `load_tile(transposed=True)` |
+| `fmha.lds_f32_*`        | 0*    | lds scratch    | already extracted; not tile-shaped |
+
+\* zero direct calls: they are reached through `reduce_s_across_shards`.
+
+### 13.1 The five functions to add
+
+    load_tile(info, ptr, tbase, toff, rows, rows_in_tile, *,
+              rows_axis, cols_axis, col_base, ...) -> LoadedTile
+    store_tile(info, ptr, tbase, toff, values, rows, cols_axis, ...)
+    load_lds_tile(info, lds_ptr, row, col) -> list[fx.Vector]
+    store_lds_tile(info, lds_ptr, values, row, col, *, transposed=False)
+    stage_vram_to_lds(info, ptr, tbase, toff, lds_ptr, ...)   # §8
+
+`stage_vram_to_lds` is `load_tile` then `store_lds_tile` on gfx1201 and one
+instruction elsewhere. It is the only entry that exists for a portability
+reason rather than a deduplication one.
+
+### 13.2 Order, and what each step replaces
+
+| # | step | replaces | gate |
+| - | ---- | -------- | ---- |
+| 1 | rename subtile constants (Part II §9) | `Q_ROW_TILES`, `N_SUB_TILES`, `K_SUB_N` | bitwise, all configs |
+| 2 | `TileInfo` for K and V, `lds_base`/`lds_stride` fields | `k_buf_base`, `v_buf_base` | bitwise |
+| 3 | `load_lds_tile` / `store_lds_tile` | `lds_load_v8`, `lds_store_vx`, `_v_store_row_major`, `_v_store_transposed` | bitwise; needs V_TRANSPOSED both ways -- hd64 vs hd384 |
+| 4 | `load_tile` for Q | the §3 preload | five configs, §5 |
+| 5 | `load_tile` for K and V | `coop_load_k_global`, `coop_load_v_global`, `load_global_f16xN`, `load_global_v8f16` | hd16 (guard), hd100 (padded), hd384 (chunked V) |
+| 6 | `stage_vram_to_lds` | `coop_load_store_k` | hd16, where KV_NEEDS_GUARD makes it a dynamic `if` |
+| 7 | `store_tile` | `_store_global_half` | hd100 padded (column masking on the store) |
+| 8 | `map_subtiles` for the (a) sites | 5 of 15 `qt` loops | bitwise |
+
+Steps 2-3 are LDS-only and cannot affect global addressing; 4-7 each touch one
+residence pair. Every step is independently revertible, which matters because
+step 6 is the one that runs into the dynamic-`if` rule and may have to keep a
+hand-written form.
+
+### 13.3 What this plan does not do
+
+- **No `Tile` object owning values** -- Part II §7.
+- **No `copy_atom_call`** -- §12, no RDNA lowering.
+- **No change to GEMM1/GEMM2 operand indexing** -- Part II §10(c).
+- **No `transposed=True` on the vram side beyond V** until a bwd kernel needs
+  K^T, per §6.
