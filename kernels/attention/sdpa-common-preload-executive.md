@@ -1,5 +1,10 @@
 # Executive plan: the `Aperture` refactor for gfx1201 SDPA
 
+**Status: executed, `a40cd565..0660a6d5`.** Steps 1-8 landed as eight
+commits; step 9 was surveyed and declined. See §12 for what each step
+actually did and where it departed from the plan below, which is left as
+written so the departures are legible.
+
 Self-contained. Everything needed to execute is here; nothing depends on
 recalling how it was derived. Companion documents: `sdpa-common-preload.md`
 (design narrative), `sdpa-fix-unstable.md` (API-stability follow-up),
@@ -362,3 +367,130 @@ live and still spills **more** — 272 B vs 44 B of scratch at 192, for 0.863 vs
 - 298 tests pass; the full ladder is within noise of the pre-refactor revision.
 - Re-run the `api-stability` skill and record the delta in unstable **call
   sites** — the number this work should move.
+
+All met. 392 tests pass (298 kernel + 94 interface). The full ladder against
+`a40cd565` spans 0.993 to 1.008 across 13 widths x 2 lengths x 2 modes, which
+is inside the harness's own resolution.
+
+---
+
+## 12. What actually happened
+
+| # | step | outcome |
+| - | --- | --- |
+| 1 | rename | `5906abd3`, bitwise identical |
+| 2 | `MaskedAxis` protocol | `4100c045`, bitwise identical |
+| 3 | `Aperture` | `2be30327`, bitwise identical |
+| 4 | `to_lds` / `from_lds` | `17d8a65f`, bitwise identical |
+| 5 | Q load | `0136b7c5`, bitwise identical |
+| 6 | K/V load | `b29936bb`, bitwise identical |
+| 7 | `stage` | `944e66a9`, bitwise identical |
+| 8 | O store | `0660a6d5`, 8 opcodes changed, deliberately |
+| 9 | `map_subtiles` | declined; §12.4 |
+
+The kernel is 2826 -> 2781 lines and the arch module 875 -> 1137. The point
+was never the line count: what moved is that all four tensors' bounds and
+geometry now live on one object each, and the movement helpers are shared
+with the backward kernels.
+
+### 12.1 Departures from the plan, and why
+
+**No `LoadedRegion`, and no `load()` owning the loops** (step 5). The plan
+had `load()` return a struct of packs, rows, rows_i32 and in_bounds. It would
+have needed `shard_qk_off`, `K_STEP_QK`, `klane`, `WMMA_LANE_K`, `WMMA_M`,
+`wave_q_offset`, `start_q` and `ROW_SUBTILES` passed in -- eight schedule
+parameters to absorb four lines of loop. The plan already exempted `rows` on
+exactly this ground; columns are no different. What landed instead is
+`Aperture.read_v8` for a single operand, with both loops still in the kernel.
+
+**K and V carry no `rows` axis** (step 3). `make_addr_pair` was already given
+`seqlen_k` and redirects an out-of-range row itself, so a `rows` field would
+be the same bound stated twice -- and not for free: an IR-backed field crosses
+every dynamic `if` the object is live across, which is the live-range cost
+§9.1 measured at 6%.
+
+**Q's and O's apertures appear in steps 5 and 8, not 3.** Built in step 3 they
+would have been objects with no reader, and hoisting `q_rows_axis` up to sit
+beside them permuted hd384 causal's SGPR allocation for nothing. Same opcode
+sequence, same resource counts -- harmless, but a gate result worth keeping
+clean.
+
+**No `transposed=` flag on `to_lds`** (step 4). `_v_store_transposed` turned
+out to be `lds_store_vx` with width 8, character for character. The two arms
+differ only in which index is the row: `to_lds(..., d, kv, 8)` against
+`to_lds(..., kv_row, v_col_base, vec_width)`. There was never a difference in
+the store itself.
+
+**V does not use `read_vec`** (step 6). Neither V arm discards, only `safe`s,
+and that is correct: V reaches only O, and an O column past `hdim_vo` is
+dropped by the epilogue store, so zeroing it is work with no reader. The
+transposed arm could not discard per element in any case -- after the 8x8
+transpose a lane's vector runs along kv, so all 8 elements share one column.
+Both facts are now recorded at the site; neither was before.
+
+### 12.2 Methods versus free functions
+
+The split is forced, not stylistic. **Anything that emits a branch is a free
+function in `fmha_common_gfx1201`** -- `stage`, `publish`, `write_v8` -- because
+only module-level code may build an `scf.IfOp`, the `if` -> `scf.if` rewrite
+being lexical per `@flyc.kernel` function (§4.1). Everything else is an
+`Aperture` method: `lds_index`, `batch_row`, `to_lds`, `from_lds`, `read_v8`,
+`read_vec`.
+
+Writing `fmha.write_v8(ap, ...)` has a second effect worth knowing: it keeps
+`ap` out of `_collect_assigned_vars`, which treats `ap.method(...)` under a
+dynamic `if` as region state and makes the `scf.if` yield the aperture back.
+
+### 12.3 The `_collect_assigned_vars` trap
+
+Discovered in step 2 and worth restating, since §4.2 said the protocol solved
+everything. It does not solve this, which is Python scoping rather than the
+carry protocol: the rewriter assigns a collected name back after the region,
+and if that name came from an *enclosing* scope the assignment makes it a
+local of the inner function -- unbound on any sibling path that skips the `if`,
+typically a `const_expr` arm. 14 configs failed with `UnboundLocalError`.
+
+Three fixes, in order of preference: put the code in a module-level function
+(immune -- nothing there is rewritten); call a free function so the base name
+is a module rather than the object; or bind a local alias before the branch,
+which is what `ast_rewriter._check_local_var` recommends in its own warning.
+Steps 7 and 8 took the first two and both aliases disappeared.
+
+### 12.4 Step 9, declined
+
+Surveyed all 15 remaining `for qt in range_constexpr(ROW_SUBTILES)` sites:
+
+- six are already list comprehensions;
+- two are the GEMM loops, deliberately innermost, which §9.4 says keep;
+- five have bodies of 15 to 60 lines -- the softmax, the p-pack build, the two
+  epilogue stores -- where the loop is not the thing that makes them long;
+- two are flat-list builders (`init_args`, `_yield_args`).
+
+`map_subtiles(n, fn)` would be `[fn(qt) for qt in range_constexpr(n)]`: a pure
+forwarder that hides the loop variable and forces a lambda at every call site.
+The comprehensions are already the clearest spelling and the rest are not maps.
+
+The survey did turn up a real fragility, out of scope here: the loop-state
+layout is encoded three times -- `_ML`/`_OFF`/`_KOFF`/`_VOFF`, the `init_args`
+builder, and the `_yield_args` builder -- and all three must agree with the
+unpacking in `kv_loop_body`. That wants a state-layout object, which is a
+different refactor from this one.
+
+### 12.5 Unstable-call-site count, after
+
+The DoD asked for the delta. It is roughly zero, and that is the honest
+answer: this work moved unstable calls between files rather than removing
+them. `fmha_common_gfx1201.py` has ~72 unstable call sites and
+`flash_attn_func_gfx1201_aiw.py` ~81, dominated by `_to_raw`/`_raw` (53) and
+`ArithValue` (19).
+
+Two corrections to §4.4 found while auditing:
+
+- `fx.as_ir_value` **is** stable, via `flydsl.expr.typing.as_ir_value`. It is
+  the drop-in for all 53 `_to_raw` sites and is the single largest item in
+  `sdpa-fix-unstable.md`.
+- `flydsl.expr.arith.maxnumf` is stable, so `FastMath.max`'s
+  `arith.MaxNumFOp` has a stable spelling if it accepts `fastmath=`.
+
+`exe._cf = cf` in the builder remains the one `[PRIVATE-WRITE]`; unchanged by
+this work and still `sdpa-fix-unstable.md` P3.
