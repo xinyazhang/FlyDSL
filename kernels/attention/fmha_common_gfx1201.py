@@ -75,11 +75,12 @@ from flydsl._mlir.dialects import scf as _scf
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import ArithValue, _to_raw
-from gfx1201_standalone import buffer_ops, utils as common_utils
+from gfx1201_standalone import buffer_ops, kernels_common, utils as common_utils
 
 __all__ = ["llvm_ptr_ty", "pointer_to_llvm_ptr", "lds_load_v8", "lds_store_vx", "global_load_tr_v8",
            "bitcast_i32", "pack_bf16_pair", "bf16_trunc_pack_v8",
            "FastMath", "MaskedAxis", "Aperture",
+           "stage", "publish",
            "lds_f32_ptr", "lds_f32_store", "lds_f32_load",
            "reduce_s_across_shards",
            "cond_load", "seqinfo_addr", "decode_addressing", "lse_token_pitch",
@@ -537,6 +538,67 @@ class Aperture:
             num_batches=exemplar.num_batches,
             needs_guard=exemplar.needs_guard,
         )
+
+
+# --------------------------------------------------------------------------
+# Cooperative staging: VRAM -> LDS
+# --------------------------------------------------------------------------
+
+
+def _over_batches(aperture, base_row, block_rows, body):
+    """`body(batch, row)` for each cooperative-load batch, under the row guard.
+
+    The guard exists because `_load_geom` covers BLOCK_N rows with `ceil()`
+    batches, so the last one can overshoot and leave some lanes with no row.
+    Whether it is needed is `aperture.needs_guard`, a `const_expr`, so the
+    unguarded configs emit no branch at all.
+
+    An explicit `IfOp`, not Python's `if`: the rewrite from `if` to `scf.if`
+    is lexical per `@flyc.kernel` function, so a module-level helper only gets
+    a branch by writing one. That is also what removes the guarded/unguarded
+    duplication -- the kernel had to spell both arms because the `const_expr`
+    test could not wrap a single call.
+    """
+    for batch in range_constexpr(aperture.num_batches):
+        row = aperture.batch_row(base_row, batch)
+        if aperture.needs_guard:
+            if_op = _scf.IfOp(_to_raw(row < block_rows))
+            with kernels_common._if_then(if_op):
+                body(batch, row)
+        else:
+            body(batch, row)
+
+
+def stage(aperture, lds_ptr, read, base_row, col, block_rows):
+    """VRAM -> LDS for this thread's share of one tile.
+
+    gfx1201 has no direct global->LDS instruction, so this is load-then-store
+    through VGPRs; gfx950 and gfx1250 have one. Naming the operation puts the
+    seam where that ISA difference falls, rather than leaving each caller to
+    open-code a pair.
+
+    Load and store sit inside the *same* guard, which matters: when the last
+    batch overshoots BLOCK_N those lanes have no row, and issuing their
+    clamped, redundant global loads anyway measured -9.6%. Only a distance-0
+    schedule can do this -- at distance 1 the loaded value is loop-carried, so
+    it has to exist unconditionally, and the load and the store are guarded
+    separately by `read_batches` and `publish`.
+    """
+    def body(_batch, row):
+        aperture.to_lds(
+            lds_ptr, aperture.read_vec(read, row, col), row, col,
+            aperture.vec_width,
+        )
+
+    _over_batches(aperture, base_row, block_rows, body)
+
+
+def publish(aperture, lds_ptr, vecs, base_row, col, block_rows):
+    """Registers -> LDS: the store half, for a tile already in flight."""
+    def body(batch, row):
+        aperture.to_lds(lds_ptr, vecs[batch], row, col, aperture.vec_width)
+
+    _over_batches(aperture, base_row, block_rows, body)
 
 
 # --------------------------------------------------------------------------

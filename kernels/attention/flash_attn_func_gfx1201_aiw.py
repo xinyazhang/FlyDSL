@@ -1182,58 +1182,18 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             ]
 
         def coop_store_k_lds(vecs):
-            # A local alias; see `coop_load_store_k` below for why.
-            ap = k_ap
-            for batch in range_constexpr(ap.num_batches):
-                lds_row = ap.batch_row(load_row_in_batch, batch)
-                if const_expr(ap.needs_guard):
-                    row_valid = lds_row < fx.Index(BLOCK_N)
-                    if row_valid:
-                        ap.to_lds(
-                            lds_kv, vecs[batch], lds_row, load_col_base,
-                            ap.vec_width,
-                        )
-                else:
-                    ap.to_lds(
-                        lds_kv, vecs[batch], lds_row, load_col_base,
-                        ap.vec_width,
-                    )
+            """Distance-1 K staging: publish the tile loaded last iteration."""
+            fmha.publish(
+                k_ap, lds_kv, vecs, load_row_in_batch, load_col_base,
+                fx.Index(BLOCK_N),
+            )
 
         def coop_load_store_k(start_k):
-            """Distance-0 K staging: load and store inside a single guard.
-
-            The guard has to cover the *load*, not just the store. When
-            K's rows-per-batch overshoots BLOCK_N some cooperative-load lanes
-            have no row -- at BLOCK_DMODEL 32 with BLOCK_N 64 that is exactly half
-            of them -- and issuing their (clamped, redundant) global loads
-            anyway measured -9.6% against the baseline kernel. Distance 1
-            cannot do this: there the loaded value is loop-carried, so it has
-            to exist unconditionally.
-            """
-            # A local alias, not `k_ap` directly. The rewriter collects any
-            # `name.method(...)` under a dynamic `if` as carried state and
-            # assigns the name back afterwards, which would make `k_ap` a
-            # local of *this* function -- unbound on the needs_guard-false
-            # path, which never runs that `if`. Binding a local before the
-            # branch is the fix `ast_rewriter._check_local_var` recommends.
-            ap = k_ap
-            read = fetch_k(start_k)
-            for batch in range_constexpr(ap.num_batches):
-                lds_row = ap.batch_row(load_row_in_batch, batch)
-                if const_expr(ap.needs_guard):
-                    row_valid = lds_row < fx.Index(BLOCK_N)
-                    if row_valid:
-                        ap.to_lds(
-                            lds_kv,
-                            ap.read_vec(read, lds_row, load_col_base),
-                            lds_row, load_col_base, ap.vec_width,
-                        )
-                else:
-                    ap.to_lds(
-                        lds_kv,
-                        ap.read_vec(read, lds_row, load_col_base),
-                        lds_row, load_col_base, ap.vec_width,
-                    )
+            """Distance-0 K staging: load and store inside a single guard."""
+            fmha.stage(
+                k_ap, lds_kv, fetch_k(start_k), load_row_in_batch,
+                load_col_base, fx.Index(BLOCK_N),
+            )
 
         # ---- V staging ----
         #
