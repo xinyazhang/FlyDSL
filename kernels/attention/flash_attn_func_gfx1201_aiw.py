@@ -1162,14 +1162,17 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         def load_global_v8f16(base_ptr, base64, off32):
             return _load_global_half_vec(base_ptr, base64, off32, v8f16_type)
 
-        # ---- K staging ----
+        # How each tensor is read: its address split, paired with the load
+        # instruction that consumes it. Each is `start -> (row, col) -> value`,
+        # which is what every movement helper in `fmha_common` takes, so none
+        # of them has to know that V^T uses a different instruction from V.
+        fetch_k = fmha.reader(k_addr, lambda b, o: load_global_f16xN(k_ptr, b, o))
+        fetch_v = fmha.reader(v_addr, lambda b, o: load_global_f16xN(v_ptr, b, o))
+        fetch_v_tr = fmha.reader(
+            v_addr, lambda b, o: fmha.global_load_tr_v8(v_ptr_i64, b, o, v8f16_type)
+        )
 
-        def fetch_k(start_k):
-            """`(row, col) -> one K vector`, for the aperture's masked reads."""
-            def read(row, col):
-                b64, o32 = k_addr(start_k, row, col)
-                return load_global_f16xN(k_ptr, b64, o32)
-            return read
+        # ---- K staging ----
 
         def coop_load_k_global(start_k):
             """Issue this thread's K global loads; results stay in registers."""
@@ -1214,25 +1217,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             store_kv_off=klane * WMMA_LANE_K,
         )
 
-        def fetch_v(start_k):
-            """`(row, col) -> one V vector`, row-major."""
-            def read(row, col):
-                b64, o32 = v_addr(start_k, row, col)
-                return load_global_f16xN(v_ptr, b64, o32)
-            return read
-
-        def fetch_v_transposed(start_k):
-            """`(row, col) -> one transposed V block`, via `global_load_tr_b128`."""
-            def read(row, col):
-                b64, o32 = v_addr(start_k, row, col)
-                return fmha.global_load_tr_v8(v_ptr_i64, b64, o32, v8f16_type)
-            return read
-
         def coop_load_v_global(start_k, chunk=0):
             """V columns [chunk*VO_CHUNK_COLS, +VO_CHUNK_COLS) of this KV tile."""
             if const_expr(V_TRANSPOSED):
                 return fmha.read_transposed(
-                    v_ap, v_tr, fetch_v_transposed(start_k),
+                    v_ap, v_tr, fetch_v_tr(start_k),
                     chunk * VO_CHUNK_COLS + D_OFFSET,
                 )
             col = v_col_base

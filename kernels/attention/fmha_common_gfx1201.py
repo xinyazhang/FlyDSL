@@ -603,6 +603,26 @@ def publish(aperture, lds_ptr, vecs, base_row, col, block_rows):
     _over_batches(aperture, base_row, block_rows, body)
 
 
+def reader(addr, load):
+    """Bind a tensor's address split to its load: `start -> (row, col) -> value`.
+
+    Curried on `start` because the tile origin moves every KV iteration while
+    the address closure and the load instruction do not. What comes out is the
+    `read` argument every movement helper here takes, so the helpers never
+    need to know how a tensor is addressed or which load it uses.
+
+    Not an `Aperture` field, for the reason in that class's docstring: `addr`
+    closes over traced values, and an object holding one could not implement
+    the carry protocol.
+    """
+    def at(start):
+        def read(row, col):
+            base64, off32 = addr(start, row, col)
+            return load(base64, off32)
+        return read
+    return at
+
+
 def read_batches(aperture, read, base_row, col):
     """VRAM -> registers: this thread's share of one tile, columns masked.
 
