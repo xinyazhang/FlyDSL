@@ -6,7 +6,6 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, rocdl
 from flydsl.expr.typing import T
-from flydsl.expr.utils.arith import ArithValue, _to_raw
 
 # Pointer/global-load helpers now live in mem_ops; re-exported here for back-compat.
 from kernels.common.mem_ops import extract_global_ptr as extract_global_ptr
@@ -75,17 +74,19 @@ def urem_pow2(value, divisor: int):
 def ssel(pred, a, b):
     """``pred ? a : b`` as an ``fx.Int32``.
 
-    Thin, and the thinness is the point: ``ArithValue.select`` returns a raw
-    MLIR value with no arithmetic overloads, so a caller writing
-    ``ssel(c, x, y) + fx.Int32(1)`` needs the result typed. Without this the
-    wrap gets open-coded at every call site, which is how the gfx1201 SDPA
-    kernel and ``pa_metadata.py`` each ended up with their own copy.
+    Thin, and the thinness is the point: without it the result-typing wrap
+    gets open-coded at every call site, which is how the gfx1201 SDPA kernel
+    and ``pa_metadata.py`` each ended up with their own copy.
+
+    ``pred`` may be an ``fx.Boolean`` (what a comparison returns), a raw i1
+    ``ir.Value``, or an ``ArithValue`` -- ``fx.Boolean`` accepts all three,
+    the last two because ``ArithValue`` subclasses ``ir.Value``.
 
     Operands are *not* coerced. Pass i32; passing an ``fx.Index`` gets you a
     64-bit unsigned select, which is a silent bug wherever the value can be
     negative.
     """
-    return fx.Int32(ArithValue(pred).select(a, b))
+    return fx.Int32(fx.Boolean(pred).select(a, b))
 
 
 def smin(a, b):
@@ -115,16 +116,14 @@ def sdiv_rd_pow2(value, divisor: int):
     past the start of the sequence gets turned into a tile index. Truncating
     there starts the left run one tile late and silently drops live columns.
 
-    Written as an explicit `arith.shrsi` rather than `value >> n` so the
-    signedness is visible at the definition, which is the entire reason this
-    exists next to `udiv_pow2`.
+    `>>` rather than an explicit `arith.shrsi`, which this used to spell out
+    so the signedness was visible. It still is, one level up: `_shift_op`
+    picks `shrsi` over `shrui` from the operand's `signed` flag, so the
+    `fx.Int32` coercion below *is* the signedness declaration -- and it is the
+    same coercion that stops an `fx.Index` caller getting a logical shift.
     """
     assert is_pow2(divisor), f"sdiv_rd_pow2 needs a power-of-two divisor, got {divisor}"
-    return fx.Int32(
-        ArithValue(
-            arith.shrsi(_to_raw(fx.Int32(value)), _to_raw(fx.Int32(pow2_shift(divisor))))
-        )
-    )
+    return fx.Int32(value) >> fx.Int32(pow2_shift(divisor))
 
 
 def udiv_const(value, divisor: int):
