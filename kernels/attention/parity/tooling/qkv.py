@@ -54,11 +54,3 @@ def make_qkv(
 
     out = tuple(one() for _ in range(n))
     return out[0] if n == 1 else out
-
-
-def empty_like_bhsd(t, layout=LAYOUT_BHSD):
-    """An output tensor matching `t`'s BHSD shape, in the requested layout."""
-    b, h, s, d = t.shape
-    if layout == LAYOUT_BHSD:
-        return torch.empty(b, h, s, d, dtype=t.dtype, device=t.device)
-    return torch.empty(b, s, h, d, dtype=t.dtype, device=t.device).transpose(1, 2)
