@@ -551,13 +551,9 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         # Delta is *required* to share LSE's layout. It is produced beside it
         # by the same caller, and giving it its own would double the decode for
         # no expressiveness.
-        _tok = fx.Index(lse_tokens)
-        _nhq = fx.Index(num_head_q)
-        _row_base_ht = (_q_batch_v * _nhq + head_q) * _tok + _q_row_off_v
-        _row_base_th = (_q_batch_v * _tok + _q_row_off_v) * _nhq + head_q
-        _is_th = ((fx.Int32(varlen_bits) >> fx.Int32(16)) & fx.Int32(3)) != fx.Int32(0)
-        row_base = fx.Index(_is_th.select(fx.Index(_row_base_th), fx.Index(_row_base_ht)))
-        row_pitch = fx.Index(_is_th.select(_nhq, fx.Index(1)))
+        row_base, row_pitch = fmha.lse_row_addressing(
+            varlen_bits, _q_batch_v, head_q, num_head_q, lse_tokens, _q_row_off_v
+        )
 
         def load_row_f32(base_ptr, q_row):
             """`tensor[q_row]` of a row-wise f32 side input, address always legal.

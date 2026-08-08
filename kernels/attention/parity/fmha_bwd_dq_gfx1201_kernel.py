@@ -631,10 +631,10 @@ def build_bwd_dq_module_primary(meta, knobs):
         _tok_row = fx.Index(common_utils.smax(_lse_tok, fx.Int32(0)))
         #   _HT  (H, T)   AOTriton's, and the default: T contiguous
         #   _TH  (T, H)   Transformer Engine's:         H contiguous
-        _lse_off_ht = (_q_batch_v * _nhq_v + head_q) * _tok_v + _tok_row
-        _lse_off_th = (_q_batch_v * _tok_v + _tok_row) * _nhq_v + head_q
-        _is_th = ((fx.Int32(varlen_bits) >> fx.Int32(16)) & fx.Int32(3)) != fx.Int32(0)
-        _lse_off = fx.Index(_is_th.select(fx.Index(_lse_off_th), fx.Index(_lse_off_ht)))
+        _lse_base, _lse_pitch = fmha.lse_row_addressing(varlen_bits, _q_batch_v, head_q, num_head_q, _tok_i32, _tok_row)
+        # `_tok_row` is already the clamped absolute row, so the offset is the
+        # base itself -- this caller wants one row, not a range.
+        _lse_off = _lse_base
 
         def _load_row_f32(ptr):
             return _pointer_load(
@@ -808,7 +808,7 @@ def build_bwd_dq_module_primary(meta, knobs):
                 _kv_i32 = fx.Int32(kv_block_start)
                 _klane_off = fx.Int32(klane) * fx.Int32(8)
                 for _i in range_constexpr(NUM_S_VALS):
-                    _col = _kv_i32 + fx.Int32((_i // 16) * 32 + ((_i // 8) % 2) * 16 + _i % 8) + _klane_off
+                    _col = _kv_i32 + fx.Int32(fmha.acc_elem_column(_i)) + _klane_off
                     _dead = _col >= seqlen_k_i32
                     if const_expr(CAUSAL):
                         # Both edges of the band, signed throughout:

@@ -85,6 +85,8 @@ __all__ = [
     "llvm_ptr_ty",
     "pointer_to_llvm_ptr",
     "load_geom",
+    "acc_elem_column",
+    "lse_row_addressing",
     "lds_load_v8",
     "lds_store_vx",
     "global_load_tr_v8",
@@ -150,6 +152,67 @@ def pointer_to_llvm_ptr(ptr) -> ir.Value:
     """
     ptr_i64 = fx.Int64(fx.ptrtoint(ptr))
     return _llvm.IntToPtrOp(llvm_ptr_ty(), fx.as_ir_value(ptr_i64)).result
+
+
+def lse_row_addressing(varlen_bits, batch, head, num_head_q, tokens, row_off):
+    """`(base, pitch)` for a row-wise f32 side input -- logsumexp, and delta.
+
+    The element for absolute query row `r` is at `base + r * pitch`. Factored
+    that way because `base` is loop-invariant while `r` is not: the four
+    callers that had open-coded this each recomputed the whole offset per row.
+
+    Two layouts, one select, decoded from VarlenBits bits 17:16:
+
+        _HT   (H, T), T contiguous -- AOTriton's and this kernel's default.
+              base = (batch * H + head) * tokens + row_off,   pitch = 1
+        _TH   (T, H), H contiguous -- Transformer Engine's.
+              base = (batch * tokens + row_off) * H + head,   pitch = H
+
+    `tokens` is `lse_token_pitch`'s answer, not `max_seqlen_q`: a stacked
+    layout runs to the batch total rather than padding each row-group.
+
+    **Delta is required to share LSE's layout.** It is produced beside it by
+    the same caller, and giving it its own decode would double the work for no
+    expressiveness -- so both side inputs use this one function.
+
+    Four callers of one fact: the forward *writes* LSE through it, and all
+    three backward kernels *read* LSE and delta through it. It was two
+    spellings and a third that had already factored out the base, which is the
+    form kept here.
+    """
+    tok = fx.Index(tokens)
+    nhq = fx.Index(num_head_q)
+    base_ht = (batch * nhq + head) * tok + row_off
+    base_th = (batch * tok + row_off) * nhq + head
+    is_th = ((fx.Int32(varlen_bits) >> fx.Int32(16)) & fx.Int32(3)) != fx.Int32(0)
+    base = fx.Index(is_th.select(fx.Index(base_th), fx.Index(base_ht)))
+    pitch = fx.Index(is_th.select(nhq, fx.Index(1)))
+    return base, pitch
+
+
+def acc_elem_column(i):
+    """Which column of the WMMA tile flattened accumulator element `i` holds.
+
+    A plain Python int in, a plain Python int out -- no IR, no operands. The
+    lane's own contribution (`klane * 8`) and the tile origin are the caller's
+    to add, because they are traced values and this is not.
+
+        column(i) = (i // 16) * 32 + ((i // 8) % 2) * 16 + i % 8   [+ klane * 8]
+
+    The three terms are the three nestings of the GEMM unroll read backwards.
+    `i // 16` picks the column sub-tile, 32 columns wide. `(i // 8) % 2` picks
+    which half of that sub-tile -- the unroll walks (sub-tile, half) pairs, so
+    the halves alternate every 8 elements. `i % 8` is the position inside a
+    lane's eight, and within a 16-row WMMA block a lane holds rows
+    `klane * 8 + si`, which is where the caller's `klane * 8` comes from.
+
+    The consequence worth naming: **within each group of eight only `i % 8`
+    varies**, so those eight are eight *contiguous* columns and a masked read
+    of them is one v8 load rather than a gather. Three call sites in the
+    forward -- the KV tail mask, bias, and dropout -- and one in `bwd_dq` had
+    each open-coded the expression with a paragraph of this comment attached.
+    """
+    return (i // 16) * 32 + ((i // 8) % 2) * 16 + i % 8
 
 
 def load_geom(width, vec_width, block_size, rows):

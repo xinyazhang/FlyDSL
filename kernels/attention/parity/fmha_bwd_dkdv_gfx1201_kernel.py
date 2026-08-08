@@ -689,15 +689,12 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             # Row-wise quantities. `lse_tokens` and the HT/TH choice come from
             # the same VarlenBits the forward wrote them under, so the two
             # kernels cannot disagree about the layout.
-            _tok = fx.Index(lse_tokens)
-            _nhq = fx.Index(num_head_q)
-            _is_th = ((fx.Int32(varlen_bits) >> fx.Int32(16)) & fx.Int32(3)) != fx.Int32(0)
+            _row_base, _row_pitch = fmha.lse_row_addressing(
+                varlen_bits, _q_batch_v, head_q, num_head_q, lse_tokens, _q_row_off_v
+            )
 
             def _row_scalar_off(row_idx):
-                _row = _q_row_off_v + row_idx
-                _off_ht = (_q_batch_v * _nhq + head_q) * _tok + _row
-                _off_th = (_q_batch_v * _tok + _row) * _nhq + head_q
-                return fx.Index(_is_th.select(fx.Index(_off_th), fx.Index(_off_ht)))
+                return _row_base + row_idx * _row_pitch
 
             for qsub in range_constexpr(Q_SUBTILES):
                 _qs = qsub * WMMA_M
