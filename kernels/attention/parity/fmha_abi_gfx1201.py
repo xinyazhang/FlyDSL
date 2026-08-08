@@ -28,11 +28,12 @@ from __future__ import annotations
 
 import weakref
 
-import flydsl.compiler as flyc
-import flydsl.expr as fx
 import fmha_common_gfx1201 as fmha
 from philox import dropout_threshold
 from torch import float32 as torch_f32
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 
 __all__ = [
     "VARLEN_STACKED",
@@ -98,12 +99,11 @@ def varlen_bits(q_side=0, k_side=0, lse_layout=VARLEN_LSE_LAYOUT_HT):
         if (b >> 3) & 3 == 1 and (b >> 1) & 3 != 1:
             # REUSE takes a *position* out of the length array, which is
             # only a position when the lengths are cumulative.
-            raise ValueError(
-                f"{name}={b:#04x}: POSITION=REUSE requires " f"LENGTH=CUMULATIVE (plan section 1, axis C)"
-            )
+            raise ValueError(f"{name}={b:#04x}: POSITION=REUSE requires " f"LENGTH=CUMULATIVE (plan section 1, axis C)")
         if (b >> 1) & 3 == 3 or (b >> 3) & 3 == 3:
             raise ValueError(f"{name}={b:#04x} uses a reserved code")
     return q_side | (k_side << 8) | lse_layout
+
 
 VARLEN_DENSE = 0  # noqa: F841  (ditto)
 VARLEN_COMPACT_SIDE = VARLEN_STACKED | VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_REUSE  # 0x0B
@@ -217,6 +217,7 @@ def varlen_seqused_k(
 
 
 NULL_PTR = flyc.from_c_void_p(fx.Uint8, 0)
+
 
 def ptr_arg(t):
     if hasattr(t, "data_ptr"):

@@ -8,6 +8,7 @@ shows bias comparable to spread.
 Run from this directory:  python3 accuracy_probe.py
 """
 
+import _bootstrap  # noqa: F401  (puts parity/ on sys.path)
 import torch
 from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
 

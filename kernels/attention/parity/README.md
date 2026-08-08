@@ -35,9 +35,7 @@ tree. Nothing here is collected by `scripts/run_tests.sh`.
 | public API | `flash_attn_func_gfx1201_interface.py` |
 | PRNG, and the debug dropout-mask kernel | `philox.py`, `dropout_mask_gfx1201.py` |
 | correctness | `test_flash_attn_func_gfx1201{,_aiw}.py`, `test_dropout_mask_gfx1201.py`, `test_philox.py` |
-| performance | `perf_ab.py` (interleaved A/B), `bench_fmha.py`, `bench_one.py`, `bench_aiw_ab.py` |
-| codegen gate | `codegen_fingerprint.py` — VGPR, scratch, instruction count, ISA hash |
-| accuracy vs fp64 | `accuracy_probe.py` |
+| the dev harness | [`tooling/`](tooling/README.md) -- benchmarks, codegen gate, ISA dumper, accuracy probe |
 
 ## The written record
 

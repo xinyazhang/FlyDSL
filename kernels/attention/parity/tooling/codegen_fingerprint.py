@@ -16,7 +16,12 @@ import tempfile
 
 # This directory, not a hardcoded checkout: the fingerprint is compared
 # across worktrees, so an absolute path would silently measure the wrong one.
+# This directory is `parity/tooling`; the kernels are its parent. Derived
+# rather than hardcoded: the fingerprint is compared across worktrees, so an
+# absolute path would silently measure the wrong one.
 HERE = os.path.dirname(os.path.abspath(__file__))
+PARITY = os.path.dirname(HERE)
+sys.path.insert(0, PARITY)
 sys.path.insert(0, HERE)
 CONFIGS = [(64, False), (128, True), (256, True)]
 

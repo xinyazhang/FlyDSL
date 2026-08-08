@@ -44,7 +44,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(os.path.dirname(os.path.dirname(_HERE)))
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_HERE))))
 
 # Tier 2.9: the fast screen. One sequence length, one masking mode, the head
 # dims that production actually uses plus the two that are structurally
@@ -68,9 +68,17 @@ B, H, REPS = 1, 8, 5
 
 def _worker() -> int:
     """Read `hd causal N` lines on stdin, print `tflops` per line."""
-    sys.path.insert(0, os.path.join(os.environ["FLYDSL_AB_ROOT"], "kernels", "attention", "parity"))
+    _root = os.environ["FLYDSL_AB_ROOT"]
+    sys.path.insert(0, os.path.join(_root, "kernels", "attention", "parity", "tooling"))
+    sys.path.insert(0, os.path.join(_root, "kernels", "attention", "parity"))
     import torch
     from bench_shim import do_bench
+    from qkv import make_qkv
+
+    # Shape is the ABI and not negotiable; layout is a knob, because a
+    # contiguous BHSD tensor puts a head's tokens D apart where BSHD puts
+    # them H*D apart -- a real difference in access pattern, not a detail.
+    _LAYOUT = os.environ.get("FLYDSL_AB_LAYOUT", "bhsd")
     from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201 as F
 
     cache: dict = {}
@@ -84,7 +92,7 @@ def _worker() -> int:
         key = (hd, causal, n)
         if key not in cache:
             torch.manual_seed(0)
-            cache[key] = tuple(torch.randn(B, H, n, hd, dtype=torch.float16, device="cuda") for _ in range(3))
+            cache[key] = make_qkv(B, H, n, hd, dtype=torch.float16, layout=_LAYOUT)
             q, k, v = cache[key]
             F(q, k, v, causal=causal)  # warm the JIT before timing
             torch.cuda.synchronize()
