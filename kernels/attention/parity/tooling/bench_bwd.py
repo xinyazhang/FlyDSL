@@ -39,17 +39,15 @@ numbers move with the board.
 import argparse
 import os
 
+import _bootstrap  # noqa: F401  (puts parity/ on sys.path)
 import torch
 import torch.nn.functional as F
-
-import _bootstrap  # noqa: F401  (puts parity/ on sys.path)
 from bench_shim import do_bench
-from qkv import make_qkv
-
 from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
 from fmha_bwd_dkdv_gfx1201_interface import flydsl_flash_attn_bwd_dkdv_gfx1201
 from fmha_bwd_dq_gfx1201_interface import flydsl_bwd_dq_gfx1201
 from fmha_bwd_fuse_gfx1201_interface import flydsl_fmha_bwd_fuse_gfx1201
+from qkv import make_qkv
 
 
 def bwd_flops(batch, heads, n, d, causal):
@@ -71,8 +69,9 @@ def main():
     a = p.parse_args()
 
     print(f"batch={a.batch} heads={a.heads} causal={a.causal} layout={a.layout} f16")
-    print(f"{'D':>4} {'N':>6} {'provider':>8} {'delta':>8} {'kernel':>8} {'total':>8} "
-          f"{'TFLOPS':>8} {'vs torch':>8}")
+    print(
+        f"{'D':>4} {'N':>6} {'provider':>8} {'delta':>8} {'kernel':>8} {'total':>8} " f"{'TFLOPS':>8} {'vs torch':>8}"
+    )
 
     for d in (int(x) for x in a.head_dims.split(",")):
         for n in (int(x) for x in a.n_ctx.split(",")):
@@ -92,29 +91,31 @@ def main():
 
             rows = []
             try:
-                ms_dkdv = do_bench(lambda: flydsl_flash_attn_bwd_dkdv_gfx1201(
-                    q, k, v, do, o, lse2, causal=a.causal, delta=delta))
-                ms_dq = do_bench(lambda: flydsl_bwd_dq_gfx1201(
-                    q, k, v, o, do, lse2, causal=a.causal, delta=delta))
+                ms_dkdv = do_bench(
+                    lambda: flydsl_flash_attn_bwd_dkdv_gfx1201(q, k, v, do, o, lse2, causal=a.causal, delta=delta)
+                )
+                ms_dq = do_bench(lambda: flydsl_bwd_dq_gfx1201(q, k, v, o, do, lse2, causal=a.causal, delta=delta))
                 rows.append(("split", ms_dkdv + ms_dq))
             except Exception as e:
                 rows.append(("split", f"n/a ({type(e).__name__})"))
             try:
-                ms_fuse = do_bench(lambda: flydsl_fmha_bwd_fuse_gfx1201(
-                    q, k, v, o, do, lse2, causal=a.causal, delta=delta))
+                ms_fuse = do_bench(
+                    lambda: flydsl_fmha_bwd_fuse_gfx1201(q, k, v, o, do, lse2, causal=a.causal, delta=delta)
+                )
                 rows.append(("fuse", ms_fuse))
             except Exception as e:
                 rows.append(("fuse", f"n/a ({type(e).__name__})"))
 
-            print(f"{d:>4} {n:>6} {'torch':>8} {'':>8} {'':>8} {ms_torch:8.2f} "
-                  f"{tf_torch:8.1f} {1.0:8.2f}")
+            print(f"{d:>4} {n:>6} {'torch':>8} {'':>8} {'':>8} {ms_torch:8.2f} " f"{tf_torch:8.1f} {1.0:8.2f}")
             for name, ms in rows:
                 if isinstance(ms, str):
                     print(f"{d:>4} {n:>6} {name:>8} {'':>8} {ms:>26}")
                     continue
                 tot = ms + ms_delta
-                print(f"{d:>4} {n:>6} {name:>8} {ms_delta:8.2f} {ms:8.2f} {tot:8.2f} "
-                      f"{flops / tot * 1e-9:8.1f} {tf_torch and (ms_torch / tot):8.2f}")
+                print(
+                    f"{d:>4} {n:>6} {name:>8} {ms_delta:8.2f} {ms:8.2f} {tot:8.2f} "
+                    f"{flops / tot * 1e-9:8.1f} {tf_torch and (ms_torch / tot):8.2f}"
+                )
 
 
 if __name__ == "__main__":

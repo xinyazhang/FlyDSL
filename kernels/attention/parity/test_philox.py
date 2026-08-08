@@ -406,7 +406,7 @@ def _run_span(seed, first_offset, count, width):
         vals = rng.span_u32(s, o, count)
         dst = fx.recast_iter(i32p, OUT)
         for j in range_constexpr(count):
-            fx.ptr_store(fx.Int32(vals[j]), dst + fx.Int64(fx.Int32(j)))
+            fx.ptr_store(fx.Int32(vals[j]), dst + fx.Int64(j))
 
     @flyc.jit
     def launch(OUT: fx.Pointer, s: fx.Int64, o: fx.Int64, stream: fx.Stream = fx.Stream(None)):

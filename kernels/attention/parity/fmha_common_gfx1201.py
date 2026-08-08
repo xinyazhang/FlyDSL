@@ -82,7 +82,6 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 __all__ = [
-    "llvm_ptr_ty",
     "pointer_to_llvm_ptr",
     "load_geom",
     "acc_elem_column",
@@ -121,18 +120,13 @@ __all__ = [
 ]
 
 
-def llvm_ptr_ty() -> ir.Type:
-    return ir.Type.parse("!llvm.ptr")
-
-
 def pointer_to_llvm_ptr(ptr) -> ir.Value:
     """A `!fly.ptr` kernel argument as an LLVM pointer, for raw load/store.
 
-    Not `mem_ops.get_llvm_ptr`, which takes the same idea from the other end:
-    it calls `extract_aligned_pointer_as_index`, which requires a memref and
-    rejects a `!fly.ptr` outright. `fx.ptrtoint` is the reverse -- it reads
-    `ptr.address_space` and so requires the pointer. Neither op accepts both,
-    so this is not a duplicate of that helper but the other half of the pair.
+    Thin wrapper over `fx.to_llvm_ptr`, which resolves the pointer's semantic
+    address space through the active backend rather than hardcoding a number.
+    Kept as a named function because the reason the arguments are pointers at
+    all is not local to any one call site:
 
     **Why the attention kernels take pointers and not tensors.** Every other
     kernel in the tree declares `fx.Tensor`, which would reach `get_llvm_ptr`
@@ -150,8 +144,7 @@ def pointer_to_llvm_ptr(ptr) -> ir.Value:
     for a thing that is not there. They would stay pointers and keep needing
     this.
     """
-    ptr_i64 = fx.Int64(fx.ptrtoint(ptr))
-    return _llvm.IntToPtrOp(llvm_ptr_ty(), fx.as_ir_value(ptr_i64)).result
+    return fx.to_llvm_ptr(ptr)
 
 
 def lse_row_addressing(varlen_bits, batch, head, num_head_q, tokens, row_off):
@@ -317,9 +310,9 @@ def global_load_tr_v8(base_i64, base64, off32, v8_type):
     `stride_seq = 8388608`, whose 256th row is exactly 2**31. Narrowing it
     wrapped and read another allocation.
     """
-    base_bytes = fx.as_ir_value(fx.Int64(fx.Index(base64) * 2))
-    off_bytes = fx.as_ir_value(fx.Int64(fx.Index(off32) * 2))
-    addr = arith.addi(arith.addi(base_i64, base_bytes), off_bytes)
+    base_bytes = fx.Int64(fx.Index(base64) * 2)
+    off_bytes = fx.Int64(fx.Index(off32) * 2)
+    addr = fx.as_ir_value(fx.Int64(base_i64) + base_bytes + off_bytes)
     p = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), addr).result
     return rocdl.global_load_tr_b128(v8_type, p)
 

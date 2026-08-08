@@ -65,8 +65,6 @@ from typing import Literal, TypeAlias
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import arith
-from flydsl.expr.utils.arith import ArithValue
-from flydsl.expr.utils.arith import _to_raw as _raw
 
 __all__ = [
     "PHILOX_WIDTHS",
@@ -177,8 +175,25 @@ def _const(width: PhiloxWidth, name: str) -> Word:
     return _ty(width)(_CONSTS[width][name])
 
 
+# The round arithmetic stays on raw `arith` ops rather than the `fx` operator
+# overloads. Philox is modular arithmetic over u32/u64, and the overloads
+# constant-fold through unbounded Python ints: with a compile-time seed and
+# offset every round is foldable, and the key schedule's repeated `k += KEY`
+# runs off the end instead of wrapping. At width 64 that raises outright
+# ("Python int too large to convert to C long"); at width 32 it only survives
+# because `fx.Int32` truncates what it is handed, which is the wrap by luck.
+# `arith.addi`/`muli`/`xori` wrap at the declared width, which is the semantics
+# this PRNG is defined in.
 def _mul_lo(a: Word, b: Word, width: PhiloxWidth) -> Word:
-    return _ty(width)(ArithValue(arith.muli(_raw(a), _raw(b))))
+    return _ty(width)(arith.muli(fx.as_ir_value(a), fx.as_ir_value(b)))
+
+
+def _xor(a: Word, b: Word, width: PhiloxWidth) -> Word:
+    return _ty(width)(arith.xori(fx.as_ir_value(a), fx.as_ir_value(b)))
+
+
+def _add(a: Word, b: Word, width: PhiloxWidth) -> Word:
+    return _ty(width)(arith.addi(fx.as_ir_value(a), fx.as_ir_value(b)))
 
 
 def _mul_hi(a: Word, b: Word, width: PhiloxWidth) -> Word:
@@ -189,16 +204,8 @@ def _mul_hi(a: Word, b: Word, width: PhiloxWidth) -> Word:
     64 the backend expands it; that expansion is exactly what makes the 64-bit
     variant expensive, and is the thing the microbenchmark prices.
     """
-    op = arith.MulUIExtendedOp(_raw(a), _raw(b))
-    return _ty(width)(ArithValue(op.high))
-
-
-def _xor(a: Word, b: Word, width: PhiloxWidth) -> Word:
-    return _ty(width)(ArithValue(arith.xori(_raw(a), _raw(b))))
-
-
-def _add(a: Word, b: Word, width: PhiloxWidth) -> Word:
-    return _ty(width)(ArithValue(arith.addi(_raw(a), _raw(b))))
+    op = arith.MulUIExtendedOp(fx.as_ir_value(a), fx.as_ir_value(b))
+    return _ty(width)(op.high)
 
 
 def philox_4x(
@@ -303,7 +310,7 @@ def dropout_threshold(p: float) -> int:
     return max(-(2**31), min(2**31 - 1, t))
 
 
-def keep_mask(vals: list[fx.Int32], threshold: int | fx.Int32) -> list[ArithValue]:
+def keep_mask(vals: list[fx.Int32], threshold: int | fx.Int32) -> list[fx.Boolean]:
     """`vals > threshold` as **signed** compares -- one predicate per value.
 
     Signed is not an implementation detail: the randoms span the full u32
@@ -313,13 +320,13 @@ def keep_mask(vals: list[fx.Int32], threshold: int | fx.Int32) -> list[ArithValu
     still attention-shaped. AOTriton makes the same choice for the same
     reason, having bitcast to `int32` to get a comparison at all.
 
-    `fx.Int32` is `signed=True`, so the predicate here agrees with what its
-    `>` overload would emit; it is spelled out because the values arrive as
-    raw `u32` bit patterns whose Python-side type is incidental, and this
-    module rather than each caller should own which way they are read.
+    `fx.Int32` is `signed=True`, so its `>` overload emits the signed compare.
+    The re-wrap of each `v` is not redundant: the values arrive as raw `u32`
+    bit patterns whose Python-side type is incidental, and this module rather
+    than each caller should own which way they are read.
     """
     thr = fx.Int32(threshold)
-    return [ArithValue(arith.cmpi(arith.CmpIPredicate.sgt, _raw(fx.Int32(v)), _raw(thr))) for v in vals]
+    return [fx.Int32(v) > thr for v in vals]
 
 
 def to_uniform_f32(v: fx.Int32) -> fx.Float32:
@@ -329,12 +336,8 @@ def to_uniform_f32(v: fx.Int32) -> fx.Float32:
     `dropout_threshold`. The debug mask kernel does, because a float mask is
     what a human reads.
     """
-    f = fx.Float32(ArithValue(arith.sitofp(fx.Float32.ir_type, _raw(fx.Int32(v)))))
-    return fx.Float32(ArithValue(arith.addf(_raw(_fmul32(f, fx.Float32(_U32_SCALE))), _raw(fx.Float32(0.5)))))
-
-
-def _fmul32(a: fx.Float32, b: fx.Float32) -> fx.Float32:
-    return fx.Float32(ArithValue(arith.mulf(_raw(a), _raw(b))))
+    f = fx.Int32(v).to(fx.Float32)
+    return f * fx.Float32(_U32_SCALE) + fx.Float32(0.5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,7 +412,7 @@ class Philox:
             out.extend(self.u32(seed, base + fx.Int64(k)))
         return out
 
-    def keep_span(self, seed: U64, first_offset: U64, count: int, threshold: int | fx.Int32) -> list[ArithValue]:
+    def keep_span(self, seed: U64, first_offset: U64, count: int, threshold: int | fx.Int32) -> list[fx.Boolean]:
         """`span_u32` and `keep_mask` together: the dropout mask for a run."""
         return keep_mask(self.span_u32(seed, first_offset, count), threshold)
 
@@ -470,15 +473,11 @@ def _split64(v: U64) -> tuple[fx.Int32, fx.Int32]:
 
     Free on GPU targets: a 64-bit value is a pair of 32-bit registers, so this
     lowers to register naming rather than a shift and a mask.
+
+    `fx.Int64` is signed, so `>>` is an arithmetic shift where the value is a
+    `u64`. That is still correct here because the truncation keeps only bits
+    0..31 of the result, which are bits 32..63 of `v` for either shift; the two
+    differ only in the top half, which is discarded.
     """
     v = fx.Int64(v)
-    lo = fx.Int32(ArithValue(arith.trunci(fx.Int32.ir_type, _raw(v))))
-    hi = fx.Int32(
-        ArithValue(
-            arith.trunci(
-                fx.Int32.ir_type,
-                _raw(ArithValue(arith.shrui(_raw(v), _raw(fx.Int64(32))))),
-            )
-        )
-    )
-    return lo, hi
+    return fx.Int32(v), fx.Int32(v >> fx.Int64(32))

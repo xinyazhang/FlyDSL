@@ -1699,7 +1699,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     # each group is one span of the stream.
                     for _st in range_constexpr(NUM_S_ACCS):
                         _c0 = (_st // 2) * 32 + (_st % 2) * 16
-                        _bcol = fx.Int64(kv_block_start) + fx.Int64(_c0) + fx.Int64(fx.Int32(klane) * fx.Int32(8))
+                        _bcol = fx.Int64(kv_block_start) + _c0 + fx.Int64(fx.Int32(klane) * 8)
                         _first = PHILOX.grid_offset(_ph_base, _ph_stride, q_rows[qt], _bcol)
                         _keep = PHILOX.keep_span(philox_seed, _first, 8, idropout_p)
                         for _r in range_constexpr(8):
