@@ -713,11 +713,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     VEC_WIDTH = 8
 
     def _load_geom(width):
-        """Cooperative-load geometry for a row of `width` elements."""
-        tpr = width // VEC_WIDTH
-        rpb = BLOCK_SIZE // tpr
-        nb = (BLOCK_N + rpb - 1) // rpb
-        return tpr, rpb, nb, nb * rpb != BLOCK_N
+        return fmha.load_geom(width, VEC_WIDTH, BLOCK_SIZE, BLOCK_N)
 
     # Cover BLOCK_N rows with ceil() batches, not floor(). Flooring silently
     # dropped rows whenever K_ROWS_PER_BATCH neither reached BLOCK_N nor

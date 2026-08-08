@@ -84,6 +84,7 @@ from flydsl.expr.typing import Vector as Vec
 __all__ = [
     "llvm_ptr_ty",
     "pointer_to_llvm_ptr",
+    "load_geom",
     "lds_load_v8",
     "lds_store_vx",
     "global_load_tr_v8",
@@ -149,6 +150,54 @@ def pointer_to_llvm_ptr(ptr) -> ir.Value:
     """
     ptr_i64 = fx.Int64(fx.ptrtoint(ptr))
     return _llvm.IntToPtrOp(llvm_ptr_ty(), fx.as_ir_value(ptr_i64)).result
+
+
+def load_geom(width, vec_width, block_size, rows):
+    """Cooperative-load geometry: `(threads_per_row, rows_per_batch, batches, needs_guard)`.
+
+    `block_size` threads cooperate to fill `rows` rows of `width` elements,
+    `vec_width` elements per thread per access.
+
+    **`ceil` and not `floor` on the batch count.** Flooring silently drops rows
+    whenever rows-per-batch neither reaches `rows` nor divides it: at
+    BLOCK_DMODEL 160/192/224 the forward gets 25/21/18, so `rows // that == 1`
+    and only 25/21/18 of the 32 KV rows reached LDS. The rest was stale, which
+    surfaced as NaN.
+
+    **Two independent reasons for the row guard, and both must be checked.**
+    This is the whole reason the function is shared rather than copied:
+
+    1. `nb * rpb != rows` -- the ceil() batches overshoot the tile, so the last
+       batch leaves some lanes with no row.
+    2. `tpr * rpb != block_size` -- when threads-per-row does not divide the
+       workgroup, the leftover threads get `tid // tpr == rpb`, one row *past*
+       their batch's share. Those are harmless duplicates of the next batch's
+       row except on the *final* batch, where the row is past `rows` and the
+       store lands in whatever tile follows.
+
+    Reason 2 is the one that was missing, and it is not hypothetical. Three
+    kernels grew a private copy of this function testing only reason 1:
+
+    - the forward is safe, but by coincidence rather than construction. Eight
+      of its thirty configs (the non-power-of-two widths 48/80/96/160/192/224/
+      384) do have leftover threads, and in every one reason 1 happens to fire
+      anyway; in every config where the guard is absent, `tpr` divides the
+      workgroup exactly.
+    - `bwd_dq` hit it and fixed it locally.
+    - `bwd_dkdv` hit it and did **not**: at head_dim 224 its shipped default
+      (block_m 16, 4 waves -> tpr 28, rpb 4, nb 4) gives `nb * rpb == rows`
+      exactly, so no guard was emitted while 16 of 128 threads wrote one row
+      past the tile. Measured 0.90 relative error on dK, silent because the
+      store is in bounds for the LDS allocation as a whole, and invisible
+      because that kernel's test ladder stopped at 128.
+
+    That is three independent derivations of one fact and two of them wrong,
+    which is the argument for one copy.
+    """
+    tpr = max(1, width // vec_width)
+    rpb = max(1, block_size // tpr)
+    nb = (rows + rpb - 1) // rpb
+    return tpr, rpb, nb, (nb * rpb != rows) or (tpr * rpb != block_size)
 
 
 # --------------------------------------------------------------------------

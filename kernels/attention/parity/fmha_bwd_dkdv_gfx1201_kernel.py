@@ -379,16 +379,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     VEC_WIDTH = 8
 
     def _load_geom(width):
-        """Cooperative-load geometry for a `width`-element row over BLOCK_M rows.
-
-        `ceil` and not `floor` on the batch count: flooring silently drops rows
-        whenever rows-per-batch neither reaches BLOCK_M nor divides it, which
-        surfaces as stale LDS rather than as an error.
-        """
-        tpr = max(1, width // VEC_WIDTH)
-        rpb = max(1, BLOCK_SIZE // tpr)
-        nb = (BLOCK_M + rpb - 1) // rpb
-        return tpr, rpb, nb, nb * rpb != BLOCK_M
+        return fmha.load_geom(width, VEC_WIDTH, BLOCK_SIZE, BLOCK_M)
 
     QRM_TPR, QRM_RPB, QRM_BATCHES, QRM_GUARD = _load_geom(BLOCK_DMODEL)
     DORM_TPR, DORM_RPB, DORM_BATCHES, DORM_GUARD = _load_geom(BLOCK_DMODEL_V)

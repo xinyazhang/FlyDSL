@@ -309,33 +309,7 @@ def build_bwd_dq_module_primary(meta, knobs):
     VEC_WIDTH = 8
 
     def _load_geom(width):
-        """Cooperative-load geometry for a row of `width` elements.
-
-        Two independent reasons for the row guard, and **both** must be
-        checked. The forward's version tests only the first, which is safe
-        there because its wave counts happen never to hit the second.
-
-        1. `nb * rpb != BLOCK_N` -- ceil() batches can overshoot the tile, so
-           the last batch leaves some lanes with no row.
-        2. `tpr * rpb != BLOCK_SIZE` -- when threads-per-row does not divide
-           the workgroup, the leftover threads get `tid // tpr == rpb`, one
-           row *past* their batch's share. Those rows are redundant copies of
-           the next batch's (same row, same column, same value) except on the
-           final batch, where the row is `BLOCK_N + something` and the store
-           lands outside the tile.
-
-        Reason 2 bites at exactly one rung of this kernel's ladder:
-        BLOCK_DMODEL 224 with 4 waves gives tpr 28, rpb 4, nb 8, so `nb * rpb`
-        is exactly BLOCK_N and the first test passes -- while 16 of the 128
-        threads write row 32 of a 32-row tile, i.e. into the V tile that
-        follows it. Measured as a 0.6 relative error on dQ before the fix, and
-        it is a *silent* corruption: the store is in bounds for the LDS
-        allocation as a whole.
-        """
-        tpr = width // VEC_WIDTH
-        rpb = BLOCK_SIZE // tpr
-        nb = (BLOCK_N + rpb - 1) // rpb
-        return tpr, rpb, nb, (nb * rpb != BLOCK_N) or (tpr * rpb != BLOCK_SIZE)
+        return fmha.load_geom(width, VEC_WIDTH, BLOCK_SIZE, BLOCK_N)
 
     # ceil() batches, not floor(): flooring silently drops rows whenever
     # rows-per-batch neither reaches BLOCK_N nor divides it, which surfaces as

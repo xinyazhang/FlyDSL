@@ -238,8 +238,16 @@ def _check(q, k, v, do, causal_type=0, window=None, dtype=None, label="", seed=0
 # --------------------------------------------------------------------------
 
 
+# The full ladder the tuning module compiles, not a prefix of it. This used to
+# stop at 128, which is exactly why the `_load_geom` guard bug at head_dim 224
+# shipped: that rung is the only one where threads-per-row does not divide the
+# workgroup *and* the ceil() batches land exactly on the tile, so no guard was
+# emitted and 16 of 128 threads wrote one row past it. It measured 0.90
+# relative error on dK -- silent, because the store stays inside the LDS
+# allocation as a whole. A ladder that stops short of the widest compiled width
+# is not a ladder.
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-@pytest.mark.parametrize("head_dim", [16, 32, 48, 64, 80, 96, 128])
+@pytest.mark.parametrize("head_dim", [16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256])
 def test_head_dim_ladder(head_dim, causal):
     _require_env()
     q, k, v, do = _case(1, 2, 2, 256, 256, head_dim)
