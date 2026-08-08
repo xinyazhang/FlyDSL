@@ -91,9 +91,9 @@ Grid:   (batch * num_q_tiles * num_heads,)
 """
 
 import math as host_math
-import weakref
 from dataclasses import fields
 
+import fmha_abi_gfx1201 as abi
 import fmha_common_gfx1201 as fmha
 from fmha_tuning_gfx1201 import (  # noqa: F401
     FmhaInputMetadata,
@@ -109,8 +109,7 @@ from fmha_tuning_gfx1201 import (  # noqa: F401
 )
 from gfx1201_standalone import buffer_ops, wmma_ops
 from gfx1201_standalone import utils as common_utils
-from philox import Philox, dropout_threshold
-from torch import float32 as torch_f32
+from philox import Philox
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -149,48 +148,14 @@ def dtype_to_elem_type(dtype_str: str):
     raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', or 'bf16')")
 
 
-# Compiled-function cache, keyed by the `@flyc.jit` launcher it belongs to.
-#
-# A `WeakKeyDictionary` beside the function rather than an `exe._cf` attribute
-# on it: that attribute is not one FlyDSL defines, so writing it mutates a
-# FlyDSL-owned object and is a higher-severity finding than merely *reading*
-# an unstable API. Weak keys so an entry dies with its launcher instead of
-# pinning one compiled artifact -- and the GPU code object it owns -- per
-# configuration for the life of the process.
-_COMPILED = weakref.WeakKeyDictionary()
-
-
-def _run_compiled(exe, *args):
-    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
-    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
-
-    `flyc.compile` does cache internally -- `JitFunction._mem_cache`, keyed on
-    the full argument signature -- so this is not about avoiding recompilation.
-    It is about dispatch overhead, and that is not small: measured against a
-    plain `exe(*args)`, this saves **157 us per call** at
-    (head_dim 64, N 512), where the whole call is 63 us with the cache and
-    220 us without. The gap closes as the kernel grows (5 us at N 4096).
-
-    One `CompiledFunction` per launcher is correct here because the launcher is
-    itself per-configuration -- `build_flash_attn_func_aiw_module` is
-    `lru_cache`d on `(FmhaInputMetadata, FmhaKnobs)` -- and every argument that
-    varies within a configuration is a runtime pointer or scalar, which
-    `CompiledFunction` accepts. A `const_expr` argument added later would
-    invalidate that, since this cache has one slot per launcher while
-    `flyc.compile`'s has one per argument signature.
-    """
-    cf = _COMPILED.get(exe)
-    if cf is None:
-        _COMPILED[exe] = flyc.compile(exe, *args)
-    else:
-        cf(*args)
-
-
 def _llvm_value(value):
     """Unwrap FlyDSL scalar/vector wrappers for LLVM pointer load ops."""
     if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
         return value.ir_value()
     return value
+
+
+_COMPILED = abi.new_compiled_cache()
 
 
 def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
@@ -2201,78 +2166,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
     }
 
-    _NULL_PTR = flyc.from_c_void_p(fx.Uint8, 0)
-
-    def _ptr_arg(t):
-        if hasattr(t, "data_ptr"):
-            type_name = type(t).__name__
-            module_name = type(t).__module__
-            ptr = 0 if type_name == "FakeTensor" or "fake_tensor" in module_name else t.data_ptr()
-            return flyc.from_c_void_p(fx.Uint8, ptr)
-        return t
-
-    def _strides_of(t, name):
-        """`(batch, head, seq)` strides of a rank-4 BHSD tensor, in elements.
-
-        **Shape and layout are different things**, and this reads the second.
-        *Shape* is `t.shape`, and the kernel requires it to be BHSD --
-        `(batch, num_heads, seq_len, head_dim)` -- because that is what fixes
-        which axis each of the three returned slots describes. *Layout* is how
-        the data actually sits in memory, and any permutation is accepted so
-        long as D is innermost, which is what `stride(3) == 1` checks. A BSHD
-        *layout* is therefore fine; pass it as `t.transpose(1, 2)`, which has
-        BHSD shape.
-
-        The order is the ABI. AOTriton dispatches the compiled hsaco directly
-        rather than through the Python wrapper, so these three slots are the
-        contract, and a caller that fills them from a BSHD shape swaps head
-        with sequence -- reading heads where the kernel means tokens, which
-        produces finite garbage and never faults.
-        """
-        if not hasattr(t, "stride"):
-            raise TypeError(f"{name} must be a rank-4 tensor so its strides can be read, " f"got {type(t).__name__}")
-        if t.dim() != 4:
-            raise ValueError(f"{name} must be rank 4, got shape {tuple(t.shape)}")
-        if t.stride(3) != 1:
-            raise ValueError(f"{name} must have a contiguous last dimension, got " f"stride(3)={t.stride(3)}")
-        return t.stride(0), t.stride(1), t.stride(2)
-
-    def _lse_args(lse, seq_len, varlen, num_head_q):
-        """The logsumexp pointer, and a check that its layout matches the bits.
-
-        Returns only a pointer: unlike Q/K/V/O this tensor is always compact,
-        so the kernel derives both pitches from `LSE_LAYOUT`, `num_head_q` and
-        the token count (sdpa-varlen-plan.md section 4.2). Inferring strides
-        here as well would give one fact two sources.
-
-        What the host can do instead -- and could not while it was inferring --
-        is verify the caller's tensor actually has the declared layout.
-        """
-        if lse is None:
-            return _NULL_PTR
-        if lse.dtype != torch_f32:
-            raise ValueError(f"logsumexp must be float32, got {lse.dtype}")
-        if lse.dim() != 2:
-            raise ValueError(f"logsumexp must be rank 2, got shape {tuple(lse.shape)}")
-        if not lse.is_contiguous():
-            raise ValueError(
-                "logsumexp must be contiguous: the kernel derives its pitches "
-                "from VarlenBits rather than reading strides"
-            )
-        _layout = 0 if varlen is None else (int(varlen["bits"]) >> 16) & 3
-        if _layout == 0:
-            # The token pitch the kernel will derive. Only checkable when the
-            # caller supplies it: under a stacked layout it lives in
-            # `seqinfo[N]` on the device, and reading that back would cost a
-            # sync for a validation.
-            want_last = int(seq_len) if varlen is None else varlen.get("lse_tokens")
-            if want_last is not None and lse.shape[1] != int(want_last):
-                raise ValueError(f"VARLEN_LSE_LAYOUT_HT wants (*, {int(want_last)}), got " f"{tuple(lse.shape)}")
-        else:
-            if lse.shape[1] != num_head_q:
-                raise ValueError(f"VARLEN_LSE_LAYOUT_TH wants (*, {num_head_q}), got " f"{tuple(lse.shape)}")
-        return _ptr_arg(lse)
-
     # Causal alignment is expressed as a *sentinel* window, resolved in the
     # kernel against each sequence's own lengths (`parse_window` in the
     # prologue). The host does not resolve it.
@@ -2287,207 +2180,16 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     #
     # Resolving in one place removes the class of bug rather than the
     # instance.
-    _CAUSAL_SENTINEL = {
-        1: _WINDOW_TOPLEFT,  # j <= i
-        2: _WINDOW_BOTRIGHT,  # j <= i + (seqlen_k - seqlen_q)
-    }
 
     # ---- VarlenBits, sdpa-varlen-plan.md section 2 ----
     #
     # One byte per side, decoded by the same kernel-side function twice, plus
     # the LSE layout in byte 2. `0` is BHSD / MAX / IMPLIED on both sides with
     # an (H, T) logsumexp -- the conventional dense case, and the default.
-    VARLEN_STACKED = 1
-    VARLEN_LENGTH_MAX = 0 << 1  # noqa: F841  (the table is the wire spec)
-    VARLEN_LENGTH_CUMULATIVE = 1 << 1
-    VARLEN_LENGTH_INDIVIDUAL = 2 << 1
-    VARLEN_POSITION_IMPLIED = 0 << 3
-    VARLEN_POSITION_REUSE = 1 << 3
-    VARLEN_POSITION_ARRAY = 2 << 3
     # `_HT` is AOTriton's and this kernel's default: shape (H, T), T
     # contiguous. `_TH` is Transformer Engine's (T, H).
-    VARLEN_LSE_LAYOUT_HT = 0 << 16
-    VARLEN_LSE_LAYOUT_TH = 1 << 16  # noqa: F841  (ditto)
 
-    def varlen_bits(q_side=0, k_side=0, lse_layout=VARLEN_LSE_LAYOUT_HT):
-        """Assemble VarlenBits from per-side bytes."""
-        for name, b in (("q_side", q_side), ("k_side", k_side)):
-            if not 0 <= b <= 0xFF:
-                raise ValueError(f"{name} must fit in a byte, got {b:#x}")
-            if (b >> 3) & 3 == 1 and (b >> 1) & 3 != 1:
-                # REUSE takes a *position* out of the length array, which is
-                # only a position when the lengths are cumulative.
-                raise ValueError(
-                    f"{name}={b:#04x}: POSITION=REUSE requires " f"LENGTH=CUMULATIVE (plan section 1, axis C)"
-                )
-            if (b >> 1) & 3 == 3 or (b >> 3) & 3 == 3:
-                raise ValueError(f"{name}={b:#04x} uses a reserved code")
-        return q_side | (k_side << 8) | lse_layout
-
-    VARLEN_DENSE = 0  # noqa: F841  (ditto)
-    VARLEN_COMPACT_SIDE = VARLEN_STACKED | VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_REUSE  # 0x0B
-    VARLEN_PADDED_SIDE = VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_IMPLIED
     # 0x02
-
-    VARLEN_STRIDED_SIDE = VARLEN_STACKED | VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_ARRAY  # 0x13
-    VARLEN_SEQUSED_PACKED_SIDE = VARLEN_STACKED | VARLEN_LENGTH_INDIVIDUAL | VARLEN_POSITION_ARRAY  # 0x15
-    VARLEN_SEQUSED_CACHE_SIDE = VARLEN_LENGTH_INDIVIDUAL | VARLEN_POSITION_IMPLIED  # 0x04
-
-    def varlen_compact(
-        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT
-    ):
-        """Classical packed varlen: 1THD tensors, `cu_seqlens` for both roles.
-
-        `seqinfo_?1` is deliberately **not** passed: `POSITION = REUSE` takes
-        the position out of the cumulative length value already loaded, so
-        this configuration reads no position array at all (plan section 1.2).
-        """
-        return dict(
-            bits=varlen_bits(VARLEN_COMPACT_SIDE, VARLEN_COMPACT_SIDE, lse_layout),
-            seqinfo_q0=cu_seqlens_q,
-            seqinfo_q1=None,
-            seqinfo_k0=cu_seqlens_k,
-            seqinfo_k1=None,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            lse_tokens=lse_tokens,
-        )
-
-    def varlen_padded(
-        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, lse_tokens=None, lse_layout=VARLEN_LSE_LAYOUT_HT
-    ):
-        """BHSD tensors whose sequences are short: lengths only, no positions."""
-        return dict(
-            bits=varlen_bits(VARLEN_PADDED_SIDE, VARLEN_PADDED_SIDE, lse_layout),
-            seqinfo_q0=cu_seqlens_q,
-            seqinfo_q1=None,
-            seqinfo_k0=cu_seqlens_k,
-            seqinfo_k1=None,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            lse_tokens=lse_tokens,
-        )
-
-    def varlen_strided(
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seq_strides_q,
-        seq_strides_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        lse_tokens=None,
-        lse_layout=VARLEN_LSE_LAYOUT_HT,
-    ):
-        """Packed tensors with padding *between* sequences (TE's layout).
-
-        Differs from `varlen_compact` in one thing only: positions come from a
-        second array instead of being reused from the length array. That is
-        the whole of AOTriton's `StridedVarlen`, and the reason the two roles
-        must never be swapped -- `seq_strides` differences are *padded*
-        extents, not lengths.
-        """
-        return dict(
-            bits=varlen_bits(VARLEN_STRIDED_SIDE, VARLEN_STRIDED_SIDE, lse_layout),
-            seqinfo_q0=cu_seqlens_q,
-            seqinfo_q1=seq_strides_q,
-            seqinfo_k0=cu_seqlens_k,
-            seqinfo_k1=seq_strides_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            lse_tokens=lse_tokens,
-        )
-
-    def varlen_seqused_k(
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        k_is_cache=False,
-        lse_tokens=None,
-        lse_layout=VARLEN_LSE_LAYOUT_HT,
-    ):
-        """Packed Q against a KV cache with per-sequence *used* lengths.
-
-        `torch.nn.attention.varlen`'s `seqused_k`, and the configuration no
-        `VarlenType` can express: the K side takes its **length** from an
-        individual array and its **position** from a cumulative one, so the
-        two axes read different tensors.
-
-        `k_is_cache=True` is the rectangular variant -- a BHSD cache with no
-        `cu_seqlens_k` at all, where the position is implied by the batch
-        index.
-        """
-        k_side = VARLEN_SEQUSED_CACHE_SIDE if k_is_cache else VARLEN_SEQUSED_PACKED_SIDE
-        return dict(
-            bits=varlen_bits(VARLEN_COMPACT_SIDE, k_side, lse_layout),
-            seqinfo_q0=cu_seqlens_q,
-            seqinfo_q1=None,
-            seqinfo_k0=seqused_k,
-            seqinfo_k1=None if k_is_cache else cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            lse_tokens=lse_tokens,
-        )
-
-    def _resolve_window(window, seqlen_q, seqlen_k):
-        """(window_left, window_right), signed, as the kernel wants them.
-
-        Non-causal still forwards a pair so both arms share one ABI and stay
-        directly comparable -- the same reason the strides are always passed
-        even under STRIDES_CONSTEXPR.
-
-        Causal alignments forward a *sentinel*, not a bound: the kernel
-        resolves it per sequence, which is the only correct thing to do once
-        there is more than one sequence.
-        """
-        if CAUSAL_TYPE == 0:
-            if window is not None:
-                # Silently dropping it would return dense attention that is
-                # the right shape, finite, and wrong -- and a window is only
-                # ever passed by a caller who believes it is being applied.
-                # The non-causal arm has no left-masked region to apply one
-                # with, so this is a build-time choice, not a runtime one.
-                raise ValueError(
-                    "window= requires a causal build; this one has "
-                    "causal=False. Pass causal=True, causal_type=3 for "
-                    "generalized sliding-window attention"
-                )
-            return 0, 0
-        if HOST_CAUSAL_TYPE in _CAUSAL_SENTINEL:
-            if window is not None:
-                raise ValueError(
-                    f"causal_type={HOST_CAUSAL_TYPE} already fixes the window; " "pass causal_type=3 to choose one"
-                )
-            _s = _CAUSAL_SENTINEL[HOST_CAUSAL_TYPE]
-            wl, wr = _s, _s
-        else:
-            if window is None:
-                raise ValueError(
-                    "causal_type=3 is generalized sliding-window attention and "
-                    "requires window=(left, right); "
-                    f"pass ({seqlen_q}, 0) for top-left causal or "
-                    f"({seqlen_q}, {seqlen_k - seqlen_q}) for bottom-right"
-                )
-            wl, wr = window
-        return int(wl), int(wr)
-
-    def _dropout_args(dropout_p, seed, offset_base):
-        """(seed, offset_base, threshold, 1/(1-p)) in launch order.
-
-        The threshold and the scale are computed here, once per call, rather
-        than per element in the kernel -- `philox.dropout_threshold` turns the
-        probability into an i32 the raw random can be compared against, so the
-        hot path never converts a random to a float.
-        """
-        if not ENABLE_DROPOUT:
-            return 0, 0, 0, 1.0
-        if dropout_p is None:
-            raise ValueError("this build has dropout=True and requires dropout_p=")
-        p = float(dropout_p)
-        if not 0.0 <= p < 1.0:
-            raise ValueError(f"dropout_p must be in [0, 1), got {p}")
-        return (int(seed), int(offset_base), dropout_threshold(p), 1.0 / (1.0 - p))
 
     def _bias_args(bias):
         """(pointer, stride_b0, stride_b1, stride_b2) for a (B, H, Sq, Sk) bias.
@@ -2497,14 +2199,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         accumulator group in one v8.
         """
         if not BIAS_TYPE:
-            return _NULL_PTR, 0, 0, 0
+            return abi.NULL_PTR, 0, 0, 0
         if bias is None:
             raise ValueError("this build has BIAS_TYPE=1 and requires bias=")
         if bias.dim() != 4:
             raise ValueError(f"bias must be rank 4 (B, H, Sq, Sk), got {tuple(bias.shape)}")
         if bias.stride(3) != 1:
             raise ValueError(f"bias must have a contiguous last (Sk) dimension, got " f"stride(3)={bias.stride(3)}")
-        return (_ptr_arg(bias), bias.stride(0), bias.stride(1), bias.stride(2))
+        return (abi.ptr_arg(bias), bias.stride(0), bias.stride(1), bias.stride(2))
 
     def _resolve_scale(Q, scale):
         """Default sm_scale from the tensor's *real* head dim, not the tile.
@@ -2520,32 +2222,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             return 1.0 / host_math.sqrt(Q.shape[3])
         return float(sm_scale)
 
-    def _varlen_args(varlen, seqlen_q, seqlen_k):
-        """(bits, q0, q1, k0, k1, max_q, max_k) in launch order.
-
-        `varlen` is None for the dense case, else a dict with `bits` and
-        whichever `seqinfo_*` tensors that configuration reads. Unread slots
-        stay **null**, which is safe because the kernel's decode branches
-        rather than selects -- see the prologue.
-        """
-        if varlen is None:
-            return (0, _NULL_PTR, _NULL_PTR, _NULL_PTR, _NULL_PTR, int(seqlen_q), int(seqlen_k))
-        if STRIDES_CONSTEXPR:
-            raise ValueError(
-                "STRIDES_CONSTEXPR derives the layout from the shape, which "
-                "varlen invalidates; it is a dense-only diagnostic arm"
-            )
-        # No implemented-subset gate: every encodable side byte now decodes,
-        # since the decoder is one function covering all three axis values.
-        # `varlen_bits` rejects the combinations that are not *meaningful*
-        # (reserved codes, REUSE without cumulative lengths).
-        bits = int(varlen["bits"])
-        got = tuple(
-            _ptr_arg(varlen[k]) if varlen.get(k) is not None else _NULL_PTR
-            for k in ("seqinfo_q0", "seqinfo_q1", "seqinfo_k0", "seqinfo_k1")
-        )
-        return (bits,) + got + (int(varlen["max_seqlen_q"]), int(varlen["max_seqlen_k"]))
-
     def _prep(Q, K, V, O):  # noqa: E741
         """Pointers, head counts and the twelve strides, in launch order.
 
@@ -2555,7 +2231,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         """
         st = []
         for t, name in ((Q, "Q"), (K, "K"), (V, "V"), (O, "O")):
-            st.extend(_strides_of(t, name))
+            st.extend(abi.strides_of(t, name))
         # BHSD: axis 1 is heads, axis 2 the sequence. Read rather than
         # assumed -- under MQA/GQA K and V carry fewer heads than Q.
         nhq, nhk = Q.shape[1], K.shape[1]
@@ -2566,7 +2242,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             raise ValueError(f"O and Q must share num_heads, got {O.shape[1]} and {nhq}")
         if nhq % nhk:
             raise ValueError(f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})")
-        return [_ptr_arg(t) for t in (Q, K, V, O)], (nhq, nhk, hqk, hvo), st
+        return [abi.ptr_arg(t) for t in (Q, K, V, O)], (nhq, nhk, hqk, hvo), st
 
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
@@ -2590,12 +2266,13 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     ):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
-        _lse_p = _lse_args(lse, seqlen_q, varlen, meta[0])
-        _wl, _wr = _resolve_window(window, seqlen_q, seqlen_k)
-        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(varlen, seqlen_q, seqlen_k)
+        _lse_p = abi.lse_args(lse, seqlen_q, varlen, meta[0])
+        _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
+        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k)
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
-        _ps, _po, _ip, _dsc = _dropout_args(dropout_p, philox_seed, philox_offset)
-        _run_compiled(
+        _ps, _po, _ip, _dsc = abi.dropout_args(ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset)
+        abi.run_compiled(
+            _COMPILED,
             launch_flash_attn_aiw,
             *ptrs,
             _lse_p,
@@ -2643,11 +2320,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     ):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
-        _lse_p = _lse_args(lse, seqlen_q, varlen, meta[0])
-        _wl, _wr = _resolve_window(window, seqlen_q, seqlen_k)
-        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(varlen, seqlen_q, seqlen_k)
+        _lse_p = abi.lse_args(lse, seqlen_q, varlen, meta[0])
+        _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
+        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k)
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
-        _ps, _po, _ip, _dsc = _dropout_args(dropout_p, philox_seed, philox_offset)
+        _ps, _po, _ip, _dsc = abi.dropout_args(ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset)
         return flyc.compile(
             launch_flash_attn_aiw,
             *ptrs,
@@ -2677,13 +2354,16 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         )
 
     _launch.compile = _compile
-    # Attached rather than module-level: the validation closes over
-    # STRIDES_CONSTEXPR and the shipped-configuration set.
-    _launch.varlen_bits = varlen_bits
-    _launch.varlen_compact = varlen_compact
-    _launch.varlen_padded = varlen_padded
-    _launch.varlen_strided = varlen_strided
-    _launch.varlen_seqused_k = varlen_seqused_k
+    # Still attached to the launcher, for the callers and tests that reach them
+    # that way -- but they now forward to `fmha_abi_gfx1201`, which is the one
+    # copy of the wire spec. The old comment claimed they closed over
+    # STRIDES_CONSTEXPR; only `varlen_args` does, and it takes it as an
+    # argument now.
+    _launch.varlen_bits = abi.varlen_bits
+    _launch.varlen_compact = abi.varlen_compact
+    _launch.varlen_padded = abi.varlen_padded
+    _launch.varlen_strided = abi.varlen_strided
+    _launch.varlen_seqused_k = abi.varlen_seqused_k
     return _launch
 
 

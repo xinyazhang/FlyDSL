@@ -103,9 +103,9 @@ ones causal needs anyway.
 """
 
 import math as host_math
-import weakref
 from dataclasses import fields
 
+import fmha_abi_gfx1201 as abi
 import fmha_common_gfx1201 as fmha
 from fmha_tuning_bwd_dkdv_gfx1201 import (  # noqa: F401
     LDS_PAD,
@@ -116,7 +116,7 @@ from fmha_tuning_bwd_dkdv_gfx1201 import (  # noqa: F401
 )
 from gfx1201_standalone import buffer_ops, wmma_ops
 from gfx1201_standalone import utils as common_utils
-from philox import Philox, dropout_threshold
+from philox import Philox
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -136,37 +136,6 @@ _WINDOW_TOPLEFT = fmha.WINDOW_TOPLEFT
 _WINDOW_BOTRIGHT = fmha.WINDOW_BOTRIGHT
 
 
-def dtype_to_elem_type(dtype_str: str):
-    """Map a dtype string to its FlyDSL numeric type.
-
-    An inlined copy of `kernels.common.kernels_common.dtype_to_elem_type`, for
-    the reason the forward kernel gives: this directory must run with the cwd
-    set to it and no PYTHONPATH.
-    """
-    if dtype_str == "f16":
-        return fx.Float16
-    if dtype_str == "bf16":
-        return fx.BFloat16
-    raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f16' or 'bf16')")
-
-
-_COMPILED = weakref.WeakKeyDictionary()
-
-
-def _run_compiled(exe, *args):
-    """Compile once, then dispatch through the cached `CompiledFunction`.
-
-    Same construction and same reasoning as the forward's `_run_compiled`: a
-    `WeakKeyDictionary` beside the launcher rather than an attribute on it, so
-    nothing FlyDSL owns is mutated and an entry dies with its launcher.
-    """
-    cf = _COMPILED.get(exe)
-    if cf is None:
-        _COMPILED[exe] = flyc.compile(exe, *args)
-    else:
-        cf(*args)
-
-
 # ---- VarlenBits, sdpa-varlen-plan.md section 2 ----
 #
 # **These are transcriptions of the forward's, and the two must not drift.**
@@ -177,83 +146,9 @@ def _run_compiled(exe, *args):
 # right end state and is named in the report; until then, a backward caller
 # may equally pass the dict the *forward's* `exe.varlen_compact(...)` returns,
 # which is the cheapest way to be sure the two agree.
-VARLEN_STACKED = 1
-VARLEN_LENGTH_MAX = 0 << 1  # noqa: F841  (the table is the wire spec)
-VARLEN_LENGTH_CUMULATIVE = 1 << 1
-VARLEN_LENGTH_INDIVIDUAL = 2 << 1
-VARLEN_POSITION_IMPLIED = 0 << 3
-VARLEN_POSITION_REUSE = 1 << 3
-VARLEN_POSITION_ARRAY = 2 << 3
-VARLEN_LSE_LAYOUT_HT = 0 << 16
-VARLEN_LSE_LAYOUT_TH = 1 << 16  # noqa: F841  (ditto)
-
-VARLEN_DENSE = 0  # noqa: F841  (ditto)
-VARLEN_COMPACT_SIDE = VARLEN_STACKED | VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_REUSE  # 0x0B
-VARLEN_PADDED_SIDE = VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_IMPLIED  # 0x02
-VARLEN_STRIDED_SIDE = VARLEN_STACKED | VARLEN_LENGTH_CUMULATIVE | VARLEN_POSITION_ARRAY  # 0x13
 
 
-def varlen_bits(q_side=0, k_side=0, lse_layout=VARLEN_LSE_LAYOUT_HT):
-    """Assemble VarlenBits from per-side bytes."""
-    for name, b in (("q_side", q_side), ("k_side", k_side)):
-        if not 0 <= b <= 0xFF:
-            raise ValueError(f"{name} must fit in a byte, got {b:#x}")
-        if (b >> 3) & 3 == 1 and (b >> 1) & 3 != 1:
-            raise ValueError(f"{name}={b:#04x}: POSITION=REUSE requires LENGTH=CUMULATIVE")
-        if (b >> 1) & 3 == 3 or (b >> 3) & 3 == 3:
-            raise ValueError(f"{name}={b:#04x} uses a reserved code")
-    return q_side | (k_side << 8) | lse_layout
-
-
-def varlen_compact(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, lse_tokens=None, lse_layout=0):
-    """Classical packed varlen: 1THD tensors, `cu_seqlens` for both roles."""
-    return dict(
-        bits=varlen_bits(VARLEN_COMPACT_SIDE, VARLEN_COMPACT_SIDE, lse_layout),
-        seqinfo_q0=cu_seqlens_q,
-        seqinfo_q1=None,
-        seqinfo_k0=cu_seqlens_k,
-        seqinfo_k1=None,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        lse_tokens=lse_tokens,
-    )
-
-
-def varlen_padded(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, lse_tokens=None, lse_layout=0):
-    """BHSD tensors whose sequences are short: lengths only, no positions."""
-    return dict(
-        bits=varlen_bits(VARLEN_PADDED_SIDE, VARLEN_PADDED_SIDE, lse_layout),
-        seqinfo_q0=cu_seqlens_q,
-        seqinfo_q1=None,
-        seqinfo_k0=cu_seqlens_k,
-        seqinfo_k1=None,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        lse_tokens=lse_tokens,
-    )
-
-
-def varlen_strided(
-    cu_seqlens_q,
-    cu_seqlens_k,
-    seq_strides_q,
-    seq_strides_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    lse_tokens=None,
-    lse_layout=0,
-):
-    """Packed tensors with padding *between* sequences (TE's layout)."""
-    return dict(
-        bits=varlen_bits(VARLEN_STRIDED_SIDE, VARLEN_STRIDED_SIDE, lse_layout),
-        seqinfo_q0=cu_seqlens_q,
-        seqinfo_q1=seq_strides_q,
-        seqinfo_k0=cu_seqlens_k,
-        seqinfo_k1=seq_strides_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        lse_tokens=lse_tokens,
-    )
+_COMPILED = abi.new_compiled_cache()
 
 
 def _llvm_value(value):
@@ -398,7 +293,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     DOTR_LOADS = (_DOTR_TILES + NUM_WAVES - 1) // NUM_WAVES
     DOTR_GUARD = DOTR_LOADS * NUM_WAVES != _DOTR_TILES
 
-    elem_numeric_cls = dtype_to_elem_type(dtype_str)
+    elem_numeric_cls = abi.dtype_to_elem_type(dtype_str)
 
     @fx.struct
     class SharedStorage:
@@ -1097,31 +992,6 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
     }
 
-    _NULL_PTR = flyc.from_c_void_p(fx.Uint8, 0)
-
-    def _ptr_arg(t):
-        if hasattr(t, "data_ptr"):
-            type_name = type(t).__name__
-            module_name = type(t).__module__
-            ptr = 0 if type_name == "FakeTensor" or "fake_tensor" in module_name else t.data_ptr()
-            return flyc.from_c_void_p(fx.Uint8, ptr)
-        return t
-
-    def _strides_of(t, name):
-        """`(batch, head, seq)` strides of a rank-4 BHSD tensor, in elements.
-
-        The same contract and the same three slots as the forward's
-        `_strides_of`: the *shape* must be BHSD, the *layout* may be any
-        permutation with D innermost. The order is the ABI.
-        """
-        if not hasattr(t, "stride"):
-            raise TypeError(f"{name} must be a rank-4 tensor so its strides can be read, got {type(t).__name__}")
-        if t.dim() != 4:
-            raise ValueError(f"{name} must be rank 4, got shape {tuple(t.shape)}")
-        if t.stride(3) != 1:
-            raise ValueError(f"{name} must have a contiguous last dimension, got stride(3)={t.stride(3)}")
-        return t.stride(0), t.stride(1), t.stride(2)
-
     def _row_tensor_ptr(t, name, num_head_q, varlen, seq_len):
         """Pointer to a compact rank-2 row-wise tensor (logsumexp or delta).
 
@@ -1145,51 +1015,12 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                 raise ValueError(f"{name}: VARLEN_LSE_LAYOUT_HT wants (*, {int(want_last)}), got {tuple(t.shape)}")
         elif t.shape[1] != num_head_q:
             raise ValueError(f"{name}: VARLEN_LSE_LAYOUT_TH wants (*, {num_head_q}), got {tuple(t.shape)}")
-        return _ptr_arg(t)
-
-    _CAUSAL_SENTINEL = {1: _WINDOW_TOPLEFT, 2: _WINDOW_BOTRIGHT}
-
-    def _resolve_window(window, seqlen_q, seqlen_k):
-        if CAUSAL_TYPE == 0:
-            if window is not None:
-                raise ValueError("window= requires a causal build; pass causal=True, causal_type=3")
-            return 0, 0
-        if HOST_CAUSAL_TYPE in _CAUSAL_SENTINEL:
-            if window is not None:
-                raise ValueError(f"causal_type={HOST_CAUSAL_TYPE} already fixes the window; pass causal_type=3")
-            _s = _CAUSAL_SENTINEL[HOST_CAUSAL_TYPE]
-            return int(_s), int(_s)
-        if window is None:
-            raise ValueError(
-                "causal_type=3 is generalized sliding-window attention and requires window=(left, right); "
-                f"pass ({seqlen_q}, 0) for top-left causal or ({seqlen_q}, {seqlen_k - seqlen_q}) for bottom-right"
-            )
-        return int(window[0]), int(window[1])
-
-    def _dropout_args(dropout_p, seed, offset_base):
-        if not ENABLE_DROPOUT:
-            return 0, 0, 0, 1.0
-        if dropout_p is None:
-            raise ValueError("this build has dropout=True and requires dropout_p=")
-        p = float(dropout_p)
-        if not 0.0 <= p < 1.0:
-            raise ValueError(f"dropout_p must be in [0, 1), got {p}")
-        return (int(seed), int(offset_base), dropout_threshold(p), 1.0 / (1.0 - p))
-
-    def _varlen_args(varlen, seqlen_q, seqlen_k):
-        if varlen is None:
-            return (0, _NULL_PTR, _NULL_PTR, _NULL_PTR, _NULL_PTR, int(seqlen_q), int(seqlen_k))
-        bits = int(varlen["bits"])
-        got = tuple(
-            _ptr_arg(varlen[k]) if varlen.get(k) is not None else _NULL_PTR
-            for k in ("seqinfo_q0", "seqinfo_q1", "seqinfo_k0", "seqinfo_k1")
-        )
-        return (bits,) + got + (int(varlen["max_seqlen_q"]), int(varlen["max_seqlen_k"]))
+        return abi.ptr_arg(t)
 
     def _prep(Q, K, V, DO, DK, DV):
         st = []
         for t, name in ((Q, "Q"), (K, "K"), (V, "V"), (DO, "DO"), (DK, "DK"), (DV, "DV")):
-            st.extend(_strides_of(t, name))
+            st.extend(abi.strides_of(t, name))
         nhq, nhk = Q.shape[1], K.shape[1]
         hqk, hvo = Q.shape[3], V.shape[3]
         if V.shape[1] != nhk:
@@ -1200,7 +1031,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             raise ValueError(f"DK/DV must carry num_heads_k ({nhk}), got {DK.shape[1]} and {DV.shape[1]}")
         if nhq % nhk:
             raise ValueError(f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})")
-        return [_ptr_arg(t) for t in (Q, K, V, DO, DK, DV)], (nhq, nhk, hqk, hvo), st
+        return [abi.ptr_arg(t) for t in (Q, K, V, DO, DK, DV)], (nhq, nhk, hqk, hvo), st
 
     def _resolve_scale(Q, scale):
         if scale is not None:
@@ -1233,10 +1064,11 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         ptrs, meta_t, st = _prep(Q, K, V, DO, DK, DV)
         _lp = _row_tensor_ptr(L, "logsumexp", meta_t[0], varlen, seqlen_q)
         _dp = _row_tensor_ptr(Delta, "delta", meta_t[0], varlen, seqlen_q)
-        _wl, _wr = _resolve_window(window, seqlen_q, seqlen_k)
-        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(varlen, seqlen_q, seqlen_k)
-        _ps, _po, _ip, _dsc = _dropout_args(dropout_p, philox_seed, philox_offset)
-        _run_compiled(
+        _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
+        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(False, varlen, seqlen_q, seqlen_k)
+        _ps, _po, _ip, _dsc = abi.dropout_args(ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset)
+        abi.run_compiled(
+            _COMPILED,
             launch_bwd_dkdv,
             *ptrs,
             _lp,
@@ -1261,10 +1093,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             stream if stream is not None else fx.Stream(None),
         )
 
-    _launch.varlen_bits = varlen_bits
-    _launch.varlen_compact = varlen_compact
-    _launch.varlen_padded = varlen_padded
-    _launch.varlen_strided = varlen_strided
+    _launch.varlen_bits = abi.varlen_bits
+    _launch.varlen_compact = abi.varlen_compact
+    _launch.varlen_padded = abi.varlen_padded
+    _launch.varlen_strided = abi.varlen_strided
     return _launch
 
 

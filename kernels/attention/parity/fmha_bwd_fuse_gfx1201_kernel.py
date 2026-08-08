@@ -104,8 +104,8 @@ accumulator nesting; see `fmha_bwd_fuse_gfx1201_interface` for the reduction.
 """
 
 import math as host_math
-import weakref
 
+import fmha_abi_gfx1201 as abi
 import fmha_common_gfx1201 as fmha
 from fmha_tuning_bwd_fuse_gfx1201 import (  # noqa: F401
     LDS_PAD,
@@ -139,27 +139,7 @@ _LOG2E = host_math.log2(host_math.e)
 # the wrong direction. Fold all four into one place if this graduates.
 
 
-def dtype_to_elem_type(dtype_str: str):
-    """Map a dtype string to its FlyDSL numeric type."""
-    if dtype_str == "f16":
-        return fx.Float16
-    if dtype_str == "bf16":
-        return fx.BFloat16
-    raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f16' or 'bf16')")
-
-
-_COMPILED = weakref.WeakKeyDictionary()
-
-
-def _run_compiled(exe, *args):
-    """Compile-and-run on the first call, fast dispatch after. See the forward
-    kernel's copy for the measured dispatch saving and why the cache is a
-    `WeakKeyDictionary` beside the function rather than an attribute on it."""
-    cf = _COMPILED.get(exe)
-    if cf is None:
-        _COMPILED[exe] = flyc.compile(exe, *args)
-    else:
-        cf(*args)
+_COMPILED = abi.new_compiled_cache()
 
 
 def _llvm_value(value):
@@ -385,7 +365,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
     TR_Q_TILES, TR_Q_LOADS, TR_Q_GUARD = _tr_geom(Q_STEP)
     TR_K_TILES, TR_K_LOADS, TR_K_GUARD = _tr_geom(KV_STEP)
 
-    elem_numeric_cls = dtype_to_elem_type(dtype_str)
+    elem_numeric_cls = abi.dtype_to_elem_type(dtype_str)
 
     @fx.struct
     class SharedStorage:
@@ -1162,69 +1142,6 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
     }
 
-    _NULL_PTR = flyc.from_c_void_p(fx.Uint8, 0)
-
-    def _ptr_arg(t):
-        if hasattr(t, "data_ptr"):
-            type_name = type(t).__name__
-            module_name = type(t).__module__
-            ptr = 0 if type_name == "FakeTensor" or "fake_tensor" in module_name else t.data_ptr()
-            return flyc.from_c_void_p(fx.Uint8, ptr)
-        return t
-
-    def _strides_of(t, name):
-        """`(batch, head, seq)` strides of a rank-4 BHSD tensor, in elements.
-
-        Shape and layout are different things and this reads the second: the
-        *shape* must be BHSD because that is what fixes which axis each slot
-        describes, but any memory layout with D innermost is accepted. Same
-        contract as the forward kernel's `_strides_of`, and the order is the
-        ABI rather than a convenience.
-        """
-        if not hasattr(t, "stride"):
-            raise TypeError(f"{name} must be a rank-4 tensor so its strides can be read, got {type(t).__name__}")
-        if t.dim() != 4:
-            raise ValueError(f"{name} must be rank 4, got shape {tuple(t.shape)}")
-        if t.stride(3) != 1:
-            raise ValueError(f"{name} must have a contiguous last dimension, got stride(3)={t.stride(3)}")
-        return t.stride(0), t.stride(1), t.stride(2)
-
-    _CAUSAL_SENTINEL = {1: fmha.WINDOW_TOPLEFT, 2: fmha.WINDOW_BOTRIGHT}
-
-    def _resolve_window(window, seqlen_q, seqlen_k):
-        """(window_left, window_right) as the kernel wants them.
-
-        Causal alignments forward a *sentinel*, resolved per sequence in the
-        kernel. Resolving on the host is correct only when there is one
-        (seqlen_q, seqlen_k) pair to resolve against, which varlen breaks.
-        """
-        if HOST_CAUSAL_TYPE == 0:
-            if window is not None:
-                raise ValueError("window= requires a causal build; this one has causal=False")
-            return 0, 0
-        if HOST_CAUSAL_TYPE in _CAUSAL_SENTINEL:
-            if window is not None:
-                raise ValueError(f"causal_type={HOST_CAUSAL_TYPE} already fixes the window; pass causal_type=3")
-            s = _CAUSAL_SENTINEL[HOST_CAUSAL_TYPE]
-            return s, s
-        if window is None:
-            raise ValueError(
-                "causal_type=3 is generalized sliding-window attention and requires "
-                f"window=(left, right); pass ({seqlen_q}, 0) for top-left causal or "
-                f"({seqlen_q}, {seqlen_k - seqlen_q}) for bottom-right"
-            )
-        return int(window[0]), int(window[1])
-
-    def _varlen_args(varlen, seqlen_q, seqlen_k):
-        if varlen is None:
-            return (0, _NULL_PTR, _NULL_PTR, _NULL_PTR, _NULL_PTR, int(seqlen_q), int(seqlen_k))
-        bits = int(varlen["bits"])
-        got = tuple(
-            _ptr_arg(varlen[k]) if varlen.get(k) is not None else _NULL_PTR
-            for k in ("seqinfo_q0", "seqinfo_q1", "seqinfo_k0", "seqinfo_k1")
-        )
-        return (bits,) + got + (int(varlen["max_seqlen_q"]), int(varlen["max_seqlen_k"]))
-
     def _launch(
         Q,
         K,
@@ -1253,7 +1170,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         st = []
         for t, name in ((Q, "Q"), (K, "K"), (V, "V"), (DO, "DO"), (DK, "DK"), (DV, "DV"), (DQ, "DQ")):
-            st.extend(_strides_of(t, name))
+            st.extend(abi.strides_of(t, name))
         nhq, nhk = Q.shape[1], K.shape[1]
         hqk, hvo = Q.shape[3], V.shape[3]
         if nhq % nhk:
@@ -1263,12 +1180,16 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                 f"DK/DV must carry num_head_q ({nhq}) heads -- GQA is reduced by the "
                 f"caller, not in the kernel. Got {DK.shape[1]} and {DV.shape[1]}"
             )
-        _wl, _wr = _resolve_window(window, seqlen_q, seqlen_k)
-        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = _varlen_args(varlen, seqlen_q, seqlen_k)
+        # This kernel has no separate device-side causal type; like dkdv and dq
+        # it collapses every masking mode onto gSWA, so the first argument --
+        # which `resolve_window` only tests against 0 -- is that derivation.
+        _wl, _wr = abi.resolve_window(0 if HOST_CAUSAL_TYPE == 0 else 3, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
+        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(False, varlen, seqlen_q, seqlen_k)
         _scale = float(scale) if scale is not None else float(sm_scale)
-        _run_compiled(
+        abi.run_compiled(
+            _COMPILED,
             launch_bwd_fuse,
-            *[_ptr_arg(t) for t in (Q, K, V, DO, DK, DV, DQ, L, Delta)],
+            *[abi.ptr_arg(t) for t in (Q, K, V, DO, DK, DV, DQ, L, Delta)],
             _sq0,
             _sq1,
             _sk0,

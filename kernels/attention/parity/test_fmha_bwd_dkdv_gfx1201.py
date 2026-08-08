@@ -33,8 +33,9 @@ import torch
 import torch.nn.functional as F
 from dropout_mask_gfx1201 import dropout_mask
 from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
+from fmha_abi_gfx1201 import varlen_compact, varlen_padded
 from fmha_bwd_dkdv_gfx1201_interface import flydsl_flash_attn_bwd_dkdv_gfx1201
-from fmha_bwd_dkdv_gfx1201_kernel import build_bwd_dkdv_module_primary, varlen_compact, varlen_padded
+from fmha_bwd_dkdv_gfx1201_kernel import build_bwd_dkdv_module_primary
 from fmha_tuning_bwd_dkdv_gfx1201 import BwdDkDvKnobs, BwdDkDvMetadata
 from fmha_tuning_bwd_dkdv_gfx1201 import plan as bwd_plan
 from philox import dropout_threshold
