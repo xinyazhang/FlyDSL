@@ -746,9 +746,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
-        philox_seed: fx.Int64,
+        philox_seed_ptr: fx.Pointer,
         philox_offset1: fx.Pointer,
         philox_offset2: fx.Int64,
+        philox_seed_output: fx.Pointer,
+        philox_offset_output: fx.Pointer,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
         num_head_q: fx.Int32,
@@ -999,7 +1001,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # shared with the debug mask kernel -- see the comment there. This
             # kernel supplies only which plane a workgroup is on.
             _off_zh = fx.Int32(z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
+            _ph_seed = fmha.philox_seed_value(philox_seed_ptr)
             _ph_off = fmha.philox_offset_base(philox_offset1, philox_offset2)
+            fmha.philox_report(philox_seed_output, philox_offset_output, _ph_seed, _ph_off)
             _ph_base, _ph_stride = PHILOX.grid_plane(_ph_off, _off_zh, max_seqlen_q, max_seqlen_k)
 
         # `clamp` is const_expr: with both prefetch distances 0 and neither
@@ -1703,7 +1707,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         _c0 = (_st // 2) * 32 + (_st % 2) * 16
                         _bcol = fx.Int64(kv_block_start) + _c0 + fx.Int64(fx.Int32(klane) * 8)
                         _first = PHILOX.grid_offset(_ph_base, _ph_stride, q_rows[qt], _bcol)
-                        _keep = PHILOX.keep_span(philox_seed, _first, 8, idropout_p)
+                        _keep = PHILOX.keep_span(_ph_seed, _first, 8, idropout_p)
                         for _r in range_constexpr(8):
                             _i = _st * 8 + _r
                             p_vals[_i] = fx.as_ir_value(_keep[_r].select(fx.Float32(p_vals[_i]), fx.Float32(0.0)))
@@ -2018,9 +2022,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
-        philox_seed: fx.Int64,
+        philox_seed_ptr: fx.Pointer,
         philox_offset1: fx.Pointer,
         philox_offset2: fx.Int64,
+        philox_seed_output: fx.Pointer,
+        philox_offset_output: fx.Pointer,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
         num_head_q: fx.Int32,
@@ -2077,9 +2083,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             max_seqlen_k,
             window_left,
             window_right,
-            philox_seed,
+            philox_seed_ptr,
             philox_offset1,
             philox_offset2,
+            philox_seed_output,
+            philox_offset_output,
             idropout_p,
             dropout_scale,
             num_head_q,
@@ -2263,6 +2271,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         philox_seed=0,
         philox_offset1=None,
         philox_offset2=0,
+        philox_seed_output=None,
+        philox_offset_output=None,
     ):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
@@ -2270,9 +2280,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k)
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
-        _ps, _po1, _po2, _ip, _dsc = abi.dropout_args(
-            ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset1, philox_offset2
+        _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(
+            ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset1, philox_offset2, Q.device, stream
         )
+        _so, _oo = abi.dropout_outputs(ENABLE_DROPOUT, philox_seed_output, philox_offset_output)
         abi.run_compiled(
             _COMPILED,
             launch_flash_attn_aiw,
@@ -2292,6 +2303,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _ps,
             _po1,
             _po2,
+            _so,
+            _oo,
             _ip,
             _dsc,
             *meta,
@@ -2321,6 +2334,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         philox_seed=0,
         philox_offset1=None,
         philox_offset2=0,
+        philox_seed_output=None,
+        philox_offset_output=None,
     ):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = _prep(Q, K, V, O)
@@ -2328,9 +2343,10 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k)
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
-        _ps, _po1, _po2, _ip, _dsc = abi.dropout_args(
-            ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset1, philox_offset2
+        _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(
+            ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset1, philox_offset2, Q.device, stream
         )
+        _so, _oo = abi.dropout_outputs(ENABLE_DROPOUT, philox_seed_output, philox_offset_output)
         return flyc.compile(
             launch_flash_attn_aiw,
             *ptrs,
@@ -2349,6 +2365,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _ps,
             _po1,
             _po2,
+            _so,
+            _oo,
             _ip,
             _dsc,
             *meta,

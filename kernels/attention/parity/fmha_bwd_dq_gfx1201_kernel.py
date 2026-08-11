@@ -350,7 +350,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
-        philox_seed: fx.Int64,
+        philox_seed_ptr: fx.Pointer,
         philox_offset1: fx.Pointer,
         philox_offset2: fx.Int64,
         idropout_p: fx.Int32,
@@ -668,6 +668,7 @@ def build_bwd_dq_module_primary(meta, knobs):
             # which is why both call `Philox.grid_plane` / `grid_offset`
             # rather than transcribing the formula.
             _off_zh = fx.Int32(z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
+            _ph_seed = fmha.philox_seed_value(philox_seed_ptr)
             _ph_off = fmha.philox_offset_base(philox_offset1, philox_offset2)
             _ph_base, _ph_stride = PHILOX.grid_plane(_ph_off, _off_zh, max_seqlen_q, max_seqlen_k)
 
@@ -839,7 +840,7 @@ def build_bwd_dq_module_primary(meta, knobs):
                     _c0 = (_st // 2) * COLS_PER_SUBTILE + (_st % 2) * 16
                     _bcol = fx.Int64(kv_block_start) + _c0 + fx.Int64(fx.Int32(klane) * 8)
                     _first = PHILOX.grid_offset(_ph_base, _ph_stride, q_row, _bcol)
-                    _keep = PHILOX.keep_span(philox_seed, _first, 8, idropout_p)
+                    _keep = PHILOX.keep_span(_ph_seed, _first, 8, idropout_p)
                     for _r in range_constexpr(8):
                         _i = _st * 8 + _r
                         dp_raw[_i] = fx.as_ir_value(
@@ -986,7 +987,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
-        philox_seed: fx.Int64,
+        philox_seed_ptr: fx.Pointer,
         philox_offset1: fx.Pointer,
         philox_offset2: fx.Int64,
         idropout_p: fx.Int32,
@@ -1039,7 +1040,7 @@ def build_bwd_dq_module_primary(meta, knobs):
             max_seqlen_k,
             window_left,
             window_right,
-            philox_seed,
+            philox_seed_ptr,
             philox_offset1,
             philox_offset2,
             idropout_p,
@@ -1191,7 +1192,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         _dp = _row_tensor(delta, "delta", meta_t[0], seqlen_q, varlen)
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(False, varlen, seqlen_q, seqlen_k)
-        _ps, _po1, _po2, _ip, _dsc = abi.dropout_args(ENABLE_DROPOUT, dropout_p, seed, off1, off2)
+        _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(ENABLE_DROPOUT, dropout_p, seed, off1, off2, Q.device)
         return (
             *ptrs,
             _lp,

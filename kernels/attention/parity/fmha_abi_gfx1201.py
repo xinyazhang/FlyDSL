@@ -26,9 +26,11 @@ host behaviour a knob reaches -- something the closure form hid.
 
 from __future__ import annotations
 
+import contextlib
 import weakref
 
 import fmha_common_gfx1201 as fmha
+import torch
 from philox import dropout_threshold
 from torch import float32 as torch_f32
 
@@ -59,6 +61,8 @@ __all__ = [
     "lse_args",
     "resolve_window",
     "dropout_args",
+    "dropout_outputs",
+    "u64_scalar",
     "varlen_args",
     "run_compiled",
     "new_compiled_cache",
@@ -335,8 +339,56 @@ def resolve_window(causal_type, host_causal_type, window, seqlen_q, seqlen_k):
     return int(wl), int(wr)
 
 
-def dropout_args(enable_dropout, dropout_p, seed, offset1, offset2):
-    """(seed, offset1, offset2, threshold, 1/(1-p)) in launch order.
+def u64_scalar(value, device, stream=None):
+    """A one-element device u64 holding `value`, or `value` if already one.
+
+    `None` stays `None` (the null case). A tensor is taken as-is and *not*
+    copied, which is the point: under graph capture the caller owns a counter
+    the graph re-reads, and copying it here would freeze it again.
+
+    An int is materialised, which is what AOTriton's host does with its own
+    `DEFAULT_PHILOX_SEED`. `torch.int64` and not a uint64: torch has no
+    unsigned 64-bit dtype, and the kernel reads the same eight bytes either
+    way. Allocated on `stream` when one is given, because the kernel that
+    reads it runs there.
+
+    **The returned tensor must stay referenced until the launch is enqueued.**
+    Only its raw pointer reaches the kernel, so nothing else keeps it alive --
+    callers bind it to a local that outlives the launch call.
+    """
+    if value is None or hasattr(value, "data_ptr"):
+        if value is not None and value.numel() < 1:
+            raise ValueError("a philox scalar tensor must hold at least one element")
+        if value is not None and value.element_size() != 8:
+            raise ValueError(f"a philox scalar tensor must be 8 bytes per element, got {value.dtype}")
+        return value
+    with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+        return torch.tensor([int(value)], dtype=torch.int64, device=device)
+
+
+def dropout_outputs(enable_dropout, seed_output, offset_output):
+    """(seed_output, offset_output) in launch order -- the forward's write-back.
+
+    The forward records the `(seed, offset)` it actually drew from so the
+    backward can be handed them rather than re-deriving them. That matters
+    only under graph capture, where the effective offset is a sum formed on
+    the device out of a counter the host cannot read without synchronising.
+    Either may be `None`, meaning the caller does not want the value.
+    """
+    if not enable_dropout:
+        return NULL_PTR, NULL_PTR
+    return (
+        NULL_PTR if seed_output is None else ptr_arg(seed_output),
+        NULL_PTR if offset_output is None else ptr_arg(offset_output),
+    )
+
+
+def dropout_args(enable_dropout, dropout_p, seed, offset1, offset2, device=None, stream=None):
+    """(seed, offset1, offset2, threshold, 1/(1-p), keepalive) in launch order.
+
+    The trailing `keepalive` is not a kernel argument. It is whatever tensor
+    `u64_scalar` had to materialise for an int seed, returned so the caller
+    can hold it across the launch; see that function.
 
     The counter is the pair torch splits it into, not one pre-summed scalar:
     `offset1` is a device pointer the kernel adds in when non-null, `offset2`
@@ -355,16 +407,22 @@ def dropout_args(enable_dropout, dropout_p, seed, offset1, offset2):
     hot path never converts a random to a float.
     """
     if not enable_dropout:
-        return 0, NULL_PTR, 0, 0, 1.0
+        return NULL_PTR, NULL_PTR, 0, 0, 1.0, None
     if dropout_p is None:
         raise ValueError("this build has dropout=True and requires dropout_p=")
     p = float(dropout_p)
     if not 0.0 <= p < 1.0:
         raise ValueError(f"dropout_p must be in [0, 1), got {p}")
-    if offset1 is not None and getattr(offset1, "numel", lambda: 1)() < 1:
-        raise ValueError("philox_offset1 must hold at least one element")
-    off1 = NULL_PTR if offset1 is None else ptr_arg(offset1)
-    return (int(seed), off1, int(offset2), dropout_threshold(p), 1.0 / (1.0 - p))
+    seed_t = u64_scalar(seed, device, stream)
+    off1_t = u64_scalar(offset1, device, stream)
+    return (
+        NULL_PTR if seed_t is None else ptr_arg(seed_t),
+        NULL_PTR if off1_t is None else ptr_arg(off1_t),
+        int(offset2),
+        dropout_threshold(p),
+        1.0 / (1.0 - p),
+        (seed_t, off1_t),
+    )
 
 
 def varlen_args(strides_constexpr, varlen, seqlen_q, seqlen_k):

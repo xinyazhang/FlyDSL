@@ -1958,6 +1958,74 @@ def test_dropout_offset_splits_into_a_pointer_and_an_immediate():
     assert not torch.equal(scalar_only, run(counter(401), 600)), "the device counter does not reach the stream"
 
 
+def test_philox_seed_takes_a_device_tensor():
+    """The seed is a pointer too, for the same reason the offset counter is.
+
+    A captured graph whose offset moves but whose key is frozen is not the
+    stream torch's own RNG would have produced, so `PhiloxCudaState` keeps
+    both in device memory and AOTriton takes the seed as `philox_seed_ptr`.
+    An `int` still works and is materialised host-side, exactly as AOTriton's
+    own caller does with `DEFAULT_PHILOX_SEED`.
+    """
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    exe = _drop_build(head_dim)
+
+    def run(seed):
+        out = torch.empty_like(q)
+        exe(q, k, v, out, 1, seq, dropout_p=0.5, philox_seed=seed, philox_offset2=3)
+        torch.cuda.synchronize()
+        return out
+
+    def u64(n):
+        return torch.tensor([n], dtype=torch.int64, device=q.device)
+
+    assert torch.equal(run(7), run(u64(7))), "an int seed and the same seed in device memory disagree"
+    assert not torch.equal(run(u64(7)), run(u64(8))), "the seed tensor is not being read"
+
+
+def test_philox_write_back_reports_the_effective_pair():
+    """What the forward drew from, for the backward to replay.
+
+    The offset it reports is the *sum*, not the immediate it was handed: that
+    sum is formed on the device and is the only form the backward can use.
+    Both outputs are optional, and omitting them must not disturb the run.
+    """
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    exe = _drop_build(head_dim)
+
+    def u64(n):
+        return torch.tensor([n], dtype=torch.int64, device=q.device)
+
+    seed_out, off_out = u64(0), u64(0)
+    reported = torch.empty_like(q)
+    exe(
+        q,
+        k,
+        v,
+        reported,
+        1,
+        seq,
+        dropout_p=0.5,
+        philox_seed=u64(31337),
+        philox_offset1=u64(900),
+        philox_offset2=100,
+        philox_seed_output=seed_out,
+        philox_offset_output=off_out,
+    )
+    torch.cuda.synchronize()
+    assert seed_out.item() == 31337
+    assert off_out.item() == 1000, "the reported offset must be the summed base, not the immediate"
+
+    silent = torch.empty_like(q)
+    exe(q, k, v, silent, 1, seq, dropout_p=0.5, philox_seed=u64(31337), philox_offset1=u64(900), philox_offset2=100)
+    torch.cuda.synchronize()
+    assert torch.equal(reported, silent), "asking for the write-back changed the result"
+
+
 @pytest.mark.parametrize("p", [0.25, 0.5])
 def test_dropout_expectation_is_preserved(p):
     """Dropout must be unbiased: `E[O]` stays at the undropped output.

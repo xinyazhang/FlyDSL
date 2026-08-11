@@ -678,6 +678,78 @@ def test_split_philox_offset_regenerates_the_same_stream():
     assert rel < 4e-2, f"the split offset reached a different stream: rel={rel:.3e}"
 
 
+def test_backward_replays_the_pair_the_forward_reported():
+    """The write-back round trip, which is the only way a captured graph works.
+
+    Under capture the effective offset is `*offset1 + offset2`, summed on the
+    device out of a counter the host cannot read without synchronising. So the
+    forward is asked to record what it drew from, and the backward is driven
+    from those two words rather than from anything the host believed it
+    passed. Here the host deliberately does *not* know the answer -- the
+    counter is 900 and the immediate 100, and the reference mask is built from
+    whatever the forward reports.
+    """
+    _require_env()
+    B, H, N, D, p, seed = 1, 4, 128, 64, 0.5, 4242
+    gen = torch.Generator(device="cuda").manual_seed(23)
+    q, k, v, do = (torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", generator=gen) for _ in range(4))
+
+    def u64(n):
+        return torch.tensor([n], dtype=torch.int64, device=q.device)
+
+    fwd = build_flash_attn_func_aiw_module(num_heads=H, head_dim=D, causal=False, dtype_str="f16", dropout=True)
+    seed_out, off_out = u64(0), u64(0)
+    fwd(
+        q,
+        k,
+        v,
+        torch.empty_like(q),
+        B,
+        N,
+        dropout_p=p,
+        philox_seed=u64(seed),
+        philox_offset1=u64(900),
+        philox_offset2=100,
+        philox_seed_output=seed_out,
+        philox_offset_output=off_out,
+    )
+    torch.cuda.synchronize()
+    assert (seed_out.item(), off_out.item()) == (seed, 1000), "the forward did not report what it used"
+
+    keep = dropout_mask(B, H, N, N, seed_out.item(), off_out.item()) > dropout_threshold(p)
+    qg = q.float().clone().requires_grad_(True)
+    og, _ = torch.ops.aten._scaled_dot_product_attention_math(qg, k.float(), v.float(), dropout_p=p, dropout_mask=keep)
+    (dq_ref,) = torch.autograd.grad(og, qg, do.float())
+    with torch.no_grad():
+        o, _ = torch.ops.aten._scaled_dot_product_attention_math(
+            q.float(), k.float(), v.float(), dropout_p=p, dropout_mask=keep
+        )
+        lse = torch.logsumexp(q.float() @ k.float().transpose(-1, -2) / math.sqrt(D), dim=-1)
+        delta = (do.float() * o).sum(-1)
+
+    exe = build_bwd_dq_module(num_heads=H, head_dim=D, causal=False, dtype_str="f16", dropout=True)
+    dq = torch.zeros_like(q)
+    exe(
+        q,
+        k,
+        v,
+        do,
+        dq,
+        lse.reshape(B * H, N).contiguous(),
+        delta.reshape(B * H, N).contiguous(),
+        B,
+        N,
+        N,
+        dropout_p=p,
+        philox_seed=seed_out,
+        philox_offset1=off_out,
+        philox_offset2=0,
+    )
+    torch.cuda.synchronize()
+    rel = _rel(dq, dq_ref)
+    assert rel < 4e-2, f"the backward did not replay the forward's stream: rel={rel:.3e}"
+
+
 def test_dropout_with_a_wrong_seed_is_detected():
     """The negative control. A comparison against a reference is only worth
     its tolerance if a wrong mask actually breaks it."""

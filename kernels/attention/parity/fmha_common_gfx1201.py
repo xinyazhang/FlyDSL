@@ -118,6 +118,8 @@ __all__ = [
     "decompose_causal_regions",
     "make_addr_pair",
     "philox_offset_base",
+    "philox_seed_value",
+    "philox_report",
 ]
 
 
@@ -1079,14 +1081,74 @@ def philox_offset_base(offset1, offset2):
     rather than as a Python `if` because the rewrite to `scf.if` is lexical
     per `@flyc.kernel`, and this is module level.
     """
-    nonnull = fx.Int64(fx.ptrtoint(offset1)) != fx.Int64(0)
+    return fx.Int64(offset2) + _load_u64_or_zero(offset1)
+
+
+def philox_seed_value(seed_ptr):
+    """`*seed_ptr`, or 0 when null. The seed side of the same graph story.
+
+    A captured graph must see the seed move too, so torch keeps it in device
+    memory exactly as it keeps the offset counter, and AOTriton takes it as
+    `philox_seed_ptr` rather than a value. Splitting the offset but leaving the
+    seed an immediate would give a replay a moving counter under a frozen key,
+    which is not the same stream torch's own RNG would have produced.
+
+    Null reads as 0 rather than faulting, matching AOTriton's `dropout_rng`.
+    """
+    return _load_u64_or_zero(seed_ptr)
+
+
+def philox_report(seed_output, offset_output, seed, offset_base):
+    """Write back the `(seed, offset)` this launch actually drew from.
+
+    Only the backward can say why this exists. It has to regenerate the
+    forward's stream, and under graph capture the effective offset is
+    `*offset1 + offset2` -- a sum formed *on the device*, from a counter the
+    host cannot read without synchronising. So the forward records what it
+    used and the backward is handed that, instead of both sides trying to
+    re-derive it and being wrong in different ways.
+
+    One workgroup stores, not all of them: every workgroup computed the same
+    two values, so the rest would be writing the same bytes to the same two
+    addresses for no reason. `block_idx` raw rather than the flipped
+    `q_tile_idx`, matching AOTriton's `program_id` guard -- which workgroup is
+    designated does not matter, only that exactly one is.
+
+    Either output may be null, which is how a caller says it does not want the
+    value; both are skipped independently.
+    """
+    first = (
+        (fx.Index(gpu.block_idx.x) == fx.Index(0))
+        & (fx.Index(gpu.block_idx.y) == fx.Index(0))
+        & (fx.Index(gpu.block_idx.z) == fx.Index(0))
+    )
+    with kernels_common._if_then(_scf.IfOp(fx.as_ir_value(first))):
+        _store_u64_if_nonnull(seed_output, seed)
+        _store_u64_if_nonnull(offset_output, offset_base)
+
+
+def _load_u64_or_zero(ptr):
+    """`*ptr` as an i64, or 0 when `ptr` is null.
+
+    The load is *skipped*, not selected away -- `select` evaluates both arms
+    and would fault on the null. Same explicit `IfOp` and the same reason as
+    `cond_load`, at i64: written out rather than as a Python `if` because the
+    rewrite to `scf.if` is lexical per `@flyc.kernel`, and this is module
+    level.
+    """
+    nonnull = fx.Int64(fx.ptrtoint(ptr)) != fx.Int64(0)
     if_op = _scf.IfOp(fx.as_ir_value(nonnull), results_=[T.i64], has_else=True)
     with ir.InsertionPoint(if_op.then_block):
-        addr = fx.recast_iter(_i64_global_ptr_ty(), offset1)
-        _scf.YieldOp([fx.as_ir_value(fx.ptr_load(addr, fx.Int64))])
+        _scf.YieldOp([fx.as_ir_value(fx.ptr_load(fx.recast_iter(_i64_global_ptr_ty(), ptr), fx.Int64))])
     with ir.InsertionPoint(if_op.else_block):
         _scf.YieldOp([fx.as_ir_value(fx.Int64(0))])
-    return fx.Int64(offset2) + fx.Int64(if_op.results[0])
+    return fx.Int64(if_op.results[0])
+
+
+def _store_u64_if_nonnull(ptr, value):
+    nonnull = fx.Int64(fx.ptrtoint(ptr)) != fx.Int64(0)
+    with kernels_common._if_then(_scf.IfOp(fx.as_ir_value(nonnull))):
+        fx.ptr_store(fx.Int64(value), fx.recast_iter(_i64_global_ptr_ty(), ptr))
 
 
 def _i64_global_ptr_ty():

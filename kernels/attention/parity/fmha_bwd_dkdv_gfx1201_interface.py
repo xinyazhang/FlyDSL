@@ -94,7 +94,7 @@ def flydsl_flash_attn_bwd_dkdv_gfx1201(
     max_seqlen_k: int | None = None,
     batch_size: int | None = None,
     dropout_p: float | None = None,
-    philox_seed: int = 0,
+    philox_seed: int | torch.Tensor = 0,
     philox_offset1: torch.Tensor | None = None,
     philox_offset2: int = 0,
     delta: torch.Tensor | None = None,
@@ -118,6 +118,11 @@ def flydsl_flash_attn_bwd_dkdv_gfx1201(
             module's `varlen_*` constructors returns. The forward's identically
             named constructors produce the same dict, and passing the forward's
             is the cheapest way to be certain the two agree.
+        philox_seed: the dropout key, as an int or a one-element int64
+            device tensor. The tensor form is the captured-graph one and is
+            read on the device; an int is materialised here, as AOTriton's
+            own caller does. The forward's `philox_seed_output` is exactly
+            this argument's value and can be handed straight back.
         philox_offset1 / philox_offset2: the dropout counter, split the way
             `at::cuda::PhiloxCudaState` splits it -- a one-element int64 device
             tensor the kernel adds in, plus an immediate. `None` and an
