@@ -142,7 +142,9 @@ def _reference(q, k, v, do, causal_type=0, window=None, sm_scale=None, keep=None
     return o.detach(), lse.detach(), delta, dk, dv
 
 
-def _bwd_via_kernel(q, k, v, do, o, lse, delta, causal_type, window, dropout_p=None, seed=0, offset=0, knobs=None):
+def _bwd_via_kernel(
+    q, k, v, do, o, lse, delta, causal_type, window, dropout_p=None, seed=0, offset=0, knobs=None, offset1=None
+):
     """Direct builder call, bypassing the interface's delta and allocation."""
     batch, num_heads_q, seq_q, _ = q.shape
     seq_k = k.shape[2]
@@ -179,7 +181,8 @@ def _bwd_via_kernel(q, k, v, do, o, lse, delta, causal_type, window, dropout_p=N
         window=window,
         dropout_p=dropout_p,
         philox_seed=seed,
-        philox_offset=offset,
+        philox_offset1=offset1,
+        philox_offset2=offset,
     )
     torch.cuda.synchronize()
     return dk, dv
@@ -199,7 +202,7 @@ def _case(batch, hq, hk, seq_q, seq_k, head_dim, dtype=torch.float16, seed=0):
     )
 
 
-def _check(q, k, v, do, causal_type=0, window=None, dtype=None, label="", seed=0, offset=0, **kw):
+def _check(q, k, v, do, causal_type=0, window=None, dtype=None, label="", seed=0, offset=0, offset1=None, **kw):
     """Reference and kernel on the same inputs, both gradients within tolerance.
 
     `seed` / `offset` are the kernel's Philox arguments and are deliberately
@@ -221,6 +224,7 @@ def _check(q, k, v, do, causal_type=0, window=None, dtype=None, label="", seed=0
         dropout_p=kw.get("dropout_p") if kw.get("keep") is not None else None,
         seed=seed,
         offset=offset,
+        offset1=offset1,
     )
     tol = _tol(dtype or q.dtype)
     # See `_rel`: the two gradients share a problem, so the larger norm is the
@@ -547,6 +551,36 @@ def test_dropout(p, causal):
         seed=seed,
         offset=offset,
         label=f"dropout p={p} causal={causal}",
+    )
+
+
+def test_split_philox_offset_survives_the_kv_loop():
+    """The pointer half of the counter, read once and used inside the KV loop.
+
+    Worth its own case here rather than only in dQ: this kernel decodes the
+    offset in the prologue and consumes it *inside* an `scf.for`, so the loaded
+    value has to dominate the loop body. dQ's use is in the same block as its
+    decode and would not catch that. The reference mask is drawn by the debug
+    kernel from the summed scalar, so agreeing with it says the two halves met
+    on the device.
+    """
+    _require_env()
+    seed, p = 1234, 0.5
+    batch, heads, seq, head_dim = 1, 2, 128, 64
+    q, k, v, do = _case(batch, heads, heads, seq, seq, head_dim)
+    keep = dropout_mask(batch, heads, seq, seq, seed, 9) > dropout_threshold(p)
+    _check(
+        q,
+        k,
+        v,
+        do,
+        causal_type=0,
+        keep=keep,
+        dropout_p=p,
+        seed=seed,
+        offset=4,
+        offset1=torch.tensor([5], dtype=torch.int64, device=q.device),
+        label="split philox offset 5+4",
     )
 
 

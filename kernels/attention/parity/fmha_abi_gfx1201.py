@@ -335,8 +335,19 @@ def resolve_window(causal_type, host_causal_type, window, seqlen_q, seqlen_k):
     return int(wl), int(wr)
 
 
-def dropout_args(enable_dropout, dropout_p, seed, offset_base):
-    """(seed, offset_base, threshold, 1/(1-p)) in launch order.
+def dropout_args(enable_dropout, dropout_p, seed, offset1, offset2):
+    """(seed, offset1, offset2, threshold, 1/(1-p)) in launch order.
+
+    The counter is the pair torch splits it into, not one pre-summed scalar:
+    `offset1` is a device pointer the kernel adds in when non-null, `offset2`
+    an immediate. See `fmha.philox_offset_base` for why a captured CUDA graph
+    needs the pointer half, and `philox_offset1`/`philox_offset2` in AOTriton
+    for the ABI this matches.
+
+    `offset1` may be a tensor holding one u64, or None for the uncaptured
+    case. A one-element `torch.int64` tensor is the same 8 bytes as the `u64`
+    the kernel reads; torch has no unsigned 64-bit dtype to spell it with, and
+    the counter is far from the sign bit.
 
     The threshold and the scale are computed here, once per call, rather
     than per element in the kernel -- `philox.dropout_threshold` turns the
@@ -344,13 +355,16 @@ def dropout_args(enable_dropout, dropout_p, seed, offset_base):
     hot path never converts a random to a float.
     """
     if not enable_dropout:
-        return 0, 0, 0, 1.0
+        return 0, NULL_PTR, 0, 0, 1.0
     if dropout_p is None:
         raise ValueError("this build has dropout=True and requires dropout_p=")
     p = float(dropout_p)
     if not 0.0 <= p < 1.0:
         raise ValueError(f"dropout_p must be in [0, 1), got {p}")
-    return (int(seed), int(offset_base), dropout_threshold(p), 1.0 / (1.0 - p))
+    if offset1 is not None and getattr(offset1, "numel", lambda: 1)() < 1:
+        raise ValueError("philox_offset1 must hold at least one element")
+    off1 = NULL_PTR if offset1 is None else ptr_arg(offset1)
+    return (int(seed), off1, int(offset2), dropout_threshold(p), 1.0 / (1.0 - p))
 
 
 def varlen_args(strides_constexpr, varlen, seqlen_q, seqlen_k):

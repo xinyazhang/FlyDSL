@@ -619,12 +619,63 @@ def test_dropout_matches_the_reported_mask(p):
         N,
         dropout_p=p,
         philox_seed=seed,
-        philox_offset=off,
+        philox_offset2=off,
     )
     torch.cuda.synchronize()
     assert torch.isfinite(dq).all()
     rel = _rel(dq, dq_ref)
     assert rel < 4e-2, f"p={p} rel={rel:.3e}"
+
+
+def test_split_philox_offset_regenerates_the_same_stream():
+    """A `(pointer, immediate)` offset pair must reach the same stream as the sum.
+
+    This is the agreement that matters for a captured graph: the reference mask
+    comes from `dropout_mask_gfx1201`, which takes one scalar offset, so if the
+    backward's two halves were summed anywhere other than on the device -- or
+    in the wrong order, or at the wrong width -- dQ would move by an O(1)
+    amount against the same tolerance the seed test relies on.
+    """
+    _require_env()
+    B, H, N, D, p = 1, 4, 128, 64, 0.5
+    seed, off = 20250807, 5
+    gen = torch.Generator(device="cuda").manual_seed(23)
+    q, k, v, do = (torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", generator=gen) for _ in range(4))
+    keep = dropout_mask(B, H, N, N, seed, off) > dropout_threshold(p)
+
+    qg = q.float().clone().requires_grad_(True)
+    og, _ = torch.ops.aten._scaled_dot_product_attention_math(qg, k.float(), v.float(), dropout_p=p, dropout_mask=keep)
+    (dq_ref,) = torch.autograd.grad(og, qg, do.float())
+    with torch.no_grad():
+        o, _ = torch.ops.aten._scaled_dot_product_attention_math(
+            q.float(), k.float(), v.float(), dropout_p=p, dropout_mask=keep
+        )
+        lse = torch.logsumexp(q.float() @ k.float().transpose(-1, -2) / math.sqrt(D), dim=-1)
+        delta = (do.float() * o).sum(-1)
+
+    exe = build_bwd_dq_module(num_heads=H, head_dim=D, causal=False, dtype_str="f16", dropout=True)
+    # off == 5 == 3 + 2, with the 3 living in device memory the way a captured
+    # graph's counter does.
+    dq = torch.zeros_like(q)
+    exe(
+        q,
+        k,
+        v,
+        do,
+        dq,
+        lse.reshape(B * H, N).contiguous(),
+        delta.reshape(B * H, N).contiguous(),
+        B,
+        N,
+        N,
+        dropout_p=p,
+        philox_seed=seed,
+        philox_offset1=torch.tensor([3], dtype=torch.int64, device=q.device),
+        philox_offset2=2,
+    )
+    torch.cuda.synchronize()
+    rel = _rel(dq, dq_ref)
+    assert rel < 4e-2, f"the split offset reached a different stream: rel={rel:.3e}"
 
 
 def test_dropout_with_a_wrong_seed_is_detected():
@@ -660,7 +711,7 @@ def test_dropout_with_a_wrong_seed_is_detected():
         N,
         dropout_p=p,
         philox_seed=1,
-        philox_offset=0,
+        philox_offset2=0,
     )
     torch.cuda.synchronize()
     assert _rel(dq, dq_ref) > 4e-2, "a wrong dropout mask was not detected; the tolerance is doing the work"

@@ -117,6 +117,7 @@ __all__ = [
     "CausalRegions",
     "decompose_causal_regions",
     "make_addr_pair",
+    "philox_offset_base",
 ]
 
 
@@ -1054,6 +1055,47 @@ def cond_load(cond, addr, default):
     with ir.InsertionPoint(if_op.else_block):
         _scf.YieldOp([fx.as_ir_value(default)])
     return fx.Int32(if_op.results[0])
+
+
+def philox_offset_base(offset1, offset2):
+    """`offset2 + *offset1` -- the Philox counter, split the way torch splits it.
+
+    `at::cuda::PhiloxCudaState` carries the offset two ways. Outside a graph
+    capture it is an immediate. Under capture the counter has to advance
+    between replays, so it lives in device memory that the graph re-reads,
+    while the per-call increment stays baked in as an immediate;
+    `at::cuda::philox::unpack` is `*offset_.ptr + offset_intragraph_`. Passing
+    one pre-summed scalar instead is what freezes a captured graph onto a
+    single dropout mask, because the sum is done once at capture time and the
+    replay never sees the counter move.
+
+    AOTriton spells the pair `philox_offset1` (the pointer) and
+    `philox_offset2` (the immediate), and this is the same ABI so that the two
+    are drop-in for each other.
+
+    A null `offset1` is the uncaptured case. The load is *skipped*, not
+    selected away -- `select` evaluates both arms and would fault. Same
+    explicit `IfOp` and the same reason as `cond_load`, at i64: written out
+    rather than as a Python `if` because the rewrite to `scf.if` is lexical
+    per `@flyc.kernel`, and this is module level.
+    """
+    nonnull = fx.Int64(fx.ptrtoint(offset1)) != fx.Int64(0)
+    if_op = _scf.IfOp(fx.as_ir_value(nonnull), results_=[T.i64], has_else=True)
+    with ir.InsertionPoint(if_op.then_block):
+        addr = fx.recast_iter(_i64_global_ptr_ty(), offset1)
+        _scf.YieldOp([fx.as_ir_value(fx.ptr_load(addr, fx.Int64))])
+    with ir.InsertionPoint(if_op.else_block):
+        _scf.YieldOp([fx.as_ir_value(fx.Int64(0))])
+    return fx.Int64(offset2) + fx.Int64(if_op.results[0])
+
+
+def _i64_global_ptr_ty():
+    """A u64 counter in global memory. Alignment 8, for the same reason as i32."""
+    return fx.PointerType.get(
+        elem_ty=fx.Int64.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=8,
+    )
 
 
 def _i32_global_ptr_ty():

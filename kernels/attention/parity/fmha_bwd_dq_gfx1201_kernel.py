@@ -351,7 +351,8 @@ def build_bwd_dq_module_primary(meta, knobs):
         window_left: fx.Int32,
         window_right: fx.Int32,
         philox_seed: fx.Int64,
-        philox_offset_base: fx.Int64,
+        philox_offset1: fx.Pointer,
+        philox_offset2: fx.Int64,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
         num_head_q: fx.Int32,
@@ -667,7 +668,8 @@ def build_bwd_dq_module_primary(meta, knobs):
             # which is why both call `Philox.grid_plane` / `grid_offset`
             # rather than transcribing the formula.
             _off_zh = fx.Int32(z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
-            _ph_base, _ph_stride = PHILOX.grid_plane(philox_offset_base, _off_zh, max_seqlen_q, max_seqlen_k)
+            _ph_off = fmha.philox_offset_base(philox_offset1, philox_offset2)
+            _ph_base, _ph_stride = PHILOX.grid_plane(_ph_off, _off_zh, max_seqlen_q, max_seqlen_k)
 
         # ---- Constants ----
         # Genuinely -inf, so exp2(-inf - lse) is exactly 0. There is no `m_i`
@@ -985,7 +987,8 @@ def build_bwd_dq_module_primary(meta, knobs):
         window_left: fx.Int32,
         window_right: fx.Int32,
         philox_seed: fx.Int64,
-        philox_offset_base: fx.Int64,
+        philox_offset1: fx.Pointer,
+        philox_offset2: fx.Int64,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
         num_head_q: fx.Int32,
@@ -1037,7 +1040,8 @@ def build_bwd_dq_module_primary(meta, knobs):
             window_left,
             window_right,
             philox_seed,
-            philox_offset_base,
+            philox_offset1,
+            philox_offset2,
             idropout_p,
             dropout_scale,
             num_head_q,
@@ -1178,14 +1182,16 @@ def build_bwd_dq_module_primary(meta, knobs):
             raise ValueError(f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})")
         return [abi.ptr_arg(t) for t in (Q, K, V, DO, DQ)], (nhq, nhk, hqk, hvo), st
 
-    def _args(Q, K, V, DO, DQ, lse, delta, batch_size, seqlen_q, seqlen_k, scale, window, varlen, dropout_p, seed, off):
+    def _args(
+        Q, K, V, DO, DQ, lse, delta, batch_size, seqlen_q, seqlen_k, scale, window, varlen, dropout_p, seed, off1, off2
+    ):
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta_t, st = _prep(Q, K, V, DO, DQ)
         _lp = _row_tensor(lse, "logsumexp", meta_t[0], seqlen_q, varlen)
         _dp = _row_tensor(delta, "delta", meta_t[0], seqlen_q, varlen)
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(False, varlen, seqlen_q, seqlen_k)
-        _ps, _po, _ip, _dsc = abi.dropout_args(ENABLE_DROPOUT, dropout_p, seed, off)
+        _ps, _po1, _po2, _ip, _dsc = abi.dropout_args(ENABLE_DROPOUT, dropout_p, seed, off1, off2)
         return (
             *ptrs,
             _lp,
@@ -1201,7 +1207,8 @@ def build_bwd_dq_module_primary(meta, knobs):
             _wl,
             _wr,
             _ps,
-            _po,
+            _po1,
+            _po2,
             _ip,
             _dsc,
             *meta_t,
@@ -1226,7 +1233,8 @@ def build_bwd_dq_module_primary(meta, knobs):
         varlen=None,
         dropout_p=None,
         philox_seed=0,
-        philox_offset=0,
+        philox_offset1=None,
+        philox_offset2=0,
     ):
         args = _args(
             Q,
@@ -1244,7 +1252,8 @@ def build_bwd_dq_module_primary(meta, knobs):
             varlen,
             dropout_p,
             philox_seed,
-            philox_offset,
+            philox_offset1,
+            philox_offset2,
         )
         abi.run_compiled(_COMPILED, launch_bwd_dq, *args, stream if stream is not None else fx.Stream(None))
 
@@ -1265,7 +1274,8 @@ def build_bwd_dq_module_primary(meta, knobs):
         varlen=None,
         dropout_p=None,
         philox_seed=0,
-        philox_offset=0,
+        philox_offset1=None,
+        philox_offset2=0,
     ):
         args = _args(
             Q,
@@ -1283,7 +1293,8 @@ def build_bwd_dq_module_primary(meta, knobs):
             varlen,
             dropout_p,
             philox_seed,
-            philox_offset,
+            philox_offset1,
+            philox_offset2,
         )
         return flyc.compile(launch_bwd_dq, *args, fx.Stream(stream))
 

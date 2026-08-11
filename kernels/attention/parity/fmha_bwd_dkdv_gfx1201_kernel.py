@@ -320,7 +320,8 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         window_left: fx.Int32,
         window_right: fx.Int32,
         philox_seed: fx.Int64,
-        philox_offset_base: fx.Int64,
+        philox_offset1: fx.Pointer,
+        philox_offset2: fx.Int64,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
         num_head_q: fx.Int32,
@@ -624,7 +625,8 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         _total_i32 = group_i32 * _n_blocks_i32
 
         if const_expr(ENABLE_DROPOUT):
-            _ph_stride_all = PHILOX.grid_plane(philox_offset_base, fx.Int32(0), max_seqlen_q, max_seqlen_k)[1]
+            _ph_off = fmha.philox_offset_base(philox_offset1, philox_offset2)
+            _ph_stride_all = PHILOX.grid_plane(_ph_off, fx.Int32(0), max_seqlen_q, max_seqlen_k)[1]
 
         # ---- Loop-carried state: dK^T then dV^T accumulators ----
         c_zero_v8f32 = Vec.filled(8, 0.0, fx.Float32)
@@ -768,7 +770,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                         # the select chain. This is the layout cost of running
                         # the loop transposed and it is the reason dropout is
                         # off by default; see the module docstring.
-                        _ph_base = fx.Int64(philox_offset_base) + fx.Int64(
+                        _ph_base = _ph_off + fx.Int64(
                             fx.Int32(z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
                         ) * fx.Int64(max_seqlen_q) * fx.Int64(_ph_stride_all)
                         _rn = PHILOX.randoms_per_offset
@@ -863,7 +865,8 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         window_left: fx.Int32,
         window_right: fx.Int32,
         philox_seed: fx.Int64,
-        philox_offset_base: fx.Int64,
+        philox_offset1: fx.Pointer,
+        philox_offset2: fx.Int64,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
         num_head_q: fx.Int32,
@@ -919,7 +922,8 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             window_left,
             window_right,
             philox_seed,
-            philox_offset_base,
+            philox_offset1,
+            philox_offset2,
             idropout_p,
             dropout_scale,
             num_head_q,
@@ -1055,7 +1059,8 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         varlen=None,
         dropout_p=None,
         philox_seed=0,
-        philox_offset=0,
+        philox_offset1=None,
+        philox_offset2=0,
     ):
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta_t, st = _prep(Q, K, V, DO, DK, DV)
@@ -1063,7 +1068,9 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         _dp = _row_tensor_ptr(Delta, "delta", meta_t[0], varlen, seqlen_q)
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(False, varlen, seqlen_q, seqlen_k)
-        _ps, _po, _ip, _dsc = abi.dropout_args(ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset)
+        _ps, _po1, _po2, _ip, _dsc = abi.dropout_args(
+            ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset1, philox_offset2
+        )
         abi.run_compiled(
             _COMPILED,
             launch_bwd_dkdv,
@@ -1081,7 +1088,8 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             _wl,
             _wr,
             _ps,
-            _po,
+            _po1,
+            _po2,
             _ip,
             _dsc,
             *meta_t,

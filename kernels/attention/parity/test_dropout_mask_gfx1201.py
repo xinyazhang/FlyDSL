@@ -167,7 +167,7 @@ def test_attention_matches_math_backend_given_the_mask(p, head_dim):
     q, k, v = (torch.randn(B, H, SQ, head_dim, dtype=torch.float16, device="cuda") for _ in range(3))
     o = torch.empty_like(q)
     build_flash_attn_func_aiw_module(num_heads=H, head_dim=head_dim, causal=False, dtype_str="f16", dropout=True)(
-        q, k, v, o, B, SQ, dropout_p=p, philox_seed=seed, philox_offset=off
+        q, k, v, o, B, SQ, dropout_p=p, philox_seed=seed, philox_offset2=off
     )
     torch.cuda.synchronize()
 
@@ -199,7 +199,7 @@ def test_mask_kernel_disagreeing_is_detected():
     q, k, v = (torch.randn(B, H, SQ, head_dim, dtype=torch.float16, device="cuda") for _ in range(3))
     o = torch.empty_like(q)
     build_flash_attn_func_aiw_module(num_heads=H, head_dim=head_dim, causal=False, dtype_str="f16", dropout=True)(
-        q, k, v, o, B, SQ, dropout_p=p, philox_seed=1, philox_offset=0
+        q, k, v, o, B, SQ, dropout_p=p, philox_seed=1, philox_offset2=0
     )
     torch.cuda.synchronize()
 

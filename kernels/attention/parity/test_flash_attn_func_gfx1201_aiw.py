@@ -1911,7 +1911,7 @@ def test_dropout_is_reproducible_from_seed_alone():
 
 
 def test_dropout_offset_shifts_the_mask():
-    """`philox_offset` must reach the stream too, not just the seed.
+    """`philox_offset2` must reach the stream too, not just the seed.
 
     PyTorch's RNG state is a (seed, offset) pair and advances the offset
     between calls; a build that ignored it would repeat the same mask for
@@ -1922,10 +1922,40 @@ def test_dropout_offset_shifts_the_mask():
     q, k, v = _qkv(1, seq, head_dim, torch.float16)
     exe = _drop_build(head_dim)
     a, b = torch.empty_like(q), torch.empty_like(q)
-    exe(q, k, v, a, 1, seq, dropout_p=0.5, philox_seed=11, philox_offset=0)
-    exe(q, k, v, b, 1, seq, dropout_p=0.5, philox_seed=11, philox_offset=1 << 20)
+    exe(q, k, v, a, 1, seq, dropout_p=0.5, philox_seed=11, philox_offset2=0)
+    exe(q, k, v, b, 1, seq, dropout_p=0.5, philox_seed=11, philox_offset2=1 << 20)
     torch.cuda.synchronize()
     assert not torch.equal(a, b)
+
+
+def test_dropout_offset_splits_into_a_pointer_and_an_immediate():
+    """`*philox_offset1 + philox_offset2` is the counter, as torch splits it.
+
+    The whole point of the pair is that the pointer half is read *on the
+    device*, so a captured CUDA graph sees a counter that has moved since
+    capture. The three cases here are that split being real: any (ptr, imm)
+    pair summing to the same value gives the same mask, a null pointer is the
+    identity, and bumping the device word alone changes the mask -- which is
+    what a graph replay does and what a pre-summed scalar could not express.
+    """
+    _require_env()
+    head_dim, seq = 64, 256
+    q, k, v = _qkv(1, seq, head_dim, torch.float16)
+    exe = _drop_build(head_dim)
+
+    def run(off1, off2):
+        out = torch.empty_like(q)
+        exe(q, k, v, out, 1, seq, dropout_p=0.5, philox_seed=11, philox_offset1=off1, philox_offset2=off2)
+        torch.cuda.synchronize()
+        return out
+
+    def counter(n):
+        return torch.tensor([n], dtype=torch.int64, device=q.device)
+
+    scalar_only = run(None, 1000)
+    assert torch.equal(scalar_only, run(counter(400), 600)), "the two halves are not being summed"
+    assert torch.equal(scalar_only, run(counter(1000), 0)), "the pointer half alone is not read"
+    assert not torch.equal(scalar_only, run(counter(401), 600)), "the device counter does not reach the stream"
 
 
 @pytest.mark.parametrize("p", [0.25, 0.5])

@@ -95,7 +95,8 @@ def flydsl_flash_attn_bwd_dkdv_gfx1201(
     batch_size: int | None = None,
     dropout_p: float | None = None,
     philox_seed: int = 0,
-    philox_offset: int = 0,
+    philox_offset1: torch.Tensor | None = None,
+    philox_offset2: int = 0,
     delta: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """dK and dV for one attention call on RDNA4 (gfx1201).
@@ -117,6 +118,14 @@ def flydsl_flash_attn_bwd_dkdv_gfx1201(
             module's `varlen_*` constructors returns. The forward's identically
             named constructors produce the same dict, and passing the forward's
             is the cheapest way to be certain the two agree.
+        philox_offset1 / philox_offset2: the dropout counter, split the way
+            `at::cuda::PhiloxCudaState` splits it -- a one-element int64 device
+            tensor the kernel adds in, plus an immediate. `None` and an
+            immediate is the uncaptured case; under CUDA graph capture the
+            tensor is the counter the graph re-reads on replay, which is what
+            keeps a replayed step from repeating one frozen mask. Must match
+            what the forward was given, or the regenerated stream differs and
+            the gradient is silently wrong.
         delta: `rowsum(dO * O)` if the caller has already formed it -- a fused
             preprocess kernel would supply this. Computed here when omitted.
 
@@ -226,6 +235,7 @@ def flydsl_flash_attn_bwd_dkdv_gfx1201(
             varlen=varlen,
             dropout_p=dropout_p,
             philox_seed=philox_seed,
-            philox_offset=philox_offset,
+            philox_offset1=philox_offset1,
+            philox_offset2=philox_offset2,
         )
     return dk, dv
