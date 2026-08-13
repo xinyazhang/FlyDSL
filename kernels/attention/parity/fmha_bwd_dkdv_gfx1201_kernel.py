@@ -7,7 +7,7 @@ A port of AOTriton's `bwd_kernel_dk_dv` + `bwd_inner_dk_dv`, against **our**
 forward kernel's ABI (`flash_attn_func_gfx1201_aiw.py`): BHSD shapes, three
 strides per tensor, `fx.Pointer` arguments, VarlenBits addressing, and the
 logsumexp layout `fmha.lse_token_pitch` describes. AOTriton's `cu_seqlens_q/k`
-+ `num_seqlens` logic is deliberately *not* ported; the varlen prologue below
++ `batch_size` logic is deliberately *not* ported; the varlen prologue below
 is byte-for-byte the forward's.
 
 --- Why the loop is inverted, and what that costs -------------------------
@@ -314,7 +314,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
-        num_seqlens: fx.Int32,
+        batch_size: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
@@ -380,12 +380,12 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         # that is to call the same decoder with the same arguments.
         z_i32 = fx.Int32(gpu.block_idx.z)
         seqlen_q_i32, q_row_off, q_batch = fmha.decode_addressing(
-            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, z_i32, num_seqlens
+            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, z_i32, batch_size
         )
         seqlen_k_i32, k_row_off, k_batch = fmha.decode_addressing(
-            varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32, num_seqlens
+            varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32, batch_size
         )
-        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, num_seqlens)
+        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, batch_size)
 
         seqlen_q_v = fx.Index(seqlen_q_i32)
         seqlen_k_v = fx.Index(seqlen_k_i32)
@@ -859,8 +859,8 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
-        batch_size: fx.Int32,
         varlen_bits: fx.Int32,
+        batch_size: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
@@ -892,7 +892,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         stride_dv_batch: fx.Int64,
         stride_dv_head: fx.Int64,
         stride_dv_seq: fx.Int64,
-        sm_scale_v: fx.Float32,
+        sm_scale_arg: fx.Float32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -949,7 +949,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             stride_dv_batch,
             stride_dv_head,
             stride_dv_seq,
-            sm_scale_v,
+            sm_scale_arg,
         )
 
         if const_expr(WAVES_PER_EU is not None):
@@ -1082,8 +1082,8 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             _sq1,
             _sk0,
             _sk1,
-            batch_size,
             _vb,
+            batch_size,
             _mq,
             _mk,
             _wl,

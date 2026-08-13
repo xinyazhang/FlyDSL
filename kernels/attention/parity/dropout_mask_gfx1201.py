@@ -68,11 +68,11 @@ def build_dropout_mask_module(
         stride_rz: fx.Int64,
         stride_rh: fx.Int64,
         stride_rm: fx.Int64,
+        num_head_q: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         philox_seed: fx.Int64,
         philox_offset_base: fx.Int64,
-        num_head_q: fx.Int32,
     ):
         # `ir_type` needs the MLIR context, so it is read here rather than at
         # build time.
@@ -135,11 +135,11 @@ def build_dropout_mask_module(
             stride_rz,
             stride_rh,
             stride_rm,
+            num_head_q,
             max_seqlen_q,
             max_seqlen_k,
             philox_seed,
             philox_offset_base,
-            num_head_q,
         ).launch(
             grid=(m_tiles, n_tiles, planes),
             block=(THREADS, 1, 1),

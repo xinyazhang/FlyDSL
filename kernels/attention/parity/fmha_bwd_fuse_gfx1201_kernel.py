@@ -387,7 +387,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
-        num_seqlens: fx.Int32,
+        batch_size: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         num_kv_blocks: fx.Int32,
@@ -451,12 +451,12 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         # function.
         z_i32 = fx.Int32(gpu.block_idx.z)
         seqlen_q_i32, q_row_off, q_batch = fmha.decode_addressing(
-            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, z_i32, num_seqlens
+            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, z_i32, batch_size
         )
         seqlen_k_i32, k_row_off, k_batch = fmha.decode_addressing(
-            varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32, num_seqlens
+            varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32, batch_size
         )
-        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, num_seqlens)
+        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, batch_size)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_buf = lds.buf.ptr
@@ -1001,10 +1001,12 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
-        batch_size: fx.Int32,
         varlen_bits: fx.Int32,
+        batch_size: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
+        num_kv_blocks: fx.Int32,
+        num_q_blocks: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
         num_head_q: fx.Int32,
@@ -1032,7 +1034,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
-        sm_scale_v: fx.Float32,
+        sm_scale_arg: fx.Float32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -1041,8 +1043,6 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         # extents key on Max_seqlen: under varlen there is no single sequence
         # length, so every sequence gets the longest one's worth of programs
         # and the short ones exit with empty region counts.
-        n_kv_blocks = (fx.Index(max_seqlen_k) + (KV_TILE - 1)) // KV_TILE
-        n_q_blocks = (fx.Index(max_seqlen_q) + (Q_TILE - 1)) // Q_TILE
 
         launcher = bwd_fuse_kernel(
             Q,
@@ -1062,8 +1062,8 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             batch_size,
             max_seqlen_q,
             max_seqlen_k,
-            fx.Int32(n_kv_blocks),
-            fx.Int32(n_q_blocks),
+            num_kv_blocks,
+            num_q_blocks,
             window_left,
             window_right,
             num_head_q,
@@ -1091,7 +1091,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             stride_dq_batch,
             stride_dq_head,
             stride_dq_seq,
-            sm_scale_v,
+            sm_scale_arg,
         )
 
         if const_expr(WAVES_PER_EU is not None):
@@ -1127,7 +1127,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                 op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
 
         launcher.launch(
-            grid=(n_kv_blocks + n_q_blocks, fx.Index(num_head_q), fx.Index(batch_size)),
+            grid=(fx.Index(num_kv_blocks) + fx.Index(num_q_blocks), fx.Index(num_head_q), fx.Index(batch_size)),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
         )
@@ -1190,10 +1190,12 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             _sq1,
             _sk0,
             _sk1,
-            int(batch_size),
             _vb,
+            int(batch_size),
             _mq,
             _mk,
+            (_mk + KV_TILE - 1) // KV_TILE,
+            (_mq + Q_TILE - 1) // Q_TILE,
             _wl,
             _wr,
             nhq,
