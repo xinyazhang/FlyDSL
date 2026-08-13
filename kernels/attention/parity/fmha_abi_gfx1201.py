@@ -425,16 +425,38 @@ def dropout_args(enable_dropout, dropout_p, seed, offset1, offset2, device=None,
     )
 
 
-def varlen_args(strides_constexpr, varlen, seqlen_q, seqlen_k):
-    """(bits, q0, q1, k0, k1, max_q, max_k) in launch order.
+def varlen_args(strides_constexpr, varlen, seqlen_q, seqlen_k, batch_size=None):
+    """(bits, num_seqlens, q0, q1, k0, k1, max_q, max_k) in launch order.
 
     `varlen` is None for the dense case, else a dict with `bits` and
     whichever `seqinfo_*` tensors that configuration reads. Unread slots
     stay **null**, which is safe because the kernel's decode branches
     rather than selects -- see the prologue.
+
+    **`num_seqlens` is not the batch size** and the two must never share a
+    variable. `batch_size` is the extent of a BHSD tensor's first axis;
+    `num_seqlens` is how many sequences are packed into a 1HTD one. They
+    coincide under packed varlen and are unrelated otherwise, which is exactly
+    what makes conflating them survive testing. It is derived here, from the
+    `cu_seqlens` array itself rather than from anything the caller asserts --
+    `len(cu_seqlens_q) - 1`, as AOTriton's host does it.
+
+    Zero means "no packed Q side", which is AOTriton's `Num_seqlens == 0`.
+    Only a STACKED Q side reads it (`lse_token_pitch`, to reach slot [N] of the
+    array holding the batch total); every other mode's row pitch is
+    `max_seqlen` and the value goes unread. Q side only, because the logsumexp
+    it describes is a Q-side output.
+
+    `batch_size` is not used to compute anything -- it is checked. It is the
+    grid's batch extent, which under a packed Q side has to be the sequence
+    count, and it reaches us from the caller while `num_seqlens` is read off
+    `cu_seqlens`. Two independent routes to one number is the whole reason to
+    compare them: a caller that packs N sequences and passes B launches the
+    wrong number of programs, and every one of them addresses a plausible
+    row.
     """
     if varlen is None:
-        return (0, NULL_PTR, NULL_PTR, NULL_PTR, NULL_PTR, int(seqlen_q), int(seqlen_k))
+        return (0, 0, NULL_PTR, NULL_PTR, NULL_PTR, NULL_PTR, int(seqlen_q), int(seqlen_k))
     if strides_constexpr:
         raise ValueError(
             "strides_constexpr derives the layout from the shape, which "
@@ -445,11 +467,20 @@ def varlen_args(strides_constexpr, varlen, seqlen_q, seqlen_k):
     # `varlen_bits` rejects the combinations that are not *meaningful*
     # (reserved codes, REUSE without cumulative lengths).
     bits = int(varlen["bits"])
+    q_stacked = bool(bits & VARLEN_STACKED)
+    if q_stacked and varlen.get("seqinfo_q0") is None:
+        raise ValueError("a STACKED Q side needs seqinfo_q0 (cu_seqlens_q) to count its sequences")
+    num_seqlens = int(varlen["seqinfo_q0"].numel()) - 1 if q_stacked else 0
+    if num_seqlens and batch_size is not None and int(batch_size) != num_seqlens:
+        raise ValueError(
+            f"batch_size={int(batch_size)} but cu_seqlens_q describes {num_seqlens} packed sequences. "
+            f"A stacked Q side launches one program per sequence, so the two must agree."
+        )
     got = tuple(
         ptr_arg(varlen[k]) if varlen.get(k) is not None else NULL_PTR
         for k in ("seqinfo_q0", "seqinfo_q1", "seqinfo_k0", "seqinfo_k1")
     )
-    return (bits,) + got + (int(varlen["max_seqlen_q"]), int(varlen["max_seqlen_k"]))
+    return (bits, num_seqlens) + got + (int(varlen["max_seqlen_q"]), int(varlen["max_seqlen_k"]))
 
 
 def run_compiled(cache, exe, *args):

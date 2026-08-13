@@ -387,7 +387,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
-        batch_size: fx.Int32,
+        num_seqlens: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         num_kv_blocks: fx.Int32,
@@ -451,12 +451,12 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         # function.
         z_i32 = fx.Int32(gpu.block_idx.z)
         seqlen_q_i32, q_row_off, q_batch = fmha.decode_addressing(
-            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, z_i32, batch_size
+            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, z_i32
         )
         seqlen_k_i32, k_row_off, k_batch = fmha.decode_addressing(
-            varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32, batch_size
+            varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32
         )
-        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, batch_size)
+        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, num_seqlens)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_buf = lds.buf.ptr
@@ -1002,6 +1002,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
+        num_seqlens: fx.Int32,
         batch_size: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
@@ -1059,7 +1060,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             seqinfo_k0,
             seqinfo_k1,
             varlen_bits,
-            batch_size,
+            num_seqlens,
             max_seqlen_q,
             max_seqlen_k,
             num_kv_blocks,
@@ -1180,7 +1181,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         # it collapses every masking mode onto gSWA, so the first argument --
         # which `resolve_window` only tests against 0 -- is that derivation.
         _wl, _wr = abi.resolve_window(0 if HOST_CAUSAL_TYPE == 0 else 3, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
-        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(False, varlen, seqlen_q, seqlen_k)
+        _vb, _ns, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(False, varlen, seqlen_q, seqlen_k, batch_size)
         _scale = float(scale) if scale is not None else float(sm_scale)
         abi.run_compiled(
             _COMPILED,
@@ -1191,6 +1192,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             _sk0,
             _sk1,
             _vb,
+            _ns,
             int(batch_size),
             _mq,
             _mk,

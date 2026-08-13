@@ -1004,6 +1004,37 @@ _VARLEN_LENGTHS = [
 ]
 
 
+def test_num_seqlens_is_derived_and_is_not_the_batch_size():
+    """`num_seqlens` counts packed sequences; `batch_size` sizes a BHSD axis.
+
+    They are equal under packed varlen and unrelated otherwise, which is what
+    makes conflating them survive a test suite -- the one mode that reads the
+    value is the one mode where either answer is right. So it is derived from
+    `cu_seqlens_q` rather than taken from the caller, and zero everywhere the
+    kernel would not read it, matching AOTriton's `Num_seqlens == 0`.
+
+    `varlen_padded` is the interesting row: it *is* varlen, but its Q side is
+    not STACKED -- BHSD tensors with short sequences -- so the logsumexp pitch
+    is `max_seqlen` and the count goes unread. Zero, not the batch.
+
+    Host-only; no device needed.
+    """
+    import fmha_abi_gfx1201 as abi
+
+    def cu(n):
+        return torch.arange(n + 1, dtype=torch.int32) * 8
+
+    assert abi.varlen_args(False, None, 128, 128, 4)[1] == 0, "dense must send 0"
+    assert abi.varlen_args(False, abi.varlen_compact(cu(5), cu(5), 8, 8), 8, 8, 5)[1] == 5
+    assert abi.varlen_args(False, abi.varlen_padded(cu(5), cu(5), 8, 8), 8, 8, 5)[1] == 0
+
+    # The grid launches one program per sequence, so a caller that packs five
+    # and asks for four is launching the wrong number -- each of them landing
+    # on a plausible row.
+    with pytest.raises(ValueError, match="describes 5 packed sequences"):
+        abi.varlen_args(False, abi.varlen_compact(cu(5), cu(5), 8, 8), 8, 8, 4)
+
+
 @pytest.mark.parametrize("lens_q,label", _VARLEN_LENGTHS, ids=[x[1] for x in _VARLEN_LENGTHS])
 @pytest.mark.parametrize("ctype", [0, 1, 2], ids=["full", "topleft", "botright"])
 def test_varlen_compact_lengths(lens_q, label, ctype):

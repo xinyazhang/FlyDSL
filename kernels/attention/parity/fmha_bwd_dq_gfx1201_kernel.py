@@ -345,7 +345,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
-        batch_size: fx.Int32,
+        num_seqlens: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
@@ -398,17 +398,17 @@ def build_bwd_dq_module_primary(meta, knobs):
         # The only place the layout is examined; everything downstream reads
         # the scalars and cannot tell which mode it is in. `z` is uniform, so
         # every load here is scalar and none touches the VGPR budget. This is
-        # **our** ABI, not AOTriton's cu_seqlens/batch_size: the backward pass
+        # **our** ABI, not AOTriton's cu_seqlens/num_seqlens: the backward pass
         # has to interoperate with our forward kernel.
         z_i32 = fx.Int32(gpu.block_idx.z)
 
         seqlen_q_i32, q_row_off, q_batch = fmha.decode_addressing(
-            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, z_i32, batch_size
+            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, z_i32
         )
         seqlen_k_i32, k_row_off, k_batch = fmha.decode_addressing(
-            varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32, batch_size
+            varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32
         )
-        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, batch_size)
+        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, num_seqlens)
 
         seqlen_k_v = fx.Index(seqlen_k_i32)
 
@@ -982,6 +982,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
+        num_seqlens: fx.Int32,
         batch_size: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
@@ -1016,7 +1017,7 @@ def build_bwd_dq_module_primary(meta, knobs):
     ):
         ctx = CompilationContext.get_current()
 
-        bs_idx = fx.Index(batch_size)
+        batch_idx = fx.Index(batch_size)
         # The grid's Q extent keys on Max_seqlen_q: under varlen there is no
         # single seqlen_q, so every sequence gets the longest one's worth of
         # workgroups and the short ones exit empty.
@@ -1035,7 +1036,7 @@ def build_bwd_dq_module_primary(meta, knobs):
             seqinfo_k0,
             seqinfo_k1,
             varlen_bits,
-            batch_size,
+            num_seqlens,
             max_seqlen_q,
             max_seqlen_k,
             window_left,
@@ -1110,7 +1111,7 @@ def build_bwd_dq_module_primary(meta, knobs):
                 op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
 
         launcher.launch(
-            grid=(fx.Index(num_head_q), num_q_tiles, bs_idx),
+            grid=(fx.Index(num_head_q), num_q_tiles, batch_idx),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
         )
@@ -1191,7 +1192,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         _lp = _row_tensor(lse, "logsumexp", meta_t[0], seqlen_q, varlen)
         _dp = _row_tensor(delta, "delta", meta_t[0], seqlen_q, varlen)
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
-        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(False, varlen, seqlen_q, seqlen_k)
+        _vb, _ns, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(False, varlen, seqlen_q, seqlen_k, batch_size)
         _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(ENABLE_DROPOUT, dropout_p, seed, off1, off2, Q.device)
         return (
             *ptrs,
@@ -1202,6 +1203,7 @@ def build_bwd_dq_module_primary(meta, knobs):
             _sk0,
             _sk1,
             _vb,
+            _ns,
             batch_size,
             _mq,
             _mk,

@@ -741,7 +741,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
-        batch_size: fx.Int32,
+        num_seqlens: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
@@ -811,12 +811,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         z_i32 = fx.Int32(gpu.block_idx.z)
 
         seqlen_q_i32, q_row_off, q_batch = fmha.decode_addressing(
-            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, z_i32, batch_size
+            varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, z_i32
         )
         seqlen_k_i32, k_row_off, k_batch = fmha.decode_addressing(
-            varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32, batch_size
+            varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32
         )
-        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, batch_size)
+        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, num_seqlens)
 
         seqlen_k_v = fx.Index(seqlen_k_i32)
 
@@ -2017,6 +2017,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
+        num_seqlens: fx.Int32,
         batch_size: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
@@ -2053,7 +2054,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     ):
         ctx = CompilationContext.get_current()
 
-        bs_idx = fx.Index(batch_size)
+        batch_idx = fx.Index(batch_size)
         # Grid Q extent keys on Max_seqlen_q: under varlen there is no single
         # seqlen_q, so every sequence gets the longest one's worth of
         # workgroups and the short ones exit empty (plan section 6).
@@ -2078,7 +2079,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             seqinfo_k0,
             seqinfo_k1,
             varlen_bits,
-            batch_size,
+            num_seqlens,
             max_seqlen_q,
             max_seqlen_k,
             window_left,
@@ -2162,7 +2163,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
 
         launcher.launch(
-            grid=(fx.Index(num_head_q), num_q_tiles, bs_idx),
+            grid=(fx.Index(num_head_q), num_q_tiles, batch_idx),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
         )
@@ -2278,7 +2279,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         ptrs, meta, st = _prep(Q, K, V, O)
         _lse_p = abi.lse_args(lse, seqlen_q, varlen, meta[0])
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
-        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k)
+        _vb, _ns, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
+            STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, batch_size
+        )
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
         _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(
             ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset1, philox_offset2, Q.device, stream
@@ -2295,6 +2298,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _sk0,
             _sk1,
             _vb,
+            _ns,
             batch_size,
             _mq,
             _mk,
@@ -2341,7 +2345,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         ptrs, meta, st = _prep(Q, K, V, O)
         _lse_p = abi.lse_args(lse, seqlen_q, varlen, meta[0])
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
-        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k)
+        _vb, _ns, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
+            STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, batch_size
+        )
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
         _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(
             ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset1, philox_offset2, Q.device, stream
@@ -2357,6 +2363,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _sk0,
             _sk1,
             _vb,
+            _ns,
             batch_size,
             _mq,
             _mk,

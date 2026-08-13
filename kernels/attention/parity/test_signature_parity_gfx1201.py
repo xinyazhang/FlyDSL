@@ -15,10 +15,13 @@ static test: it parses the source rather than importing it, needs no GPU, and
 runs in milliseconds.
 
 The rule is subsequence rather than equality because a launcher legitimately
-takes arguments its kernel does not. `stream` is the obvious one. `batch_size`
-in the mask kernel is the other kind: it sizes the grid's third axis, and the
-kernel recovers its plane from `block_idx.z` instead, so passing it would be a
-dead kernarg. Both are listed per module below, which is the point -- a new
+takes arguments its kernel does not. `stream` is the obvious one. `batch_size` is the
+other kind, and every launcher here has it: it sizes the grid's batch axis, and
+the kernel recovers its own index from `block_idx.z` rather than being told the
+extent. Passing it would be a dead kernarg -- and worse, it is *not*
+`num_seqlens`, which the kernel does take. A BHSD batch and a count of packed
+1HTD sequences are different quantities that happen to be equal under packed
+varlen; one variable for both is a bug waiting for a dense run that reads it. Both are listed per module below, which is the point -- a new
 divergence has to be written down here to pass, and writing it down is where
 someone asks whether it should exist.
 """
@@ -33,10 +36,10 @@ import pytest
 # Arguments the launcher may carry that its kernel does not. Anything else is a
 # failure, including a *reordering*, which subsequence matching also catches.
 _JIT_ONLY = {
-    "flash_attn_func_gfx1201_aiw.py": {"stream"},
-    "fmha_bwd_dq_gfx1201_kernel.py": {"stream"},
-    "fmha_bwd_dkdv_gfx1201_kernel.py": {"stream"},
-    "fmha_bwd_fuse_gfx1201_kernel.py": {"stream"},
+    "flash_attn_func_gfx1201_aiw.py": {"stream", "batch_size"},
+    "fmha_bwd_dq_gfx1201_kernel.py": {"stream", "batch_size"},
+    "fmha_bwd_dkdv_gfx1201_kernel.py": {"stream", "batch_size"},
+    "fmha_bwd_fuse_gfx1201_kernel.py": {"stream", "batch_size"},
     "dropout_mask_gfx1201.py": {"stream", "batch_size"},
 }
 

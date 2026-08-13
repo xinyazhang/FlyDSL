@@ -1189,7 +1189,7 @@ def seqinfo_addr(ptr, index):
     return fx.recast_iter(_i32_global_ptr_ty(), ptr) + fx.Int64(index)
 
 
-def decode_addressing(varlen_bits, bits_shift, max_seqlen, s0, s1, z, num_seqlens):
+def decode_addressing(varlen_bits, bits_shift, max_seqlen, s0, s1, z):
     """One side of VarlenBits: where this workgroup's sequence lives.
 
     Returns `(seqlen, row_off, batch)` -- how long this sequence is, which row
