@@ -387,6 +387,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
+        batch_size: fx.Int32,
         num_seqlens: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
@@ -1002,8 +1003,8 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
-        num_seqlens: fx.Int32,
         batch_size: fx.Int32,
+        num_seqlens: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         num_kv_blocks: fx.Int32,
@@ -1060,6 +1061,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             seqinfo_k0,
             seqinfo_k1,
             varlen_bits,
+            batch_size,
             num_seqlens,
             max_seqlen_q,
             max_seqlen_k,
@@ -1128,7 +1130,11 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                 op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
 
         launcher.launch(
-            grid=(fx.Index(num_kv_blocks) + fx.Index(num_q_blocks), fx.Index(num_head_q), fx.Index(batch_size)),
+            grid=(
+                fx.Index(num_kv_blocks) + fx.Index(num_q_blocks),
+                fx.Index(num_head_q),
+                fx.Index((num_seqlens != fx.Int32(0)).select(num_seqlens, batch_size)),
+            ),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
         )
@@ -1152,6 +1158,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         batch_size,
         seqlen_q,
         seqlen_k=None,
+        num_seqlens=0,
         scale=None,
         stream=None,
         window=None,
@@ -1181,7 +1188,9 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         # it collapses every masking mode onto gSWA, so the first argument --
         # which `resolve_window` only tests against 0 -- is that derivation.
         _wl, _wr = abi.resolve_window(0 if HOST_CAUSAL_TYPE == 0 else 3, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
-        _vb, _ns, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(False, varlen, seqlen_q, seqlen_k, batch_size)
+        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
+            False, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
+        )
         _scale = float(scale) if scale is not None else float(sm_scale)
         abi.run_compiled(
             _COMPILED,
@@ -1192,8 +1201,8 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             _sk0,
             _sk1,
             _vb,
-            _ns,
             int(batch_size),
+            int(num_seqlens),
             _mq,
             _mk,
             (_mk + KV_TILE - 1) // KV_TILE,

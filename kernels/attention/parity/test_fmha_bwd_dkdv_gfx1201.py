@@ -467,9 +467,10 @@ def _varlen_check(lens_q, lens_k, causal_type, mode, head_dim=64, heads=2, label
         dv,
         lse,
         delta,
-        n,
+        q.shape[0],
         mq,
         seqlen_k=mk,
+        num_seqlens=n if mode == "compact" else 0,
         varlen=make(cq, ck, mq, mk, lse_tokens=lse_tokens),
     )
     torch.cuda.synchronize()

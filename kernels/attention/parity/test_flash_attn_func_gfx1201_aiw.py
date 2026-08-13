@@ -1004,18 +1004,16 @@ _VARLEN_LENGTHS = [
 ]
 
 
-def test_num_seqlens_is_derived_and_is_not_the_batch_size():
-    """`num_seqlens` counts packed sequences; `batch_size` sizes a BHSD axis.
+def test_batch_size_and_num_seqlens_are_checked_separately():
+    """`batch_size` is `q.size(0)`; `num_seqlens` counts packed sequences.
 
-    They are equal under packed varlen and unrelated otherwise, which is what
-    makes conflating them survive a test suite -- the one mode that reads the
-    value is the one mode where either answer is right. So it is derived from
-    `cu_seqlens_q` rather than taken from the caller, and zero everywhere the
-    kernel would not read it, matching AOTriton's `Num_seqlens == 0`.
-
-    `varlen_padded` is the interesting row: it *is* varlen, but its Q side is
-    not STACKED -- BHSD tensors with short sequences -- so the logsumexp pitch
-    is `max_seqlen` and the count goes unread. Zero, not the batch.
+    For a dense BHSD call they are `(B, 0)`; for a packed `(1, H, T, D)` call
+    holding N sequences they are `(1, N)` -- different numbers, which is why
+    one variable cannot serve. Each also has a second, independent source, so
+    the launcher checks rather than trusts: `q.size(0)` for one and
+    `len(cu_seqlens_q) - 1` for the other. Passing N where `batch_size` belongs
+    is the specific mistake -- N programs over a tensor whose batch axis is 1,
+    each landing on a plausible row.
 
     Host-only; no device needed.
     """
@@ -1024,15 +1022,25 @@ def test_num_seqlens_is_derived_and_is_not_the_batch_size():
     def cu(n):
         return torch.arange(n + 1, dtype=torch.int32) * 8
 
-    assert abi.varlen_args(False, None, 128, 128, 4)[1] == 0, "dense must send 0"
-    assert abi.varlen_args(False, abi.varlen_compact(cu(5), cu(5), 8, 8), 8, 8, 5)[1] == 5
-    assert abi.varlen_args(False, abi.varlen_padded(cu(5), cu(5), 8, 8), 8, 8, 5)[1] == 0
+    packed = torch.empty(1, 2, 40, 8)  # 1HTD, five sequences of eight
+    dense = torch.empty(5, 2, 8, 8)  # BHSD
+    vl = abi.varlen_compact(cu(5), cu(5), 8, 8)
 
-    # The grid launches one program per sequence, so a caller that packs five
-    # and asks for four is launching the wrong number -- each of them landing
-    # on a plausible row.
+    abi.varlen_args(False, vl, 8, 8, packed, 1, 5)
+    abi.varlen_args(False, None, 8, 8, dense, 5, 0)
+
+    with pytest.raises(ValueError, match=r"batch_size=5 but q.size\(0\)=1"):
+        abi.varlen_args(False, vl, 8, 8, packed, 5, 5)
     with pytest.raises(ValueError, match="describes 5 packed sequences"):
-        abi.varlen_args(False, abi.varlen_compact(cu(5), cu(5), 8, 8), 8, 8, 4)
+        abi.varlen_args(False, vl, 8, 8, packed, 1, 4)
+    with pytest.raises(ValueError, match="a dense call packs no sequences"):
+        abi.varlen_args(False, None, 8, 8, dense, 5, 5)
+
+    # varlen, but BHSD with a real batch axis -- nothing is packed, so 0.
+    padded = abi.varlen_padded(cu(5), cu(5), 8, 8)
+    abi.varlen_args(False, padded, 8, 8, dense, 5, 0)
+    with pytest.raises(ValueError, match="the Q side is not STACKED"):
+        abi.varlen_args(False, padded, 8, 8, dense, 5, 5)
 
 
 @pytest.mark.parametrize("lens_q,label", _VARLEN_LENGTHS, ids=[x[1] for x in _VARLEN_LENGTHS])
@@ -1063,7 +1071,7 @@ def test_varlen_compact_lengths(lens_q, label, ctype):
         dtype_str="f16",
     )
     mq, mk = max(lens_q), max(lens_k)
-    exe(q, k, v, o, N, mq, mk, varlen=exe.varlen_compact(cq, ck, mq, mk))
+    exe(q, k, v, o, 1, mq, mk, num_seqlens=N, varlen=exe.varlen_compact(cq, ck, mq, mk))
     torch.cuda.synchronize()
     _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck, f"compact/{label}/ctype={ctype}")
 
@@ -1097,7 +1105,7 @@ def test_varlen_bottom_right_diagonal_is_per_sequence():
         dtype_str="f16",
     )
     mq, mk = max(lens_q), max(lens_k)
-    exe(q, k, v, o, N, mq, mk, varlen=exe.varlen_compact(cq, ck, mq, mk))
+    exe(q, k, v, o, 1, mq, mk, num_seqlens=N, varlen=exe.varlen_compact(cq, ck, mq, mk))
     torch.cuda.synchronize()
     _assert_varlen_matches_dense(exe, q, k, v, o, lens_q, lens_k, cq, ck, "bottom-right/varlen")
 
@@ -1144,7 +1152,7 @@ def test_varlen_dead_workgroups_do_not_read_past_the_tensor(lens, label, causal)
         causal=causal,
         dtype_str="f16",
     )
-    exe(q, k, v, o, N, mq, mq, varlen=exe.varlen_compact(cq, ck, mq, mq))
+    exe(q, k, v, o, 1, mq, mq, num_seqlens=N, varlen=exe.varlen_compact(cq, ck, mq, mq))
     torch.cuda.synchronize()
     assert torch.isfinite(o).all()
     _assert_varlen_matches_dense(exe, q, k, v, o, lens, lens, cq, ck, f"grid-waste/{label}")
@@ -1177,7 +1185,17 @@ def test_varlen_sequence_with_no_keys(causal):
         causal=causal,
         dtype_str="f16",
     )
-    exe(q, k, v, o, N, max(lens_q), max(lens_k), varlen=exe.varlen_compact(cq, ck, max(lens_q), max(lens_k)))
+    exe(
+        q,
+        k,
+        v,
+        o,
+        1,
+        max(lens_q),
+        max(lens_k),
+        num_seqlens=N,
+        varlen=exe.varlen_compact(cq, ck, max(lens_q), max(lens_k)),
+    )
     torch.cuda.synchronize()
     s0, e0 = int(cq[1]), int(cq[1]) + lens_q[1]
     assert (o[:, s0:e0] == 0).all(), "rows with no keys must be exactly zero"
@@ -1208,7 +1226,7 @@ def test_varlen_zero_length_writes_nothing():
         dtype_str="f16",
     )
     mq, mk = max(lens_q), max(lens_k)
-    exe(q, k, v, o, N, mq, mk, lse=lse, varlen=exe.varlen_compact(cq, ck, mq, mk))
+    exe(q, k, v, o, 1, mq, mk, num_seqlens=N, lse=lse, varlen=exe.varlen_compact(cq, ck, mq, mk))
     torch.cuda.synchronize()
     # Rows belonging to real sequences were written; there are no rows
     # belonging to the empty ones, so nothing else may have been touched.
@@ -1278,7 +1296,7 @@ def test_varlen_single_sequence_reduces_to_dense():
     o_dense = torch.empty_like(q)
     exe(q, k, v, o_dense, 1, L, L)
     o_varlen = torch.empty_like(q)
-    exe(q, k, v, o_varlen, 1, L, L, varlen=exe.varlen_compact(_cu([L]), _cu([L]), L, L))
+    exe(q, k, v, o_varlen, 1, L, L, num_seqlens=1, varlen=exe.varlen_compact(_cu([L]), _cu([L]), L, L))
     torch.cuda.synchronize()
     assert torch.equal(o_dense, o_varlen)
 
@@ -1306,16 +1324,17 @@ def test_varlen_lse_layout_th_transposes():
     )
     o = torch.empty_like(q)
     lse_ht = torch.zeros(_NUM_HEADS, Tq, dtype=torch.float32, device="cuda")
-    exe(q, k, v, o, N, mq, mk, lse=lse_ht, varlen=exe.varlen_compact(cq, ck, mq, mk))
+    exe(q, k, v, o, 1, mq, mk, num_seqlens=N, lse=lse_ht, varlen=exe.varlen_compact(cq, ck, mq, mk))
     lse_th = torch.zeros(Tq, _NUM_HEADS, dtype=torch.float32, device="cuda")
     exe(
         q,
         k,
         v,
         o,
-        N,
+        1,
         mq,
         mk,
+        num_seqlens=N,
         lse=lse_th,
         varlen=exe.varlen_compact(cq, ck, mq, mk, lse_tokens=Tq, lse_layout=_LSE_LAYOUT_TH),
     )
@@ -1374,7 +1393,7 @@ def test_varlen_strided_reads_the_position_array(ctype):
         dtype_str="f16",
     )
     mq, mk = max(lens_q), max(lens_k)
-    exe(q, k, v, o, N, mq, mk, varlen=exe.varlen_strided(cq, ck, sst_q, sst_k, mq, mk))
+    exe(q, k, v, o, 1, mq, mk, num_seqlens=N, varlen=exe.varlen_strided(cq, ck, sst_q, sst_k, mq, mk))
     torch.cuda.synchronize()
 
     for z, (lq, lk) in enumerate(zip(lens_q, lens_k)):
@@ -1394,7 +1413,7 @@ def test_varlen_strided_reads_the_position_array(ctype):
 
     # Negative control: the same buffer read as if it were gapless.
     o_compact = torch.zeros_like(q)
-    exe(q, k, v, o_compact, N, mq, mk, varlen=exe.varlen_compact(cq, ck, mq, mk))
+    exe(q, k, v, o_compact, 1, mq, mk, num_seqlens=N, varlen=exe.varlen_compact(cq, ck, mq, mk))
     torch.cuda.synchronize()
     assert not torch.equal(o, o_compact), (
         "strided produced the same result as the gapless reading of the same " "buffer -- seqinfo_?1 is not being read"
@@ -1436,7 +1455,17 @@ def test_varlen_seqused_k_shortens_only_k(k_is_cache):
         causal=False,
         dtype_str="f16",
     )
-    exe(q, k, v, o, N, mq, mk, varlen=exe.varlen_seqused_k(cq, ck, su, mq, mk, k_is_cache=k_is_cache))
+    exe(
+        q,
+        k,
+        v,
+        o,
+        1,
+        mq,
+        mk,
+        num_seqlens=N,
+        varlen=exe.varlen_seqused_k(cq, ck, su, mq, mk, k_is_cache=k_is_cache),
+    )
     torch.cuda.synchronize()
 
     for z, lq in enumerate(lens_q):
@@ -1651,7 +1680,14 @@ def test_varlen_suite_b_all_modes(mode, gqa):
             lse_tokens=int(cq[-1]),
         )
     o = torch.zeros_like(q)
-    exe(q, k, v, o, N, mq, mk, varlen=varlen)
+    # `batch_size` is q.size(0) whatever the layout, and `num_seqlens` counts
+    # sequences packed into a 1HTD tensor. Six modes share this call and they
+    # do not agree: "padded" is BHSD with a real batch axis and packs nothing,
+    # so it wants (N, 0) where the packed modes want (1, N). Read off the Q
+    # side's STACKED bit rather than listing the modes, which is the same rule
+    # `varlen_args` checks against.
+    packed = bool(varlen["bits"] & 1)
+    exe(q, k, v, o, q.shape[0], mq, mk, num_seqlens=N if packed else 0, varlen=varlen)
     torch.cuda.synchronize()
 
     for z, lq_z in enumerate(_SUITE_B_Q):

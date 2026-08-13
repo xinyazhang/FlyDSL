@@ -425,38 +425,38 @@ def dropout_args(enable_dropout, dropout_p, seed, offset1, offset2, device=None,
     )
 
 
-def varlen_args(strides_constexpr, varlen, seqlen_q, seqlen_k, batch_size=None):
-    """(bits, num_seqlens, q0, q1, k0, k1, max_q, max_k) in launch order.
+def varlen_args(strides_constexpr, varlen, seqlen_q, seqlen_k, q, batch_size, num_seqlens):
+    """(bits, q0, q1, k0, k1, max_q, max_k) in launch order, plus two checks.
 
     `varlen` is None for the dense case, else a dict with `bits` and
     whichever `seqinfo_*` tensors that configuration reads. Unread slots
     stay **null**, which is safe because the kernel's decode branches
     rather than selects -- see the prologue.
 
-    **`num_seqlens` is not the batch size** and the two must never share a
-    variable. `batch_size` is the extent of a BHSD tensor's first axis;
-    `num_seqlens` is how many sequences are packed into a 1HTD one. They
-    coincide under packed varlen and are unrelated otherwise, which is exactly
-    what makes conflating them survive testing. It is derived here, from the
-    `cu_seqlens` array itself rather than from anything the caller asserts --
-    `len(cu_seqlens_q) - 1`, as AOTriton's host does it.
+    **`batch_size` and `num_seqlens` are different quantities and never share
+    a variable on the host.** `batch_size` is `q.size(0)`, always, whatever the
+    layout. `num_seqlens` is how many sequences are packed into a 1HTD tensor,
+    and is 0 when nothing is packed. For a dense BHSD call they are `(B, 0)`;
+    for a packed `(1, H, T, D)` call holding N sequences they are `(1, N)` --
+    genuinely different numbers, which is why one variable cannot serve.
 
-    Zero means "no packed Q side", which is AOTriton's `Num_seqlens == 0`.
-    Only a STACKED Q side reads it (`lse_token_pitch`, to reach slot [N] of the
-    array holding the batch total); every other mode's row pitch is
-    `max_seqlen` and the value goes unread. Q side only, because the logsumexp
-    it describes is a Q-side output.
-
-    `batch_size` is not used to compute anything -- it is checked. It is the
-    grid's batch extent, which under a packed Q side has to be the sequence
-    count, and it reaches us from the caller while `num_seqlens` is read off
-    `cu_seqlens`. Two independent routes to one number is the whole reason to
-    compare them: a caller that packs N sequences and passes B launches the
-    wrong number of programs, and every one of them addresses a plausible
-    row.
+    Neither is returned: both are already the caller's, and this function's job
+    for them is to *check*, because each has a second, independent source of
+    truth. `batch_size` must be `q.size(0)`, and a packed `num_seqlens` must be
+    `len(cu_seqlens_q) - 1`. Passing N where `batch_size` belongs is the
+    specific mistake -- it launches N programs over a tensor whose batch axis
+    is 1, and every one of them addresses a plausible row.
     """
+    if int(batch_size) != int(q.shape[0]):
+        raise ValueError(
+            f"batch_size={int(batch_size)} but q.size(0)={int(q.shape[0])}. batch_size is the "
+            f"tensor's batch extent whatever the layout; a packed 1HTD tensor has 1, and its "
+            f"sequence count goes in num_seqlens."
+        )
     if varlen is None:
-        return (0, 0, NULL_PTR, NULL_PTR, NULL_PTR, NULL_PTR, int(seqlen_q), int(seqlen_k))
+        if int(num_seqlens):
+            raise ValueError(f"num_seqlens={int(num_seqlens)} without varlen=; a dense call packs no sequences")
+        return (0, NULL_PTR, NULL_PTR, NULL_PTR, NULL_PTR, int(seqlen_q), int(seqlen_k))
     if strides_constexpr:
         raise ValueError(
             "strides_constexpr derives the layout from the shape, which "
@@ -467,20 +467,27 @@ def varlen_args(strides_constexpr, varlen, seqlen_q, seqlen_k, batch_size=None):
     # `varlen_bits` rejects the combinations that are not *meaningful*
     # (reserved codes, REUSE without cumulative lengths).
     bits = int(varlen["bits"])
-    q_stacked = bool(bits & VARLEN_STACKED)
-    if q_stacked and varlen.get("seqinfo_q0") is None:
-        raise ValueError("a STACKED Q side needs seqinfo_q0 (cu_seqlens_q) to count its sequences")
-    num_seqlens = int(varlen["seqinfo_q0"].numel()) - 1 if q_stacked else 0
-    if num_seqlens and batch_size is not None and int(batch_size) != num_seqlens:
+    # A STACKED Q side is the packed one, and the only one the kernel reads
+    # `num_seqlens` for (`lse_token_pitch`, to reach slot [N] of the array
+    # holding the batch total). A non-stacked varlen side -- `varlen_padded`,
+    # BHSD tensors with short sequences -- has a real batch axis and packs
+    # nothing, so its count is 0 like the dense case.
+    if bits & VARLEN_STACKED:
+        if varlen.get("seqinfo_q0") is None:
+            raise ValueError("a STACKED Q side needs seqinfo_q0 (cu_seqlens_q) to count its sequences")
+        packed = int(varlen["seqinfo_q0"].numel()) - 1
+        if int(num_seqlens) != packed:
+            raise ValueError(f"num_seqlens={int(num_seqlens)} but cu_seqlens_q describes {packed} packed sequences")
+    elif int(num_seqlens):
         raise ValueError(
-            f"batch_size={int(batch_size)} but cu_seqlens_q describes {num_seqlens} packed sequences. "
-            f"A stacked Q side launches one program per sequence, so the two must agree."
+            f"num_seqlens={int(num_seqlens)} but the Q side is not STACKED, so nothing is packed "
+            f"and the batch axis is real; this configuration wants num_seqlens=0"
         )
     got = tuple(
         ptr_arg(varlen[k]) if varlen.get(k) is not None else NULL_PTR
         for k in ("seqinfo_q0", "seqinfo_q1", "seqinfo_k0", "seqinfo_k1")
     )
-    return (bits, num_seqlens) + got + (int(varlen["max_seqlen_q"]), int(varlen["max_seqlen_k"]))
+    return (bits,) + got + (int(varlen["max_seqlen_q"]), int(varlen["max_seqlen_k"]))
 
 
 def run_compiled(cache, exe, *args):

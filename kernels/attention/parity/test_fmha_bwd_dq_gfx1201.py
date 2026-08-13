@@ -507,9 +507,10 @@ def test_varlen_compact_matches_dense(lens_q, label, ctype):
         dq,
         lse,
         delta,
-        N,
+        1,
         mq,
         mk,
+        num_seqlens=N,
         varlen=exe.varlen_compact(cq, ck, mq, mk, lse_tokens=max(Tq, 1)),
     )
     torch.cuda.synchronize()

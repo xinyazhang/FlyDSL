@@ -741,6 +741,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
+        batch_size: fx.Int32,
         num_seqlens: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
@@ -2017,8 +2018,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
-        num_seqlens: fx.Int32,
         batch_size: fx.Int32,
+        num_seqlens: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
@@ -2054,7 +2055,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     ):
         ctx = CompilationContext.get_current()
 
-        batch_idx = fx.Index(batch_size)
+        nseq_idx = fx.Index((num_seqlens != fx.Int32(0)).select(num_seqlens, batch_size))
         # Grid Q extent keys on Max_seqlen_q: under varlen there is no single
         # seqlen_q, so every sequence gets the longest one's worth of
         # workgroups and the short ones exit empty (plan section 6).
@@ -2079,6 +2080,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             seqinfo_k0,
             seqinfo_k1,
             varlen_bits,
+            batch_size,
             num_seqlens,
             max_seqlen_q,
             max_seqlen_k,
@@ -2163,7 +2165,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
 
         launcher.launch(
-            grid=(fx.Index(num_head_q), num_q_tiles, batch_idx),
+            grid=(fx.Index(num_head_q), num_q_tiles, nseq_idx),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
         )
@@ -2262,6 +2264,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         batch_size,
         seqlen_q,
         seqlen_k=None,
+        num_seqlens=0,
         scale=None,
         stream=None,
         lse=None,
@@ -2279,8 +2282,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         ptrs, meta, st = _prep(Q, K, V, O)
         _lse_p = abi.lse_args(lse, seqlen_q, varlen, meta[0])
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
-        _vb, _ns, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
-            STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, batch_size
+        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
+            STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
         )
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
         _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(
@@ -2298,8 +2301,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _sk0,
             _sk1,
             _vb,
-            _ns,
             batch_size,
+            num_seqlens,
             _mq,
             _mk,
             _wl,
@@ -2328,6 +2331,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         batch_size,
         seqlen_q,
         seqlen_k=None,
+        num_seqlens=0,
         scale=None,
         stream=None,
         lse=None,
@@ -2345,8 +2349,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         ptrs, meta, st = _prep(Q, K, V, O)
         _lse_p = abi.lse_args(lse, seqlen_q, varlen, meta[0])
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
-        _vb, _ns, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
-            STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, batch_size
+        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
+            STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
         )
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
         _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(
@@ -2363,8 +2367,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _sk0,
             _sk1,
             _vb,
-            _ns,
             batch_size,
+            num_seqlens,
             _mq,
             _mk,
             _wl,

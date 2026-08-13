@@ -138,13 +138,16 @@ def flydsl_fmha_bwd_fuse_gfx1201(
 
     batch, nhq, seq_q, head_dim = q.shape
     nhk, seq_k = k.shape[1], k.shape[2]
+    # `batch` is q.size(0) whatever the layout, and `n_seq` counts sequences
+    # packed into a 1HTD tensor -- for a packed call they are 1 and N, not one
+    # number twice. The launcher checks both against their independent sources.
     if varlen is None:
-        if num_seqlens is not None and num_seqlens != batch:
-            raise ValueError(f"num_seqlens={num_seqlens} contradicts the dense batch extent {batch}")
-        n_seq = batch
+        if num_seqlens:
+            raise ValueError(f"num_seqlens={num_seqlens} without varlen=; a dense call packs no sequences")
+        n_seq = 0
     else:
         if num_seqlens is None:
-            raise ValueError("varlen= requires num_seqlens=: a stacked batch's sequence count is not in the shape")
+            raise ValueError("varlen= requires num_seqlens=: a packed tensor's sequence count is not in its shape")
         n_seq = int(num_seqlens)
 
     _plan = _plan_build(
@@ -190,12 +193,13 @@ def flydsl_fmha_bwd_fuse_gfx1201(
             dq,
             lse,
             delta,
-            n_seq,
+            batch,
             seq_q,
             seq_k,
             scale=_plan.meta.sm_scale,
             stream=launch_stream,
             window=window,
+            num_seqlens=n_seq,
             varlen=varlen,
         )
 

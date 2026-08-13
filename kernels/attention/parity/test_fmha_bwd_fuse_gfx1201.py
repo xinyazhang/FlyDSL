@@ -328,7 +328,7 @@ def test_varlen_compact_matches_dense(causal_type):
     o = torch.zeros_like(q)
     lse = torch.zeros(nh, max(Tq, 1), dtype=torch.float32, device="cuda")
     vl = fwd.varlen_compact(cq, ck, mq, mk)
-    fwd(q, k, v, o, n, mq, mk, lse=lse, varlen=vl)
+    fwd(q, k, v, o, 1, mq, mk, num_seqlens=n, lse=lse, varlen=vl)
     torch.cuda.synchronize()
 
     dq, dk, dv = bwd_fuse(q, k, v, o, do, lse, causal=bool(causal_type), sm_scale=scale, varlen=vl, num_seqlens=n)
@@ -375,7 +375,7 @@ def test_varlen_compact_accuracy():
     o = torch.zeros_like(q)
     lse = torch.zeros(nh, T, dtype=torch.float32, device="cuda")
     vl = fwd.varlen_compact(cq, cq, m, m)
-    fwd(q, k, v, o, n, m, m, lse=lse, varlen=vl)
+    fwd(q, k, v, o, 1, m, m, num_seqlens=n, lse=lse, varlen=vl)
     torch.cuda.synchronize()
     dq, dk, dv = bwd_fuse(q, k, v, o, do, lse, causal=True, sm_scale=scale, varlen=vl, num_seqlens=n)
     torch.cuda.synchronize()
