@@ -419,7 +419,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         # packed tensor `row_off + start_k` rows in runs past the end of the
         # whole allocation, not merely past this sequence. The forward records
         # a 1.3 MB overshoot hitting an unmapped page on the Q side.
-        _k_start_addr = fx.Index(_alive.select(start_k, fx.Index(0)))
+        _k_start_addr = fx.Index(start_k if _alive else fx.Index(0))
 
         _q_last_i32 = common_utils.smax(seqlen_q_i32 - fx.Int32(1), fx.Int32(0))
         _k_last_i32 = common_utils.smax(seqlen_k_i32 - fx.Int32(1), fx.Int32(0))
@@ -734,7 +734,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                 for si in range_constexpr(8):
                     _q_row_i32 = _q_base_i32 + fx.Int32(si)
                     _q_ok = _q_row_i32 < seqlen_q_i32
-                    _safe_row = fx.Index(_q_ok.select(fx.Index(_q_row_i32), fx.Index(0)))
+                    _safe_row = fx.Index(fx.Index(_q_row_i32) if _q_ok else fx.Index(0))
                     _off = _row_scalar_off(_safe_row)
                     _lse = load_global_f32(l_ptr, _off)
                     _di = load_global_f32(delta_ptr, _off)
@@ -760,7 +760,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                         # makes the left term inert rather than absent.
                         _dead = _dead | (kv_row_abs_i32 > _q_row_i32 + _wr_i32)
                         _dead = _dead | (kv_row_abs_i32 < _q_row_i32 - _wl_i32)
-                    _p = fx.as_ir_value(_dead.select(fx.Float32(0.0), fx.Float32(_p)))
+                    _p = fx.as_ir_value(fx.Float32(0.0) if _dead else fx.Float32(_p))
 
                     _dpv = fx.Float32(Vec(dp_acc)[si])
                     if const_expr(ENABLE_DROPOUT):
@@ -781,14 +781,14 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                         _slot = fx.Int32(kv_row_abs_i32) % fx.Int32(_rn)
                         _keep = _keeps[0]
                         for _r in range_constexpr(_rn - 1):
-                            _keep = (_slot == fx.Int32(_r + 1)).select(_keeps[_r + 1], _keep)
+                            _keep = _keeps[_r + 1] if _slot == fx.Int32(_r + 1) else _keep
                         # dV takes the dropped-and-rescaled P; dS takes the
                         # original. Reversing that is AOTriton's explicit
                         # "CAVEAT: do NOT update p".
                         _p_drop = fx.as_ir_value(
-                            _keep.select(fastmath.mul(fx.Float32(_p), dropout_scale), fx.Float32(0.0))
+                            fastmath.mul(fx.Float32(_p), dropout_scale) if _keep else fx.Float32(0.0)
                         )
-                        _dpv = fx.Float32(_keep.select(fastmath.mul(_dpv, dropout_scale), fx.Float32(0.0)))
+                        _dpv = fx.Float32(fastmath.mul(_dpv, dropout_scale) if _keep else fx.Float32(0.0))
                     else:
                         _p_drop = _p
 
@@ -899,7 +899,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     ):
         ctx = CompilationContext.get_current()
 
-        nseq_idx = fx.Index((num_seqlens != fx.Int32(0)).select(num_seqlens, batch_size))
+        nseq_idx = fx.Index(num_seqlens if num_seqlens != fx.Int32(0) else batch_size)
         # The grid's KV extent keys on Max_seqlen_k: under varlen there is no
         # single seqlen_k, so every sequence gets the longest one's worth of
         # workgroups and the short ones exit having walked zero Q blocks.

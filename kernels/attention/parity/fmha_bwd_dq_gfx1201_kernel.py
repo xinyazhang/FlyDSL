@@ -447,7 +447,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         # workgroup would otherwise address `row_off + start_q` rows into a
         # packed tensor, which runs past the whole allocation rather than only
         # past this sequence.
-        _q_start_addr = fx.Index(_alive.select(start_q, fx.Index(0)))
+        _q_start_addr = fx.Index(start_q if _alive else fx.Index(0))
 
         # MQA/GQA: num_head_q / num_head_k query heads share each KV head.
         head_k = head_q // (fx.Index(num_head_q) // fx.Index(num_head_k))
@@ -652,8 +652,8 @@ def build_bwd_dq_module_primary(meta, knobs):
         # l_i = 0 and delta = 0 the row's Q and dO packs are already zero, so
         # dS comes out exactly 0 and the row contributes nothing -- and its
         # store is guarded anyway.
-        _lse_nat = fx.Float32(_q_in.select(fx.Float32(_load_row_f32(L)), fx.Float32(0.0)))
-        delta_i = fx.Float32(_q_in.select(fx.Float32(_load_row_f32(Delta)), fx.Float32(0.0)))
+        _lse_nat = fx.Float32(fx.Float32(_load_row_f32(L)) if _q_in else fx.Float32(0.0))
+        delta_i = fx.Float32(fx.Float32(_load_row_f32(Delta)) if _q_in else fx.Float32(0.0))
         # The forward writes LSE in natural units; the exponent here is base 2,
         # so this is AOTriton's `l_i = tl.load(...) * RCP_LN2` exactly.
         #
@@ -717,8 +717,8 @@ def build_bwd_dq_module_primary(meta, knobs):
             _full_end = (seqlen_k_v // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N)
             kv_upper = fx.Index(((seqlen_k_v + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N))
             # A dead workgroup walks nothing.
-            _full_end = fx.Index(_alive.select(_full_end, fx.Index(0)))
-            kv_upper = fx.Index(_alive.select(kv_upper, fx.Index(0)))
+            _full_end = fx.Index(_full_end if _alive else fx.Index(0))
+            kv_upper = fx.Index(kv_upper if _alive else fx.Index(0))
 
         init_args = [fx.as_ir_value(c_zero_v8f32) for _ in range_constexpr(D_CHUNKS)]
         loop_results = init_args
@@ -821,7 +821,7 @@ def build_bwd_dq_module_primary(meta, knobs):
                         # plain causal maps onto this path.
                         _dead = _dead | (_col > q_row_i32 + _wr_i32)
                         _dead = _dead | (_col < q_row_i32 - _wl_i32)
-                    s_raw[_i] = _dead.select(c_neg_inf, s_raw[_i])
+                    s_raw[_i] = c_neg_inf if _dead else s_raw[_i]
 
             # P, from the forward's logsumexp rather than from a running max:
             # the backward pass has the denominator already. A dead column is
@@ -845,10 +845,7 @@ def build_bwd_dq_module_primary(meta, knobs):
                     for _r in range_constexpr(8):
                         _i = _st * 8 + _r
                         dp_raw[_i] = fx.as_ir_value(
-                            _keep[_r].select(
-                                fastmath.mul(fx.Float32(dp_raw[_i]), dropout_scale),
-                                fx.Float32(0.0),
-                            )
+                            fastmath.mul(fx.Float32(dp_raw[_i]), dropout_scale) if _keep[_r] else fx.Float32(0.0)
                         )
 
             # dS = P * (dP - delta). One flat unroll; both operands share the
@@ -929,11 +926,7 @@ def build_bwd_dq_module_primary(meta, knobs):
                 """Tile column for masked iteration i: the left run, then the
                 right one. Discontinuous at the seam."""
                 _i = fx.Int32(i_idx)
-                return common_utils.ssel(
-                    (_i < _n_l),
-                    _l_col0 + _i * _BN_I32,
-                    _r_col0 + (_i - _n_l) * _BN_I32,
-                )
+                return _l_col0 + _i * _BN_I32 if _i < _n_l else _r_col0 + (_i - _n_l) * _BN_I32
 
             for _mi, inner_iter_args in range(fx.Index(0), _n_masked, 1, init=loop_results):
                 loop_results = yield kv_loop_body(fx.Index(_masked_col(_mi)), inner_iter_args, True)
@@ -1018,7 +1011,7 @@ def build_bwd_dq_module_primary(meta, knobs):
     ):
         ctx = CompilationContext.get_current()
 
-        nseq_idx = fx.Index((num_seqlens != fx.Int32(0)).select(num_seqlens, batch_size))
+        nseq_idx = fx.Index(num_seqlens if num_seqlens != fx.Int32(0) else batch_size)
         # The grid's Q extent keys on Max_seqlen_q: under varlen there is no
         # single seqlen_q, so every sequence gets the longest one's worth of
         # workgroups and the short ones exit empty.

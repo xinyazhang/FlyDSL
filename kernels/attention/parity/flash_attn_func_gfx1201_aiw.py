@@ -902,7 +902,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # unmapped page. It is a *read*, and one whose result is discarded, so
         # smaller overshoots land inside the allocation and are silently
         # harmless, which is exactly why the varlen tests did not catch it.
-        _q_start_addr = fx.Index(_alive.select(start_q, fx.Index(0)))
+        _q_start_addr = fx.Index(start_q if _alive else fx.Index(0))
 
         # MQA/GQA: Num_head_q / Num_head_k query heads share each KV head.
         # The ratio is uniform and computed once, so the scalar divide is
@@ -1354,8 +1354,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _full_end = (seqlen_k_v // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N)
             kv_upper = fx.Index(((seqlen_k_v + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N))
             # Same empty-work clamp as the causal arm above.
-            _full_end = fx.Index(_alive.select(_full_end, fx.Index(0)))
-            kv_upper = fx.Index(_alive.select(kv_upper, fx.Index(0)))
+            _full_end = fx.Index(_full_end if _alive else fx.Index(0))
+            kv_upper = fx.Index(kv_upper if _alive else fx.Index(0))
 
         # Tiles this workgroup will actually walk. Zero for a sequence with no
         # keys and for every workgroup the varlen grid dispatches past the end
@@ -1377,11 +1377,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         if const_expr(CAUSAL):
             _first_col = fx.Index(
                 common_utils.smax(
-                    common_utils.ssel(
-                        (_n_f > fx.Int32(0)),
-                        _f_col0,
-                        _m_col0,
-                    ),
+                    _f_col0 if _n_f > fx.Int32(0) else _m_col0,
                     fx.Int32(0),
                 )
             )
@@ -1405,13 +1401,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # scalars only and rejects the list of vectors a prefetch produces,
         # while a loop carries exactly that list. The trip count is uniform
         # across the workgroup, so no divergence is introduced.
-        _pf_n = fx.Index(
-            common_utils.ssel(
-                (_kv_tiles_i32 > fx.Int32(0)),
-                fx.Int32(1),
-                fx.Int32(0),
-            )
-        )
+        _pf_n = fx.Index(fx.Int32(1) if _kv_tiles_i32 > fx.Int32(0) else fx.Int32(0))
         _pf_init = []
         if const_expr(K_PREFETCH_DIST):
             for _ in range_constexpr(k_ap.num_batches):
@@ -1662,7 +1652,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                             # term inert.
                             _dead = _dead | (_col > q_row_i32 + _wr_i32)
                             _dead = _dead | (_col < q_row_i32 - _wl_i32)
-                        s_raw[_i] = _dead.select(c_neg_inf, s_raw[_i])
+                        s_raw[_i] = c_neg_inf if _dead else s_raw[_i]
 
                 local_max = s_raw[0]
                 for r in range_constexpr(NUM_S_VALS - 1):
@@ -1711,7 +1701,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         _keep = PHILOX.keep_span(_ph_seed, _first, 8, idropout_p)
                         for _r in range_constexpr(8):
                             _i = _st * 8 + _r
-                            p_vals[_i] = fx.as_ir_value(_keep[_r].select(fx.Float32(p_vals[_i]), fx.Float32(0.0)))
+                            p_vals[_i] = fx.as_ir_value(fx.Float32(p_vals[_i]) if _keep[_r] else fx.Float32(0.0))
 
                 m_new_all.append(m_new_raw)
                 l_new_all.append(l_new)
@@ -1864,11 +1854,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # The successor of the last full tile is the first masked one,
                 # which is only the adjacent tile when the left run is empty.
                 _nxt = fx.Index(
-                    common_utils.ssel(
-                        (fx.Int32(kv_block_start) + _BN_I32 < _f_col0 + _n_f * _BN_I32),
-                        fx.Int32(kv_block_start) + _BN_I32,
-                        _m_col0,
-                    )
+                    fx.Int32(kv_block_start) + _BN_I32
+                    if fx.Int32(kv_block_start) + _BN_I32 < _f_col0 + _n_f * _BN_I32
+                    else _m_col0
                 )
                 loop_results = yield kv_loop_body(kv_block_start, inner_iter_args, False, next_kv_start=_nxt)
 
@@ -1877,11 +1865,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 right one. Discontinuous at the seam, which is exactly why the
                 prefetch has to go through this same map."""
                 _i = fx.Int32(i_idx)
-                return common_utils.ssel(
-                    (_i < _n_l),
-                    _l_col0 + _i * _BN_I32,
-                    _r_col0 + (_i - _n_l) * _BN_I32,
-                )
+                return _l_col0 + _i * _BN_I32 if _i < _n_l else _r_col0 + (_i - _n_l) * _BN_I32
 
             for _mi, inner_iter_args in range(fx.Index(0), _n_masked, 1, init=loop_results):
                 loop_results = yield kv_loop_body(
@@ -1939,9 +1923,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # zero for exactly the rows that must contribute nothing.
                 # l is bit-exact 0 there, so test the bit pattern; integer
                 # compares lower predictably.
-                _lse = (fmha.bitcast_i32(fx.Float32(_l)) != fx.Int32(0)).select(
-                    fx.Float32(_lse), fx.Float32(float("inf"))
-                )
+                _lse = fx.Float32(_lse) if fmha.bitcast_i32(fx.Float32(_l)) != fx.Int32(0) else fx.Float32(float("inf"))
                 # LSE_LAYOUT, VarlenBits bits 17:16. The *inputs* are Q's
                 # decode -- batch, row offset, length -- so the two layouts
                 # are the same indices arranged two ways, not two features
@@ -2055,7 +2037,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     ):
         ctx = CompilationContext.get_current()
 
-        nseq_idx = fx.Index((num_seqlens != fx.Int32(0)).select(num_seqlens, batch_size))
+        nseq_idx = fx.Index(num_seqlens if num_seqlens != fx.Int32(0) else batch_size)
         # Grid Q extent keys on Max_seqlen_q: under varlen there is no single
         # seqlen_q, so every sequence gets the longest one's worth of
         # workgroups and the short ones exit empty (plan section 6).

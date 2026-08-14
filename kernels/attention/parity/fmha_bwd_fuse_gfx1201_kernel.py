@@ -566,7 +566,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             live program.
             """
             ok = q_row < seqlen_q_i32
-            safe = fx.Index(ok.select(fx.Int32(q_row), fx.Int32(0)))
+            safe = fx.Index(fx.Int32(q_row) if ok else fx.Int32(0))
             off = row_base + safe * row_pitch
             return _pointer_load(f32_ty, buffer_ops.get_element_ptr(base_ptr, fx.Int64(off), elem_type=f32_ty))
 
@@ -745,7 +745,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                             # plain causal reaches this path.
                             dead = dead | (kv_row_i32 > q_g + wr_i32)
                             dead = dead | (kv_row_i32 < q_g - wl_i32)
-                        s = fx.Float32(dead.select(c_neg_inf, fx.Float32(s)))
+                        s = fx.Float32(c_neg_inf if dead else fx.Float32(s))
                     p = rocdl.exp2(f32_ty, fx.as_ir_value(s))
                     p_vals.append(p)
                     ds_vals.append(
@@ -795,11 +795,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                 """Query-block origin for masked iteration `i`: the left run,
                 then the right one. Discontinuous at the seam."""
                 _i = fx.Int32(i_idx)
-                return common_utils.ssel(
-                    _i < n_left,
-                    left_col0 + _i * step_i32,
-                    right_col0 + (_i - n_left) * step_i32,
-                )
+                return left_col0 + _i * step_i32 if _i < n_left else right_col0 + (_i - n_left) * step_i32
 
             for _mi, iargs in range(fx.Index(0), fx.Index(n_left + n_right), 1, init=results):
                 results = yield q_body(fx.Index(masked_col(_mi)), iargs, True)
@@ -859,7 +855,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             # A dead program still addresses `row_off + start_q` rows in, which
             # for a stacked layout runs past the whole allocation rather than
             # merely past this sequence.
-            q_start_safe = fx.Index(alive.select(start_q, fx.Index(0)))
+            q_start_safe = fx.Index(start_q if alive else fx.Index(0))
             q_tile_base = q_tbase(q_start_safe)
             do_tile_base = do_tbase(q_start_safe)
 
@@ -918,7 +914,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                         if const_expr(CAUSAL):
                             dead = dead | (kv_g > q_row_i32 + wr_i32)
                             dead = dead | (kv_g < q_row_i32 - wl_i32)
-                        s = fx.Float32(dead.select(c_neg_inf, fx.Float32(s)))
+                        s = fx.Float32(c_neg_inf if dead else fx.Float32(s))
                     p = rocdl.exp2(f32_ty, fx.as_ir_value(s))
                     ds_vals.append(
                         fastmath.mul(
@@ -952,11 +948,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
 
             def masked_col(i_idx):
                 _i = fx.Int32(i_idx)
-                return common_utils.ssel(
-                    _i < n_left,
-                    left_col0 + _i * step_i32,
-                    right_col0 + (_i - n_left) * step_i32,
-                )
+                return left_col0 + _i * step_i32 if _i < n_left else right_col0 + (_i - n_left) * step_i32
 
             for _mi, iargs in range(fx.Index(0), fx.Index(n_left + n_right), 1, init=results):
                 results = yield kv_body(fx.Index(masked_col(_mi)), iargs, True)
@@ -1133,7 +1125,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             grid=(
                 fx.Index(num_kv_blocks) + fx.Index(num_q_blocks),
                 fx.Index(num_head_q),
-                fx.Index((num_seqlens != fx.Int32(0)).select(num_seqlens, batch_size)),
+                fx.Index(num_seqlens if num_seqlens != fx.Int32(0) else batch_size),
             ),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
