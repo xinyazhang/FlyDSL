@@ -2195,7 +2195,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
 
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
-    def _launch(
+    def _args(
         Q,
         K,
         V,
@@ -2217,6 +2217,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         philox_seed_output=None,
         philox_offset_output=None,
     ):  # noqa: E741
+        """Every kernel argument but the stream, in launch order.
+
+        `_launch` and `_compile` were 62 identical lines out of 66, differing
+        only in whether the tail is `run_compiled` or `flyc.compile` and how
+        the stream is spelled. dQ already had this shape; the forward did not.
+        """
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta, st = abi.prep_tensors([("Q", Q), ("K", K), ("V", V), ("O", O)], q_heads=("O",))
         _lse_p = abi.lse_args(lse, seqlen_q, varlen, meta[0])
@@ -2225,108 +2231,55 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
         )
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
+        # `_hold` keeps a materialised philox scalar alive across the launch;
+        # see `abi.u64_scalar`. Returned so the caller's frame owns it.
         _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(
             ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset1, philox_offset2, Q.device, stream
         )
         _so, _oo = abi.dropout_outputs(ENABLE_DROPOUT, philox_seed_output, philox_offset_output)
-        abi.run_compiled(
-            _COMPILED,
-            launch_flash_attn_aiw,
-            *ptrs,
-            _lse_p,
-            _bp,
-            _sq0,
-            _sq1,
-            _sk0,
-            _sk1,
-            _vb,
-            batch_size,
-            num_seqlens,
-            _mq,
-            _mk,
-            _wl,
-            _wr,
-            _ps,
-            _po1,
-            _po2,
-            _so,
-            _oo,
-            _ip,
-            _dsc,
-            *meta,
-            *st,
-            _sb0,
-            _sb1,
-            _sb2,
-            abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
-            stream if stream is not None else fx.Stream(None),
+        return (
+            (
+                *ptrs,
+                _lse_p,
+                _bp,
+                _sq0,
+                _sq1,
+                _sk0,
+                _sk1,
+                _vb,
+                batch_size,
+                num_seqlens,
+                _mq,
+                _mk,
+                _wl,
+                _wr,
+                _ps,
+                _po1,
+                _po2,
+                _so,
+                _oo,
+                _ip,
+                _dsc,
+                *meta,
+                *st,
+                _sb0,
+                _sb1,
+                _sb2,
+                abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
+            ),
+            _hold,
+            stream,
         )
 
-    def _compile(
-        Q,
-        K,
-        V,
-        O,  # noqa: E741
-        batch_size,
-        seqlen_q,
-        seqlen_k=None,
-        num_seqlens=0,
-        scale=None,
-        stream=None,
-        lse=None,
-        window=None,
-        varlen=None,
-        bias=None,
-        dropout_p=None,
-        philox_seed=0,
-        philox_offset1=None,
-        philox_offset2=0,
-        philox_seed_output=None,
-        philox_offset_output=None,
-    ):  # noqa: E741
-        seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
-        ptrs, meta, st = abi.prep_tensors([("Q", Q), ("K", K), ("V", V), ("O", O)], q_heads=("O",))
-        _lse_p = abi.lse_args(lse, seqlen_q, varlen, meta[0])
-        _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
-        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
-            STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
-        )
-        _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
-        _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(
-            ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset1, philox_offset2, Q.device, stream
-        )
-        _so, _oo = abi.dropout_outputs(ENABLE_DROPOUT, philox_seed_output, philox_offset_output)
-        return flyc.compile(
-            launch_flash_attn_aiw,
-            *ptrs,
-            _lse_p,
-            _bp,
-            _sq0,
-            _sq1,
-            _sk0,
-            _sk1,
-            _vb,
-            batch_size,
-            num_seqlens,
-            _mq,
-            _mk,
-            _wl,
-            _wr,
-            _ps,
-            _po1,
-            _po2,
-            _so,
-            _oo,
-            _ip,
-            _dsc,
-            *meta,
-            *st,
-            _sb0,
-            _sb1,
-            _sb2,
-            abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
-            fx.Stream(stream),
-        )
+    def _launch(*args, **kwargs):
+        """Dispatch one forward pass. Signature is `_args`'s, which binds it."""
+        packed, _hold, stream = _args(*args, **kwargs)
+        abi.run_compiled(_COMPILED, launch_flash_attn_aiw, *packed, stream if stream is not None else fx.Stream(None))
+
+    def _compile(*args, **kwargs):
+        """AOT-compile the same call `_launch` would dispatch."""
+        packed, _hold, stream = _args(*args, **kwargs)
+        return flyc.compile(launch_flash_attn_aiw, *packed, fx.Stream(stream))
 
     _launch.compile = _compile
     # Still attached to the launcher, for the callers and tests that reach them
