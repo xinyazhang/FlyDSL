@@ -1,181 +1,204 @@
-# Decorating the shared module: `@flyc.jit` on `fmha_common_gfx1201.py`
+# Deduplicating the four kernels, and what `@flyc.jit` unblocks
 
-## 0. What changed, and why it matters
+## 0. The enabling fact
 
-`fmha_common_gfx1201.py` opens with a section titled *"Why the branching helpers
-live here"*, whose premise is:
+`fmha_common_gfx1201.py` opens with a section whose premise is:
 
 > Nothing in this file is AST-rewritten. The rewrite from Python's `if` to
 > `scf.if` is lexical per `@flyc.kernel` function, so a module-level helper gets
 > a branch only by building the `scf.IfOp` itself.
 
-That premise is **half wrong, and has been all along**. The rewrite is lexical
-per *decorated* function, and `@flyc.jit` decorates too --
-`jit_function.py:22` runs the same `ASTRewriter.transform` that
-`kernel_function.py:461` does. A module-level helper gets the rewrite by asking
-for it.
-
-`@flyc.jit` is not "host code". `JitFunction.__call__` opens with:
+Half wrong, and has been all along. The rewrite is lexical per **decorated**
+function, and `@flyc.jit` decorates: `jit_function.py:22` runs the same
+`ASTRewriter.transform` as `kernel_function.py:461`. `JitFunction.__call__`
+opens with
 
 ```python
 if ir.Context.current is not None:
     return self.func(*args, **kwargs)   # already tracing -> inline the body here
 ```
 
-So the decorator means *"AST-rewrite and trace this"*, and the call site decides
-the role: from Python it is a host launcher, from inside an open trace it is a
-device-side inline. `@flyc.kernel` is the one with a fixed job -- it refuses to
-run outside a trace at all (`kernel_function.py:161`) and emits a `gpu.func`
-with a kernarg signature.
+so the decorator means *"AST-rewrite and trace this"*, and the call site decides
+the role: from Python a host launcher, from inside an open trace a device-side
+inline. A module-level helper gets branching by asking for it.
 
-The consequence for this file: every hand-built `_scf.IfOp` and every `.select`
-that exists *only because the file could not branch* is now optional.
+**But that is not the main deduplication story**, and the survey below is
+deliberately blunt about which parts it unblocks and which parts were merely
+never done.
 
 ## 1. Survey
 
-### 1a. Hand-built control flow (7 sites)
+Method: every nested helper in the four kernels, anonymised (identifiers to `V`,
+string constants to `S`) and compared pairwise by AST shape; plus a matching-run
+scan over anonymised top-level statement sequences to catch straight-line
+regions no helper wraps. Numbers are recoverable lines, i.e. total minus the one
+surviving copy.
 
-| helper | shape | becomes |
+### 1a. Host-side helpers -- ~252 lines, and **never blocked by anything**
+
+| helper | copies | lines | recoverable |
+|---|---|---|---|
+| `_launch` | 4 | 66 / 42 / 60 / 72 | ~168 |
+| `_compile` | 2 | 65 / 42 | ~42 |
+| `_prep` | 3 | 21 / 14 / 15 | ~29 |
+| `_resolve_scale` | 3 | 13 / 7 / 6 | ~13 |
+| `_row_tensor` / `_row_tensor_ptr` | 2 | 26 / 24 | (0.99 similar) |
+
+`_resolve_scale` is **structurally identical** across three kernels (ratio 1.00
+fwd/dq, 0.96 to dkdv). `_prep` is 0.82--0.89. `_launch` is 0.79--0.96 across all
+four, and the four `launch_*` jit bodies are 0.83--0.96 similar to each other.
+
+These are plain Python running before a launch. They want
+`fmha_abi_gfx1201.py`, which already exists for exactly this purpose and whose
+docstring already says so. **This is the largest single win in the survey and it
+has nothing to do with `@flyc.jit`.** It was possible the whole time; it just was
+not done.
+
+Caveat on `_launch`/`_compile`: the similarity is real but so is the argument
+list, which *is* the kernarg ABI and differs per kernel. What factors cleanly is
+the middle -- validation, stride collection, window/varlen/dropout marshalling --
+not the call itself. Expect to recover well under the 168 the diff suggests.
+
+### 1b. Device-side straight-line prologue -- also never blocked
+
+The top-level statement scan finds 28--75 shared lines per kernel *pair*, all in
+the prologue (fwd L784--935, dq L380--500, dkdv L360--490, fuse L430--520):
+
+| unit | copies | note |
 |---|---|---|
-| `cond_load` | `IfOp` + 2 `YieldOp`, i32 result | a one-line ternary |
-| `_load_u64_or_zero` | `IfOp` + 2 `YieldOp`, i64 result | a one-line ternary |
-| `_store_u64_if_nonnull` | `IfOp`, void | `if ptr != 0: ...` |
-| `philox_report` | nested `IfOp`, void | nested `if` |
-| `_over_batches` | `IfOp`, void, `const_expr` sibling | `if row < block_rows: body(...)` |
-| `write_v8` | `IfOp`, void | `if aperture.cols.valid(col): write(...)` |
-| `publish_transposed` | `IfOp`, void | plain `if` |
+| thread decomposition (`tid`, `wave_id`, `lane`, `lane16`, `klane`) | 4 | identical 5 lines |
+| vector type triple + `wmma_acc` closure | 4 | `v8f32_type`, `v8f16_type`, `vxf16_type` |
+| `pointer_to_llvm_ptr` run | 4 | same shape, different tensor sets |
+| `_llvm_value` | 4 | ~12 recoverable |
+| `_split_ptr` | 4 | ~15 recoverable; fwd/dq identical at 1.00 |
+| `_to_global_ptr_i64` | 2 | ~2 |
 
-`cond_load` is the headline. Its docstring spends nine lines explaining that it
-is *"a real `scf.if`, not a select, and that is the point"* -- because the
-sequence-info pointers are null whenever their mode is off, and a select would
-evaluate both arms and fault. **The ternary is exactly that**: the rewriter
-lowers `a if c else b` to `scf_ifexp_dispatch(c, lambda: a, lambda: b)`, and the
-arms are lambdas, so only the taken one runs. The entire helper collapses to:
+All straight-line. No branch, no select, nothing that needed the rewrite. A
+plain module-level function would have served since day one.
 
-```python
-return fx.ptr_load(addr, fx.Int32) if cond else default
-```
+### 1c. Actually unblocked by `@flyc.jit` -- the smaller pile
 
-and the docstring shrinks to the one fact a reader still needs (the address is
-the caller's and touches no memory).
+Everything here needs a branch or a lazy ternary, so it genuinely could not live
+in an undecorated module.
 
-### 1b. `.select` / `ssel` used because the file cannot branch (26 sites)
+**Hand-built `_scf.IfOp` already in `fmha_common` (7 sites).** These are not
+duplication -- they are the *workaround* for the missing rewrite, and they
+collapse:
 
-| helper | count |
+| helper | becomes |
 |---|---|
-| `decode_addressing` | 6 |
-| `lse_token_pitch` | 3 |
-| `resolve_window` | 3 |
-| `decompose_causal_regions` | 4 |
-| `make_addr_pair` | 3 |
-| `lse_row_addressing` | 2 |
-| `MaskedAxis` methods | 2 |
-| `Aperture.read` | 1 |
-| others | 2 |
+| `cond_load` | a one-line ternary |
+| `_load_u64_or_zero` | a one-line ternary |
+| `_store_u64_if_nonnull` | `if ptr != 0: ...` |
+| `philox_report` | nested `if`, two levels shallower |
+| `_over_batches`, `write_v8`, `publish_transposed` | plain `if` |
 
-These are pure-value selects. Converting them is the same readability change
-already made inside the four kernels, where it was **bitwise-ISA-neutral** at
-head_dim 128 and 384 in both masking modes -- the backend if-converts every one
-back to a `v_cndmask`.
+`cond_load` is the headline. Its docstring spends nine lines arguing it must be
+*"a real `scf.if`, not a select, and that is the point"* -- because the
+sequence-info pointers are null when their mode is off and a select would
+evaluate both arms and fault. The ternary lowers to
+`scf_ifexp_dispatch(c, lambda: a, lambda: b)`: lazy arms, real `scf.if`. Exactly
+the required semantics, in one line.
 
-Worth stating plainly: **an undecorated module function must not use a
-ternary.** Without the rewrite, `a if cond else b` is plain Python, so
-`bool(cond)` runs on an `fx.Boolean` -- it will either raise or silently pick
-one arm at trace time and bake it in. Tier 2 is therefore *gated on* Tier 0;
-they cannot be done in either order.
+**`.select` / `ssel` in `fmha_common` (26 sites)** -- `decode_addressing` 6,
+`decompose_causal_regions` 4, `lse_token_pitch` 3, `resolve_window` 3,
+`make_addr_pair` 3, `lse_row_addressing` 2, `MaskedAxis` 2, `Aperture` 1, other
+2. Readability only; the same change inside the kernels was bitwise-ISA-neutral.
 
-### 1c. Logic that could move here but has not (the actual duplication)
+**Cross-kernel duplicates that branch:**
 
-| what | copies | notes |
+| helper | copies | recoverable |
 |---|---|---|
-| `masked_col` / `_masked_col` | **4** (fwd, dq, fuse x2) | identical left-run/right-run column map; needs a branch or a ternary |
-| `wmma_acc` | 3 | trivial wrapper, never blocked -- just never moved |
-| `_llvm_value` | 3 | ditto |
-| `_alive` clamps (`x if alive else 0`) | 4+ | one-liners; sharing may not pay |
-| LLVM passthrough / `waves_per_eu` attr block | 4 | builder-level Python, no tracing at all -- a plain function, not a jit one |
+| `masked_col` / `_masked_col` | 4 (fwd, dq, fuse x2) | ~8 |
+| `_alive` clamps (`x if alive else 0`) | 4+ | one-liners, probably not worth a helper |
+| `_load_row_f32` / `load_global_f32` | 2, 0.79 similar | ~9 |
+| `_pack_v8` / `pack_v8` | 2, 0.98 similar | ~11 |
 
-`masked_col` is the one worth doing: four copies of the same discontinuous seam
-map, and the seam is precisely the thing that was got wrong during bring-up.
+**Honest total for 1c: ~30 lines of cross-kernel duplication, plus the seven
+workaround helpers and 26 selects.** The value here is correctness and
+legibility -- four copies of the discontinuous seam map is four chances to get
+the seam wrong, and the seam *was* got wrong during bring-up -- not line count.
 
-## 2. The boundary, measured
+### 1d. The boundary, measured
 
-Spikes under `/tmp/tmp/spike/`, all run on gfx1201. A module-level `@flyc.jit`
-helper called from inside a `@flyc.kernel`:
+Spikes under `/tmp/tmp/spike/`, on gfx1201, module-level `@flyc.jit` called from
+a `@flyc.kernel`:
 
 | pattern | result |
 |---|---|
-| closure argument called under a dynamic `if` | **works** |
-| frozen-dataclass argument, method called in the *condition* | **works** |
-| dataclass attribute *read* under the branch | **works** |
+| closure argument called under a dynamic `if` | works |
+| frozen-dataclass argument, method called in the *condition* | works |
+| dataclass attribute *read* under the branch | works |
 | dataclass **method call** under the branch | `TypeError: Cannot extract IR values from Axis(width=7)` |
 
-The last row is the trap the file header already documents, and the header's own
-workaround still applies: *call a free function so the base name is a module
-rather than the object.* Every helper in 1a already obeys that -- their branch
-bodies call `body(...)`, `write(...)`, `fx.ptr_load(...)`,
-`_store_u64_if_nonnull(...)`. None calls a method on a parameter.
+The last row is the trap the file header documents. Its workaround still
+applies: *call a free function so the base name is a module rather than the
+object.* Every helper in 1c already obeys it -- their branch bodies call
+`body(...)`, `write(...)`, `fx.ptr_load(...)`.
 
-One genuinely new and favourable fact: the trap fires on names from an
-*enclosing scope*, and inside one of these helpers everything arrives as a
-**parameter**, which is already a local. Moving branchy code out of a kernel and
-into a decorated module helper therefore makes this class of bug *less* likely,
-not more.
+One new and favourable fact: the trap fires on names from an *enclosing scope*,
+and inside a helper everything arrives as a **parameter**, already a local.
+Moving branchy code out of a kernel into a decorated helper makes this class of
+bug less likely, not more.
 
-## 3. Plan
+## 2. Plan
 
-Each step is independently committable and independently gated.
+Ordered by value per unit of risk, which puts the `@flyc.jit` work *last* --
+the big wins do not need it.
 
-**Tier 0 -- decorate, change nothing else.** Add `@flyc.jit` to the seven
-helpers in 1a and to the pure-value helpers in 1b, leaving their bodies exactly
-as they are. Gate: full suite, plus bitwise ISA at hd 128/384 x both masking
-modes. This proves the decorator alone is inert before any body is touched, and
-it is the step that would expose a surprise in argument binding or caching.
+**Step 1 -- host helpers to `fmha_abi_gfx1201.py` (~150-250 lines).** Start with
+`_resolve_scale` (identical x3), then `_prep`, then `_row_tensor`. Leave
+`_launch`/`_compile` for a separate pass: factor the marshalling middle, keep
+the per-kernel argument list where it is, since that list is the ABI. Pure
+Python, no tracing, no `@flyc.jit`. Gate: full suite.
 
-**Tier 1 -- collapse the hand-built control flow.** Rewrite the seven bodies as
-`if` / ternary. `cond_load` and `_load_u64_or_zero` become one-liners;
-`philox_report` loses two nesting levels. Delete the now-stale paragraphs from
-the file header and from `cond_load`'s docstring -- the "must build the IfOp
-myself" rationale is gone and leaving it would actively mislead. Gate: as Tier 0.
+**Step 2 -- straight-line device prologue to `fmha_common` (~40 lines).** A
+plain (undecorated) `fmha.wave_decomposition(tid)` returning the five indices,
+and a `fmha.vector_types(elem_dtype)` returning the triple. `_llvm_value`,
+`_split_ptr`, `_to_global_ptr_i64` alongside. Still no decorator needed. Gate:
+full suite + bitwise ISA at hd 128/384 x both masking modes.
 
-**Tier 2 -- `ssel` / `.select` to ternaries.** The 26 sites in 1b. Mechanical,
-and the same change already validated inside the kernels. Watch `MaskedAxis` and
-`Aperture`: they are methods, so `self` is a parameter and a `self.foo()` under
-a branch would trip the 1d boundary -- keep such calls in the condition or hoist
-them. Gate: as Tier 0.
+**Step 3 -- decorate, change nothing else.** Add `@flyc.jit` to the seven
+workaround helpers and the select-heavy value helpers, bodies untouched. Proves
+the decorator is inert before any body moves. Gate: as step 2.
 
-**Tier 3 -- consolidate `masked_col`.** Move the four copies to one
-`fmha.masked_col(i, n_left, left_col0, right_col0, step)`. Gate: as Tier 0, and
-additionally the varlen and causal suites, which are what exercise the seam.
+**Step 4 -- collapse the workarounds.** Rewrite those seven bodies as
+`if`/ternary. Delete the stale paragraphs from the file header and from
+`cond_load`'s docstring; leaving the "must build the IfOp myself" rationale in
+place would actively mislead. Gate: as step 2.
 
-**Tier 4 -- optional, and probably not worth it.** `wmma_acc` and `_llvm_value`
-are three-line duplicates that were never blocked by anything; moving them is
-tidiness, not leverage. The passthrough-attribute block is builder-level Python
-and wants a plain shared function, not `@flyc.jit`. Do these only if touching
-those files anyway.
+**Step 5 -- `ssel`/`.select` to ternaries (26 sites).** Mechanical. Watch
+`MaskedAxis`/`Aperture`: they are methods, so `self` is a parameter and a
+`self.foo()` under a branch trips 1d -- keep such calls in the condition or
+hoist. Gate: as step 2.
 
-## 4. Risks
+**Step 6 -- the branchy cross-kernel duplicates.** `masked_col` first (4 copies,
+and the seam is the part that has actually been wrong), then `_pack_v8` and
+`_load_row_f32`. Gate: as step 2, plus the varlen and causal suites.
 
-- **Silent eager ternary.** The one way to get this wrong quietly: add a ternary
-  to a module function and forget the decorator. Trace-time Python then picks an
-  arm and bakes it in, and every test that exercises only the chosen arm passes.
-  Mitigation: Tier 0 before Tier 2, and never add a ternary to this file in the
-  same commit that adds the decorator.
-- **Host-callable by accident.** These helpers are device-only, but a decorated
-  one called with no open trace will try to *compile*, with a confusing error.
-  Currently unreachable; worth one line in the file header.
+## 3. Risks
+
+- **Silent eager ternary.** Add a ternary to an undecorated module function and
+  Python evaluates it at trace time: `bool(cond)` on an `fx.Boolean` either
+  raises or bakes in one arm, and every test exercising only that arm passes.
+  This is why step 3 precedes step 5 and why the two must not share a commit.
+- **Host-callable by accident.** A decorated device-only helper called with no
+  open trace will try to *compile*. Unreachable today; worth a line in the
+  header.
 - **`test_signature_parity_gfx1201.py` asserts one `@flyc.jit` per module.** It
-  only scans the four kernel modules, so decorating `fmha_common` does not trip
-  it -- but adding a nested jit helper *to a kernel module* would, with
-  `expected one @flyc.jit, found [...]`. Two-line fix (pair the jit that calls
-  the kernel) whenever that happens.
-- **Perf.** Expected nil: the decorator adds one Python call and an
-  `ir.Context.current` check at trace time, nothing at runtime, and the ternary
-  if-converts. But it is expected, not known, until each tier's ISA gate says so.
+  scans only the four kernel modules, so decorating `fmha_common` is fine --
+  but adding a nested jit helper *to a kernel module* trips it. Two-line fix.
+- **Perf.** Expected nil -- one Python call and a context check at trace time,
+  nothing at runtime, and ternaries if-convert. Expected, not known, until each
+  step's ISA gate says so.
+- **Prologue extraction is the one with real ISA risk.** Steps 1 and 3--5 move
+  code that emits identical IR. Step 2 changes *where* values are materialised,
+  which can reorder definitions and perturb the scheduler. Gate it hardest.
 
-## 5. Not doing
+## 4. Not doing
 
 `stage`, `publish`, `read_batches`, `read_transposed` and the rest of the
 `Aperture` surface stay free functions taking the aperture as a parameter. That
-shape is what keeps object method calls out of branch bodies, which section 2
-shows is still the one hard constraint. Decorating them buys nothing -- their
-branching is already delegated to `_over_batches` and `write_v8`.
+shape is what keeps object method calls out of branch bodies, which 1d shows is
+still the one hard constraint. Decorating them buys nothing -- their branching
+is already delegated to `_over_batches` and `write_v8`.
