@@ -115,7 +115,7 @@ from fmha_tuning_bwd_fuse_gfx1201 import (  # noqa: F401
     lds_elems_dkdv,
     lds_elems_dq,
 )
-from gfx1201_standalone import buffer_ops, wmma_ops
+from gfx1201_standalone import buffer_ops
 from gfx1201_standalone import utils as common_utils
 
 import flydsl.compiler as flyc
@@ -425,11 +425,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         elem_type = elem_numeric_cls.ir_type
         elem_dtype = elem_numeric_cls
         f32_ty = ir.F32Type.get()
-        v8f32_type = Vec.make_type(8, fx.Float32)
         v8f16_type = Vec.make_type(8, elem_dtype)
-
-        def wmma_acc(a_v8, b_v8, c_v8):
-            return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
 
         q_ptr = fmha.pointer_to_llvm_ptr(Q)
         k_ptr = fmha.pointer_to_llvm_ptr(K)
@@ -462,11 +458,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_buf = lds.buf.ptr
 
-        tid = fx.Index(gpu.thread_idx.x)
-        wave_id = tid // WARP_SIZE
-        lane = tid % WARP_SIZE
-        lane16 = lane % 16
-        klane = lane // 16
+        tid, wave_id, lane, lane16, klane = fmha.wave_lanes(WARP_SIZE)
 
         load_row_in_batch = tid // TPR
         load_col_base = (tid % TPR) * VEC_WIDTH
@@ -713,12 +705,12 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                 dp_acc = fx.as_ir_value(c_zero_v8f32)
                 for ks in range_constexpr(ND):
                     col = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
-                    s_acc = wmma_acc(
+                    s_acc = fmha.wmma_acc(
                         a_q_ap.from_lds(lds_buf, lane16, col),
                         a_k_ap.from_lds(lds_buf, kv_row_local, col),
                         s_acc,
                     )
-                    dp_acc = wmma_acc(
+                    dp_acc = fmha.wmma_acc(
                         a_do_ap.from_lds(lds_buf, lane16, col),
                         a_v_ap.from_lds(lds_buf, kv_row_local, col),
                         dp_acc,
@@ -763,8 +755,8 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                 for db in range_constexpr(ND):
                     d_row = fx.Index(db * WMMA_N) + lane16
                     t_col = klane * WMMA_LANE_K
-                    dv_accs[db] = wmma_acc(a_dot_ap.from_lds(lds_buf, d_row, t_col), p_pack, dv_accs[db])
-                    dk_accs[db] = wmma_acc(a_qt_ap.from_lds(lds_buf, d_row, t_col), ds_pack, dk_accs[db])
+                    dv_accs[db] = fmha.wmma_acc(a_dot_ap.from_lds(lds_buf, d_row, t_col), p_pack, dv_accs[db])
+                    dk_accs[db] = fmha.wmma_acc(a_qt_ap.from_lds(lds_buf, d_row, t_col), ds_pack, dk_accs[db])
 
                 # Every wave must be done reading the Q/dO tiles before the
                 # next iteration overwrites them.
@@ -901,8 +893,8 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                 dpt_acc = fx.as_ir_value(c_zero_v8f32)
                 for ks in range_constexpr(ND):
                     col = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
-                    st_acc = wmma_acc(b_k_ap.from_lds(lds_buf, lane16, col), q_packs[ks], st_acc)
-                    dpt_acc = wmma_acc(b_v_ap.from_lds(lds_buf, lane16, col), do_packs[ks], dpt_acc)
+                    st_acc = fmha.wmma_acc(b_k_ap.from_lds(lds_buf, lane16, col), q_packs[ks], st_acc)
+                    dpt_acc = fmha.wmma_acc(b_v_ap.from_lds(lds_buf, lane16, col), do_packs[ks], dpt_acc)
 
                 ds_vals = []
                 for e in range_constexpr(8):
@@ -926,7 +918,9 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                 ds_pack = pack_v8(ds_vals)
                 for db in range_constexpr(ND):
                     d_row = fx.Index(db * WMMA_N) + lane16
-                    dq_accs[db] = wmma_acc(b_kt_ap.from_lds(lds_buf, d_row, klane * WMMA_LANE_K), ds_pack, dq_accs[db])
+                    dq_accs[db] = fmha.wmma_acc(
+                        b_kt_ap.from_lds(lds_buf, d_row, klane * WMMA_LANE_K), ds_pack, dq_accs[db]
+                    )
                 gpu.barrier()
                 return dq_accs
 

@@ -70,7 +70,7 @@ own warning.
 
 from dataclasses import dataclass
 
-from gfx1201_standalone import kernels_common
+from gfx1201_standalone import kernels_common, wmma_ops
 from gfx1201_standalone import utils as common_utils
 
 import flydsl.expr as fx
@@ -82,6 +82,8 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 __all__ = [
+    "wave_lanes",
+    "wmma_acc",
     "pointer_to_llvm_ptr",
     "load_geom",
     "acc_elem_column",
@@ -121,6 +123,39 @@ __all__ = [
     "philox_seed_value",
     "philox_report",
 ]
+
+
+def wave_lanes(warp_size):
+    """`(tid, wave_id, lane, lane16, klane)` -- this thread's place in the block.
+
+    The same five lines opened all four kernels. `lane16` and `klane` are the
+    WMMA operand split rather than anything general: a 16x16x16 fragment puts
+    the row/column in `lane % 16` and the K offset in `lane // 16`, which is
+    why they belong together with the wave decomposition and not with the
+    caller's tiling.
+
+    **Emission order is load-bearing** and matches what the four kernels had
+    line for line: `//` before `%`, then the two lane splits. Reordering the
+    first two is behaviour-preserving but moves the SSA definitions, which at
+    head_dim 384 -- where the kernel is pinned at 256 VGPRs -- was enough to
+    reschedule the whole body. Same instruction mix and same count, different
+    order; not a regression, but not something to change by accident either.
+    """
+    tid = fx.Index(gpu.thread_idx.x)
+    wave_id = tid // warp_size
+    lane = tid % warp_size
+    return tid, wave_id, lane, lane % 16, lane // 16
+
+
+def wmma_acc(a_v8, b_v8, c_v8):
+    """One 16x16x16 WMMA into an f32 accumulator.
+
+    Dispatch is on the operand element type, inside `wmma_ops`, rather than on
+    a `dtype_str` here -- see that module for why. Was a closure over
+    `v8f32_type` in all four kernels; the type is a context lookup, so making
+    it here costs nothing and removes the closure.
+    """
+    return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, Vec.make_type(8, fx.Float32))
 
 
 def pointer_to_llvm_ptr(ptr) -> ir.Value:

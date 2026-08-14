@@ -114,7 +114,7 @@ from fmha_tuning_bwd_dkdv_gfx1201 import (  # noqa: F401
     BwdDkDvMetadata,
     resolve_knobs,
 )
-from gfx1201_standalone import buffer_ops, wmma_ops
+from gfx1201_standalone import buffer_ops
 from gfx1201_standalone import utils as common_utils
 from philox import Philox
 
@@ -367,12 +367,8 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         l_ptr = fmha.pointer_to_llvm_ptr(L)
         delta_ptr = fmha.pointer_to_llvm_ptr(Delta)
 
-        v8f32_type = Vec.make_type(8, fx.Float32)
         v8f16_type = Vec.make_type(8, elem_dtype)
         vxf16_type = Vec.make_type(VEC_WIDTH, elem_dtype)
-
-        def wmma_acc(a_v8, b_v8, c_v8):
-            return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
 
         # ---- Varlen prologue: VarlenBits -> six scalars ----
         #
@@ -394,11 +390,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_qdo = lds.qdo.ptr
 
-        tid = fx.Index(gpu.thread_idx.x)
-        wave_id = tid // WARP_SIZE
-        lane = tid % WARP_SIZE
-        lane16 = lane % 16
-        klane = lane // 16
+        tid, wave_id, lane, lane16, klane = fmha.wave_lanes(WARP_SIZE)
 
         # 3D grid: (kv_tile, head_k, batch). The KV tile goes on x, which
         # dispatches fastest, for the reason the forward gives about its q_tile
@@ -710,7 +702,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                 s_acc = fx.as_ir_value(c_zero_v8f32)
                 for ks in range_constexpr(D_STEPS):
                     _qa = q_rm_ap.from_lds(lds_qdo, fx.Index(_qs) + lane16, fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K)
-                    s_acc = wmma_acc(_qa, k_packs[ks], s_acc)
+                    s_acc = fmha.wmma_acc(_qa, k_packs[ks], s_acc)
 
                 # ==== GEMM2: dP[q][kv] = dO . V^T ====
                 dp_acc = fx.as_ir_value(c_zero_v8f32)
@@ -718,7 +710,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                     _da = do_rm_ap.from_lds(
                         lds_qdo, fx.Index(_qs) + lane16, fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
                     )
-                    dp_acc = wmma_acc(_da, v_packs[ks], dp_acc)
+                    dp_acc = fmha.wmma_acc(_da, v_packs[ks], dp_acc)
 
                 # ==== P and dS ====
                 #
@@ -801,12 +793,12 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                 # ==== GEMM3: dV^T[d][kv] += dO^T . P ====
                 for dc in range_constexpr(DV_STEPS):
                     _a = do_tr_ap.from_lds(lds_qdo, fx.Index(dc * WMMA_N) + lane16, fx.Index(_qs) + klane * WMMA_LANE_K)
-                    dv_accs[dc] = wmma_acc(_a, _p_pack, dv_accs[dc])
+                    dv_accs[dc] = fmha.wmma_acc(_a, _p_pack, dv_accs[dc])
 
                 # ==== GEMM4: dK^T[d][kv] += Q^T . dS ====
                 for dc in range_constexpr(D_STEPS):
                     _a = q_tr_ap.from_lds(lds_qdo, fx.Index(dc * WMMA_N) + lane16, fx.Index(_qs) + klane * WMMA_LANE_K)
-                    dk_accs[dc] = wmma_acc(_a, _ds_pack, dk_accs[dc])
+                    dk_accs[dc] = fmha.wmma_acc(_a, _ds_pack, dk_accs[dc])
 
             # Every wave must finish reading this Q/dO window before the next
             # iteration overwrites it.

@@ -107,7 +107,7 @@ from fmha_tuning_gfx1201 import (  # noqa: F401
     resolve_shards,
     vo_chunks,
 )
-from gfx1201_standalone import buffer_ops, wmma_ops
+from gfx1201_standalone import buffer_ops
 from gfx1201_standalone import utils as common_utils
 from philox import Philox
 
@@ -786,14 +786,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         v_ptr = fmha.pointer_to_llvm_ptr(V)
         v_ptr_i64 = _to_global_ptr_i64(V)
         o_ptr = fmha.pointer_to_llvm_ptr(O)
-        v8f32_type = Vec.make_type(8, fx.Float32)
         v8f16_type = Vec.make_type(8, elem_dtype)
         vxf16_type = Vec.make_type(VEC_WIDTH, elem_dtype)
-
-        def wmma_acc(a_v8, b_v8, c_v8):
-            # Dispatch is on the operand element type, in `wmma_ops`, rather
-            # than on `dtype_str` here -- see that module for why.
-            return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
 
         # ---- Varlen prologue: VarlenBits -> six scalars ----
         #
@@ -830,12 +824,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         _lds_byte_base = fx.as_ir_value(fx.ptrtoint(lds_kv))
         _RED_BYTE0 = (LDS_V_BASE if RED_ALIASES_V else LDS_KV_TOTAL_SIZE - (RED_F32_TOTAL * 4 + 1) // 2) * 2
 
-        tid = fx.Index(gpu.thread_idx.x)
-
-        wave_id = tid // WARP_SIZE
-        lane = tid % WARP_SIZE
-        lane16 = lane % 16
-        klane = lane // 16
+        tid, wave_id, lane, lane16, klane = fmha.wave_lanes(WARP_SIZE)
 
         # (q_tile, shard) decomposition of the wave index. At QK_SHARDS == 1
         # this is q_tile == wave_id and shard == 0, i.e. the unsharded mapping.
@@ -1516,8 +1505,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     acc_idx_a = st_idx * 2
                     acc_idx_b = st_idx * 2 + 1
                     for qt in range_constexpr(ROW_SUBTILES):
-                        s_accs_all[qt][acc_idx_a] = wmma_acc(k_pack_a, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_a])
-                        s_accs_all[qt][acc_idx_b] = wmma_acc(k_pack_b, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_b])
+                        s_accs_all[qt][acc_idx_a] = fmha.wmma_acc(
+                            k_pack_a, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_a]
+                        )
+                        s_accs_all[qt][acc_idx_b] = fmha.wmma_acc(
+                            k_pack_b, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_b]
+                        )
 
             # ==== Cross-shard S reduction ====
             # Each shard-wave holds a partial sum over its own BLOCK_DMODEL slice;
@@ -1771,7 +1764,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         # the V LDS reads per FLOP at ROW_SUBTILES > 1.
                         for st_idx in range_constexpr(COL_SUBTILES):
                             for qt in range_constexpr(ROW_SUBTILES):
-                                o_accs_all[qt][_vc * D_CHUNKS + dc] = wmma_acc(
+                                o_accs_all[qt][_vc * D_CHUNKS + dc] = fmha.wmma_acc(
                                     cur_v_packs[st_idx],
                                     p_packs_all_qt[qt][st_idx][pks],
                                     o_accs_all[qt][_vc * D_CHUNKS + dc],

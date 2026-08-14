@@ -96,7 +96,7 @@ from fmha_tuning_bwd_dq_gfx1201 import (  # noqa: F401
     BwdDqKnobs,
     resolve_knobs,
 )
-from gfx1201_standalone import buffer_ops, wmma_ops
+from gfx1201_standalone import buffer_ops
 from gfx1201_standalone import kernels_common as common_kernels
 from gfx1201_standalone import utils as common_utils
 from philox import Philox
@@ -385,13 +385,9 @@ def build_bwd_dq_module_primary(meta, knobs):
         do_ptr = fmha.pointer_to_llvm_ptr(DO)
         dq_ptr = fmha.pointer_to_llvm_ptr(DQ)
         k_ptr_i64 = fx.as_ir_value(fx.Int64(fx.ptrtoint(K)))
-        v8f32_type = Vec.make_type(8, fx.Float32)
         v8f16_type = Vec.make_type(8, elem_dtype)
         vxf16_type = Vec.make_type(VEC_WIDTH, elem_dtype)
         f32_ty = ir.F32Type.get()
-
-        def wmma_acc(a_v8, b_v8, c_v8):
-            return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
 
         # ---- Varlen prologue: VarlenBits -> six scalars ----
         #
@@ -415,11 +411,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_kv = lds.kv.ptr
 
-        tid = fx.Index(gpu.thread_idx.x)
-        wave_id = tid // WARP_SIZE
-        lane = tid % WARP_SIZE
-        lane16 = lane % 16
-        klane = lane // 16
+        tid, wave_id, lane, lane16, klane = fmha.wave_lanes(WARP_SIZE)
         wave_q_offset = wave_id * ROWS_PER_WAVE
 
         # 3D grid: (head_q, q_tile, batch). Same axis order as the forward, and
@@ -768,8 +760,8 @@ def build_bwd_dq_module_primary(meta, knobs):
                     st_base_row = st_idx * COLS_PER_SUBTILE
                     k_pack_a = k_ap.from_lds(lds_kv, lane16 + fx.Index(st_base_row), k_col)
                     k_pack_b = k_ap.from_lds(lds_kv, lane16 + fx.Index(st_base_row + 16), k_col)
-                    s_accs[st_idx * 2] = wmma_acc(k_pack_a, q_packs[ks], s_accs[st_idx * 2])
-                    s_accs[st_idx * 2 + 1] = wmma_acc(k_pack_b, q_packs[ks], s_accs[st_idx * 2 + 1])
+                    s_accs[st_idx * 2] = fmha.wmma_acc(k_pack_a, q_packs[ks], s_accs[st_idx * 2])
+                    s_accs[st_idx * 2 + 1] = fmha.wmma_acc(k_pack_b, q_packs[ks], s_accs[st_idx * 2 + 1])
 
             # ==== GEMM2: dP^T = V @ dO^T ====
             # The identical access pattern with V in place of K and dO in place
@@ -781,8 +773,8 @@ def build_bwd_dq_module_primary(meta, knobs):
                     st_base_row = st_idx * COLS_PER_SUBTILE
                     v_pack_a = v_ap.from_lds(lds_kv, lane16 + fx.Index(st_base_row), v_col)
                     v_pack_b = v_ap.from_lds(lds_kv, lane16 + fx.Index(st_base_row + 16), v_col)
-                    dp_accs[st_idx * 2] = wmma_acc(v_pack_a, do_packs[ks], dp_accs[st_idx * 2])
-                    dp_accs[st_idx * 2 + 1] = wmma_acc(v_pack_b, do_packs[ks], dp_accs[st_idx * 2 + 1])
+                    dp_accs[st_idx * 2] = fmha.wmma_acc(v_pack_a, do_packs[ks], dp_accs[st_idx * 2])
+                    dp_accs[st_idx * 2 + 1] = fmha.wmma_acc(v_pack_b, do_packs[ks], dp_accs[st_idx * 2 + 1])
 
             s_raw = []
             dp_raw = []
@@ -898,7 +890,7 @@ def build_bwd_dq_module_primary(meta, knobs):
                 for st_idx in range_constexpr(COL_SUBTILES):
                     for pks in range_constexpr(PV_K_STEPS):
                         kt_pack = _load_kt(dc, st_idx * COLS_PER_SUBTILE, pks)
-                        dq_accs[dc] = wmma_acc(kt_pack, ds_packs[st_idx * 2 + pks], dq_accs[dc])
+                        dq_accs[dc] = fmha.wmma_acc(kt_pack, ds_packs[st_idx * 2 + pks], dq_accs[dc])
 
             return [dq_accs[i] for i in range_constexpr(D_CHUNKS)]
 
