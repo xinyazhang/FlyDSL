@@ -151,18 +151,12 @@ _WINDOW_BOTRIGHT = fmha.WINDOW_BOTRIGHT
 _COMPILED = abi.new_compiled_cache()
 
 
-def _llvm_value(value):
-    if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
-        return value.ir_value()
-    return value
-
-
 def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
-    return _llvm.LoadOp(result_type, _llvm_value(ptr)).result
+    return _llvm.LoadOp(result_type, fmha.llvm_value(ptr)).result
 
 
 def _pointer_store(value: ir.Value, ptr: ir.Value):
-    return _llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
+    return _llvm.StoreOp(fmha.llvm_value(value), fmha.llvm_value(ptr))
 
 
 def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
@@ -446,18 +440,14 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         qk_cols = fmha.MaskedAxis(fx.Index(hdim_qk), active=PADDED_HEAD, elem_dtype=elem_dtype)
         vo_cols = fmha.MaskedAxis(fx.Index(hdim_vo), active=PADDED_HEAD, elem_dtype=elem_dtype)
 
-        def _split_ptr(ptr, base64, off):
-            p = buffer_ops.get_element_ptr(ptr, fx.Int64(base64), elem_type=elem_type)
-            return buffer_ops.get_element_ptr(p, fx.Int64(off), elem_type=elem_type)
-
         def load_global_f16xN(base_ptr, base64, off32):
-            return _pointer_load(vxf16_type, _split_ptr(base_ptr, base64, off32))
+            return _pointer_load(vxf16_type, fmha.split_ptr(base_ptr, base64, off32, elem_type))
 
         def load_global_v8f16(base_ptr, base64, off32):
-            return _pointer_load(v8f16_type, _split_ptr(base_ptr, base64, off32))
+            return _pointer_load(v8f16_type, fmha.split_ptr(base_ptr, base64, off32, elem_type))
 
         def store_global_v8f16(base_ptr, base64, off32, val):
-            _pointer_store(val, _split_ptr(base_ptr, base64, off32))
+            _pointer_store(val, fmha.split_ptr(base_ptr, base64, off32, elem_type))
 
         def load_global_f32(base_ptr, off64):
             """One f32 from a compact rank-2 tensor (logsumexp or delta).

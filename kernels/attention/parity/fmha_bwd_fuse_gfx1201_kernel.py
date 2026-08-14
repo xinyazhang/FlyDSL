@@ -142,18 +142,12 @@ _LOG2E = host_math.log2(host_math.e)
 _COMPILED = abi.new_compiled_cache()
 
 
-def _llvm_value(value):
-    if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
-        return value.ir_value()
-    return value
-
-
 def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
-    return _llvm.LoadOp(result_type, _llvm_value(ptr)).result
+    return _llvm.LoadOp(result_type, fmha.llvm_value(ptr)).result
 
 
 def _pointer_store(value: ir.Value, ptr: ir.Value):
-    return _llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
+    return _llvm.StoreOp(fmha.llvm_value(value), fmha.llvm_value(ptr))
 
 
 def listify(carried, n):
@@ -519,15 +513,11 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             dq_st, head_q, _q_batch_v, _q_row_off_v, seqlen_k=seqlen_q_v, seq_last=q_last, hoist=False, clamp=False
         )
 
-        def _split_ptr(ptr, base64, off):
-            p = buffer_ops.get_element_ptr(ptr, fx.Int64(base64), elem_type=elem_type)
-            return buffer_ops.get_element_ptr(p, fx.Int64(off), elem_type=elem_type)
-
         def load_global_v8(ptr, base64, off):
-            return _pointer_load(v8f16_type, _split_ptr(ptr, base64, off))
+            return _pointer_load(v8f16_type, fmha.split_ptr(ptr, base64, off, elem_type))
 
         def store_global_v8(ptr, base64, off, val):
-            _pointer_store(val, _split_ptr(ptr, base64, off))
+            _pointer_store(val, fmha.split_ptr(ptr, base64, off, elem_type))
 
         # ---- Row-wise f32 side inputs: LSE and delta ----
         #

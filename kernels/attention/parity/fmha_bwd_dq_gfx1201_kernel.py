@@ -131,18 +131,12 @@ _WINDOW_BOTRIGHT = fmha.WINDOW_BOTRIGHT
 _COMPILED = abi.new_compiled_cache()
 
 
-def _llvm_value(value):
-    if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
-        return value.ir_value()
-    return value
-
-
 def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
-    return _llvm.LoadOp(result_type, _llvm_value(ptr)).result
+    return _llvm.LoadOp(result_type, fmha.llvm_value(ptr)).result
 
 
 def _pointer_store(value: ir.Value, ptr: ir.Value):
-    return _llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
+    return _llvm.StoreOp(fmha.llvm_value(value), fmha.llvm_value(ptr))
 
 
 def build_bwd_dq_module_primary(meta, knobs):
@@ -547,24 +541,14 @@ def build_bwd_dq_module_primary(meta, knobs):
             store_kv_off=klane * WMMA_LANE_K,
         )
 
-        def _split_ptr(ptr, base64, off):
-            """ptr + base64 (uniform) + off (divergent). Both 64-bit.
-
-            `off` is deliberately not narrowed to i32: it carries
-            `row_in_tile * s_seq`, and a view keeps its source's strides, so
-            256 rows of a sliced 1 GiB tensor is already 2**31.
-            """
-            p = buffer_ops.get_element_ptr(ptr, fx.Int64(base64), elem_type=elem_type)
-            return buffer_ops.get_element_ptr(p, fx.Int64(off), elem_type=elem_type)
-
         def load_global_f16xN(base_ptr, base64, off32):
-            return _pointer_load(vxf16_type, _split_ptr(base_ptr, base64, off32))
+            return _pointer_load(vxf16_type, fmha.split_ptr(base_ptr, base64, off32, elem_type))
 
         def load_global_v8f16(base_ptr, base64, off32):
-            return _pointer_load(v8f16_type, _split_ptr(base_ptr, base64, off32))
+            return _pointer_load(v8f16_type, fmha.split_ptr(base_ptr, base64, off32, elem_type))
 
         def store_global_v8(base_ptr, base64, off32, val):
-            _pointer_store(val, _split_ptr(base_ptr, base64, off32))
+            _pointer_store(val, fmha.split_ptr(base_ptr, base64, off32, elem_type))
 
         # How each tensor is read: its address split, paired with the load
         # instruction that consumes it. `start -> (row, col) -> value`, which

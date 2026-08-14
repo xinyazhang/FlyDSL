@@ -70,7 +70,7 @@ own warning.
 
 from dataclasses import dataclass
 
-from gfx1201_standalone import kernels_common, wmma_ops
+from gfx1201_standalone import buffer_ops, kernels_common, wmma_ops
 from gfx1201_standalone import utils as common_utils
 
 import flydsl.expr as fx
@@ -83,6 +83,8 @@ from flydsl.expr.typing import Vector as Vec
 
 __all__ = [
     "wave_lanes",
+    "llvm_value",
+    "split_ptr",
     "wmma_acc",
     "pointer_to_llvm_ptr",
     "load_geom",
@@ -156,6 +158,33 @@ def wmma_acc(a_v8, b_v8, c_v8):
     it here costs nothing and removes the closure.
     """
     return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, Vec.make_type(8, fx.Float32))
+
+
+def llvm_value(value):
+    """Unwrap a FlyDSL scalar/vector wrapper for a raw LLVM pointer op."""
+    if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
+        return value.ir_value()
+    return value
+
+
+def split_ptr(ptr, base64, off, elem_type):
+    """`ptr + base64 + off`, both 64-bit, added as two element steps.
+
+    The split is for the addressing mode, not for arithmetic: `base64` is
+    uniform across the wave and `off` is divergent, and keeping them separate
+    is what lets `SelectGlobalSAddr` hold the base in SGPRs instead of forcing
+    a 64-bit VGPR address pair.
+
+    **`off` must not be narrowed to i32.** It carries `row_in_tile * s_seq`,
+    and a view keeps the strides of the tensor it was taken from rather than
+    of the shape the kernel sees: eight heads sliced out of a 1 GiB
+    `(1, 64, 16384, 512)` f16 tensor give `s_seq = 8388608`, whose 256th row
+    is exactly 2**31. The truncation wrapped and the kernel read another
+    allocation. `s_seq` is already `fx.Index`, so the product was always
+    computed in 64 bits; only the cast threw the high half away.
+    """
+    p = buffer_ops.get_element_ptr(ptr, fx.Int64(base64), elem_type=elem_type)
+    return buffer_ops.get_element_ptr(p, fx.Int64(off), elem_type=elem_type)
 
 
 def pointer_to_llvm_ptr(ptr) -> ir.Value:

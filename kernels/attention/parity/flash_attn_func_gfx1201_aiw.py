@@ -148,22 +148,15 @@ def dtype_to_elem_type(dtype_str: str):
     raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', or 'bf16')")
 
 
-def _llvm_value(value):
-    """Unwrap FlyDSL scalar/vector wrappers for LLVM pointer load ops."""
-    if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
-        return value.ir_value()
-    return value
-
-
 _COMPILED = abi.new_compiled_cache()
 
 
 def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
-    return _llvm.LoadOp(result_type, _llvm_value(ptr)).result
+    return _llvm.LoadOp(result_type, fmha.llvm_value(ptr)).result
 
 
 def _pointer_store(value: ir.Value, ptr: ir.Value):
-    return _llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
+    return _llvm.StoreOp(fmha.llvm_value(value), fmha.llvm_value(ptr))
 
 
 # Causal alignment as a *window* sentinel, AOTriton's `WindowValue`. These
@@ -1081,29 +1074,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             needs_guard=V_NEEDS_GUARD,
         )
 
-        def _split_ptr(ptr, base64, off):
-            """ptr + base64 (uniform) + off (divergent). Both 64-bit.
-
-            `off` used to be truncated to i32 on the reasoning that a
-            within-tile offset is small. It is not: it carries
-            `row_in_tile * s_seq`, and a non-compact input's sequence stride is
-            bounded by the tensor its view was taken from, not by the shape the
-            kernel sees. Slicing eight heads out of a 1 GiB
-            (1, 64, 16384, 512) f16 tensor gives `s_seq = 8388608`, and 256
-            rows of that is exactly 2**31 -- so the truncation wrapped and the
-            kernel read another allocation.
-
-            `s_seq` is already `fx.Index`, so the product was always computed
-            in 64 bits; only this cast threw the high half away.
-            """
-            p = buffer_ops.get_element_ptr(ptr, fx.Int64(base64), elem_type=elem_type)
-            return buffer_ops.get_element_ptr(p, fx.Int64(off), elem_type=elem_type)
-
         def _load_global_half_vec(ptr, base64, off32, vec_type):
-            return _pointer_load(vec_type, _split_ptr(ptr, base64, off32))
+            return _pointer_load(vec_type, fmha.split_ptr(ptr, base64, off32, elem_type))
 
         def _store_global_half(ptr, base64, off32, val):
-            _pointer_store(val, _split_ptr(ptr, base64, off32))
+            _pointer_store(val, fmha.split_ptr(ptr, base64, off32, elem_type))
 
         def load_global_f16xN(base_ptr, base64, off32):
             return _load_global_half_vec(base_ptr, base64, off32, vxf16_type)
