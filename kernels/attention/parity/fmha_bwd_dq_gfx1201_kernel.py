@@ -100,7 +100,6 @@ from gfx1201_standalone import buffer_ops, wmma_ops
 from gfx1201_standalone import kernels_common as common_kernels
 from gfx1201_standalone import utils as common_utils
 from philox import Philox
-from torch import float32 as torch_f32
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -1117,33 +1116,6 @@ def build_bwd_dq_module_primary(meta, knobs):
         "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
     }
 
-    def _row_tensor(t, name, num_head_q, seq_len, varlen):
-        """Check an (H, T)-or-(T, H) f32 row tensor and return its pointer.
-
-        `L` and `Delta` share one offset computation in the kernel, so they
-        must share a layout; checking them the same way here is what makes
-        that safe. Unlike Q/K/V the kernel derives the pitches from VarlenBits
-        rather than reading strides, so contiguity is required rather than
-        merely convenient.
-        """
-        if t is None:
-            raise ValueError(f"{name} is required by the backward kernel")
-        if t.dtype != torch_f32:
-            raise ValueError(f"{name} must be float32, got {t.dtype}")
-        if t.dim() != 2:
-            raise ValueError(f"{name} must be rank 2, got shape {tuple(t.shape)}")
-        if not t.is_contiguous():
-            raise ValueError(f"{name} must be contiguous: the kernel derives its pitches from VarlenBits")
-        _layout = 0 if varlen is None else (int(varlen["bits"]) >> 16) & 3
-        if _layout == 0:
-            want_last = int(seq_len) if varlen is None else varlen.get("lse_tokens")
-            if want_last is not None and t.shape[1] != int(want_last):
-                raise ValueError(f"{name} with LSE_LAYOUT_HT wants (*, {int(want_last)}), got {tuple(t.shape)}")
-        else:
-            if t.shape[1] != num_head_q:
-                raise ValueError(f"{name} with LSE_LAYOUT_TH wants (*, {num_head_q}), got {tuple(t.shape)}")
-        return abi.ptr_arg(t)
-
     # Causal alignment is expressed as a *sentinel* window, resolved in the
     # kernel against each sequence's own lengths. The host does not resolve it:
     # under varlen bottom-right needs `seqlen_k[z] - seqlen_q[z]`, which
@@ -1155,29 +1127,6 @@ def build_bwd_dq_module_primary(meta, knobs):
     # the LSE layout in byte 2. `0` is the dense case and the default. Spelled
     # out here rather than imported from the forward kernel module so that this
     # file states the wire encoding it implements.
-
-    def _resolve_scale(Q, scale):
-        """Default sm_scale from the tensor's *real* head dim, not the tile."""
-        if scale is not None:
-            return float(scale)
-        if PADDED_HEAD and hasattr(Q, "shape"):
-            return 1.0 / host_math.sqrt(Q.shape[3])
-        return float(sm_scale)
-
-    def _prep(Q, K, V, DO, DQ):
-        """Pointers, head counts and the fifteen strides, in launch order."""
-        st = []
-        for t, name in ((Q, "Q"), (K, "K"), (V, "V"), (DO, "DO"), (DQ, "DQ")):
-            st.extend(abi.strides_of(t, name))
-        nhq, nhk = Q.shape[1], K.shape[1]
-        hqk, hvo = Q.shape[3], V.shape[3]
-        if V.shape[1] != nhk:
-            raise ValueError(f"K and V must share num_heads, got {nhk} and {V.shape[1]}")
-        if DO.shape[1] != nhq or DQ.shape[1] != nhq:
-            raise ValueError("dO and dQ must carry Q's num_heads")
-        if nhq % nhk:
-            raise ValueError(f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})")
-        return [abi.ptr_arg(t) for t in (Q, K, V, DO, DQ)], (nhq, nhk, hqk, hvo), st
 
     def _args(
         Q,
@@ -1200,9 +1149,11 @@ def build_bwd_dq_module_primary(meta, knobs):
         off2,
     ):
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
-        ptrs, meta_t, st = _prep(Q, K, V, DO, DQ)
-        _lp = _row_tensor(lse, "logsumexp", meta_t[0], seqlen_q, varlen)
-        _dp = _row_tensor(delta, "delta", meta_t[0], seqlen_q, varlen)
+        ptrs, meta_t, st = abi.prep_tensors(
+            [("Q", Q), ("K", K), ("V", V), ("DO", DO), ("DQ", DQ)], q_heads=("DO", "DQ")
+        )
+        _lp = abi.row_tensor_arg(lse, "logsumexp", meta_t[0], seqlen_q, varlen)
+        _dp = abi.row_tensor_arg(delta, "delta", meta_t[0], seqlen_q, varlen)
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
             False, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
@@ -1230,7 +1181,7 @@ def build_bwd_dq_module_primary(meta, knobs):
             _dsc,
             *meta_t,
             *st,
-            _resolve_scale(Q, scale),
+            abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
         )
 
     def _launch(

@@ -2200,42 +2200,6 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             raise ValueError(f"bias must have a contiguous last (Sk) dimension, got " f"stride(3)={bias.stride(3)}")
         return (abi.ptr_arg(bias), bias.stride(0), bias.stride(1), bias.stride(2))
 
-    def _resolve_scale(Q, scale):
-        """Default sm_scale from the tensor's *real* head dim, not the tile.
-
-        The builder can only default to `1/sqrt(BLOCK_DMODEL)`, since it has no
-        idea what `hdim_qk` will be -- and under PADDED_HEAD that is the wrong
-        number. Deriving it here from `Q.shape[3]` is right in both cases and
-        identical to the builder default whenever hdim == the tile.
-        """
-        if scale is not None:
-            return float(scale)
-        if PADDED_HEAD and hasattr(Q, "shape"):
-            return 1.0 / host_math.sqrt(Q.shape[3])
-        return float(sm_scale)
-
-    def _prep(Q, K, V, O):  # noqa: E741
-        """Pointers, head counts and the twelve strides, in launch order.
-
-        Deliberately does **not** flatten: `t.reshape(-1)` materialises a copy
-        for any non-contiguous tensor, which would silently defeat the whole
-        point of reading strides. `data_ptr()` is the tensor's base either way.
-        """
-        st = []
-        for t, name in ((Q, "Q"), (K, "K"), (V, "V"), (O, "O")):
-            st.extend(abi.strides_of(t, name))
-        # BHSD: axis 1 is heads, axis 2 the sequence. Read rather than
-        # assumed -- under MQA/GQA K and V carry fewer heads than Q.
-        nhq, nhk = Q.shape[1], K.shape[1]
-        hqk, hvo = Q.shape[3], V.shape[3]
-        if V.shape[1] != nhk:
-            raise ValueError(f"K and V must share num_heads, got {nhk} and {V.shape[1]}")
-        if O.shape[1] != nhq:
-            raise ValueError(f"O and Q must share num_heads, got {O.shape[1]} and {nhq}")
-        if nhq % nhk:
-            raise ValueError(f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})")
-        return [abi.ptr_arg(t) for t in (Q, K, V, O)], (nhq, nhk, hqk, hvo), st
-
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
     def _launch(
@@ -2261,7 +2225,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         philox_offset_output=None,
     ):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
-        ptrs, meta, st = _prep(Q, K, V, O)
+        ptrs, meta, st = abi.prep_tensors([("Q", Q), ("K", K), ("V", V), ("O", O)], q_heads=("O",))
         _lse_p = abi.lse_args(lse, seqlen_q, varlen, meta[0])
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
@@ -2301,7 +2265,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _sb0,
             _sb1,
             _sb2,
-            _resolve_scale(Q, scale),
+            abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
             stream if stream is not None else fx.Stream(None),
         )
 
@@ -2328,7 +2292,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         philox_offset_output=None,
     ):  # noqa: E741
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
-        ptrs, meta, st = _prep(Q, K, V, O)
+        ptrs, meta, st = abi.prep_tensors([("Q", Q), ("K", K), ("V", V), ("O", O)], q_heads=("O",))
         _lse_p = abi.lse_args(lse, seqlen_q, varlen, meta[0])
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
@@ -2367,7 +2331,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _sb0,
             _sb1,
             _sb2,
-            _resolve_scale(Q, scale),
+            abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
             fx.Stream(stream),
         )
 

@@ -997,54 +997,6 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
     }
 
-    def _row_tensor_ptr(t, name, num_head_q, varlen, seq_len):
-        """Pointer to a compact rank-2 row-wise tensor (logsumexp or delta).
-
-        Both are checked the way the forward checks its logsumexp, and for the
-        same reason: the kernel derives their pitches from VarlenBits rather
-        than reading strides, so the host is the only place the caller's actual
-        layout can be verified.
-        """
-        if t is None:
-            raise ValueError(f"{name} is required by the dK/dV kernel")
-        if t.dtype.__str__() != "torch.float32":
-            raise ValueError(f"{name} must be float32, got {t.dtype}")
-        if t.dim() != 2:
-            raise ValueError(f"{name} must be rank 2, got shape {tuple(t.shape)}")
-        if not t.is_contiguous():
-            raise ValueError(f"{name} must be contiguous: the kernel derives its pitches from VarlenBits")
-        _layout = 0 if varlen is None else (int(varlen["bits"]) >> 16) & 3
-        if _layout == 0:
-            want_last = int(seq_len) if varlen is None else varlen.get("lse_tokens")
-            if want_last is not None and t.shape[1] != int(want_last):
-                raise ValueError(f"{name}: VARLEN_LSE_LAYOUT_HT wants (*, {int(want_last)}), got {tuple(t.shape)}")
-        elif t.shape[1] != num_head_q:
-            raise ValueError(f"{name}: VARLEN_LSE_LAYOUT_TH wants (*, {num_head_q}), got {tuple(t.shape)}")
-        return abi.ptr_arg(t)
-
-    def _prep(Q, K, V, DO, DK, DV):
-        st = []
-        for t, name in ((Q, "Q"), (K, "K"), (V, "V"), (DO, "DO"), (DK, "DK"), (DV, "DV")):
-            st.extend(abi.strides_of(t, name))
-        nhq, nhk = Q.shape[1], K.shape[1]
-        hqk, hvo = Q.shape[3], V.shape[3]
-        if V.shape[1] != nhk:
-            raise ValueError(f"K and V must share num_heads, got {nhk} and {V.shape[1]}")
-        if DO.shape[1] != nhq:
-            raise ValueError(f"DO and Q must share num_heads, got {DO.shape[1]} and {nhq}")
-        if DK.shape[1] != nhk or DV.shape[1] != nhk:
-            raise ValueError(f"DK/DV must carry num_heads_k ({nhk}), got {DK.shape[1]} and {DV.shape[1]}")
-        if nhq % nhk:
-            raise ValueError(f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})")
-        return [abi.ptr_arg(t) for t in (Q, K, V, DO, DK, DV)], (nhq, nhk, hqk, hvo), st
-
-    def _resolve_scale(Q, scale):
-        if scale is not None:
-            return float(scale)
-        if PADDED_HEAD and hasattr(Q, "shape"):
-            return 1.0 / host_math.sqrt(Q.shape[3])
-        return float(sm_scale)
-
     def _launch(
         Q,
         K,
@@ -1068,9 +1020,13 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         philox_offset2=0,
     ):
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
-        ptrs, meta_t, st = _prep(Q, K, V, DO, DK, DV)
-        _lp = _row_tensor_ptr(L, "logsumexp", meta_t[0], varlen, seqlen_q)
-        _dp = _row_tensor_ptr(Delta, "delta", meta_t[0], varlen, seqlen_q)
+        ptrs, meta_t, st = abi.prep_tensors(
+            [("Q", Q), ("K", K), ("V", V), ("DO", DO), ("DK", DK), ("DV", DV)],
+            q_heads=("DO",),
+            k_heads=("DK", "DV"),
+        )
+        _lp = abi.row_tensor_arg(L, "logsumexp", meta_t[0], seqlen_q, varlen)
+        _dp = abi.row_tensor_arg(Delta, "delta", meta_t[0], seqlen_q, varlen)
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
             False, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
@@ -1102,7 +1058,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             _dsc,
             *meta_t,
             *st,
-            _resolve_scale(Q, scale),
+            abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
             stream if stream is not None else fx.Stream(None),
         )
 

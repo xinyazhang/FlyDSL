@@ -27,6 +27,7 @@ host behaviour a knob reaches -- something the closure form hid.
 from __future__ import annotations
 
 import contextlib
+import math
 import weakref
 
 import fmha_common_gfx1201 as fmha
@@ -58,6 +59,9 @@ __all__ = [
     "NULL_PTR",
     "ptr_arg",
     "strides_of",
+    "row_tensor_arg",
+    "resolve_scale",
+    "prep_tensors",
     "lse_args",
     "resolve_window",
     "dropout_args",
@@ -257,6 +261,92 @@ def strides_of(t, name):
     if t.stride(3) != 1:
         raise ValueError(f"{name} must have a contiguous last dimension, got " f"stride(3)={t.stride(3)}")
     return t.stride(0), t.stride(1), t.stride(2)
+
+
+def prep_tensors(named, *, q_heads=(), k_heads=()):
+    """`(pointers, (nhq, nhk, hqk, hvo), strides)` in launch order.
+
+    `named` is `[("Q", Q), ("K", K), ...]` -- order is the launch order for
+    both the pointers and the three-per-tensor strides, and the names are what
+    the diagnostics quote. "Q", "K" and "V" must be present; they are what the
+    head counts and head dims are read from.
+
+    `q_heads` / `k_heads` name the *other* tensors that must carry Q's head
+    count or K's. That is the only thing that varied between the four kernels'
+    copies of this: the forward checks O against Q, dQ checks dO and dQ, dK/dV
+    checks dO against Q and dK/dV against K. Everything else -- the stride
+    sweep, the GQA divisibility rule, reading head_dim from Q and head_dim_v
+    from V -- was identical three times over.
+
+    Deliberately does **not** flatten: `t.reshape(-1)` materialises a copy for
+    any non-contiguous tensor, which would silently defeat the whole point of
+    reading strides. `data_ptr()` is the tensor's base either way.
+    """
+    by_name = dict(named)
+    for req in ("Q", "K", "V"):
+        if req not in by_name:
+            raise ValueError(f"prep_tensors needs a {req!r} entry, got {[n for n, _ in named]}")
+    st = []
+    for name, t in named:
+        st.extend(strides_of(t, name))
+    q, k, v = by_name["Q"], by_name["K"], by_name["V"]
+    # BHSD: axis 1 is heads, axis 3 the head dim. Read rather than assumed --
+    # under MQA/GQA K and V carry fewer heads than Q.
+    nhq, nhk = q.shape[1], k.shape[1]
+    hqk, hvo = q.shape[3], v.shape[3]
+    if v.shape[1] != nhk:
+        raise ValueError(f"K and V must share num_heads, got {nhk} and {v.shape[1]}")
+    for name in q_heads:
+        if by_name[name].shape[1] != nhq:
+            raise ValueError(f"{name} must carry num_heads_q ({nhq}), got {by_name[name].shape[1]}")
+    for name in k_heads:
+        if by_name[name].shape[1] != nhk:
+            raise ValueError(f"{name} must carry num_heads_k ({nhk}), got {by_name[name].shape[1]}")
+    if nhq % nhk:
+        raise ValueError(f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})")
+    return [ptr_arg(t) for _, t in named], (nhq, nhk, hqk, hvo), st
+
+
+def resolve_scale(q, scale, padded_head, default_scale):
+    """`sm_scale` from the tensor's *real* head dim, not the compiled tile.
+
+    A builder can only default to `1/sqrt(BLOCK_DMODEL)`, since it has no idea
+    what `hdim_qk` will be -- and under a padded head that is the wrong number.
+    Deriving it from `q.shape[3]` is right in both cases, and identical to the
+    builder's default whenever the two coincide.
+    """
+    if scale is not None:
+        return float(scale)
+    if padded_head and hasattr(q, "shape"):
+        return 1.0 / math.sqrt(q.shape[3])
+    return float(default_scale)
+
+
+def row_tensor_arg(t, name, num_head_q, seq_len, varlen):
+    """Check a rank-2 f32 row tensor -- logsumexp, or delta -- and take its pointer.
+
+    The two share one offset computation in the kernel, so they must share a
+    layout, and checking them the same way here is what makes that safe.
+    Unlike Q/K/V the kernel derives their pitches from VarlenBits rather than
+    reading strides, so contiguity is required rather than merely convenient --
+    and the host is the only place the caller's actual layout can be verified.
+    """
+    if t is None:
+        raise ValueError(f"{name} is required")
+    if t.dtype != torch_f32:
+        raise ValueError(f"{name} must be float32, got {t.dtype}")
+    if t.dim() != 2:
+        raise ValueError(f"{name} must be rank 2, got shape {tuple(t.shape)}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous: the kernel derives its pitches from VarlenBits")
+    layout = 0 if varlen is None else (int(varlen["bits"]) >> 16) & 3
+    if layout == 0:
+        want_last = int(seq_len) if varlen is None else varlen.get("lse_tokens")
+        if want_last is not None and t.shape[1] != int(want_last):
+            raise ValueError(f"{name} with LSE_LAYOUT_HT wants (*, {int(want_last)}), got {tuple(t.shape)}")
+    elif t.shape[1] != num_head_q:
+        raise ValueError(f"{name} with LSE_LAYOUT_TH wants (*, {num_head_q}), got {tuple(t.shape)}")
+    return ptr_arg(t)
 
 
 def lse_args(lse, seq_len, varlen, num_head_q):
