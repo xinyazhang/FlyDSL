@@ -261,7 +261,15 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     DORM_SIZE = BLOCK_M * DORM_STRIDE
     DOTR_BASE = DORM_BASE + DORM_SIZE
     DOTR_SIZE = BLOCK_DMODEL_V * DOTR_STRIDE
-    LDS_TOTAL = DOTR_BASE + DOTR_SIZE
+    # Per-row LSE and delta for the Q tile in flight, staged once per
+    # iteration and read by every wave. Two BLOCK_M-long f32 runs, expressed in
+    # 16-bit elements because the whole LDS block is typed to the kernel's
+    # element type. 16-byte aligned so the reads can widen later.
+    ROWQ_BASE = ((DOTR_BASE + DOTR_SIZE) + 7) // 8 * 8
+    ROWQ_ELEMS = 2 * BLOCK_M * 2  # f32 -> two 16-bit slots each
+    LDS_TOTAL = ROWQ_BASE + ROWQ_ELEMS
+    ROWQ_BYTE0 = ROWQ_BASE * 2
+    _ROWQ_BATCHES = (BLOCK_M + BLOCK_SIZE - 1) // BLOCK_SIZE
 
     # Cooperative-load vector width, in elements. Fixed at 8 for the alignment
     # reason the forward records: the D-axis pitch is guaranteed a multiple of
@@ -384,6 +392,9 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_qdo = lds.qdo.ptr
+        # `ptrtoint` on a shared pointer yields the 32-bit LDS byte offset,
+        # which is what the f32 scratch helpers index from.
+        _lds_byte_base = fx.as_ir_value(fx.ptrtoint(lds_qdo))
 
         tid, wave_id, lane, lane16, klane = fmha.wave_lanes(WARP_SIZE)
 
@@ -677,17 +688,24 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             fmha.publish_transposed(
                 do_tr_ap, do_tiling, lds_qdo, fmha.read_transposed(do_tr_ap, do_tiling, _fetch_do_tr)
             )
-            gpu.barrier()
-
-            # Row-wise quantities. `lse_tokens` and the HT/TH choice come from
-            # the same VarlenBits the forward wrote them under, so the two
-            # kernels cannot disagree about the layout.
-            _row_base, _row_pitch = fmha.lse_row_addressing(
+            # LSE and delta for this Q tile. Q-indexed, so the same BLOCK_M
+            # values serve every wave -- staging them once replaces 16 scalar
+            # global loads *per lane per iteration*, and with them the 64-bit
+            # address chain that dominated this loop.
+            _rowq_base, _rowq_pitch = fmha.lse_row_addressing(
                 varlen_bits, _q_batch_v, head_q, num_head_q, lse_tokens, _q_row_off_v
             )
-
-            def _row_scalar_off(row_idx):
-                return _row_base + row_idx * _row_pitch
+            for _rb in range_constexpr(_ROWQ_BATCHES):
+                _r = fx.Int32(tid) + fx.Int32(_rb * BLOCK_SIZE)
+                if _r < fx.Int32(BLOCK_M):
+                    _rr = _q_row_start_i32 + _r
+                    _ok = _rr < seqlen_q_i32
+                    _o = _rowq_base + fx.Index(fx.Index(_rr) if _ok else fx.Index(0)) * _rowq_pitch
+                    fmha.lds_f32_store(_lds_byte_base, ROWQ_BYTE0, _r, load_global_f32(l_ptr, _o))
+                    fmha.lds_f32_store(
+                        _lds_byte_base, ROWQ_BYTE0, _r + fx.Int32(BLOCK_M), load_global_f32(delta_ptr, _o)
+                    )
+            gpu.barrier()
 
             for qsub in range_constexpr(Q_SUBTILES):
                 _qs = qsub * WMMA_M
@@ -723,10 +741,11 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                 for si in range_constexpr(8):
                     _q_row_i32 = _q_base_i32 + fx.Int32(si)
                     _q_ok = _q_row_i32 < seqlen_q_i32
-                    _safe_row = fx.Index(fx.Index(_q_row_i32) if _q_ok else fx.Index(0))
-                    _off = _row_scalar_off(_safe_row)
-                    _lse = load_global_f32(l_ptr, _off)
-                    _di = load_global_f32(delta_ptr, _off)
+                    # Local row within the staged tile: 32-bit LDS indexing,
+                    # no 64-bit address arithmetic and no global load.
+                    _lrow = fx.Int32(_qs + si) + fx.Int32(klane) * fx.Int32(WMMA_LANE_K)
+                    _lse = fmha.lds_f32_load(_lds_byte_base, ROWQ_BYTE0, _lrow)
+                    _di = fmha.lds_f32_load(_lds_byte_base, ROWQ_BYTE0, _lrow + fx.Int32(BLOCK_M))
 
                     # p = exp2(sm_scale*log2e*qk - lse*log2e), AOTriton's
                     # `exp2(qk_scale*qk - l_i*RCP_LN2)` with the logsumexp in
