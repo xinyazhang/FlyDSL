@@ -178,6 +178,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     BLOCK_DMODEL_V = knobs.block_dmodel_v
     BLOCK_M = knobs.block_m
     NUM_WAVES = knobs.num_waves
+    LPT_TILE_ORDER = knobs.lpt_tile_order
     PADDED_HEAD = knobs.padded_head
     WAVES_PER_EU = knobs.waves_per_eu
     SCHED_STRATEGY = knobs.sched_strategy
@@ -392,7 +393,13 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         # (a low KV block is visited by nearly every Q block, a high one by
         # few), so spreading it across scheduling groups gives each group a
         # mixed rather than a uniform duration.
-        kv_tile_idx = fx.Index(gpu.block_idx.x)
+        if const_expr(LPT_TILE_ORDER):
+            # Max_seqlen_k, not this sequence's: the reversal must permute the
+            # *grid*, whose x extent the host sized from Max_seqlen_k.
+            _nkvt = (fx.Index(max_seqlen_k) + (BLOCK_N - 1)) // BLOCK_N
+            kv_tile_idx = _nkvt - fx.Index(1) - fx.Index(gpu.block_idx.x)
+        else:
+            kv_tile_idx = fx.Index(gpu.block_idx.x)
         head_k = fx.Index(gpu.block_idx.y)
         start_k_i32 = fx.Int32(kv_tile_idx) * fx.Int32(BLOCK_N)
         start_k = fx.Index(start_k_i32)

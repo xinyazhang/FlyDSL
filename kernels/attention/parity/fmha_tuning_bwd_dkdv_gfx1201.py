@@ -105,6 +105,39 @@ MAX_HEAD_DIM = _BLOCK_DMODEL_LADDER[-1]
 # The previous default of 4 everywhere came from one un-interleaved sweep at a
 # third shape, whose comment said "re-sweep interleaved before moving it".
 # This is that re-sweep.
+# Reverse the KV-tile axis of the grid, the forward's `lpt_tile_order`.
+#
+# **The direction is inverted here, which is why this defaults to off.** The
+# forward reverses because its cost *rises* with the tile index -- query tile i
+# attends keys j <= i, so late tiles are the expensive ones, and the natural
+# order dispatches the cheap ones first. Longest-processing-time scheduling
+# wants the opposite.
+#
+# dK/dV is the transpose of that loop: key j is attended by queries i >= j, so
+# a *low* KV tile is visited by nearly every Q block and a high one by few. The
+# natural order already dispatches longest-first, and reversing it would be
+# anti-LPT. Kept as a knob rather than not ported at all, because that
+# reasoning is a prediction about a 64-CU dispatcher, and the measurement is
+# cheap. Measured, interleaved x3, median, natural against reversed:
+#
+#                       head_dim 64      head_dim 128     head_dim 256
+#   B=4 H=16 N=2048  full   0.99x         0.97x            1.00x
+#                  causal   1.00x         0.94x            0.99x
+#   B=1 H=8  N=4096  full   1.05x         1.00x            0.99x
+#                  causal   0.96x         0.91x            0.92x
+#
+# The prediction holds, and the shape of the result is the confirmation: the
+# loss is **causal-only** -- 0.91-0.96x across both shapes -- while non-causal
+# is a wash, because there every KV tile has the same cost and the order cannot
+# matter. Reversing turns longest-first into shortest-first exactly where the
+# cost is skewed.
+#
+# Kept rather than deleted: the reversal is bitwise identical (it is a grid
+# permutation, verified), so it is a free A/B for anything that changes the
+# per-tile cost profile -- a fused dK/dV/dQ, or a window that makes the tail
+# tiles expensive instead of cheap.
+_DEFAULT_LPT_TILE_ORDER = False
+
 _NUM_WAVES_SMALL_MAX_HEAD_DIM = 64
 _NUM_WAVES_MEDIUM_MAX_HEAD_DIM = 128
 
@@ -234,6 +267,7 @@ class BwdDkDvKnobs:
 
     block_m: int | None = None
     num_waves: int | None = None
+    lpt_tile_order: bool | None = None
 
     # Function attributes and floating-point latitude. Same three-level split
     # as the forward's: `fp_mode` is the explicit flag set on the softmax-ish
@@ -263,6 +297,7 @@ class BwdDkDvKnobs:
 
 
 _KNOBS_FALLBACK = BwdDkDvKnobs(
+    lpt_tile_order=_DEFAULT_LPT_TILE_ORDER,
     # "noninf" and not "fast": `ninf` lets the compiler assume no operand is
     # infinite, and this kernel reads a logsumexp that is deliberately +inf for
     # a row with no live keys. The forward records the same hazard deleting its
