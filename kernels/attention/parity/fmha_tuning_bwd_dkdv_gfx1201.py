@@ -62,24 +62,51 @@ _BLOCK_DMODEL_LADDER = (16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256)
 
 MAX_HEAD_DIM = _BLOCK_DMODEL_LADDER[-1]
 
-# Default waves per workgroup; `BLOCK_N = 16 * this`.
+# Waves per workgroup; `BLOCK_N = 16 * this`.
 #
-# Measured B=2 H=12 N=4096 f16, best of two alternating reps, at each width's
-# chosen block_m (milliseconds, lower better):
+# The knob that matters most at large head_dim, and the reason is traffic
+# rather than registers: every workgroup streams the *whole* Q/dO sequence past
+# its KV tile, so that traffic scales as `1/BLOCK_N`. Widening the workgroup
+# quarters it. Per-wave register state is untouched -- each wave still owns 16
+# KV rows and its own dK/dV accumulators -- so this is orthogonal to the spills
+# at head_dim >= 192 and composes with anything that fixes them.
 #
-#   head_dim  causal  nw=4    nw=8    nw=16
-#   32        no      2.419   2.242   2.387
-#   32        yes     1.436   1.445   1.550
-#   64        no      3.420   3.528   3.701
-#   64        yes     1.992   1.907   2.099
-#   128       no      6.828   6.416   7.243
-#   128       yes     3.515   3.517   3.661
+# Interleaved, three reps, median, at two shapes. Milliseconds, lower better;
+# the previous default 4 against the two alternatives:
 #
-# 8 wins three of six and loses three, by 3-6% either way -- which is the
-# board's own drift (`sdpa_lore_gfx1201.md`), so this is not a threshold to key
-# on from one sweep. 16 loses everywhere. 4 stays because it is within 6% of
-# the best at every point measured; re-sweep interleaved before moving it.
-_DEFAULT_NUM_WAVES = 4
+#              B=4 H=16 N=2048           B=1 H=8 N=4096
+#   hd  mask   nw4     nw8    nw16     nw4     nw8    nw16
+#   64  no     2.03    2.04    2.09    1.04    1.01    0.99
+#   64  yes    1.15    1.24    1.26    0.65    0.71    0.78
+#   80  no     2.90    2.54    2.71    1.47    1.24    1.24
+#   80  yes    1.63    1.47    1.53    0.95    0.86    0.97
+#   128 no     4.73    4.23    4.62    2.32    1.84    2.01
+#   128 yes    2.32    2.31    2.57    1.25    1.21    1.25
+#   160 no     6.69    6.65    6.17    3.47    3.21    2.98
+#   192 no    10.05    9.54    8.83    4.95    4.72    4.55
+#   224 no    17.22   16.92   13.24      --      --      --
+#   256 no    28.28   21.18   19.08   14.09   10.85    9.53
+#   256 yes   15.39   11.69   11.11    7.86    5.89    5.46
+#
+# Three bands, and the same three at both shapes, which is why this is a table
+# and not a constant:
+#
+#   <= 64    4    widening loses; the tile is small enough that fewer, fatter
+#                 workgroups just cost occupancy
+#   80-128   8    1.05-1.26x
+#   >= 160  16    1.06-1.48x, growing with head_dim exactly as the Q/dO
+#                 traffic per KV row does
+#
+# Deliberately **not** keyed on `causal`. The two masking modes disagree only
+# at 128 and 160, by at most 4% -- inside the board's own drift
+# (`sdpa_lore_gfx1201.md`) -- and at 192 causal the wider setting is faster
+# anyway. A second axis would be two more numbers to maintain for noise.
+#
+# The previous default of 4 everywhere came from one un-interleaved sweep at a
+# third shape, whose comment said "re-sweep interleaved before moving it".
+# This is that re-sweep.
+_NUM_WAVES_SMALL_MAX_HEAD_DIM = 64
+_NUM_WAVES_MEDIUM_MAX_HEAD_DIM = 128
 
 # Head dims that stage 32 Q rows per pass rather than 16. Measured, and the
 # effect is far outside the board's drift at the wide end.
@@ -170,9 +197,14 @@ def default_num_waves(head_dim: int, head_dim_v: int) -> int:
 
     Independent of LDS: the Q/dO tiles are shared by every wave, so widening
     the workgroup costs registers (each wave's own K/V and dK/dV) rather than
-    LDS. It is capped where the register floor already exceeds the file.
+    LDS. See the table above for the three bands and the measurements.
     """
-    return _DEFAULT_NUM_WAVES
+    wide = max(head_dim, head_dim_v)
+    if wide <= _NUM_WAVES_SMALL_MAX_HEAD_DIM:
+        return 4
+    if wide <= _NUM_WAVES_MEDIUM_MAX_HEAD_DIM:
+        return 8
+    return 16
 
 
 @dataclass(frozen=True)
