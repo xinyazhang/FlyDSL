@@ -179,6 +179,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     BLOCK_M = knobs.block_m
     NUM_WAVES = knobs.num_waves
     LPT_TILE_ORDER = knobs.lpt_tile_order
+    SPLIT_HEAD_DIM = knobs.split_head_dim
     PADDED_HEAD = knobs.padded_head
     WAVES_PER_EU = knobs.waves_per_eu
     SCHED_STRATEGY = knobs.sched_strategy
@@ -197,7 +198,11 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     # WMMA_M)`. Two lanes share each row and split the K extent.
     WMMA_LANE_K = WMMA_K // (WARP_SIZE // WMMA_M)
 
-    BLOCK_N = ROWS_PER_WAVE * NUM_WAVES
+    # `split_head_dim` pairs the waves, so a workgroup covers half the KV rows.
+    if SPLIT_HEAD_DIM:
+        assert NUM_WAVES % 2 == 0, f"split_head_dim needs an even wave count, got {NUM_WAVES}"
+    NUM_PAIRS = NUM_WAVES // 2 if SPLIT_HEAD_DIM else NUM_WAVES
+    BLOCK_N = ROWS_PER_WAVE * NUM_PAIRS
     BLOCK_SIZE = NUM_WAVES * WARP_SIZE
 
     D_STEPS = BLOCK_DMODEL // WMMA_K  # k_packs, dk accumulators
@@ -267,9 +272,21 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     # element type. 16-byte aligned so the reads can widen later.
     ROWQ_BASE = ((DOTR_BASE + DOTR_SIZE) + 7) // 8 * 8
     ROWQ_ELEMS = 2 * BLOCK_M * 2  # f32 -> two 16-bit slots each
-    LDS_TOTAL = ROWQ_BASE + ROWQ_ELEMS
     ROWQ_BYTE0 = ROWQ_BASE * 2
+    # The pair exchange, only under `split_head_dim`. LDS is typed in 16-bit
+    # elements but `lds_f32_*` index in f32; the _F32 names are the indexing
+    # unit and PDS_ELEMS the block size. Mixing them is a silent 2x overrun.
+    PDS_BASE = (ROWQ_BASE + ROWQ_ELEMS + 7) // 8 * 8
+    PDS_SLOT_F32 = WARP_SIZE * 8
+    PDS_PAIR_F32 = 2 * PDS_SLOT_F32
+    PDS_ELEMS = (NUM_PAIRS * PDS_PAIR_F32 * 2) if SPLIT_HEAD_DIM else 0
+    PDS_BYTE0 = PDS_BASE * 2
     _ROWQ_BATCHES = (BLOCK_M + BLOCK_SIZE - 1) // BLOCK_SIZE
+    LDS_TOTAL = PDS_BASE + PDS_ELEMS
+    if SPLIT_HEAD_DIM:
+        assert D_STEPS % 2 == 0 and DV_STEPS % 2 == 0, "split_head_dim needs even D_STEPS/DV_STEPS"
+    D_STEPS_OWN = D_STEPS // 2 if SPLIT_HEAD_DIM else D_STEPS
+    DV_STEPS_OWN = DV_STEPS // 2 if SPLIT_HEAD_DIM else DV_STEPS
 
     # Cooperative-load vector width, in elements. Fixed at 8 for the alignment
     # reason the forward records: the D-axis pitch is guaranteed a multiple of
@@ -495,9 +512,24 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         v_ap = fmha.Aperture(vo_cols, rows=kv_rows)
 
         # This wave's 16 KV rows, and this lane's row inside them.
-        kv_row_in_tile = wave_id * fx.Index(ROWS_PER_WAVE) + lane16
+        # Under `split_head_dim` a *pair* owns the 16 KV rows and the two waves
+        # differ only in which half of the head dim they accumulate.
+        if const_expr(SPLIT_HEAD_DIM):
+            group_of_wave = wave_id // fx.Index(2)
+            role = fx.Int32(wave_id % fx.Index(2))
+        else:
+            group_of_wave = wave_id
+            role = fx.Int32(0)
+        _half_i32 = role * fx.Int32(D_STEPS_OWN)
+        _vhalf_i32 = role * fx.Int32(DV_STEPS_OWN)
+        kv_row_in_tile = group_of_wave * fx.Index(ROWS_PER_WAVE) + lane16
         kv_row_abs = start_k + kv_row_in_tile
-        kv_row_abs_i32 = start_k_i32 + fx.Int32(wave_id) * fx.Int32(ROWS_PER_WAVE) + fx.Int32(lane16)
+        kv_row_abs_i32 = start_k_i32 + fx.Int32(group_of_wave) * fx.Int32(ROWS_PER_WAVE) + fx.Int32(lane16)
+        if const_expr(SPLIT_HEAD_DIM):
+            _pds_pair = fx.Int32(group_of_wave) * fx.Int32(PDS_PAIR_F32) + fx.Int32(lane) * fx.Int32(8)
+            _pds_mine = _pds_pair + role * fx.Int32(PDS_SLOT_F32)
+            _pds_theirs = _pds_pair + (fx.Int32(1) - role) * fx.Int32(PDS_SLOT_F32)
+            _rm_base_off = fx.Index(role) * fx.Index(DORM_BASE - QRM_BASE)
 
         k_tile_base = k_tbase(_k_start_addr)
         v_tile_base = v_tbase(_k_start_addr)
@@ -514,12 +546,40 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         # compare that `fx.Index` being unsigned would otherwise deny.
         _kv_in, _kv_safe = k_ap.rows.gate(kv_row_abs, kv_row_in_tile)
 
-        k_packs = []
-        for ks in range_constexpr(D_STEPS):
-            k_packs.append(k_ap.read_v8(fetch_k, _kv_safe, fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K, _kv_in))
-        v_packs = []
-        for ks in range_constexpr(DV_STEPS):
-            v_packs.append(v_ap.read_v8(fetch_v, _kv_safe, fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K, _kv_in))
+        if const_expr(SPLIT_HEAD_DIM):
+            # Role 0 holds K (for S), role 1 holds V (for dP) -- D/4 registers
+            # instead of D/2. The role is resolved ONCE, here, on plain values:
+            # an aperture method call inside a ternary arm is `name.method(...)`
+            # under a dynamic branch, the carried-state trap `fmha_common`'s
+            # header documents, and it surfaces as a bad_alloc out of
+            # `get_ir_types` rather than the documented UnboundLocalError. An
+            # !llvm.ptr cannot cross an scf.if result either, so the pointer is
+            # chosen as an i64 address and rebuilt.
+            _role0 = role == fx.Int32(0)
+            _v4_ty = Vec.make_type(4, elem_dtype)
+            _my_addr = fx.Int64(fx.ptrtoint(K)) if _role0 else fx.Int64(fx.ptrtoint(V))
+            my_ptr = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), fx.as_ir_value(_my_addr)).result
+            _my_st = tuple(_a if _role0 else _b for _a, _b in zip(k_st, v_st))
+            my_tbase, my_toff, _ = fmha.make_addr_pair(_my_st, head_k, _k_batch_v, _k_row_off_v, **_addr_kw_k)
+            my_tile_base = my_tbase(_k_start_addr)
+
+            def fetch_my(row, col):
+                return load_global_v8f16(my_ptr, my_tile_base, my_toff(row, col))
+
+            k_packs = []
+            for ks in range_constexpr(D_STEPS):
+                _c = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
+                k_packs.append(k_ap.read_v8(fetch_my, _kv_safe, _c, _kv_in))
+            v_packs = k_packs
+        else:
+            k_packs = []
+            for ks in range_constexpr(D_STEPS):
+                _c = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
+                k_packs.append(k_ap.read_v8(fetch_k, _kv_safe, _c, _kv_in))
+            v_packs = []
+            for ks in range_constexpr(DV_STEPS):
+                _c = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
+                v_packs.append(v_ap.read_v8(fetch_v, _kv_safe, _c, _kv_in))
 
         # ---- Q and dO: the staged apertures ----
         #
@@ -633,9 +693,9 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         # ---- Loop-carried state: dK^T then dV^T accumulators ----
         c_zero_v8f32 = Vec.filled(8, 0.0, fx.Float32)
         init_args = []
-        for _ in range_constexpr(D_STEPS):
+        for _ in range_constexpr(D_STEPS_OWN):
             init_args.append(fx.as_ir_value(c_zero_v8f32))
-        for _ in range_constexpr(DV_STEPS):
+        for _ in range_constexpr(DV_STEPS_OWN):
             init_args.append(fx.as_ir_value(c_zero_v8f32))
 
         def _pack_v8(vals):
@@ -652,8 +712,8 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
 
         loop_results = init_args
         for _it, _iter_args in range(fx.Index(0), fx.Index(_total_i32), 1, init=init_args):
-            dk_accs = [_iter_args[i] for i in range_constexpr(D_STEPS)]
-            dv_accs = [_iter_args[D_STEPS + i] for i in range_constexpr(DV_STEPS)]
+            dk_accs = [_iter_args[i] for i in range_constexpr(D_STEPS_OWN)]
+            dv_accs = [_iter_args[D_STEPS_OWN + i] for i in range_constexpr(DV_STEPS_OWN)]
 
             _it_i32 = fx.Int32(_it)
             _g_i32 = _it_i32 // _nb_safe_i32
@@ -714,18 +774,46 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                 # `m' = q`, so a lane's eight results are eight consecutive q
                 # rows at one kv -- which is exactly the B-operand layout the
                 # dV and dK GEMMs want, so P needs no repacking.
-                s_acc = fx.as_ir_value(c_zero_v8f32)
-                for ks in range_constexpr(D_STEPS):
-                    _qa = q_rm_ap.from_lds(lds_qdo, fx.Index(_qs) + lane16, fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K)
-                    s_acc = fmha.wmma_acc(_qa, k_packs[ks], s_acc)
+                if const_expr(SPLIT_HEAD_DIM):
+                    # One GEMM per wave: role 0 makes S, role 1 makes dP. Same
+                    # shape and accumulator, different operands -- and those
+                    # were selected in the prologue, so this loop is branch-free.
+                    _mine = fx.as_ir_value(c_zero_v8f32)
+                    for ks in range_constexpr(D_STEPS):
+                        _c = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
+                        _a_op = fmha.lds_load_v8(
+                            lds_qdo, q_rm_ap.lds_index(fx.Index(_qs) + lane16, _c) + _rm_base_off, _v4_ty
+                        )
+                        _mine = fmha.wmma_acc(_a_op, k_packs[ks], _mine)
 
-                # ==== GEMM2: dP[q][kv] = dO . V^T ====
-                dp_acc = fx.as_ir_value(c_zero_v8f32)
-                for ks in range_constexpr(DV_STEPS):
-                    _da = do_rm_ap.from_lds(
-                        lds_qdo, fx.Index(_qs) + lane16, fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
-                    )
-                    dp_acc = fmha.wmma_acc(_da, v_packs[ks], dp_acc)
+                    # Relay: write mine, read the partner's. After the barrier
+                    # both waves hold S and dP, so the P/dS arithmetic below is
+                    # identical in both and needs no branch of its own.
+                    for _si in range_constexpr(8):
+                        fmha.lds_f32_store(
+                            _lds_byte_base, PDS_BYTE0, _pds_mine + fx.Int32(_si), fx.Float32(Vec(_mine)[_si])
+                        )
+                    gpu.barrier()
+                    _other = [
+                        fmha.lds_f32_load(_lds_byte_base, PDS_BYTE0, _pds_theirs + fx.Int32(_si))
+                        for _si in range_constexpr(8)
+                    ]
+                    s_acc = _mine
+                    dp_acc = _mine
+                else:
+                    s_acc = fx.as_ir_value(c_zero_v8f32)
+                    for ks in range_constexpr(D_STEPS):
+                        _qa = q_rm_ap.from_lds(
+                            lds_qdo, fx.Index(_qs) + lane16, fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
+                        )
+                        s_acc = fmha.wmma_acc(_qa, k_packs[ks], s_acc)
+
+                    dp_acc = fx.as_ir_value(c_zero_v8f32)
+                    for ks in range_constexpr(DV_STEPS):
+                        _da = do_rm_ap.from_lds(
+                            lds_qdo, fx.Index(_qs) + lane16, fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
+                        )
+                        dp_acc = fmha.wmma_acc(_da, v_packs[ks], dp_acc)
 
                 # ==== P and dS ====
                 #
@@ -752,7 +840,15 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                     # natural units. A row the forward found no live keys for
                     # carries +inf here, which makes p exactly 0 -- which is
                     # why the forward writes +inf and not -inf.
-                    _s = fastmath.mul(fx.Float32(Vec(s_acc)[si]), sm_log2e)
+                    # Under the split, S is mine when role 0 and the partner's
+                    # otherwise; dP the other way round.
+                    if const_expr(SPLIT_HEAD_DIM):
+                        _mv = fx.Float32(Vec(_mine)[si])
+                        _ov = fx.Float32(_other[si])
+                        _sv = _mv if _role0 else _ov
+                    else:
+                        _sv = fx.Float32(Vec(s_acc)[si])
+                    _s = fastmath.mul(_sv, sm_log2e)
                     _e = fastmath.sub(_s, fastmath.mul(fx.Float32(_lse), fx.Float32(_LOG2E)))
                     _p = rocdl.exp2(f32_ty, fx.as_ir_value(_e))
 
@@ -770,7 +866,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                         _dead = _dead | (kv_row_abs_i32 < _q_row_i32 - _wl_i32)
                     _p = fx.as_ir_value(fx.Float32(0.0) if _dead else fx.Float32(_p))
 
-                    _dpv = fx.Float32(Vec(dp_acc)[si])
+                    if const_expr(SPLIT_HEAD_DIM):
+                        _dpv = _ov if _role0 else _mv
+                    else:
+                        _dpv = fx.Float32(Vec(dp_acc)[si])
                     if const_expr(ENABLE_DROPOUT):
                         # The stream is packed `randoms_per_offset` to an
                         # offset along the *kv* axis, but a lane here holds one
@@ -807,13 +906,15 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                 _ds_pack = _pack_v8(_ds_vals)
 
                 # ==== GEMM3: dV^T[d][kv] += dO^T . P ====
-                for dc in range_constexpr(DV_STEPS):
-                    _a = do_tr_ap.from_lds(lds_qdo, fx.Index(dc * WMMA_N) + lane16, fx.Index(_qs) + klane * WMMA_LANE_K)
+                for dc in range_constexpr(DV_STEPS_OWN):
+                    _gd = fx.Index((fx.Int32(dc) + _vhalf_i32) * fx.Int32(WMMA_N))
+                    _a = do_tr_ap.from_lds(lds_qdo, _gd + lane16, fx.Index(_qs) + klane * WMMA_LANE_K)
                     dv_accs[dc] = fmha.wmma_acc(_a, _p_pack, dv_accs[dc])
 
                 # ==== GEMM4: dK^T[d][kv] += Q^T . dS ====
-                for dc in range_constexpr(D_STEPS):
-                    _a = q_tr_ap.from_lds(lds_qdo, fx.Index(dc * WMMA_N) + lane16, fx.Index(_qs) + klane * WMMA_LANE_K)
+                for dc in range_constexpr(D_STEPS_OWN):
+                    _gd = fx.Index((fx.Int32(dc) + _half_i32) * fx.Int32(WMMA_N))
+                    _a = q_tr_ap.from_lds(lds_qdo, _gd + lane16, fx.Index(_qs) + klane * WMMA_LANE_K)
                     dk_accs[dc] = fmha.wmma_acc(_a, _ds_pack, dk_accs[dc])
 
             # Every wave must finish reading this Q/dO window before the next
@@ -846,13 +947,17 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             # accumulator is dS^T Q with dS taken against the *unscaled* score,
             # so the chain rule's factor lands here rather than per element.
             _scale_vec = Vec.from_elements([fx.Float32(sm_scale_arg)], fx.Float32).broadcast_to(8).ir_value()
-            for dc in range_constexpr(D_STEPS):
+            # Under the split each wave stores only the head-dim half it
+            # accumulated; the pair writes disjoint columns, hence no reduction.
+            for dc in range_constexpr(D_STEPS_OWN):
                 _v = fastmath.mul(loop_results[dc], _scale_vec)
                 _t = Vec(_v).to(elem_dtype).ir_value()
-                fmha.write_v8(dk_out_ap, write_dk, kv_row_in_tile, fx.Index(dc * WMMA_N) + klane * WMMA_LANE_K, _t)
-            for dc in range_constexpr(DV_STEPS):
-                _t = Vec(loop_results[D_STEPS + dc]).to(elem_dtype).ir_value()
-                fmha.write_v8(dv_out_ap, write_dv, kv_row_in_tile, fx.Index(dc * WMMA_N) + klane * WMMA_LANE_K, _t)
+                _gc = fx.Index((fx.Int32(dc) + _half_i32) * fx.Int32(WMMA_N)) + klane * WMMA_LANE_K
+                fmha.write_v8(dk_out_ap, write_dk, kv_row_in_tile, _gc, _t)
+            for dc in range_constexpr(DV_STEPS_OWN):
+                _t = Vec(loop_results[D_STEPS_OWN + dc]).to(elem_dtype).ir_value()
+                _gc = fx.Index((fx.Int32(dc) + _vhalf_i32) * fx.Int32(WMMA_N)) + klane * WMMA_LANE_K
+                fmha.write_v8(dv_out_ap, write_dv, kv_row_in_tile, _gc, _t)
 
     @flyc.jit
     def launch_bwd_dkdv(

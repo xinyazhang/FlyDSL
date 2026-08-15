@@ -49,6 +49,7 @@ ROWS_PER_WAVE = 16
 
 # Workgroup LDS budget on gfx1201. The hardware allows 64 KiB per workgroup.
 _LDS_LIMIT = 65536
+_WAVE_LANES = 32  # gfx1201 is wave32; the exchange is sized per lane
 
 # LDS row padding, in elements. Same value and same reason as the forward's
 # `_LDS_PAD`: it moves consecutive rows off the same bank group, and a swizzle
@@ -138,6 +139,25 @@ MAX_HEAD_DIM = _BLOCK_DMODEL_LADDER[-1]
 # tiles expensive instead of cheap.
 _DEFAULT_LPT_TILE_ORDER = False
 
+
+# Pair the waves and split the head dim of dK/dV between them.
+#
+# Off by default. It is not a schedule tweak but a different decomposition, and
+# it wins only where the baseline spills -- see the kernel's `SPLIT_HEAD_DIM`
+# section for the mechanism and the measurements. Summary, B=4 H=16 N=2048 f16,
+# each arm at its own best num_waves:
+#
+#   head_dim   full     causal      baseline spill
+#   128        0.86x    0.82x       0
+#   192        1.06x    1.34x       91
+#   256        2.39x    2.61x       251
+#
+# The crossover is the spill boundary, which is why this is keyed on head_dim
+# and not measured per shape: below 192 the baseline holds everything in
+# registers and the pair exchange plus the halved BLOCK_N buy nothing.
+_DEFAULT_SPLIT_HEAD_DIM = False
+_SPLIT_HEAD_DIM_MIN = 192
+
 _NUM_WAVES_SMALL_MAX_HEAD_DIM = 64
 _NUM_WAVES_MEDIUM_MAX_HEAD_DIM = 128
 
@@ -186,7 +206,14 @@ def _round_to_ladder(head_dim: int) -> int:
     raise ValueError(f"head_dim {head_dim} exceeds the largest compiled tile ({MAX_HEAD_DIM})")
 
 
-def lds_bytes(block_m: int, head_dim: int, head_dim_v: int, elem_bytes: int = 2) -> int:
+def lds_bytes(
+    block_m: int,
+    head_dim: int,
+    head_dim_v: int,
+    elem_bytes: int = 2,
+    num_waves: int | None = None,
+    split_head_dim: bool = False,
+) -> int:
     """LDS a Q/dO staging pass needs, in bytes.
 
     Four tiles, because both tensors are needed in both orientations:
@@ -205,11 +232,21 @@ def lds_bytes(block_m: int, head_dim: int, head_dim_v: int, elem_bytes: int = 2)
     """
     rm = block_m * (head_dim + LDS_PAD) + block_m * (head_dim_v + LDS_PAD)
     tr = head_dim * (block_m + LDS_PAD) + head_dim_v * (block_m + LDS_PAD)
-    return (rm + tr) * elem_bytes
+    total = (rm + tr) * elem_bytes
+    # Per-row LSE and delta for the Q tile in flight: two f32 runs of block_m,
+    # staged once and read by every wave.
+    total += 2 * block_m * 4
+    if split_head_dim:
+        # `split_head_dim` pairs the waves and relays each pair's S and dP
+        # through LDS: one f32 slot per lane per wave, eight values each.
+        if num_waves is None:
+            raise ValueError("split_head_dim needs num_waves to size the pair exchange")
+        total += num_waves * _WAVE_LANES * 8 * 4
+    return total
 
 
-def _fits_lds(block_m: int, head_dim: int, head_dim_v: int) -> bool:
-    return lds_bytes(block_m, head_dim, head_dim_v) <= _LDS_LIMIT
+def _fits_lds(block_m, head_dim, head_dim_v, num_waves=None, split_head_dim=False) -> bool:
+    return lds_bytes(block_m, head_dim, head_dim_v, 2, num_waves, split_head_dim) <= _LDS_LIMIT
 
 
 def default_block_m(head_dim: int, head_dim_v: int) -> int:
@@ -268,6 +305,7 @@ class BwdDkDvKnobs:
     block_m: int | None = None
     num_waves: int | None = None
     lpt_tile_order: bool | None = None
+    split_head_dim: bool | None = None
 
     # Function attributes and floating-point latitude. Same three-level split
     # as the forward's: `fp_mode` is the explicit flag set on the softmax-ish
@@ -297,6 +335,7 @@ class BwdDkDvKnobs:
 
 
 _KNOBS_FALLBACK = BwdDkDvKnobs(
+    split_head_dim=_DEFAULT_SPLIT_HEAD_DIM,
     lpt_tile_order=_DEFAULT_LPT_TILE_ORDER,
     # "noninf" and not "fast": `ninf` lets the compiler assume no operand is
     # infinite, and this kernel reads a logsumexp that is deliberately +inf for
