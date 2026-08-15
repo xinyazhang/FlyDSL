@@ -162,6 +162,7 @@ def build_bwd_dq_module_primary(meta, knobs):
     NUM_WAVES = knobs.num_waves
     KT_LDS_LAYOUT = knobs.kt_lds_layout
     KV_ADDR_HOIST = knobs.kv_addr_hoist
+    KV_PREFETCH_DIST = knobs.kv_prefetch_dist
     WAVES_PER_EU = knobs.waves_per_eu
     FLAT_WORK_GROUP_SIZE = knobs.flat_work_group_size
     SCHED_STRATEGY_KNOB = knobs.sched_strategy
@@ -494,6 +495,10 @@ def build_bwd_dq_module_primary(meta, knobs):
         # access pattern (GEMM1 and GEMM2 differ only in which register operand
         # they pair with). Each still carries its own geometry, because their
         # column bounds are different runtime extents.
+        # Loop-carried values: the dQ accumulators, plus the prefetched K/V
+        # batches when the distance-1 schedule is on. `scf_yield_` returns a
+        # bare value rather than a list when this is 1.
+        _CARRY_N = D_CHUNKS + (NUM_BATCHES_K + NUM_BATCHES_V if KV_PREFETCH_DIST else 0)
         k_ap = fmha.Aperture(
             qk_cols,
             lds_base=0,
@@ -682,7 +687,7 @@ def build_bwd_dq_module_primary(meta, knobs):
             _BN_I32 = fx.Int32(BLOCK_N)
             _n_l, _n_f, _n_r = _regions.n_left, _regions.n_full, _regions.n_right
             _l_col0, _f_col0 = _regions.left_col0, _regions.full_col0
-            _r_col0 = _regions.right_col0
+            _r_col0, _m_col0 = _regions.right_col0, _regions.masked_col0
             _n_masked = fx.Index(_n_l + _n_r)
         else:
             # No mask beyond the KV tail: one full region, then one partial
@@ -695,36 +700,94 @@ def build_bwd_dq_module_primary(meta, knobs):
             _full_end = fx.Index(_full_end if _alive else fx.Index(0))
             kv_upper = fx.Index(kv_upper if _alive else fx.Index(0))
 
+        def _read_k(col0):
+            return fmha.read_batches(k_ap, fetch_k(col0), load_row_in_batch, load_col_base)
+
+        def _read_v(col0):
+            return fmha.read_batches_unmasked(v_ap, fetch_v(col0), v_row_in_batch, v_col_base)
+
         init_args = [fx.as_ir_value(c_zero_v8f32) for _ in range_constexpr(D_CHUNKS)]
+        if const_expr(KV_PREFETCH_DIST):
+            if const_expr(CAUSAL):
+                _kv_tiles_i32 = _n_f + _n_l + _n_r
+            else:
+                _kv_tiles_i32 = fx.Int32(kv_upper)
+            _pf_n = fx.Index(fx.Int32(1) if _kv_tiles_i32 > fx.Int32(0) else fx.Int32(0))
+            # Seeded through a 0-or-1-trip `range(..., init=)`, not a dynamic
+            # `if`: at seqlen_k == 0 there is no harmless address to clamp to,
+            # and FlyDSL's dynamic `if` merges named scalars only while a loop
+            # carries exactly the list of vectors a prefetch produces. The trip
+            # count is uniform across the workgroup, so no divergence.
+            # The first tile actually walked, which is not always the full
+            # run's origin: with no full tiles the masked run goes first. The
+            # seed feeds iteration 0's publish, so getting this wrong corrupts
+            # the very first tile -- and it is invisible on any shape whose
+            # full run is non-empty.
+            if const_expr(CAUSAL):
+                _first_col = fx.Index(_f_col0 if _n_f > fx.Int32(0) else _m_col0)
+            else:
+                _first_col = fx.Index(0)
+            _pf_init = [
+                Vec.filled(VEC_WIDTH, 0.0, elem_dtype).ir_value()
+                for _ in range_constexpr(NUM_BATCHES_K + NUM_BATCHES_V)
+            ]
+            _pf = _pf_init
+            for _pfi, _pf_args in range(fx.Index(0), _pf_n, 1, init=_pf_init):
+                _pf = yield _read_k(_first_col) + _read_v(_first_col)
+            # `scf_yield_` returns a bare value, not a list, when the loop
+            # carries exactly one.
+            if const_expr(len(_pf_init) == 1):
+                _pf = [_pf]
+            init_args = init_args + [_pf[_i] for _i in range_constexpr(NUM_BATCHES_K + NUM_BATCHES_V)]
         loop_results = init_args
 
-        def kv_loop_body(kv_block_start, inner_iter_args, _MASK_STEPS):
+        def kv_loop_body(kv_block_start, inner_iter_args, _MASK_STEPS, next_kv_start=None):
             """One KV tile. `_MASK_STEPS` is a Python bool resolved at trace
-            time, so the masked and unmasked regions emit different code."""
+            time, so the masked and unmasked regions emit different code.
+
+            `next_kv_start` is the tile a distance-1 prefetch should fetch. It
+            defaults to the following tile, which is right whenever the region
+            being walked is contiguous; the causal masked loop walks two
+            disjoint runs and passes the piecewise successor explicitly.
+            Getting that wrong fetches the wrong tile and is **invisible to a
+            correctness test**, because the value is overwritten before use --
+            the forward's copy of this carries the same warning."""
             # `inner_iter_args` is always a list, even at BLOCK_DMODEL 16 where
             # the loop carries exactly one value. The *loop result* is not --
             # see the unwrap after each loop below.
             dq_accs = [inner_iter_args[i] for i in range_constexpr(D_CHUNKS)]
+            if const_expr(KV_PREFETCH_DIST):
+                _kv = [inner_iter_args[D_CHUNKS + i] for i in range_constexpr(NUM_BATCHES_K + NUM_BATCHES_V)]
+                _k_cur, _v_cur = _kv[:NUM_BATCHES_K], _kv[NUM_BATCHES_K:]
+            if const_expr(next_kv_start is None):
+                next_kv_start = kv_block_start + fx.Index(BLOCK_N)
 
             # Everyone must be done reading the previous tile before it is
             # overwritten. Two barriers per iteration, as in the forward.
             gpu.barrier()
-            fmha.stage(
-                k_ap,
-                lds_kv,
-                fetch_k(kv_block_start),
-                load_row_in_batch,
-                load_col_base,
-                fx.Index(BLOCK_N),
-            )
-            fmha.stage(
-                v_ap,
-                lds_kv,
-                fetch_v(kv_block_start),
-                v_row_in_batch,
-                v_col_base,
-                fx.Index(BLOCK_N),
-            )
+            if const_expr(KV_PREFETCH_DIST):
+                fmha.publish(k_ap, lds_kv, _k_cur, load_row_in_batch, load_col_base, fx.Index(BLOCK_N))
+                fmha.publish(v_ap, lds_kv, _v_cur, v_row_in_batch, v_col_base, fx.Index(BLOCK_N))
+                # Issued after the store and before the barrier, so the load
+                # flies over all three GEMMs rather than only the back-edge.
+                _k_next, _v_next = _read_k(next_kv_start), _read_v(next_kv_start)
+            else:
+                fmha.stage(
+                    k_ap,
+                    lds_kv,
+                    fetch_k(kv_block_start),
+                    load_row_in_batch,
+                    load_col_base,
+                    fx.Index(BLOCK_N),
+                )
+                fmha.stage(
+                    v_ap,
+                    lds_kv,
+                    fetch_v(kv_block_start),
+                    v_row_in_batch,
+                    v_col_base,
+                    fx.Index(BLOCK_N),
+                )
             if const_expr(KT_TRANSPOSED):
                 fmha.publish_transposed(
                     kt_ap,
@@ -876,7 +939,10 @@ def build_bwd_dq_module_primary(meta, knobs):
                         kt_pack = _load_kt(dc, st_idx * COLS_PER_SUBTILE, pks)
                         dq_accs[dc] = fmha.wmma_acc(kt_pack, ds_packs[st_idx * 2 + pks], dq_accs[dc])
 
-            return [dq_accs[i] for i in range_constexpr(D_CHUNKS)]
+            _out = [dq_accs[i] for i in range_constexpr(D_CHUNKS)]
+            if const_expr(KV_PREFETCH_DIST):
+                _out = _out + _k_next + _v_next
+            return _out
 
         if const_expr(CAUSAL):
             # Full region first, then the two masked runs walked as one loop
@@ -888,13 +954,18 @@ def build_bwd_dq_module_primary(meta, knobs):
                 BLOCK_N,
                 init=init_args,
             ):
-                loop_results = yield kv_loop_body(kv_block_start, inner_iter_args, False)
+                _nxt = fx.Index(
+                    fx.Int32(kv_block_start) + _BN_I32
+                    if fx.Int32(kv_block_start) + _BN_I32 < _f_col0 + _n_f * _BN_I32
+                    else _m_col0
+                )
+                loop_results = yield kv_loop_body(kv_block_start, inner_iter_args, False, next_kv_start=_nxt)
             # `yield` hands back a bare value rather than a one-element list
             # when the loop carries exactly one, which happens at
             # BLOCK_DMODEL 16 (one dQ accumulator). Indexing that would extract
             # a vector *element*, and the failure surfaces far away, in the
             # next loop's WMMA operand type.
-            if const_expr(D_CHUNKS == 1):
+            if const_expr(_CARRY_N == 1):
                 loop_results = [loop_results]
 
             def _masked_col(i_idx):
@@ -904,20 +975,25 @@ def build_bwd_dq_module_primary(meta, knobs):
                 return _l_col0 + _i * _BN_I32 if _i < _n_l else _r_col0 + (_i - _n_l) * _BN_I32
 
             for _mi, inner_iter_args in range(fx.Index(0), _n_masked, 1, init=loop_results):
-                loop_results = yield kv_loop_body(fx.Index(_masked_col(_mi)), inner_iter_args, True)
+                loop_results = yield kv_loop_body(
+                    fx.Index(_masked_col(_mi)),
+                    inner_iter_args,
+                    True,
+                    next_kv_start=fx.Index(_masked_col(fx.Int32(_mi) + fx.Int32(1))),
+                )
         else:
             # Region 1: tiles wholly inside seqlen_k -- no masking emitted.
             for kv_block_start, inner_iter_args in range(fx.Index(0), _full_end, BLOCK_N, init=init_args):
                 loop_results = yield kv_loop_body(kv_block_start, inner_iter_args, False)
             # See the causal arm: one carried value comes back bare.
-            if const_expr(D_CHUNKS == 1):
+            if const_expr(_CARRY_N == 1):
                 loop_results = [loop_results]
 
             # Region 2: the ragged tail.
             for kv_block_start, inner_iter_args in range(_full_end, kv_upper, BLOCK_N, init=loop_results):
                 loop_results = yield kv_loop_body(kv_block_start, inner_iter_args, True)
 
-        if const_expr(D_CHUNKS == 1):
+        if const_expr(_CARRY_N == 1):
             loop_results = [loop_results]
 
         # ---- Scale and store dQ ----

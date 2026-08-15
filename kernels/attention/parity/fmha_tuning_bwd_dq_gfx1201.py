@@ -145,6 +145,21 @@ _DEFAULT_BLOCK_N = 32
 # prefetch, a wider BLOCK_N, a fused dK/dV that has K^T resident anyway).
 _DEFAULT_KT_LDS_LAYOUT = "scalar"
 
+# Distance-1 K/V prefetch, as the forward's `k_prefetch_dist`/`v_prefetch_dist`.
+#
+# 0 until measured. The loop today issues both global reads inside the barrier
+# pair and waits on them immediately: at head_dim 128 the ISA puts 0..4
+# instructions and **zero** WMMA between each `global_load` and the
+# `s_wait_loadcnt` that consumes it, where the forward gets 35-36 instructions
+# and 7 WMMA, plus two loads it does not wait on at all. So the latency is
+# fully exposed here and there are three GEMMs per tile to hide it behind --
+# one more than the forward has.
+#
+# The carry is cheap: 1-2 batches each for K and V at every head_dim on the
+# ladder, so 8-16 VGPRs. dQ measures 150/221/231/256 VGPRs at head_dim
+# 64/128/192/256, so it fits everywhere except 256, which already spills 132.
+_DEFAULT_KV_PREFETCH_DIST = 0
+
 
 def default_num_waves(head_dim: int) -> int:
     """Waves per workgroup at this head_dim."""
@@ -209,6 +224,7 @@ class BwdDqKnobs:
     num_waves: int | None = None
     kt_lds_layout: str | None = None
     kv_addr_hoist: bool | None = None
+    kv_prefetch_dist: int | None = None
 
     waves_per_eu: int | None = None
     flat_work_group_size: int | None = None
@@ -239,6 +255,7 @@ class BwdDqKnobs:
 
 _KNOBS_FALLBACK = BwdDqKnobs(
     kt_lds_layout=_DEFAULT_KT_LDS_LAYOUT,
+    kv_prefetch_dist=_DEFAULT_KV_PREFETCH_DIST,
     waves_per_eu=2,
     fp_mode="noninf",
     denormals_are_zero=True,

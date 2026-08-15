@@ -455,6 +455,82 @@ _VARLEN_LENGTHS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Distance-1 K/V prefetch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("window", [(64, 0), (96, 32), (128, 64)], ids=["wl64", "wl96wr32", "wl128wr64"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_kv_prefetch_matches_distance_zero_across_the_seam(head_dim, window):
+    """`kv_prefetch_dist=1` must be bit-identical to 0, *on a windowed shape*.
+
+    The window is the whole point. A distance-1 schedule fetches tile `i+1`
+    while computing tile `i`, so it needs the successor of the tile it is on --
+    and gSWA's masked region walks two disjoint runs, so the successor is
+    piecewise. Get it wrong and the prefetch reads the wrong tile, which is
+    **invisible on any contiguous shape** because the value is overwritten
+    before use.
+
+    Both bugs this test caught were exactly that. The first version passed
+    every existing dQ case at seqlen 256 and was wrong by `rel ~ 1.0` here:
+    the masked loop used the contiguous successor. The second seeded the
+    pre-loop fetch from the full run's origin, which is wrong whenever there
+    are no full tiles -- and `window=(64, 0)` at seqlen 512 is exactly that
+    shape.
+
+    Bitwise, not tolerance: the two arms multiply the same values in the same
+    order and differ only in when the load is issued.
+    """
+    _require_env()
+    B, H, N = 1, 2, 512
+    wl, wr = window
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    q, k, v, do = (torch.randn(B, H, N, head_dim, dtype=torch.float16, device="cuda", generator=gen) for _ in range(4))
+    i = torch.arange(N, device="cuda")[:, None]
+    j = torch.arange(N, device="cuda")[None, :]
+    band = (j <= i + wr) & (j >= i - wl)
+
+    qg = q.float().clone().requires_grad_(True)
+    sg = qg @ k.float().transpose(-1, -2) / math.sqrt(head_dim)
+    sg = sg.masked_fill(~band, float("-inf"))
+    live = torch.isfinite(sg).any(-1, keepdim=True)
+    og = torch.where(live, torch.softmax(sg, -1), torch.zeros_like(sg)) @ v.float()
+    (dq_ref,) = torch.autograd.grad(og, qg, do.float())
+    with torch.no_grad():
+        s = q.float() @ k.float().transpose(-1, -2) / math.sqrt(head_dim)
+        s = s.masked_fill(~band, float("-inf"))
+        o = torch.where(live, torch.softmax(s, -1), torch.zeros_like(s)) @ v.float()
+        lse = torch.logsumexp(s, -1)
+        lse = torch.where(live.squeeze(-1), lse, torch.full_like(lse, float("inf")))
+        lse = lse.reshape(B * H, N).contiguous()
+        delta = (do.float() * o).sum(-1).reshape(B * H, N).contiguous()
+
+    out = {}
+    for dist in (0, 1):
+        exe = build_bwd_dq_module(
+            num_heads=H,
+            head_dim=head_dim,
+            causal=True,
+            causal_type=3,
+            dtype_str="f16",
+            kv_prefetch_dist=dist,
+        )
+        dq = torch.zeros_like(q)
+        exe(q, k, v, do, dq, lse, delta, B, N, N, window=window)
+        torch.cuda.synchronize()
+        out[dist] = dq
+
+    assert torch.equal(out[0], out[1]), (
+        f"prefetch changed the result at head_dim={head_dim} window={window}: "
+        f"max|delta|={(out[1].float() - out[0].float()).abs().max().item():.3e}"
+    )
+    # And the shared answer is the right one, so the test cannot pass by both
+    # arms being broken identically -- which is the failure mode a pure A/B has.
+    rel = _rel(out[1], dq_ref)
+    assert rel < _RTOL, f"prefetch arm disagrees with autograd: rel={rel:.3e}"
+
+
 @pytest.mark.parametrize("lens_q,label", _VARLEN_LENGTHS, ids=[x[1] for x in _VARLEN_LENGTHS])
 @pytest.mark.parametrize("ctype", [0, 1, 2], ids=["full", "topleft", "botright"])
 def test_varlen_compact_matches_dense(lens_q, label, ctype):
