@@ -29,17 +29,20 @@ arch.
 Two kinds of thing still live here, and the distinction decides whether a
 change needs a benchmark or a correctness argument:
 
-- **Policy** -- `LADDER`, the fallbacks, `_wave_geometry`. Measured choices;
-  any of them could change without making a build incorrect.
-- **Geometry** -- `tile_width_for` and the divisibility rules `resolve`
-  enforces. These compute what is *legal*, and changing one can make a build
-  invalid.
+- **Policy** -- `LADDER`, the fallbacks, `_with_wave_geometry`. Measured
+  choices; any of them could change without making a build incorrect.
+- **Geometry** -- `tile_width_for`, `staging_shape`, and the divisibility rules
+  `resolve` enforces. These compute what is *legal*, and changing one can make
+  a build invalid.
 
-**The ladder is the whole design.** gfx950's dualwave LDS staging is built on a
-128-byte (64-element bf16) row -- `SMEM_D_RPT = head_dim // 64` -- so head_dim
-is not a free parameter, it is a multiple of 64. Everything between the rungs
-is served by compiling the next rung up and passing the real extent as a
-runtime argument, which is what `padded_head` records.
+**The ladder is the design, and the granule is a knob within it.** A head_dim
+between two rungs is served by compiling the next rung up and passing the real
+extent as a runtime argument, which is what `padded_head` records. What decides
+the rungs is the *staging granule* -- how many D elements one DMA issue covers
+-- and that was long assumed to be 64 because the production kernel is built
+that way. It is not a constant: `_with_wave_geometry` picks it per family, and
+`staging_shape` states the rule it has to satisfy. Only `PV_MFMA_N` is a real
+floor, and it is an instruction limit rather than a staging one.
 """
 
 from dataclasses import dataclass, fields, replace
@@ -75,12 +78,43 @@ __all__ = [
 # wave count doubles the per-lane register file. Listed here so
 # `tile_width_for` reports "not built yet" rather than "unsupported", which are
 # different problems for the caller.
+#
+# **32 is a planned rung too, below the built ones**, and it is deliberately
+# not in `LADDER_PLANNED`: that list is consulted only after `LADDER` misses,
+# so putting 32 there would never be reached -- while putting it in `LADDER`
+# would route head_dim <= 32 to a tile that does not exist yet and break a path
+# that works today, slowly. It arrives when family S is built; until then
+# head_dim <= 32 rounds up to 64 and pays for it (see `_with_wave_geometry`).
 LADDER = (64, 128)
 LADDER_PLANNED = (192, 256, 384, 512)
 
-# gfx950 dualwave geometry constant. Not a knob -- it is the 128-byte LDS row
-# the staging is built on.
-HEAD_DIM_GRANULE = 64
+# The D-axis staging granule: how many bf16 elements of one token a single DMA
+# issue covers. **Not a constant, and not 64 by necessity** -- see
+# `_with_wave_geometry`. A wave moves 512 elements per issue (64 lanes x 8), so
+# the granule and BLOCK_N together decide how many lines a KV tile occupies and
+# how many issues each wave makes:
+#
+#     tokens per issue = 512 / granule
+#     lines            = BLOCK_N / tokens_per_issue
+#     issues per wave  = lines / NUM_WAVES        (must be a positive integer)
+#
+# Granule 64 with BLOCK_N 64 is one point in that space, not the only one.
+DEFAULT_HEAD_DIM_GRANULE = 64
+
+# The PV MFMA is `v_mfma_f32_32x32x16`, whose output is 32 D columns wide, so
+# `D_CHUNKS = head_dim / 32` cannot go below 1. **This is what makes a granule
+# of 16 impossible**, and it is an instruction limit rather than a staging one:
+# the staging is perfectly regular at granule 16 (BLOCK_N 256 over 8 waves is
+# one issue per wave), but the output accumulator cannot be narrower than 32.
+# Serving head_dim 16 natively would need `v_mfma_f32_16x16x16`, whose
+# accumulator is v4f32 rather than v16f32 -- a different register layout
+# through every helper, i.e. its own family.
+PV_MFMA_N = 32
+
+# Hardware shape of one DMA issue, used by `staging_shape`.
+WARP_SIZE = 64
+DMA_BYTES = 16
+BF16_BYTES = 2
 
 
 def tile_width_for(head_dim):
@@ -251,11 +285,12 @@ class Gfx950Knobs(FmhaKnobs):
     num_kv_splits: int | None = None
 
     # Wave geometry. `None` means "the family for this tile width", which is
-    # what `_wave_geometry` decides. Pinnable so a sweep can cross the family
-    # boundary without editing the table.
+    # what `_with_wave_geometry` decides. Pinnable so a sweep can cross a
+    # family boundary without editing the table.
     num_waves: int | None = None
     block_m: int | None = None
     block_n: int | None = None
+    head_dim_granule: int | None = None
 
     # Set by `resolve`; never by a caller. Holding the traits *on* the resolved
     # knobs is what makes "knobs and traits are one thing" true at the use
@@ -293,31 +328,78 @@ class Gfx950Knobs(FmhaKnobs):
         return self
 
     def _with_wave_geometry(self):
-        """Decide `num_waves`, `block_m`, `block_n` from the resolved tile width.
+        """Decide the wave geometry and staging granule from the tile width.
 
         **The selection lives here, not in the traits constructor**, which is
-        the concrete reason R1 came before P2: family B (4 waves, 128x128, 512
-        VGPRs/lane) differs from family A only in these three numbers plus what
-        they imply, and a constructor that hardcodes them cannot host both.
+        the concrete reason R1 came before P2: the families differ only in
+        these four numbers plus what they imply, and a constructor that
+        hardcodes them cannot host more than one.
 
-        Family A is measured saturated at head_dim 128 -- 248 of 256 VGPRs,
-        zero spills -- so the next rung has to halve the wave count to double
-        the per-lane register file. See the table above `LADDER`.
+        Three families, and the granule is a *choice* in each rather than the
+        constant it used to be:
+
+        | family | tile width | waves | BLOCK_M | BLOCK_N | granule |
+        |---|---|---|---|---|---|
+        | S | <= 32 | 8 | 256 | 128 | 32 |
+        | A | <= 128 | 8 | 256 | 64 | 64 |
+        | B | > 128 | 4 | 128 | 128 | 64 |
+
+        **A** is measured saturated at head_dim 128 -- 248 of 256 VGPRs, zero
+        spills -- so **B** halves the wave count to double the per-lane
+        register file. **S** exists because padding a small head into A's
+        64-wide tile is expensive, not cheap: at B=4 H=8 N=4096 non-causal,
+        head_dim 16/32/48 each take *longer* than head_dim 64 (203/205/215 us
+        against 172), doing the full 64-wide MFMA plus the padded-head masking
+        on top -- 169 real TFLOPS at head_dim 16 against 801 at 64.
+
+        S keeps A's wave count, BLOCK_M and one-issue-per-wave DMA structure;
+        only the granule and BLOCK_N move. BLOCK_N must go to 128 to keep the
+        DMA full, since halving the granule doubles the tokens one issue
+        covers -- and independently, gfx1201's tuning table reached BLOCK_N 128
+        for small head_dim by measurement, on the grounds that a wider KV tile
+        amortises the per-tile softmax cost.
 
         Reads `self.block_dmodel`, so it runs after `_with_widths`. That
         ordering is the whole reason the width is no longer an argument: an
         argument can be stale, a field the previous step wrote cannot.
         """
-        pinned = (self.num_waves, self.block_m, self.block_n)
+        pinned = (self.num_waves, self.block_m, self.block_n, self.head_dim_granule)
         if all(x is not None for x in pinned):
             return self
         if any(x is not None for x in pinned):
-            raise ValueError(f"pin num_waves, block_m and block_n together or not at all, got {pinned}")
+            raise ValueError(
+                f"pin num_waves, block_m, block_n and head_dim_granule together or not at all, got {pinned}"
+            )
         if self.block_dmodel is None:
             raise ValueError("_with_wave_geometry runs after _with_widths; block_dmodel is not resolved")
+        if self.block_dmodel <= 32:
+            return replace(self, num_waves=8, block_m=256, block_n=128, head_dim_granule=32)  # family S
         if self.block_dmodel <= 128:
-            return replace(self, num_waves=8, block_m=256, block_n=64)  # family A
-        return replace(self, num_waves=4, block_m=128, block_n=128)  # family B
+            return replace(self, num_waves=8, block_m=256, block_n=64, head_dim_granule=64)  # family A
+        return replace(self, num_waves=4, block_m=128, block_n=128, head_dim_granule=64)  # family B
+
+    def staging_shape(self):
+        """`(tokens_per_issue, lines, issues_per_wave)` for this geometry.
+
+        The coherence check the family table has to satisfy, written once so a
+        new family is validated rather than asserted. A wave moves 512 bf16
+        elements per DMA issue (64 lanes x 8), so the granule fixes how many
+        tokens that covers, and BLOCK_N fixes how many such lines a KV tile
+        needs. `issues_per_wave` must be a positive integer or the tile does
+        not divide across the waves.
+        """
+        per_issue = (WARP_SIZE * DMA_BYTES // BF16_BYTES) // self.head_dim_granule
+        if self.block_n % per_issue:
+            raise ValueError(f"BLOCK_N {self.block_n} is not a multiple of {per_issue} tokens per DMA issue")
+        lines = self.block_n // per_issue
+        if lines % self.num_waves:
+            raise ValueError(f"{lines} KV tile lines do not divide across {self.num_waves} waves")
+        if self.block_dmodel < PV_MFMA_N:
+            raise ValueError(
+                f"block_dmodel {self.block_dmodel} is narrower than the PV MFMA's {PV_MFMA_N}-column "
+                f"output; head_dim below {PV_MFMA_N} cannot have a native tile with v_mfma_f32_32x32x16"
+            )
+        return per_issue, lines, lines // self.num_waves
 
     def _with_traits(self, meta):
         """Build the dualwave traits this configuration implies.
@@ -329,11 +411,12 @@ class Gfx950Knobs(FmhaKnobs):
         that, rather than silently building family A's geometry under family
         B's name and then benchmarking it as the new one.
         """
-        if (self.num_waves, self.block_m, self.block_n) != (8, 256, 64):
+        geom = (self.num_waves, self.block_m, self.block_n, self.head_dim_granule)
+        if geom != (8, 256, 64, 64):
             raise NotImplementedError(
-                f"wave geometry {(self.num_waves, self.block_m, self.block_n)} (family B) needs a "
-                "parity-side traits constructor; `_make_dualwave_swp_traits` hardcodes 8/256/64. "
-                "See P2 in sdpa-close-gap-gfx950.md."
+                f"geometry (waves, BLOCK_M, BLOCK_N, granule) = {geom} needs a parity-side traits "
+                "constructor; `_make_dualwave_swp_traits` hardcodes 8/256/64 and derives the granule "
+                "from a fixed 128-byte row. See P2 in sdpa-close-gap-gfx950.md."
             )
         num_kv_heads = meta.num_heads if meta.num_kv_heads is None else meta.num_kv_heads
         traits = dualwave._make_dualwave_swp_traits(

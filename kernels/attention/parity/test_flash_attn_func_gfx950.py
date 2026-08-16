@@ -371,20 +371,50 @@ def test_cross_seqlen_is_an_ordinary_field():
 
 @pytest.mark.parametrize(
     "block_dmodel,want",
-    [(64, (8, 256, 64)), (128, (8, 256, 64)), (192, (4, 128, 128)), (512, (4, 128, 128))],
+    [
+        (32, (8, 256, 128, 32)),  # family S
+        (64, (8, 256, 64, 64)),  # family A
+        (128, (8, 256, 64, 64)),
+        (192, (4, 128, 128, 64)),  # family B
+        (512, (4, 128, 128, 64)),
+    ],
 )
 def test_wave_geometry_selects_the_family(block_dmodel, want):
-    """Family A up to 128; family B above it, which is where P2 stops.
+    """Three families, keyed on the tile width, granule included.
 
-    Driven through `_with_widths` rather than by passing the width, because
-    that ordering *is* the step's contract -- it reads the field the previous
-    step wrote.
+    `block_dmodel` off the built rungs is rejected by `_with_widths`, so the
+    planned families are reached by setting the field directly -- which is also
+    what pins the step's contract: it reads what the previous step wrote.
     """
-    k = fmha_knobs("gfx950", block_dmodel=block_dmodel)
-    # `block_dmodel` above the built rungs is rejected by `_with_widths`, so
-    # reach the geometry step directly for the planned ones.
-    k = replace(k, block_dmodel=block_dmodel)._with_wave_geometry()
-    assert (k.num_waves, k.block_m, k.block_n) == want
+    k = replace(fmha_knobs("gfx950"), block_dmodel=block_dmodel)._with_wave_geometry()
+    assert (k.num_waves, k.block_m, k.block_n, k.head_dim_granule) == want
+
+
+@pytest.mark.parametrize("block_dmodel", [32, 64, 128, 192, 512])
+def test_every_family_stages_coherently(block_dmodel):
+    """Each family's (granule, BLOCK_N, waves) must divide a KV tile evenly.
+
+    A wave moves a fixed 512 bf16 elements per DMA issue, so the granule fixes
+    tokens-per-issue and BLOCK_N fixes how many lines a tile needs. This is the
+    check a *new* family has to pass, which is why it is a rule rather than a
+    table of expected numbers.
+    """
+    k = replace(fmha_knobs("gfx950"), block_dmodel=block_dmodel)._with_wave_geometry()
+    per_issue, lines, issues = k.staging_shape()
+    assert per_issue * lines == k.block_n
+    assert issues >= 1 and lines == issues * k.num_waves
+
+
+def test_granule_16_is_blocked_by_the_mfma_not_the_staging():
+    """head_dim below 32 cannot have a native tile with `v_mfma_f32_32x32x16`.
+
+    Worth pinning because the staging *is* regular at granule 16 -- BLOCK_N 256
+    over 8 waves is one issue per wave -- so the temptation is to conclude it
+    works. The PV MFMA emits 32 D columns, so `D_CHUNKS` would be below 1.
+    """
+    k = replace(fmha_knobs("gfx950"), block_dmodel=16)._with_wave_geometry()
+    with pytest.raises(ValueError, match="narrower than the PV MFMA"):
+        k.staging_shape()
 
 
 def test_wave_geometry_requires_widths_first():
@@ -401,7 +431,18 @@ def test_family_b_names_itself_rather_than_silently_building_family_a():
     which would then be benchmarked as if it were the new geometry.
     """
     with pytest.raises(NotImplementedError, match="parity-side traits constructor"):
-        fmha_knobs("gfx950", num_waves=4, block_m=128, block_n=128).resolve(_META)
+        fmha_knobs("gfx950", num_waves=4, block_m=128, block_n=128, head_dim_granule=64).resolve(_META)
+
+
+def test_family_s_names_itself_too():
+    """Family S is blocked on the same seam as B: a parity-side constructor.
+
+    Both need `_make_dualwave_swp_traits` replaced -- B because it hardcodes
+    8/256/64, S because it derives the granule from a fixed 128-byte row. One
+    piece of work unlocks both, which is why they are one phase.
+    """
+    with pytest.raises(NotImplementedError, match="parity-side traits constructor"):
+        fmha_knobs("gfx950", num_waves=8, block_m=256, block_n=128, head_dim_granule=32).resolve(_META)
 
 
 def test_wave_geometry_must_be_pinned_whole():

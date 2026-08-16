@@ -296,6 +296,77 @@ it silently serves only `K_STEPS_QK` 4 and 8 -- head_dim 64 and 128.
 `ParityQLoader.load_all` replaces it with a left fold, which family B needs
 regardless of wave count.
 
+### P2 evidence — the granule was never 64 by necessity, and it costs 2x
+
+`HEAD_DIM_GRANULE = 64` was inherited from the production kernel and treated as
+a property of the algorithm. It is not: it is how many D elements one DMA issue
+covers, and a wave moves a fixed 512 bf16 elements per issue (64 lanes x 8), so
+
+    tokens per issue = 512 / granule
+    lines            = BLOCK_N / tokens_per_issue
+    issues per wave  = lines / NUM_WAVES        (positive integer)
+
+Granule 64 with BLOCK_N 64 is one point in that space, not the only one.
+
+**What it costs today.** Padding a small head into the 64-wide tile is
+expensive rather than cheap, which settles the open question the plan carried
+from P1. At B=4 H=8 N=4096 bf16 non-causal:
+
+| head_dim | tile | µs | real TFLOPS | padded-equivalent |
+|---|---|---|---|---|
+| 16 | 64 | 203.2 | **169** | 676 |
+| 32 | 64 | 205.2 | **335** | 670 |
+| 48 | 64 | 215.2 | 479 | 639 |
+| 64 | 64 | 171.6 | 801 | 801 |
+| 128 | 128 | 253.6 | 1084 | 1084 |
+
+head_dim 16, 32 and 48 all take *the same time as each other* and **more than
+head_dim 64**, because they do the full 64-wide MFMA and pay the padded-head
+masking on top. So these shapes are MFMA-bound, not bandwidth-bound -- the
+opposite of what the plan assumed when it wrote that the target "does not
+apply" to them.
+
+**Granule 32 is viable; granule 16 is not.** Enumerating the space against the
+rule above, the clean small-head family keeps everything about family A except
+two numbers:
+
+| family | tile width | waves | BLOCK_M | BLOCK_N | granule | issues/wave |
+|---|---|---|---|---|---|---|
+| S | <= 32 | 8 | 256 | **128** | **32** | 1 |
+| A | <= 128 | 8 | 256 | 64 | 64 | 1 |
+| B | > 128 | 4 | 128 | 128 | 64 | 4 |
+
+BLOCK_N has to double because halving the granule doubles the tokens one issue
+covers. Independently, gfx1201's tuning table reached BLOCK_N 128 for small
+head_dim by measurement, on the grounds that a wider KV tile amortises the
+per-tile softmax cost -- two architectures, same conclusion.
+
+**Granule 16 is blocked by the instruction, not the staging.** The staging is
+perfectly regular at 16 (BLOCK_N 256 over 8 waves is one issue per wave), but
+the PV MFMA is `v_mfma_f32_32x32x16` and its output is 32 D columns wide, so
+`D_CHUNKS = head_dim/32` would fall below 1. Serving head_dim 16 natively needs
+`v_mfma_f32_16x16x16`, whose accumulator is v4f32 rather than v16f32 -- a
+different register layout through every helper, i.e. a fourth family. Out of
+scope. head_dim <= 16 therefore stays padded, but into a 32-wide tile: **2x
+waste instead of 4x**.
+
+Expected gain: head_dim 32 roughly doubles (335 -> ~670 real TFLOPS), head_dim
+16 likewise (169 -> ~340).
+
+**S and B share one blocker**, which is why they are one phase. Both need
+`_make_dualwave_swp_traits` replaced by a parity-side constructor -- B because
+it hardcodes 8/256/64, S because it derives the granule from a fixed 128-byte
+row -- and both need BLOCK_N != 64, which doubles the score accumulators. One
+piece of work unlocks both.
+
+*Landed now:* the selection. `_with_wave_geometry` picks the family including
+the granule, `staging_shape()` states the coherence rule a new family must
+satisfy (rather than a table of expected numbers), and `_with_traits` refuses
+any geometry it cannot actually build. `32` is deliberately **not** in
+`LADDER_PLANNED`: that list is consulted only after `LADDER` misses, so it
+would never be reached, while putting it in `LADDER` would route head_dim <= 32
+to a tile that does not exist and break a path that works today, slowly.
+
 **What family B still has to change**, none of it started:
 
 - `_make_dualwave_swp_traits` hardcodes `num_waves=8`, `block_m=256`,
