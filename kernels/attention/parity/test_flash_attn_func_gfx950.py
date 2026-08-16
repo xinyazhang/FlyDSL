@@ -30,7 +30,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module as build
-from fmha_tuning_gfx950 import LADDER, FmhaInputMetadata, resolve_knobs, tile_width_for
+from fmha_tuning_gfx950 import LADDER, FmhaInputMetadata, fmha_knobs, tile_width_for
 from gfx950_standalone import dualwave  # noqa: F401  (puts the repo root on sys.path)
 
 from kernels.attention.flash_attn_gfx950 import build_flash_attn_dualwave_swp_module as build_prod
@@ -315,6 +315,107 @@ def test_tile_width_reports_planned_rungs_distinctly():
 
 def test_padded_head_is_derived_not_guessed():
     for hdim in LADDER:
-        assert resolve_knobs(FmhaInputMetadata(num_heads=8, head_dim=hdim)).padded_head is False
-    assert resolve_knobs(FmhaInputMetadata(num_heads=8, head_dim=40)).padded_head is True
-    assert resolve_knobs(FmhaInputMetadata(num_heads=8, head_dim=64, head_dim_v=32)).padded_head is True
+        assert fmha_knobs("gfx950").resolve(FmhaInputMetadata(num_heads=8, head_dim=hdim)).padded_head is False
+    assert fmha_knobs("gfx950").resolve(FmhaInputMetadata(num_heads=8, head_dim=40)).padded_head is True
+    assert fmha_knobs("gfx950").resolve(FmhaInputMetadata(num_heads=8, head_dim=64, head_dim_v=32)).padded_head is True
+
+
+# ---------------------------------------------------------------------------
+# R1: one factory, one resolve
+# ---------------------------------------------------------------------------
+
+_META = FmhaInputMetadata(num_heads=8, head_dim=128)
+
+
+def test_factory_accepts_a_full_arch_string():
+    """`gcnArchName` carries target features; the caller should not strip them."""
+    assert fmha_knobs("gfx950:sramecc+:xnack-").resolve(_META).traits.BLOCK_M == 256
+
+
+def test_factory_rejects_unknown_arch_and_fields():
+    with pytest.raises(ValueError, match="no FMHA knobs for arch"):
+        fmha_knobs("gfx1201")
+    with pytest.raises(TypeError, match="unknown Gfx950Knobs field"):
+        fmha_knobs("gfx950", nonsense=1)
+    with pytest.raises(TypeError, match="set by resolve"):
+        fmha_knobs("gfx950", traits=object())
+
+
+def test_resolve_produces_the_traits():
+    """The whole point of R1: one object carries both halves.
+
+    Before it, the traits came from a separate `make_parity_traits(meta,
+    knobs, ...)` call, so a caller could hold knobs that disagreed with the
+    traits actually built.
+    """
+    unresolved = fmha_knobs("gfx950")
+    assert unresolved.traits is None
+    resolved = unresolved.resolve(_META)
+    assert resolved.traits is not None
+    assert resolved.traits.HEAD_DIM == 128
+
+
+def test_resolve_is_idempotent():
+    once = fmha_knobs("gfx950").resolve(_META)
+    twice = once.resolve(_META)
+    assert once.traits.cache_tag == twice.traits.cache_tag
+    assert (once.num_waves, once.block_m, once.block_n) == (twice.num_waves, twice.block_m, twice.block_n)
+
+
+def test_cross_seqlen_is_an_ordinary_field():
+    """R1's side effect: no keyword-only parameter, no `kwargs.pop`, no converter arg."""
+    assert fmha_knobs("gfx950").resolve(_META).traits.CROSS_SEQLEN is False
+    assert fmha_knobs("gfx950", cross_seqlen=True).resolve(_META).traits.CROSS_SEQLEN is True
+
+
+def test_wave_geometry_selects_the_family():
+    """Family A up to 128; family B above it, which is where P2 stops."""
+    assert fmha_knobs("gfx950")._wave_geometry(64) == (8, 256, 64)
+    assert fmha_knobs("gfx950")._wave_geometry(128) == (8, 256, 64)
+    assert fmha_knobs("gfx950")._wave_geometry(192) == (4, 128, 128)
+
+
+def test_family_b_names_itself_rather_than_silently_building_family_a():
+    """A pinned family-B geometry must fail loudly, not fall back.
+
+    `_make_dualwave_swp_traits` hardcodes 8/256/64, so building it under
+    family B's name would produce family A's kernel with family B's label --
+    which would then be benchmarked as if it were the new geometry.
+    """
+    with pytest.raises(NotImplementedError, match="parity-side traits constructor"):
+        fmha_knobs("gfx950", num_waves=4, block_m=128, block_n=128).resolve(_META)
+
+
+def test_wave_geometry_must_be_pinned_whole():
+    with pytest.raises(ValueError, match="together or not at all"):
+        fmha_knobs("gfx950", num_waves=4).resolve(_META)
+
+
+def test_builder_requires_resolved_knobs():
+    from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module_primary as build_primary
+
+    with pytest.raises(ValueError, match="must be resolved"):
+        build_primary(_META, fmha_knobs("gfx950"))
+
+
+def test_build_time_sm_scale_is_honoured():
+    """`meta.sm_scale` bakes a scale into the build; a per-call `scale` still wins.
+
+    R1 is what surfaced this: with the traits moved onto the knobs, `meta`
+    became an unused parameter of the builder, and the reason was that
+    `meta.sm_scale` had never been read at all -- a build could declare a scale
+    and the kernel would silently use `1/sqrt(head_dim)`.
+    """
+    b, h, s, d = 1, 4, 256, 64
+    q, k, v = (_rand(b, h, s, d) for _ in range(3))
+    baked = 0.03
+
+    o = torch.empty_like(q)
+    fn = build(num_heads=h, head_dim=d, causal=False, dtype_str="bf16", sm_scale=baked)
+    fn(q, k, v, o, b, s)
+    assert _err(o, _ref(q, k, v, scale=baked)) < TOL
+
+    # A per-call scale overrides the baked one.
+    o2 = torch.empty_like(q)
+    fn(q, k, v, o2, b, s, scale=0.2)
+    assert _err(o2, _ref(q, k, v, scale=0.2)) < TOL

@@ -61,40 +61,7 @@ __all__ = [
     "ParityKvLdsToVgprLoader",
     "ParityQLoader",
     "ParityStoreHelper",
-    "make_parity_traits",
 ]
-
-
-def make_parity_traits(meta, knobs, *, varlen=False, cross_seqlen=False):
-    """Dualwave traits for a resolved (meta, knobs) pair.
-
-    A thin adapter, not a second policy: every value here is either the
-    caller's or `fmha_tuning_gfx950.resolve_knobs`'. `num_heads` still reaches
-    the traits because the LDS geometry and the split-K workspace layout are
-    derived from it; the *kernel* reads its head counts at runtime and only
-    uses the constexpr ones where they are shape constants.
-    """
-    num_kv_heads = meta.num_heads if meta.num_kv_heads is None else meta.num_kv_heads
-    return dualwave._make_dualwave_swp_traits(
-        meta.num_heads,
-        num_kv_heads,
-        knobs.block_dmodel,
-        causal=meta.causal,
-        dtype_str=meta.dtype_str,
-        waves_per_eu=knobs.waves_per_eu,
-        daz=knobs.daz,
-        dualwave_swp_lazy_rescale=knobs.lazy_rescale,
-        dualwave_swp_setprio=knobs.setprio,
-        dualwave_swp_debug_lazy_counts=False,
-        dualwave_swp_enable_stagger=knobs.stagger,
-        num_kv_splits=knobs.num_kv_splits,
-        varlen=varlen,
-        cross_seqlen=cross_seqlen,
-        paged=knobs.paged,
-        kv_cache_layout=knobs.kv_cache_layout,
-        kv_vectorized=knobs.paged and knobs.kv_cache_layout == "vectorized",
-        return_lse=knobs.return_lse,
-    )
 
 
 class ParityKernelContext(dualwave.DualwaveKernelContext):

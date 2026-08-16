@@ -393,7 +393,10 @@ entry rejected on spills or LDS earlier must be retried once the budget moves.
 Not a phase -- no new capability -- but a hard gate on filing. Ordering is
 free; correctness of the result is not.
 
-### R1 — Knobs and traits are one thing; make them one class
+### R1 — Knobs and traits are one thing; make them one class — **DONE**
+
+*Outcome at the end of this section.*
+
 
 **The observation.** `FmhaKnobs` and the dualwave traits returned by
 `make_parity_traits` both answer "how to compute it", at two points on the same
@@ -451,6 +454,44 @@ declared against the current split is a field written twice and a converter
 argument to thread. The cost of deferring grows with each phase; the cost of
 doing it now is one refactor over ~200 lines with 76 tests already covering the
 behaviour.
+
+#### Outcome — done, and P2 is why it happened when it did
+
+Landed ahead of P4, triggered by P2 rather than by the deadline: family B needs
+its own traits constructor, and *that constructor is the knob-selection logic*.
+Building it under the old split would have meant threading a second geometry
+through `make_parity_traits` -- exactly the duplication R1 exists to delete.
+The wave-geometry choice now lives in `Gfx950Knobs._wave_geometry`, and
+`_build_traits` is the single place family B will slot into.
+
+Shipped as specified: `fmha_knobs(arch, **overrides)` returns an arch-specific
+subclass, `resolve(meta)` is a method that subsumes both `resolve_knobs` and
+`make_parity_traits`, and the resolved object carries `.traits`. Deleted:
+`resolve_knobs`, `make_parity_traits`, `FmhaPlan`, `plan()`, and
+`cross_seqlen`'s three-site special treatment -- it and `varlen` are now
+ordinary `Gfx950Knobs` fields. `FmhaInputMetadata` stayed arch-neutral.
+
+Two things worth carrying forward:
+
+- **The refactor found a dead field.** With the traits moved onto the knobs,
+  `meta` became an *unused parameter* of the builder -- and the reason was
+  that `meta.sm_scale` had never been read since P0. A build could declare a
+  softmax scale and the kernel would silently use `1/sqrt(head_dim)` instead.
+  Now honoured, with precedence per-call `scale` > `meta.sm_scale` > derived,
+  and a test pinning both halves. Collapsing two representations into one is
+  what made the gap visible: a parameter that is passed but never read is
+  invisible while something else in the call also consumes it.
+- **Family B fails loudly.** `_build_traits` raises if the geometry is not
+  8/256/64 rather than falling back, because the fallback would build family
+  A's kernel under family B's name -- and it would then be *benchmarked* as
+  the new geometry. Tested.
+
+gfx1201 has **not** adopted this; `fmha_tuning_gfx1201.py` keeps its own
+`FmhaKnobs`/`resolve_knobs`/`plan`. That was option 1 of the two above, chosen
+by default rather than deliberately -- there is still no board to run its 298
+tests against. The API is unified in shape, not yet in fact.
+
+86 parity tests pass; 33 production tests pass.
 
 ## Verification standard
 

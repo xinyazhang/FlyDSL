@@ -59,9 +59,8 @@ from fmha_dualwave_gfx950 import (
     ParityKvLdsToVgprLoader,
     ParityQLoader,
     ParityStoreHelper,
-    make_parity_traits,
 )
-from fmha_tuning_gfx950 import FmhaInputMetadata, FmhaKnobs, resolve_knobs
+from fmha_tuning_gfx950 import FmhaInputMetadata, fmha_knobs
 from gfx950_standalone import dualwave
 
 KERNEL_NAME = "flash_attn_func_gfx950_kernel"
@@ -98,15 +97,18 @@ _COMPILE_HINTS = {
 }
 
 
-def build_flash_attn_func_gfx950_module_primary(meta, knobs, *, cross_seqlen=False):
+def build_flash_attn_func_gfx950_module_primary(meta, knobs):
     """Build the gfx950 parity kernel for a resolved (meta, knobs) pair.
 
     Takes the two objects rather than a long parameter list, split on *who
     decides*: `meta` is what the caller asked for, `knobs` is what the tuning
-    policy answered. Build `knobs` with `fmha_tuning_gfx950.resolve_knobs`;
-    nothing here falls back to a policy.
+    policy answered. `knobs` must come from `Gfx950Knobs.resolve(meta)` --
+    nothing here falls back to a policy, and `knobs.traits` is the arch
+    configuration that call produced.
     """
-    traits = make_parity_traits(meta, knobs, varlen=False, cross_seqlen=cross_seqlen)
+    if knobs.traits is None:
+        raise ValueError("knobs must be resolved: call `fmha_knobs(arch, ...).resolve(meta)` first")
+    traits = knobs.traits
 
     BLOCK_DMODEL = knobs.block_dmodel
     PADDED_HEAD = knobs.padded_head
@@ -114,7 +116,13 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs, *, cross_seqlen=Fal
     STRIDES_CONSTEXPR = knobs.strides_constexpr
     RUNTIME_QK_STEPS = PADDED_HEAD and HDIM_MODE == "runtime_qk_steps"
 
-    _cache_tag = (traits.cache_tag, BLOCK_DMODEL, PADDED_HEAD, HDIM_MODE, STRIDES_CONSTEXPR)
+    # A scale baked into the build configuration. `None` means "derive it",
+    # which `abi.resolve_scale` then does from the *real* head dim rather than
+    # the compiled tile -- the distinction that matters under a padded head.
+    # Precedence is per-call `scale` > `meta.sm_scale` > derived.
+    BUILD_SM_SCALE = meta.sm_scale
+
+    _cache_tag = (traits.cache_tag, BLOCK_DMODEL, PADDED_HEAD, HDIM_MODE, STRIDES_CONSTEXPR, BUILD_SM_SCALE)
 
     _lds_elem_dtype = dualwave.dtype_to_elem_type(traits.DTYPE_STR)
 
@@ -897,7 +905,12 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs, *, cross_seqlen=Fal
             num_head_k,
             hdim_qk,
             hdim_vo,
-            abi.resolve_scale(Q, scale, PADDED_HEAD, 1.0 / (BLOCK_DMODEL**0.5)),
+            abi.resolve_scale(
+                Q,
+                scale if scale is not None else BUILD_SM_SCALE,
+                PADDED_HEAD,
+                1.0 / (BLOCK_DMODEL**0.5),
+            ),
             *st,
             0 if block_table_stride is None else block_table_stride,
         ), stream
@@ -923,18 +936,16 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs, *, cross_seqlen=Fal
     return _launch
 
 
-def build_flash_attn_func_gfx950_module(**kwargs):
-    """Keyword front end: name a problem, get the policy's schedule."""
+def build_flash_attn_func_gfx950_module(arch="gfx950", **kwargs):
+    """Keyword front end: name a problem, get the policy's schedule.
+
+    Splits `kwargs` on which object owns each name and hands the rest to the
+    factory. `cross_seqlen` needs no mention here any more -- it is an ordinary
+    `Gfx950Knobs` field, so it lands in `knob_kwargs` with everything else.
+    """
     from dataclasses import fields as _fields
 
     meta_fields = {f.name for f in _fields(FmhaInputMetadata)}
-    knob_fields = {f.name for f in _fields(FmhaKnobs)}
-    cross_seqlen = bool(kwargs.pop("cross_seqlen", False))
-    unknown = set(kwargs) - meta_fields - knob_fields
-    if unknown:
-        raise TypeError(f"unknown build parameter(s): {sorted(unknown)}")
     meta = FmhaInputMetadata(**{k: v for k, v in kwargs.items() if k in meta_fields})
-    overrides = FmhaKnobs(**{k: v for k, v in kwargs.items() if k in knob_fields})
-    return build_flash_attn_func_gfx950_module_primary(
-        meta, resolve_knobs(meta, overrides), cross_seqlen=cross_seqlen
-    )
+    knob_kwargs = {k: v for k, v in kwargs.items() if k not in meta_fields}
+    return build_flash_attn_func_gfx950_module_primary(meta, fmha_knobs(arch, **knob_kwargs).resolve(meta))
