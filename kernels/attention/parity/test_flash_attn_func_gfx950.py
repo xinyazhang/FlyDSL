@@ -25,6 +25,7 @@ Three kinds of test, and the distinction is what makes the suite worth having:
 """
 
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -368,11 +369,28 @@ def test_cross_seqlen_is_an_ordinary_field():
     assert fmha_knobs("gfx950", cross_seqlen=True).resolve(_META).traits.CROSS_SEQLEN is True
 
 
-def test_wave_geometry_selects_the_family():
-    """Family A up to 128; family B above it, which is where P2 stops."""
-    assert fmha_knobs("gfx950")._wave_geometry(64) == (8, 256, 64)
-    assert fmha_knobs("gfx950")._wave_geometry(128) == (8, 256, 64)
-    assert fmha_knobs("gfx950")._wave_geometry(192) == (4, 128, 128)
+@pytest.mark.parametrize(
+    "block_dmodel,want",
+    [(64, (8, 256, 64)), (128, (8, 256, 64)), (192, (4, 128, 128)), (512, (4, 128, 128))],
+)
+def test_wave_geometry_selects_the_family(block_dmodel, want):
+    """Family A up to 128; family B above it, which is where P2 stops.
+
+    Driven through `_with_widths` rather than by passing the width, because
+    that ordering *is* the step's contract -- it reads the field the previous
+    step wrote.
+    """
+    k = fmha_knobs("gfx950", block_dmodel=block_dmodel)
+    # `block_dmodel` above the built rungs is rejected by `_with_widths`, so
+    # reach the geometry step directly for the planned ones.
+    k = replace(k, block_dmodel=block_dmodel)._with_wave_geometry()
+    assert (k.num_waves, k.block_m, k.block_n) == want
+
+
+def test_wave_geometry_requires_widths_first():
+    """The step order is a data dependency, and says so instead of guessing."""
+    with pytest.raises(ValueError, match="runs after _with_widths"):
+        fmha_knobs("gfx950")._with_wave_geometry()
 
 
 def test_family_b_names_itself_rather_than_silently_building_family_a():

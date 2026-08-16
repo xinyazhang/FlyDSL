@@ -171,14 +171,28 @@ class FmhaKnobs:
     def resolve(self, meta: FmhaInputMetadata):
         raise NotImplementedError(f"{type(self).__name__} does not implement resolve()")
 
-    # -- shared derivation, for subclasses to call -----------------------
+    # -- resolution steps ------------------------------------------------
+    #
+    # Each `_with_*` takes knobs and returns knobs with some fields decided,
+    # so `resolve` is a pipeline rather than a place where scattered tuples
+    # get reassembled. Three things follow, and each removes a class of bug:
+    #
+    # - **The field names appear once.** Returning `(block_dmodel,
+    #   block_dmodel_v, padded_head, hdim_mode)` and `replace`-ing them at the
+    #   call site spelled all four twice, in an order nothing checked.
+    # - **The step order is the data dependency.** `_with_wave_geometry` reads
+    #   `self.block_dmodel`, so it *must* run after `_with_widths`; it no
+    #   longer takes it as an argument and cannot be handed a stale one.
+    # - **`dataclasses.replace` preserves the subclass**, so a base-class step
+    #   returns `Gfx950Knobs` and the pipeline can mix inherited and
+    #   arch-specific steps freely.
 
-    def _resolve_widths(self, meta):
-        """`(block_dmodel, block_dmodel_v, padded_head, hdim_mode)`.
+    def _with_widths(self, meta):
+        """Decide `block_dmodel`, `block_dmodel_v`, `padded_head`, `hdim_mode`.
 
         Every arch has a ladder and a padded-head rule; only the ladder's
-        contents differ, and those are `tile_width_for`'s. Kept here so a
-        second arch cannot accidentally decide `padded_head` by another rule.
+        contents differ, and those are `tile_width_for`'s. Kept on the base so
+        a second arch cannot accidentally decide `padded_head` by another rule.
         """
         block_dmodel = self.block_dmodel
         if block_dmodel is None:
@@ -201,7 +215,13 @@ class FmhaKnobs:
         if hdim_mode not in ("zero_fill", "runtime_qk_steps"):
             raise ValueError(f"hdim_mode must be 'zero_fill' or 'runtime_qk_steps', got {hdim_mode!r}")
 
-        return block_dmodel, block_dmodel_v, bool(padded_head), hdim_mode
+        return replace(
+            self,
+            block_dmodel=block_dmodel,
+            block_dmodel_v=block_dmodel_v,
+            padded_head=bool(padded_head),
+            hdim_mode=hdim_mode,
+        )
 
 
 @dataclass(frozen=True)
@@ -250,29 +270,30 @@ class Gfx950Knobs(FmhaKnobs):
         answer, since every derived field is recomputed from `meta` and the
         pinned fields rather than read back.
         """
-        k = _GFX950_FALLBACK.merge(self)
-        block_dmodel, block_dmodel_v, padded_head, hdim_mode = k._resolve_widths(meta)
-        num_waves, block_m, block_n = k._wave_geometry(block_dmodel)
-
-        if k.varlen and k.num_kv_splits > 1:
-            raise ValueError("varlen is not supported together with num_kv_splits > 1")
-        if k.kv_cache_layout not in ("linear", "vectorized"):
-            raise ValueError(f"kv_cache_layout must be 'linear' or 'vectorized', got {k.kv_cache_layout!r}")
-
-        resolved = replace(
-            k,
-            block_dmodel=block_dmodel,
-            block_dmodel_v=block_dmodel_v,
-            padded_head=padded_head,
-            hdim_mode=hdim_mode,
-            num_waves=num_waves,
-            block_m=block_m,
-            block_n=block_n,
+        return (
+            _GFX950_FALLBACK.merge(self)
+            ._checked_modes()
+            ._with_widths(meta)
+            ._with_wave_geometry()
+            ._with_traits(meta)
         )
-        return replace(resolved, traits=resolved._build_traits(meta))
 
-    def _wave_geometry(self, block_dmodel):
-        """`(num_waves, block_m, block_n)` for this tile width.
+    def _checked_modes(self):
+        """Reject mode combinations the kernel does not implement.
+
+        First in the pipeline because none of it depends on a derived field --
+        anything that fails here would fail whatever the ladder decided, so
+        failing before the derivation keeps the message about the caller's
+        input rather than about something computed from it.
+        """
+        if self.varlen and self.num_kv_splits > 1:
+            raise ValueError("varlen is not supported together with num_kv_splits > 1")
+        if self.kv_cache_layout not in ("linear", "vectorized"):
+            raise ValueError(f"kv_cache_layout must be 'linear' or 'vectorized', got {self.kv_cache_layout!r}")
+        return self
+
+    def _with_wave_geometry(self):
+        """Decide `num_waves`, `block_m`, `block_n` from the resolved tile width.
 
         **The selection lives here, not in the traits constructor**, which is
         the concrete reason R1 came before P2: family B (4 waves, 128x128, 512
@@ -282,24 +303,31 @@ class Gfx950Knobs(FmhaKnobs):
         Family A is measured saturated at head_dim 128 -- 248 of 256 VGPRs,
         zero spills -- so the next rung has to halve the wave count to double
         the per-lane register file. See the table above `LADDER`.
+
+        Reads `self.block_dmodel`, so it runs after `_with_widths`. That
+        ordering is the whole reason the width is no longer an argument: an
+        argument can be stale, a field the previous step wrote cannot.
         """
         pinned = (self.num_waves, self.block_m, self.block_n)
         if all(x is not None for x in pinned):
-            return pinned
+            return self
         if any(x is not None for x in pinned):
             raise ValueError(f"pin num_waves, block_m and block_n together or not at all, got {pinned}")
-        if block_dmodel <= 128:
-            return 8, 256, 64  # family A
-        return 4, 128, 128  # family B
+        if self.block_dmodel is None:
+            raise ValueError("_with_wave_geometry runs after _with_widths; block_dmodel is not resolved")
+        if self.block_dmodel <= 128:
+            return replace(self, num_waves=8, block_m=256, block_n=64)  # family A
+        return replace(self, num_waves=4, block_m=128, block_n=128)  # family B
 
-    def _build_traits(self, meta):
-        """The dualwave traits this configuration implies.
+    def _with_traits(self, meta):
+        """Build the dualwave traits this configuration implies.
 
-        Family A delegates to the production constructor, which hardcodes
-        8/256/64 -- so it is usable *because* family A's geometry is exactly
-        those numbers, not by coincidence. Family B needs its own, which is
-        work P2 still owes; failing here names that, rather than silently
-        building family A's geometry under family B's name.
+        The last step, and the one family B replaces. Family A delegates to the
+        production constructor, which hardcodes 8/256/64 -- usable *because*
+        family A's geometry is exactly those numbers, not by coincidence.
+        Family B needs its own, which is work P2 still owes; failing here names
+        that, rather than silently building family A's geometry under family
+        B's name and then benchmarking it as the new one.
         """
         if (self.num_waves, self.block_m, self.block_n) != (8, 256, 64):
             raise NotImplementedError(
@@ -308,7 +336,7 @@ class Gfx950Knobs(FmhaKnobs):
                 "See P2 in sdpa-close-gap-gfx950.md."
             )
         num_kv_heads = meta.num_heads if meta.num_kv_heads is None else meta.num_kv_heads
-        return dualwave._make_dualwave_swp_traits(
+        traits = dualwave._make_dualwave_swp_traits(
             meta.num_heads,
             num_kv_heads,
             self.block_dmodel,
@@ -328,6 +356,7 @@ class Gfx950Knobs(FmhaKnobs):
             kv_vectorized=self.paged and self.kv_cache_layout == "vectorized",
             return_lse=self.return_lse,
         )
+        return replace(self, traits=traits)
 
 
 # Defaults the policy has no shape-dependent opinion about. These match the
