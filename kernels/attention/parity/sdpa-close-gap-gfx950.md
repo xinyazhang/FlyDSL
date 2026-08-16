@@ -482,16 +482,45 @@ wrong. At head_dim 256 no column is correct. Ruled out along the way:
 - not a `s_waitcnt` race (forcing a full DMA drain does not change it, and the
   failure is deterministic).
 
-That leaves the V LDS read at `D_CHUNKS > 4`, which is where `_swizzled_v_dc_off`
-and the `V_LDS_TO_REG_*` strides live -- three of which are flagged UNVERIFIED
-in `fmha_traits_gfx950.make_traits` precisely because they have more than one
-plausible parameterisation that coincides at family A. The column signature is
-not a uniform shift, so it is not simply a wrong band stride.
+**The V read is not it either -- measured, and it eliminated the leading
+hypothesis.** Probed by setting `V[t][d] = d` (bf16 is exact to 256) under
+causal, where `q_row 0` attends to a single key, so `P` is a delta and
+`O[0][d]` *is* the V column the read fetched. At head_dim 192 the map is
+perfect: **0 of 192 columns wrong**. So `_swizzled_v_dc_off` and the three
+UNVERIFIED `V_LDS_TO_REG_*` strides are cleared.
 
-**Next step is to extend `tooling/lds_model.py` to the V read**, which the K
-model does not cover. V is read through `ds_read_tr16_b64`, a transposing load,
-so the model needs that instruction's semantics -- more work than the K side,
-and the reason it was not done first. The granule sweep waits on it.
+**Two lessons about the probes themselves**, both of which cost time:
+
+- **`V = ones` tests almost nothing.** With every V element 1.0, `O = sum_j
+  P[i][j] = 1` for *any* softmax that normalises, so the probe is blind to
+  wrong scores, wrong tokens, and any column permutation. The "columns 32..127
+  are good" reading it produced was an artifact, and it pointed the
+  investigation at the V read for two rounds.
+- **A delta-`P` probe only inspects the row it isolates.** The perfect column
+  map above is row 0. Re-running with `V[t][d] = d` at *every* token -- where
+  `O[i][d] == d` must hold for every row -- shows **no row is correct**. The
+  fault is in rows, and every probe up to that point had been reading columns.
+
+Eliminated so far, each by measurement: register pressure (zero spills at 434
+VGPRs), wave count (the 4-wave geometry is correct at head_dim 128), DMA line
+coverage (model-verified, and every line is written), `s_waitcnt` races (a full
+drain changes nothing; the failure is deterministic), the V LDS read (exact
+column map), and all three schedule knobs (`stagger`, `lazy_rescale`,
+`setprio` off individually and together).
+
+What is left is whatever is specific to `D_CHUNKS = 6`, `K_STEPS_QK = 12`,
+`SMEM_D_RPT = 3` in the multi-tile path. **The most concrete suspect is
+`ParityQLoader.load_all`**: its left fold replaced a tree that only ever
+produced 4 or 8 packs, so head_dim 192 is the *first configuration that
+exercises it*, and the bitwise-vs-production oracle cannot reach it -- that
+oracle only exists at head_dim 64 and 128, where the fold and the tree agree.
+`scale_all` is the second: it materialises the whole of Q in f32, 96 VGPRs at
+head_dim 192 against 64 at 128.
+
+Next step is to test `load_all` in isolation -- build a head_dim 192 kernel
+that computes Q the production way for the first 8 packs and compare -- rather
+than to extend the model to V, which this probe has now shown is not where the
+fault is. The granule sweep still waits on it.
 
 `LADDER` stays `(64, 128)`: 192/256 must not be reachable while this is open.
 
