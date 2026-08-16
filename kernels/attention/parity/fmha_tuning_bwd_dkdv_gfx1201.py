@@ -59,7 +59,13 @@ LDS_PAD = 4
 # The compiled tile widths, mirroring the forward's ladder so a backward build
 # can be requested for any head_dim the forward accepts. Widths above 128 are
 # *buildable but spill*; see the register floor in the module docstring.
-_BLOCK_DMODEL_LADDER = (16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256)
+_BLOCK_DMODEL_LADDER = (16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512)
+
+# Above this the primary kernel cannot be made to fit and the build routes to
+# `fmha_bwd_dkdv512_gfx1201_kernel`. Both of its budgets fail at once at 320:
+# state is `0.75 * head_dim` = 240 against a ~194 budget, and the four staging
+# tiles pass 64 KiB. See that module's docstring for the two mechanisms.
+_WIDE_HEAD_DIM_MIN = 320
 
 MAX_HEAD_DIM = _BLOCK_DMODEL_LADDER[-1]
 
@@ -158,6 +164,48 @@ _DEFAULT_LPT_TILE_ORDER = False
 _SPLIT_HEAD_DIM_MIN = 192
 
 
+def is_wide(head_dim: int, head_dim_v: int) -> bool:
+    """Whether this build routes to the wide kernel rather than the primary one."""
+    return max(head_dim, head_dim_v) >= _WIDE_HEAD_DIM_MIN
+
+
+def default_contraction_shards(head_dim: int, head_dim_v: int) -> int:
+    """Ways to split the S / dP contraction across a team.
+
+    1 below the wide threshold and 2 at or above it, and both halves of that
+    are measured rather than derived. Sharding costs `BLOCK_N`: a team is
+    `2 * shards` waves, so at fixed `num_waves` doubling the shard count halves
+    the KV rows per workgroup and doubles how often each workgroup re-reads the
+    Q/dO stream. B=1 H=8 N=4096 f16, percent of the 212.8 TFLOPS WMMA ceiling:
+
+        head_dim   C=1        C=2
+        192        26.0/25.3  22.1/20.9
+        256        30.0/31.2  20.9/19.6
+        512        spills     26.7/24.0
+
+    So it is a loss of 15-30% wherever C=1 does not spill, and the only reason
+    to pay it is that at 512 C=1 spills 230 registers. 4 shards is worse again
+    (15.5% at 512) -- spill-free, but `BLOCK_N` drops to 32 and the Q traffic
+    swamps the registers saved, the same trade `fmha_tuning_bwd_dq_gfx1201`
+    records at its own BLOCK_M.
+    """
+    return 2 if is_wide(head_dim, head_dim_v) else 1
+
+
+def default_transposed_source(head_dim: int, head_dim_v: int) -> str:
+    """Where the Q^T / dO^T WMMA operands come from.
+
+    "derived" is what makes the wide widths fit -- it removes the two
+    transposed tiles, which at head_dim 512 is 40960 of the 90496 B that
+    otherwise overflows. It is not free, but it is far cheaper than the read
+    counting suggests (1.0 -> ~4.5 LDS reads per WMMA): measured against
+    "tile" at C=1, B=1 H=8 N=4096, it costs about 10% at head_dim 256
+    (30.0 -> 26.8% of peak) and nothing measurable at 192 (26.0 -> 25.2, and
+    25.3 -> 26.3 causal, i.e. inside the board's drift).
+    """
+    return "derived" if is_wide(head_dim, head_dim_v) else "tile"
+
+
 def default_split_head_dim(head_dim: int, head_dim_v: int) -> bool:
     """Whether to pair the waves and split the head dim of dK/dV.
 
@@ -228,6 +276,7 @@ def lds_bytes(
     elem_bytes: int = 2,
     num_waves: int | None = None,
     split_head_dim: bool = False,
+    transposed_source: str = "tile",
 ) -> int:
     """LDS a Q/dO staging pass needs, in bytes.
 
@@ -241,30 +290,41 @@ def lds_bytes(
     The transposed copies are not an optimisation. A WMMA A operand's eight
     per-lane elements run along the *contraction* axis, and the four GEMMs in
     this kernel contract over `d` twice and over `q` twice, so each tensor is
-    read both ways. Deriving one from the other in LDS costs eight strided
-    scalar reads per operand -- the forward's `V_LDS_LAYOUT="row"` path, which
-    it measured 2.7% slower for a single tensor.
+    read both ways.
+
+    `transposed_source="derived"` drops the two transposed tiles and reads
+    those operands strided out of the row-major pair instead -- eight
+    `ds_read_u16` where the tile costs one `ds_read_b128`, since gfx1201 has no
+    `ds_load_tr16_b128`. The forward measured the equivalent at 2.7% for a
+    single tensor; it is what makes head_dim 512 fit, and only
+    `fmha_bwd_dkdv512_gfx1201_kernel` implements it.
     """
     rm = block_m * (head_dim + LDS_PAD) + block_m * (head_dim_v + LDS_PAD)
     tr = head_dim * (block_m + LDS_PAD) + head_dim_v * (block_m + LDS_PAD)
+    if transposed_source == "derived":
+        tr = 0
     total = (rm + tr) * elem_bytes
     # Per-row LSE and delta for the Q tile in flight: two f32 runs of block_m,
     # staged once and read by every wave.
     total += 2 * block_m * 4
     if split_head_dim:
-        # `split_head_dim` pairs the waves and relays each pair's S and dP
-        # through LDS: one f32 slot per lane per wave, eight values each.
+        # The team exchange: one f32 slot per lane per wave, eight values each.
+        # Independent of how wide the team is -- two waves relaying S and dP, or
+        # `2 * contraction_shards` waves reducing partials, is one slot per wave
+        # either way.
         if num_waves is None:
-            raise ValueError("split_head_dim needs num_waves to size the pair exchange")
+            raise ValueError("split_head_dim needs num_waves to size the exchange")
         total += num_waves * _WAVE_LANES * 8 * 4
     return total
 
 
-def _fits_lds(block_m, head_dim, head_dim_v, num_waves=None, split_head_dim=False) -> bool:
-    return lds_bytes(block_m, head_dim, head_dim_v, 2, num_waves, split_head_dim) <= _LDS_LIMIT
+def _fits_lds(block_m, head_dim, head_dim_v, num_waves=None, split_head_dim=False, transposed_source="tile") -> bool:
+    return lds_bytes(block_m, head_dim, head_dim_v, 2, num_waves, split_head_dim, transposed_source) <= _LDS_LIMIT
 
 
-def default_block_m(head_dim: int, head_dim_v: int, num_waves=None, split_head_dim: bool = False) -> int:
+def default_block_m(
+    head_dim: int, head_dim_v: int, num_waves=None, split_head_dim: bool = False, transposed_source: str = "tile"
+) -> int:
     """Q rows per staging pass: the measured choice, reduced until it fits LDS.
 
     Walks *down* rather than failing, because block_m is a pure schedule
@@ -272,7 +332,7 @@ def default_block_m(head_dim: int, head_dim_v: int, num_waves=None, split_head_d
     """
     want = _DEFAULT_BLOCK_M if max(head_dim, head_dim_v) in _BLOCK_M_32_HEAD_DIMS else 16
     for bm in (want, 16):
-        if _fits_lds(bm, head_dim, head_dim_v, num_waves, split_head_dim):
+        if _fits_lds(bm, head_dim, head_dim_v, num_waves, split_head_dim, transposed_source):
             return bm
     return 16
 
@@ -321,6 +381,19 @@ class BwdDkDvKnobs:
     num_waves: int | None = None
     lpt_tile_order: bool | None = None
     split_head_dim: bool | None = None
+
+    # Read only by `fmha_bwd_dkdv512_gfx1201_kernel`, the wide-head_dim variant.
+    # They live here rather than in a parallel dataclass so that `plan()` and
+    # `resolve_knobs` serve both kernels; the primary kernel ignores them, and
+    # their defaults are what it would have done anyway.
+    #
+    #   contraction_shards  ways the S / dP contraction is split across a team.
+    #                       1 is the primary kernel's role-only pair.
+    #   transposed_source   "tile" stages Q^T/dO^T in LDS; "derived" reads the
+    #                       same operands strided out of the row-major tiles and
+    #                       does not allocate them.
+    contraction_shards: int | None = None
+    transposed_source: str | None = None
 
     # Function attributes and floating-point latitude. Same three-level split
     # as the forward's: `fp_mode` is the explicit flag set on the softmax-ish
@@ -382,16 +455,20 @@ def resolve_knobs(meta: BwdDkDvMetadata, overrides: "BwdDkDvKnobs | None" = None
     if s.block_dmodel_v is None:
         s = replace(s, block_dmodel_v=meta.head_dim_v if meta.head_dim_v is not None else s.block_dmodel)
     hd, hdv = s.block_dmodel, s.block_dmodel_v
+    if s.contraction_shards is None:
+        s = replace(s, contraction_shards=default_contraction_shards(hd, hdv))
+    if s.transposed_source is None:
+        s = replace(s, transposed_source=default_transposed_source(hd, hdv))
     if s.split_head_dim is None:
         s = replace(s, split_head_dim=default_split_head_dim(hd, hdv))
     if s.num_waves is None:
         s = replace(s, num_waves=default_num_waves(hd, hdv))
     if s.block_m is None:
-        s = replace(s, block_m=default_block_m(hd, hdv, s.num_waves, s.split_head_dim))
-    if not _fits_lds(s.block_m, hd, hdv, s.num_waves, s.split_head_dim):
+        s = replace(s, block_m=default_block_m(hd, hdv, s.num_waves, s.split_head_dim, s.transposed_source))
+    if not _fits_lds(s.block_m, hd, hdv, s.num_waves, s.split_head_dim, s.transposed_source):
         raise ValueError(
             f"block_m={s.block_m} with head_dim=({hd}, {hdv}) needs "
-            f"{lds_bytes(s.block_m, hd, hdv, 2, s.num_waves, s.split_head_dim)} B of LDS, "
+            f"{lds_bytes(s.block_m, hd, hdv, 2, s.num_waves, s.split_head_dim, s.transposed_source)} B of LDS, "
             f"over the {_LDS_LIMIT} B cap"
         )
     return s

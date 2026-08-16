@@ -34,8 +34,7 @@ import torch.nn.functional as F
 from dropout_mask_gfx1201 import dropout_mask
 from flash_attn_func_gfx1201_interface import flydsl_flash_attn_func_gfx1201
 from fmha_abi_gfx1201 import varlen_compact, varlen_padded
-from fmha_bwd_dkdv_gfx1201_interface import flydsl_flash_attn_bwd_dkdv_gfx1201
-from fmha_bwd_dkdv_gfx1201_kernel import build_bwd_dkdv_module_primary
+from fmha_bwd_dkdv_gfx1201_interface import build_bwd_dkdv_module, flydsl_flash_attn_bwd_dkdv_gfx1201
 from fmha_tuning_bwd_dkdv_gfx1201 import BwdDkDvKnobs, BwdDkDvMetadata
 from fmha_tuning_bwd_dkdv_gfx1201 import plan as bwd_plan
 from philox import dropout_threshold
@@ -165,7 +164,7 @@ def _bwd_via_kernel(
         ),
         knobs,
     )
-    exe = build_bwd_dkdv_module_primary(_plan.meta, _plan.knobs)
+    exe = build_bwd_dkdv_module(_plan.meta, _plan.knobs)
     exe(
         q,
         k,
@@ -252,11 +251,35 @@ def _check(q, k, v, do, causal_type=0, window=None, dtype=None, label="", seed=0
 # allocation as a whole. A ladder that stops short of the widest compiled width
 # is not a ladder.
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-@pytest.mark.parametrize("head_dim", [16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize("head_dim", [16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512])
 def test_head_dim_ladder(head_dim, causal):
     _require_env()
     q, k, v, do = _case(1, 2, 2, 256, 256, head_dim)
     _check(q, k, v, do, causal_type=1 if causal else 0, label=f"hd{head_dim} causal={causal}")
+
+
+# 320 and up route to `fmha_bwd_dkdv512_gfx1201_kernel`, which the ladder above
+# already exercises -- but only through whatever the policy resolves. These pin
+# the routing itself, because the failure mode if it regresses is not an error:
+# the primary kernel would be asked for a width whose register state is 0.75 *
+# head_dim and whose LDS is over the cap, and the first of those spills rather
+# than raising.
+@pytest.mark.parametrize("head_dim,wide", [(256, False), (320, True), (512, True)])
+def test_wide_head_dim_routes_to_the_wide_kernel(head_dim, wide):
+    from fmha_tuning_bwd_dkdv_gfx1201 import BwdDkDvMetadata
+    from fmha_tuning_bwd_dkdv_gfx1201 import plan as _plan
+
+    knobs = _plan(BwdDkDvMetadata(num_heads=2, head_dim=head_dim, dtype_str="f16")).knobs
+    assert (knobs.contraction_shards > 1) is wide
+    assert (knobs.transposed_source == "derived") is wide
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_wide_head_dim_gqa(causal):
+    """The wide kernel through a fold, since its team decomposition is new."""
+    _require_env()
+    q, k, v, do = _case(1, 4, 2, 256, 256, 512)
+    _check(q, k, v, do, causal_type=1 if causal else 0, label=f"hd512 gqa causal={causal}")
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["f16", "bf16"])
@@ -457,7 +480,7 @@ def _varlen_check(lens_q, lens_k, causal_type, mode, head_dim=64, heads=2, label
             dtype_str="f16",
         )
     )
-    exe = build_bwd_dkdv_module_primary(_plan.meta, _plan.knobs)
+    exe = build_bwd_dkdv_module(_plan.meta, _plan.knobs)
     exe(
         q,
         k,
@@ -590,7 +613,7 @@ def test_dropout_off_by_default():
     _require_env()
     _plan = bwd_plan(BwdDkDvMetadata(num_heads=2, head_dim=64, causal=False, dtype_str="f16"))
     assert _plan.meta.dropout is False
-    exe = build_bwd_dkdv_module_primary(_plan.meta, _plan.knobs)
+    exe = build_bwd_dkdv_module(_plan.meta, _plan.knobs)
     q, k, v, do = _case(1, 2, 2, 128, 128, 64)
     o, lse, delta, gk, gv = _reference(q, k, v, do)
     dk = torch.zeros_like(k)

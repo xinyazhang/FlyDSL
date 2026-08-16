@@ -37,11 +37,12 @@ from __future__ import annotations
 from functools import lru_cache
 
 import torch
+from fmha_bwd_dkdv512_gfx1201_kernel import build_bwd_dkdv_module_primary as build_bwd_dkdv_module_wide
 from fmha_bwd_dkdv_gfx1201_kernel import build_bwd_dkdv_module_primary
 from fmha_tuning_bwd_dkdv_gfx1201 import BwdDkDvKnobs, BwdDkDvMetadata
 from fmha_tuning_bwd_dkdv_gfx1201 import plan as _plan_build
 
-__all__ = ["flydsl_flash_attn_bwd_dkdv_gfx1201"]
+__all__ = ["flydsl_flash_attn_bwd_dkdv_gfx1201", "build_bwd_dkdv_module"]
 
 
 def _torch_dtype_to_str(dtype: torch.dtype) -> str:
@@ -52,10 +53,32 @@ def _torch_dtype_to_str(dtype: torch.dtype) -> str:
     raise ValueError(f"flydsl_flash_attn_bwd_dkdv_gfx1201 only supports bf16/f16, got {dtype!r}")
 
 
+def build_bwd_dkdv_module(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
+    """The right dK/dV kernel for these knobs.
+
+    Two kernels behind one entry point. The primary one caps at head_dim 256,
+    where `0.75 * head_dim` of register state and four LDS staging tiles both
+    still fit; above that `fmha_tuning_bwd_dkdv_gfx1201`'s policy resolves
+    `contraction_shards` to 2 and `transposed_source` to "derived", neither of
+    which the primary kernel implements, so the build routes to the wide
+    variant. Dispatch is on the *knobs* rather than on head_dim so that forcing
+    either knob by hand picks the right builder too.
+
+    **Call this rather than either builder.** Reaching past it for
+    `build_bwd_dkdv_module_primary` and handing it wide knobs gets the four-tile
+    LDS layout at a width that policy sized for two, and the failure is a
+    `local memory (72064) exceeds limit (65536)` out of the backend rather than
+    anything that names the mistake.
+    """
+    if knobs.contraction_shards > 1 or knobs.transposed_source == "derived":
+        return build_bwd_dkdv_module_wide(meta, knobs)
+    return build_bwd_dkdv_module_primary(meta, knobs)
+
+
 @lru_cache(maxsize=32)
 def _get_kernel(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     """Build cache. Both arguments are frozen dataclasses, so both hash."""
-    return build_bwd_dkdv_module_primary(meta, knobs)
+    return build_bwd_dkdv_module(meta, knobs)
 
 
 def _as_row_2d(t: torch.Tensor, name: str) -> torch.Tensor:

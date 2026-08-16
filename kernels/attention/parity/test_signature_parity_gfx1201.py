@@ -36,6 +36,10 @@ _JIT_ONLY = {
     "flash_attn_func_gfx1201_aiw.py": {"stream"},
     "fmha_bwd_dq_gfx1201_kernel.py": {"stream"},
     "fmha_bwd_dkdv_gfx1201_kernel.py": {"stream"},
+    # The wide-head_dim dK/dV variant. Same ABI as the kernel above by
+    # construction -- it is that kernel with two extra *compile-time* knobs, so
+    # nothing new reaches the kernarg signature.
+    "fmha_bwd_dkdv512_gfx1201_kernel.py": {"stream"},
     "fmha_bwd_fuse_gfx1201_kernel.py": {"stream"},
     "dropout_mask_gfx1201.py": {"stream", "batch_size"},
 }
