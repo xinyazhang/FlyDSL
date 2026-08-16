@@ -51,6 +51,7 @@ change:
 
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr
+from flydsl.expr.typing import Vector as Vec
 from fmha_common_gfx1201 import MaskedAxis
 from gfx950_standalone import dualwave
 
@@ -309,6 +310,29 @@ class ParityQLoader(dualwave.DualwaveQLoader):
         return MaskedAxis(fx.Index(self.hdim_qk), elem_dtype=self.elem_dtype).discard(
             pack, col_base, self.traits.MFMA_LANE_K
         )
+
+    def load_all(self):
+        """Q rows for this wave, for any `K_STEPS_QK`.
+
+        The production version assembles the packs through a fixed 8 -> 16 ->
+        32 tree and then takes either one 32-pack or a concatenation of two,
+        which covers `K_STEPS_QK` 4 and 8 -- head_dim 64 and 128 -- and nothing
+        else. head_dim 192 wants 12 packs and 256 wants 16, so the tail of that
+        tree simply drops the remainder and the `Vec` constructor rejects the
+        result ("shape (96,) has 96 elements, but value has type
+        vector<64xbf16>"). It fails loudly, which is the good case.
+
+        A left fold over the packs replaces the tree. `_concat_vectors` builds
+        an explicit shuffle index list, so it does not need equal widths and
+        the uneven steps 192 needs (32+32 -> 64, 64+32 -> 96) are fine.
+        """
+        traits = self.traits
+        ctx = self.ctx_ref
+        ctx.init_q_row()
+        acc = self.load_pack(ctx.q_row_in_block, 0)
+        for ks in range_constexpr(traits.K_STEPS_QK - 1):
+            acc = dualwave._concat_vectors(acc, self.load_pack(ctx.q_row_in_block, ks + 1))
+        return Vec(acc, (traits.K_STEPS_QK * traits.MFMA_LANE_K,), self.elem_dtype)
 
 
 class ParityKvLdsToVgprLoader(dualwave.DualwaveKvLdsToVgprLoader):

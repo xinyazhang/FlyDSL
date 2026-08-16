@@ -259,6 +259,56 @@ Tuning table in `fmha_tuning_gfx950.py`, keyed on `BLOCK_DMODEL` (plan1 §N3).
 ladder. `isa_stats.py` against the reference: 4 waves, 512 VGPR, 0 spill at
 head_dim 192.
 
+### P2 evidence — family B is required, and now measured
+
+Family B was scoped from the reference asm's resource metadata, which is
+evidence about AMD's kernel, not ours. Measured directly by extending the
+ladder to 192/256 on the existing 8-wave geometry and reading
+`21_final_isa.s`:
+
+| head_dim | VGPR | spills | LDS | correct? |
+|---|---|---|---|---|
+| 64 | 164 | 0 | 34 KB | yes |
+| 128 | **248** | **0** | 68 KB | yes |
+| 192 | 256 | **506** | 102 KB | no — NaN |
+| 256 | 256 | **963** | 136 KB | no — NaN |
+
+**The 8-wave geometry is saturated at head_dim 128** -- 248 of 256 VGPRs with
+zero spills, i.e. the next rung has nowhere to go. LDS is *not* the binding
+constraint (102 KB and 136 KB both fit the 160 KB budget); the register file
+is. That is exactly why `fwd_hd192_hd128_bf16.co` runs 4 waves at 512
+VGPRs/lane: halving the wave count doubles the per-lane register file, which is
+the ~1.5-2x that 192 needs. **The asm's choice is now corroborated on our own
+kernel rather than assumed from theirs.**
+
+The NaN is a consequence, not a separate bug. It is non-deterministic at 506
+spills and becomes deterministic when the DMAs are fully drained, and it is
+*not* an addressing error: both the K and V LDS mappings were re-derived
+against the DMA writes and cover the right tokens and D columns for any
+`SMEM_D_RPT` (the K derivation is reproduced in `ParityKvLdsToVgprLoader`).
+The most likely mechanism is `_anchor_v_o`, whose inline asm ties `D_CHUNKS`
+`vector<16xf32>` operands -- 96 VGPRs at 192, 128 at 256 -- as simultaneously
+resident, which is not satisfiable alongside 506 spills.
+
+**One fix from this landed and is kept**: `DualwaveQLoader.load_all` assembles
+Q through a fixed 8 -> 16 -> 32 tree and then takes at most *two* 32-packs, so
+it silently serves only `K_STEPS_QK` 4 and 8 -- head_dim 64 and 128.
+`ParityQLoader.load_all` replaces it with a left fold, which family B needs
+regardless of wave count.
+
+**What family B still has to change**, none of it started:
+
+- `_make_dualwave_swp_traits` hardcodes `num_waves=8`, `block_m=256`,
+  `block_n=64`. It is in the production file, so parity needs its own traits
+  constructor rather than an argument.
+- `BLOCK_N` 64 -> 128 doubles the score accumulators (`v_s` is a pair of
+  `v16f32` at BLOCK_N=64), which reaches every `DualwaveSoftmaxHelper` method
+  and the causal mask's `_causal_pair_thresholds`.
+- `BLOCK_M` 256 -> 128 with 4 waves keeps `rows_per_wave` at 32, so the MFMA
+  row mapping survives -- the one piece that does.
+- The stagger/barrier structure splits 8 waves into two groups of 4; at 4
+  waves that is two groups of 2, and `stagger_i32 = wave_id_uni / 4` is wrong.
+
 ### P3 — generalized sliding window (gSWA)
 
 The mask is already a relative diagonal parameterized by `delta`, so this adds

@@ -30,10 +30,21 @@ from dataclasses import dataclass, fields, replace
 # The ladder
 # ---------------------------------------------------------------------------
 
-# Compiled tile widths. Only the first two exist today: 192 and above need the
-# 4-wave / 512-VGPR / 128x128 geometry that `fwd_hd192_hd128_bf16.co` uses, and
-# that is P2. Listed here so `tile_width_for` reports "not built yet" rather
-# than "unsupported", which are different problems for the caller.
+# Compiled tile widths. Only the first two exist today, and the reason is
+# measured rather than assumed -- see the P2 section of
+# `sdpa-close-gap-gfx950.md`. On this 8-wave geometry:
+#
+#   head_dim   VGPR   spills   LDS
+#     64        164      0     34 KB
+#    128        248      0     68 KB     <- saturated, zero spills
+#    192        256    506    102 KB
+#    256        256    963    136 KB
+#
+# LDS is not the binding constraint at 192/256; the register file is. That is
+# why `fwd_hd192_hd128_bf16.co` runs 4 waves at 512 VGPRs/lane -- halving the
+# wave count doubles the per-lane register file. Listed here so
+# `tile_width_for` reports "not built yet" rather than "unsupported", which are
+# different problems for the caller.
 LADDER = (64, 128)
 LADDER_PLANNED = (192, 256, 384, 512)
 
