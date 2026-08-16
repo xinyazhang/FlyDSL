@@ -201,6 +201,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     # `split_head_dim` pairs the waves, so a workgroup covers half the KV rows.
     if SPLIT_HEAD_DIM:
         assert NUM_WAVES % 2 == 0, f"split_head_dim needs an even wave count, got {NUM_WAVES}"
+        assert BLOCK_DMODEL == BLOCK_DMODEL_V, (
+            f"split_head_dim gives both waves one operand array and one LDS stride, "
+            f"so it needs head_dim == head_dim_v; got {BLOCK_DMODEL} and {BLOCK_DMODEL_V}"
+        )
     NUM_PAIRS = NUM_WAVES // 2 if SPLIT_HEAD_DIM else NUM_WAVES
     BLOCK_N = ROWS_PER_WAVE * NUM_PAIRS
     BLOCK_SIZE = NUM_WAVES * WARP_SIZE

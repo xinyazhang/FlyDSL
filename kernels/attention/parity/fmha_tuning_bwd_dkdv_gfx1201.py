@@ -142,8 +142,8 @@ _DEFAULT_LPT_TILE_ORDER = False
 
 # Pair the waves and split the head dim of dK/dV between them.
 #
-# Off by default. It is not a schedule tweak but a different decomposition, and
-# it wins only where the baseline spills -- see the kernel's `SPLIT_HEAD_DIM`
+# Not a schedule tweak but a different decomposition, and it wins only where
+# the baseline spills -- see the kernel's `SPLIT_HEAD_DIM`
 # section for the mechanism and the measurements. Summary, B=4 H=16 N=2048 f16,
 # each arm at its own best num_waves:
 #
@@ -155,8 +155,23 @@ _DEFAULT_LPT_TILE_ORDER = False
 # The crossover is the spill boundary, which is why this is keyed on head_dim
 # and not measured per shape: below 192 the baseline holds everything in
 # registers and the pair exchange plus the halved BLOCK_N buy nothing.
-_DEFAULT_SPLIT_HEAD_DIM = False
 _SPLIT_HEAD_DIM_MIN = 192
+
+
+def default_split_head_dim(head_dim: int, head_dim_v: int) -> bool:
+    """Whether to pair the waves and split the head dim of dK/dV.
+
+    Keyed on head_dim because the crossover *is* the spill boundary -- the
+    baseline holds everything in registers below 192 and the pair exchange
+    plus the halved BLOCK_N buy nothing there. Not keyed on `causal`: the
+    split wins by more under causal at both widths where it wins at all.
+
+    Requires `head_dim == head_dim_v`. The split gives both waves one operand
+    array and one LDS stride, which only works when K and V are the same
+    width; the kernel asserts it too.
+    """
+    return head_dim >= _SPLIT_HEAD_DIM_MIN and head_dim == head_dim_v
+
 
 _NUM_WAVES_SMALL_MAX_HEAD_DIM = 64
 _NUM_WAVES_MEDIUM_MAX_HEAD_DIM = 128
@@ -249,7 +264,7 @@ def _fits_lds(block_m, head_dim, head_dim_v, num_waves=None, split_head_dim=Fals
     return lds_bytes(block_m, head_dim, head_dim_v, 2, num_waves, split_head_dim) <= _LDS_LIMIT
 
 
-def default_block_m(head_dim: int, head_dim_v: int) -> int:
+def default_block_m(head_dim: int, head_dim_v: int, num_waves=None, split_head_dim: bool = False) -> int:
     """Q rows per staging pass: the measured choice, reduced until it fits LDS.
 
     Walks *down* rather than failing, because block_m is a pure schedule
@@ -257,7 +272,7 @@ def default_block_m(head_dim: int, head_dim_v: int) -> int:
     """
     want = _DEFAULT_BLOCK_M if max(head_dim, head_dim_v) in _BLOCK_M_32_HEAD_DIMS else 16
     for bm in (want, 16):
-        if _fits_lds(bm, head_dim, head_dim_v):
+        if _fits_lds(bm, head_dim, head_dim_v, num_waves, split_head_dim):
             return bm
     return 16
 
@@ -335,7 +350,6 @@ class BwdDkDvKnobs:
 
 
 _KNOBS_FALLBACK = BwdDkDvKnobs(
-    split_head_dim=_DEFAULT_SPLIT_HEAD_DIM,
     lpt_tile_order=_DEFAULT_LPT_TILE_ORDER,
     # "noninf" and not "fast": `ninf` lets the compiler assume no operand is
     # infinite, and this kernel reads a logsumexp that is deliberately +inf for
@@ -368,14 +382,17 @@ def resolve_knobs(meta: BwdDkDvMetadata, overrides: "BwdDkDvKnobs | None" = None
     if s.block_dmodel_v is None:
         s = replace(s, block_dmodel_v=meta.head_dim_v if meta.head_dim_v is not None else s.block_dmodel)
     hd, hdv = s.block_dmodel, s.block_dmodel_v
+    if s.split_head_dim is None:
+        s = replace(s, split_head_dim=default_split_head_dim(hd, hdv))
     if s.num_waves is None:
         s = replace(s, num_waves=default_num_waves(hd, hdv))
     if s.block_m is None:
-        s = replace(s, block_m=default_block_m(hd, hdv))
-    if not _fits_lds(s.block_m, hd, hdv):
+        s = replace(s, block_m=default_block_m(hd, hdv, s.num_waves, s.split_head_dim))
+    if not _fits_lds(s.block_m, hd, hdv, s.num_waves, s.split_head_dim):
         raise ValueError(
             f"block_m={s.block_m} with head_dim=({hd}, {hdv}) needs "
-            f"{lds_bytes(s.block_m, hd, hdv)} B of LDS, over the {_LDS_LIMIT} B cap"
+            f"{lds_bytes(s.block_m, hd, hdv, 2, s.num_waves, s.split_head_dim)} B of LDS, "
+            f"over the {_LDS_LIMIT} B cap"
         )
     return s
 
