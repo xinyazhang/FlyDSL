@@ -47,7 +47,7 @@ floor, and it is an instruction limit rather than a staging one.
 
 from dataclasses import dataclass, fields, replace
 
-from gfx950_standalone import dualwave
+from fmha_traits_gfx950 import make_traits
 
 __all__ = [
     "LADDER",
@@ -378,6 +378,44 @@ class Gfx950Knobs(FmhaKnobs):
             return replace(self, num_waves=8, block_m=256, block_n=64, head_dim_granule=64)  # family A
         return replace(self, num_waves=4, block_m=128, block_n=128, head_dim_granule=64)  # family B
 
+    # Geometries whose *address helpers* are known correct, which is a stricter
+    # set than the ones `make_traits` can describe.
+    _SUPPORTED_GEOMETRIES = ((8, 256, 64, 64),)
+
+    def _check_helpers_support_geometry(self):
+        """Refuse a geometry the kernel's addressing cannot actually serve.
+
+        `fmha_traits_gfx950.make_traits` takes the geometry as parameters, so
+        it will happily *describe* families S and B. The addressing has not
+        caught up, and the gap is specific:
+
+        - `_k_dma_m0_base` / `_v_dma_m0_base` place a tile line per wave per
+          d-band (`wave * LINE + d * N_RPT * LINE`), which assumes
+          `SMEM_N_RPT == NUM_WAVES` -- one issue per wave. Family B needs four,
+          and waves 4..15's lines would simply never be written.
+        - `init_dma_thread_offsets` splits a lane as `lane // VEC_KV` tokens by
+          `lane % VEC_KV` D-buckets, which is the right split only when the
+          granule is `VEC_KV * VEC_KV == 64`.
+        - `_k_lds_read_base_per_lane` and `_swizzled_ks_offset` fold `%8`,
+          `//8` and `//4` constants that are `SMEM_N_RPT` and
+          `granule // K_STEP_QK` at family A's numbers.
+
+        Failing here rather than at those sites keeps the diagnosis at the
+        level of the decision. A geometry that builds and runs but addresses
+        the wrong LDS produces plausible numbers, which is the failure mode
+        this whole guard exists to avoid -- P2 measured exactly that at
+        head_dim 192.
+        """
+        geom = (self.num_waves, self.block_m, self.block_n, self.head_dim_granule)
+        if geom not in self._SUPPORTED_GEOMETRIES:
+            raise NotImplementedError(
+                f"geometry (waves, BLOCK_M, BLOCK_N, granule) = {geom} is describable but not yet "
+                f"addressable: the DMA and LDS-read helpers assume SMEM_N_RPT == NUM_WAVES and a "
+                f"64-element granule. Supported: {self._SUPPORTED_GEOMETRIES}. "
+                "See P2 in sdpa-close-gap-gfx950.md."
+            )
+        return self
+
     def staging_shape(self):
         """`(tokens_per_issue, lines, issues_per_wave)` for this geometry.
 
@@ -404,33 +442,30 @@ class Gfx950Knobs(FmhaKnobs):
     def _with_traits(self, meta):
         """Build the dualwave traits this configuration implies.
 
-        The last step, and the one family B replaces. Family A delegates to the
-        production constructor, which hardcodes 8/256/64 -- usable *because*
-        family A's geometry is exactly those numbers, not by coincidence.
-        Family B needs its own, which is work P2 still owes; failing here names
-        that, rather than silently building family A's geometry under family
-        B's name and then benchmarking it as the new one.
+        The last step. `fmha_traits_gfx950.make_traits` takes the geometry as
+        parameters where the production constructor hardcodes it, and is
+        checked field-by-field against production at family A's numbers -- so
+        family A goes through this path today and the bitwise-vs-production
+        test covers it.
         """
-        geom = (self.num_waves, self.block_m, self.block_n, self.head_dim_granule)
-        if geom != (8, 256, 64, 64):
-            raise NotImplementedError(
-                f"geometry (waves, BLOCK_M, BLOCK_N, granule) = {geom} needs a parity-side traits "
-                "constructor; `_make_dualwave_swp_traits` hardcodes 8/256/64 and derives the granule "
-                "from a fixed 128-byte row. See P2 in sdpa-close-gap-gfx950.md."
-            )
+        self.staging_shape()  # the geometry must divide a KV tile evenly
+        self._check_helpers_support_geometry()
         num_kv_heads = meta.num_heads if meta.num_kv_heads is None else meta.num_kv_heads
-        traits = dualwave._make_dualwave_swp_traits(
-            meta.num_heads,
-            num_kv_heads,
-            self.block_dmodel,
+        traits = make_traits(
+            num_heads=meta.num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=self.block_dmodel,
+            num_waves=self.num_waves,
+            block_m=self.block_m,
+            block_n=self.block_n,
+            granule=self.head_dim_granule,
             causal=meta.causal,
             dtype_str=meta.dtype_str,
             waves_per_eu=self.waves_per_eu,
             daz=self.daz,
-            dualwave_swp_lazy_rescale=self.lazy_rescale,
-            dualwave_swp_setprio=self.setprio,
-            dualwave_swp_debug_lazy_counts=False,
-            dualwave_swp_enable_stagger=self.stagger,
+            lazy_rescale=self.lazy_rescale,
+            setprio=self.setprio,
+            stagger=self.stagger,
             num_kv_splits=self.num_kv_splits,
             varlen=self.varlen,
             cross_seqlen=self.cross_seqlen,

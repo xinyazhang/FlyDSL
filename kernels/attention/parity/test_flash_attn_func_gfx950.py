@@ -423,26 +423,51 @@ def test_wave_geometry_requires_widths_first():
         fmha_knobs("gfx950")._with_wave_geometry()
 
 
-def test_family_b_names_itself_rather_than_silently_building_family_a():
-    """A pinned family-B geometry must fail loudly, not fall back.
+@pytest.mark.parametrize(
+    "geom",
+    [(4, 128, 128, 64), (8, 256, 128, 32)],
+    ids=["family_b", "family_s"],
+)
+def test_unaddressable_geometry_fails_loudly(geom):
+    """Describable is not the same as addressable, and the gap must not be silent.
 
-    `_make_dualwave_swp_traits` hardcodes 8/256/64, so building it under
-    family B's name would produce family A's kernel with family B's label --
-    which would then be benchmarked as if it were the new geometry.
+    `make_traits` takes the geometry as parameters, so it will happily describe
+    families S and B. The DMA and LDS-read helpers still assume
+    `SMEM_N_RPT == NUM_WAVES` and a 64-element granule, so such a build would
+    address the wrong LDS and produce plausible numbers -- which is exactly
+    what head_dim 192 did before the ladder was reverted.
     """
-    with pytest.raises(NotImplementedError, match="parity-side traits constructor"):
-        fmha_knobs("gfx950", num_waves=4, block_m=128, block_n=128, head_dim_granule=64).resolve(_META)
+    nw, bm, bn, gran = geom
+    with pytest.raises(NotImplementedError, match="describable but not yet addressable"):
+        fmha_knobs("gfx950", num_waves=nw, block_m=bm, block_n=bn, head_dim_granule=gran).resolve(_META)
 
 
-def test_family_s_names_itself_too():
-    """Family S is blocked on the same seam as B: a parity-side constructor.
+def test_traits_constructor_matches_production_exactly():
+    """The parity constructor is a transcription; this is what makes that mean something.
 
-    Both need `_make_dualwave_swp_traits` replaced -- B because it hardcodes
-    8/256/64, S because it derives the granule from a fixed 128-byte row. One
-    piece of work unlocks both, which is why they are one phase.
+    Field-by-field against `_make_dualwave_swp_traits` at family A's geometry,
+    across the modes, because a single configuration would not catch a term
+    that happens to vanish there.
     """
-    with pytest.raises(NotImplementedError, match="parity-side traits constructor"):
-        fmha_knobs("gfx950", num_waves=8, block_m=256, block_n=128, head_dim_granule=32).resolve(_META)
+    from fmha_traits_gfx950 import assert_matches_production
+
+    for causal in (True, False):
+        for lse in (True, False):
+            for splits in (1, 2):
+                for paged, layout in ((False, "linear"), (True, "linear"), (True, "vectorized")):
+                    assert_matches_production(
+                        head_dims=LADDER,
+                        num_heads=8,
+                        num_kv_heads=8,
+                        causal=causal,
+                        return_lse=lse,
+                        num_kv_splits=splits,
+                        paged=paged,
+                        kv_cache_layout=layout,
+                        kv_vectorized=paged and layout == "vectorized",
+                    )
+    assert_matches_production(head_dims=LADDER, num_heads=8, num_kv_heads=2, kv_vectorized=False)
+    assert_matches_production(head_dims=LADDER, num_heads=8, num_kv_heads=8, dtype_str="f16", kv_vectorized=False)
 
 
 def test_wave_geometry_must_be_pinned_whole():

@@ -122,7 +122,18 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
     # Precedence is per-call `scale` > `meta.sm_scale` > derived.
     BUILD_SM_SCALE = meta.sm_scale
 
-    _cache_tag = (traits.cache_tag, BLOCK_DMODEL, PADDED_HEAD, HDIM_MODE, STRIDES_CONSTEXPR, BUILD_SM_SCALE)
+    # `traits.cache_tag` does not include the tile geometry, so two families
+    # of the same shape would collide in the JIT disk cache -- which a knob
+    # sweep hits immediately. Everything the build depends on goes in here.
+    _cache_tag = (
+        traits.cache_tag,
+        BLOCK_DMODEL,
+        PADDED_HEAD,
+        HDIM_MODE,
+        STRIDES_CONSTEXPR,
+        BUILD_SM_SCALE,
+        (knobs.num_waves, knobs.block_m, knobs.block_n, knobs.head_dim_granule),
+    )
 
     _lds_elem_dtype = dualwave.dtype_to_elem_type(traits.DTYPE_STR)
 
