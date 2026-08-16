@@ -517,10 +517,53 @@ oracle only exists at head_dim 64 and 128, where the fold and the tree agree.
 `scale_all` is the second: it materialises the whole of Q in f32, 96 VGPRs at
 head_dim 192 against 64 at 128.
 
-Next step is to test `load_all` in isolation -- build a head_dim 192 kernel
-that computes Q the production way for the first 8 packs and compare -- rather
-than to extend the model to V, which this probe has now shown is not where the
-fault is. The granule sweep still waits on it.
+### P2 — the generated asm is not the problem
+
+Checked against the CDNA4 ISA document (`amd-instinct-cdna4-instruction-set-architecture.pdf`,
+§9.1.9 *Memory Buffer Load to LDS*, §11.4 *MFMA Transpose Load from LDS*) and
+against the emitted `21_final_isa.s`. Three assumptions are now confirmed
+rather than believed:
+
+- **The LDS DMA address model is exactly right.** §9.1.9 gives
+  `LDS_ADDR = LDSbase + M0 + inst_offset + TIDinWave * 4`, modified to
+  `TIDinWave * 16` for 3- or 4-dword loads. So one `buffer_load_dwordx4 ... lds`
+  writes 64 lanes x 16 B = 1024 B starting at M0 -- which is the
+  `SMEM_LINEAR_WAVE = 512` element line the whole staging model is built on.
+- **M0 is correctly sequenced.** 72 `s_mov_b32 m0` against 72
+  `buffer_load ... lds` at head_dim 192, each immediately before its load. The
+  hypothesis that several in-flight DMAs might share a stale M0 -- which would
+  have explained everything -- is dead.
+- **The instruction mix scales exactly as it should:**
+
+  | | D=128 | D=192 | ratio |
+  |---|---|---|---|
+  | `v_mfma_*_32x32x16` | 192 | 288 | 1.5x |
+  | `ds_read_b64_tr_b16` | 192 | 288 | 1.5x |
+  | `buffer_load_dwordx4 ...lds` | 24 | 72 | 3.0x |
+  | Q loads / O stores | 8 | 12 | 1.5x |
+  | `s_barrier` | 25 | 25 | 1.0x |
+  | `v_exp_f32` | 197 | 197 | 1.0x |
+  | `scratch_*` | 0 | 0 | -- |
+
+  1.5x for everything scaling with `K_STEPS_QK` (8->12) or `D_CHUNKS` (4->6),
+  3x for the DMAs (`NUM_DMA` 2->6), 1x for the softmax and the barrier
+  structure, and no spills. The instruction stream is the right shape.
+
+**So this is not a codegen or ISA-usage bug.** A derived constant is producing
+a wrong value inside a correctly-shaped kernel, which is why every structural
+check has come back clean.
+
+*One thing to pin before family B is called done.* The ISA document is
+self-inconsistent about the M0 LDS offset width: §9.1.9's text says
+`M0[17:0]` (18-bit, 256 KB) and its figure says `M0[15:0]` (16-bit, 64 KB).
+The operative width is at least 17 bits, since head_dim 128 already addresses
+up to 67 KB and works. But **head_dim 256 addresses up to 135 KB**, which
+exceeds a 17-bit field -- so if the true width is 17 rather than 18 bits, 256
+has a second, independent failure that fixing 192 would not touch.
+
+Next step is to instrument `v_o[dc]` directly rather than inferring it from O,
+since `V=0` producing NaN says the accumulator holds something that never came
+from V. The granule sweep still waits on this.
 
 `LADDER` stays `(64, 128)`: 192/256 must not be reachable while this is open.
 
