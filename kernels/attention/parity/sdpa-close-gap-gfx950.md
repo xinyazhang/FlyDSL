@@ -561,9 +561,54 @@ up to 67 KB and works. But **head_dim 256 addresses up to 135 KB**, which
 exceeds a 17-bit field -- so if the true width is 17 rather than 18 bits, 256
 has a second, independent failure that fixing 192 would not touch.
 
-Next step is to instrument `v_o[dc]` directly rather than inferring it from O,
-since `V=0` producing NaN says the accumulator holds something that never came
-from V. The granule sweep still waits on this.
+### P2 — truncated kernels: every input to the GEMMs is correct at 192 and 256
+
+`tooling/probe_kv_staging.py` builds **truncated kernels** -- the first one or
+two pipeline steps and nothing else -- and writes the registers straight to
+memory. Inferring a stage's correctness from the final O could not distinguish
+"this stage is wrong" from "this stage is fine and a later one is wrong"; these
+check each stage against the contract the next one relies on.
+
+Result, at head_dim 192 **and 256**, against the working 128 as a control:
+
+| probe | 128 | 192 | 256 |
+|---|---|---|---|
+| K stage, D map | 0 wrong | 0 | 0 |
+| K stage, token map | 0 | 0 | 0 |
+| V stage, D map | 0 | 0 | 0 |
+| V stage, token map | 0 | 0 | 0 |
+| Q load, D map | 0 | 0 | 0 |
+| Q load, row map | 0 | 0 | 0 |
+| QK GEMM reduction depth | exact | exact | exact |
+
+The QK probe is the sharpest: with `Q = K = 1`, `S` must equal
+`head_dim * sm_scale * log2(e)`, so its **value counts how many MFMA K-steps
+actually accumulated**. Measured 64.1 / 128.2 / 192.3 / 256.5 against 64 / 128 /
+192 / 256, with zero spread across lanes. The 12- and 16-step reductions are
+whole.
+
+**So every input to the GEMMs is correct, and the QK GEMM is correct.** What is
+left is the softmax, the PV GEMM, the O accumulator and the store.
+
+Two corrections the probes forced, both mine rather than the kernel's:
+
+- **The V pack layout is not eight consecutive tokens.** A pack is two
+  `ds_read_b64_tr_b16` results concatenated, the second read one granule away,
+  so a lane's eight elements are **two groups of four, eight tokens apart**:
+  lane 0 holds tokens {0,1,2,3, 8,9,10,11} and lane 32 holds
+  {4,5,6,7, 12,13,14,15}, which together tile the step's 16 tokens once. The
+  probe reported a uniform failure at *every* head_dim including the working
+  ones, which is what identified the error as the expectation rather than the
+  kernel.
+- **A probe that fails on a known-good configuration is testing itself.** Both
+  the V and Q "failures" were of this kind -- one a wrong layout formula, one a
+  stale buffer size. Running every probe against head_dim 128 as a control is
+  what kept them from being reported as findings.
+
+Next step is the softmax and PV stages, by the same method. The harness now
+takes a `which=` selector and bypasses `LADDER` deliberately, so it can build
+the rungs the ladder keeps unreachable -- a probe that cannot build the broken
+thing is useless. The granule sweep still waits on this.
 
 `LADDER` stays `(64, 128)`: 192/256 must not be reachable while this is open.
 
