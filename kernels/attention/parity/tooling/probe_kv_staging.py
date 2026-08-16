@@ -32,6 +32,7 @@ from fmha_dualwave_gfx950 import (
     ParityKernelContext,
     ParityQLoader,
     ParitySoftmaxHelper,
+    ParityStoreHelper,
     ParityKvGmemToLdsLoader,
     ParityKvLdsToVgprLoader,
 )
@@ -45,7 +46,7 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from gfx950_standalone import dualwave
 
 
-def build_probe(head_dim, num_heads=8, which="k"):
+def build_probe(head_dim, num_heads=8, which="k", buf=0):
     """A kernel that stages KV tile 0 and dumps the register packs to `Out`."""
     meta = FmhaInputMetadata(num_heads=num_heads, head_dim=head_dim, causal=False, dtype_str="bf16")
     # Deliberately bypasses `_with_widths`, so the probe can reach the planned
@@ -56,12 +57,15 @@ def build_probe(head_dim, num_heads=8, which="k"):
     knobs = _GFX950_FALLBACK.merge(pinned)._checked_modes()._with_wave_geometry()._with_traits(meta)
     traits = knobs.traits
     WHICH = which
+    BUF = buf
     PER_LANE = {
         "k": traits.K_STEPS_QK * 2,
         "v": 4 * traits.D_CHUNKS,
         "q": traits.K_STEPS_QK,
         "s": 4,   # two v16f32 accumulators = 32 f32, dumped as 4 slots of 8
         "pv": traits.D_CHUNKS * 2,   # D_CHUNKS v16f32 accumulators
+        "ml": 1,                     # [m_row, l_row] padded to one slot
+        "store": 1,                  # writes O directly; Out is unused
     }[which] * traits.MFMA_LANE_K
 
     elem = dualwave.dtype_to_elem_type(traits.DTYPE_STR)
@@ -124,10 +128,10 @@ def build_probe(head_dim, num_heads=8, which="k"):
 
         # Step 1: stage KV tile 0 into LDS buffer 0, and wait for all of it.
         if const_expr(WHICH in ("k", "s")):
-            loader.load_k(fx.Index(0), 0)
+            loader.load_k(fx.Index(0), BUF)
         elif const_expr(WHICH == "v"):
-            loader.load_v(fx.Index(0), 0)
-        elif const_expr(WHICH == "pv"):
+            loader.load_v(fx.Index(0), BUF)
+        elif const_expr(WHICH in ("pv", "ml")):
             loader.load_k(fx.Index(0), 0)
             loader.load_v(fx.Index(0), 1)
         dualwave._s_waitcnt(0)
@@ -148,12 +152,12 @@ def build_probe(head_dim, num_heads=8, which="k"):
                 )
 
         if const_expr(WHICH == "k"):
-            k_lo, k_hi = reader.load_k(0)
+            k_lo, k_hi = reader.load_k(BUF)
             for ks in const_expr(range(traits.K_STEPS_QK)):
                 dump(ks * 2 + 0, k_lo[ks])
                 dump(ks * 2 + 1, k_hi[ks])
         elif const_expr(WHICH == "v"):
-            packs = reader.load_v(0)
+            packs = reader.load_v(BUF)
             for step in const_expr(range(4)):
                 for dc in const_expr(range(traits.D_CHUNKS)):
                     dump(step * traits.D_CHUNKS + dc, packs[step][dc])
@@ -171,6 +175,36 @@ def build_probe(head_dim, num_heads=8, which="k"):
             for j in const_expr(range(2)):
                 dump(0 + j, Vec(s_lo).shuffle(Vec(s_lo), [j * 8 + t for t in range(8)]).ir_value())
                 dump(2 + j, Vec(s_hi).shuffle(Vec(s_hi), [j * 8 + t for t in range(8)]).ir_value())
+
+        if const_expr(WHICH == "store"):
+            # The O store on its own: v_o[dc] := dc + 1, so every output column
+            # must come back as (D // D_CHUNK) + 1. Tests the store's (row, D)
+            # mapping without anything upstream of it.
+            ctx.init_q_row()
+            v_o = [
+                dualwave.Vec.filled(16, float(dc + 1), fx.Float32).ir_value()
+                for dc in const_expr(range(traits.D_CHUNKS))
+            ]
+            ParityStoreHelper(ctx).store_final_o(v_o, ctx.q_row, ctx.c_zero_f, fx.Float32(1.0))
+
+        if const_expr(WHICH == "ml"):
+            # The softmax state carried across tiles, on verified operands.
+            sm = ParitySoftmaxHelper(ctx)
+            gemm = dualwave.DualwaveGemmHelper(ctx)
+            ql = ParityQLoader(ctx)
+            q_scaled = ql.scale_all(ql.load_all())
+            v_s = sm.v_s_vec_to_lists(gemm.qk(reader.load_k(0), q_scaled))
+            m = sm.reduce_max(v_s)
+            v_s = sm.sub_m(v_s, m)
+            v_p = sm.exp2(v_s, 0, 16)
+            v_p = sm.exp2(v_p, 16, 16)
+            lrow = sm.reduce_sum(ctx.c_zero_f, v_p)
+            for slot_i, val in const_expr(((0, "m"), (1, "l"))):
+                dualwave.buffer_ops.buffer_store(
+                    as_mlir_value(fx.Float32(m if val == "m" else lrow)),
+                    rsrc,
+                    as_mlir_value(fx.Int32(base + fx.Index(slot_i))),
+                )
 
         if const_expr(WHICH == "pv"):
             # Prologue softmax then one full P*V, on verified-correct operands.
@@ -204,8 +238,8 @@ def build_probe(head_dim, num_heads=8, which="k"):
 def run(head_dim, num_heads=8):
     S, H, dev = 256, num_heads, "cuda"
 
-    def measure(which, encode, expect, label, src="kv"):
-        launch, traits = build_probe(head_dim, num_heads, which=which)
+    def measure(which, encode, expect, label, src="kv", buf=0):
+        launch, traits = build_probe(head_dim, num_heads, which=which, buf=buf)
         # BHSD *shape* over BSHD *memory*, so the strides the kernel is handed
         # -- head=head_dim, seq=head_dim*H -- are the tensor's real ones.
         T = torch.zeros(1, S, H, head_dim, device=dev, dtype=torch.bfloat16).transpose(1, 2)
@@ -278,6 +312,12 @@ def run(head_dim, num_heads=8):
     n += measure("v", lambda t, d: t * torch.ones_like(d), v_expect, "V stage: V[t][d]=t  (token map)")
     n += measure("q", lambda t, d: d, q_expect, "Q load : Q[r][d]=d  (D map)", src="q")
     n += measure("q", lambda t, d: t * torch.ones_like(d), q_expect, "Q load : Q[r][d]=r  (row map)", src="q")
+    # Buffer 1. Every probe above stages into buffer 0, but the pipeline
+    # alternates -- an error in the buffer-1 base would be invisible until the
+    # whole kernel runs.
+    n += measure("k", lambda t, d: d, k_expect, "K stage buf1: K[t][d]=d", buf=1)
+    n += measure("v", lambda t, d: d, v_expect, "V stage buf1: V[t][d]=d", buf=1)
+    n += measure("v", lambda t, d: t * torch.ones_like(d), v_expect, "V stage buf1: V[t][d]=t", buf=1)
     return n
 
 

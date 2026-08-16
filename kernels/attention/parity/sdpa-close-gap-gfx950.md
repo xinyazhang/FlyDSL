@@ -645,11 +645,51 @@ value is wrong again rather than the kernel (`P` is not exactly 1.0 after
 relied on. That is the third expectation error in this investigation; the
 control column is doing all the work.
 
-Remaining unprobed: the softmax *state* carried across tiles (`m_row`,
-`l_row`, the rescale), and the O store. Both are per-row rather than per-column
-quantities, which fits the one clue that has survived -- `V = 0` produces NaN
-when `O = sum P * 0` must be 0, and no row is correct while every column
-mapping is.
+### P2 — every stage is correct in isolation; the composition is not
+
+The probe now covers every stage of the pipeline. At head_dim 192 **and 256**,
+with the working 128 as a control throughout:
+
+| stage | probe | 128 | 192 | 256 |
+|---|---|---|---|---|
+| Q load | D map, row map | clean | clean | clean |
+| K stage, buffer 0 | D map, token map | clean | clean | clean |
+| K stage, **buffer 1** | D map | clean | clean | clean |
+| V stage, buffer 0 | D map, token map | clean | clean | clean |
+| V stage, **buffer 1** | D map, token map | clean | clean | clean |
+| QK GEMM | reduction depth | exact | exact | exact |
+| softmax | `m_row`, `l_row` | exact | exact | exact |
+| O store | (row, D) mapping | clean | clean | clean |
+
+`m_row` matches the QK probe's value to the last digit with zero spread across
+lanes, and `l_row` is exactly 64.00 -- the 64-token tile summed as `exp2(0) = 1`.
+The O store was checked by setting `v_o[dc] := dc + 1` and requiring every
+output column to come back as `D // 32 + 1`.
+
+Buffer 1 was a real gap: every earlier probe staged into buffer 0 while the
+pipeline alternates, so a wrong buffer-1 base would have been invisible until
+the whole kernel ran. It is clean.
+
+**So the fault is in the composition, not in any stage.** And it is not the
+loop trip count either -- head_dim 192 fails identically at every sequence
+length from 256 to 1024, i.e. from one loop iteration to seven, while head_dim
+128 on the *same 4-wave geometry* is correct at all of them.
+
+What that leaves, given head_dim 128 at 4 waves works and the only remaining
+differences are `SMEM_D_RPT` 2 -> 3, `D_CHUNKS` 4 -> 6, `NUM_DMA` 4 -> 6 and
+the LDS footprint:
+
+- the interleaving of the two LDS buffers across the 8 pipeline clusters, where
+  a K DMA for tile *j+1* is in flight while V for tile *j-1* is being read --
+  the probes stage one tile and read it back, so they never exercise an
+  overlap;
+- something that only appears at the full register and LDS pressure of the
+  assembled body, which the single-stage probes do not reproduce.
+
+Both are properties of the pipeline rather than of a stage, which is consistent
+with every stage passing. The next probe therefore has to stage **two tiles
+into alternating buffers with the reads interleaved**, rather than one tile in
+isolation.
 
 `LADDER` stays `(64, 128)`: 192/256 must not be reachable while this is open.
 
