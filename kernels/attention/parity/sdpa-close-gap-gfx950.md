@@ -739,6 +739,54 @@ work**, and it is dual-purpose: it is a required parity feature
 serve large head_dim, and it is the only way to get a `D_CHUNKS = 4` build at
 `SMEM_D_RPT = 3` and so finally separate the two candidates.
 
+### P2 — the failure is localised: wave 3's low half, `v_o[0]` and `v_o[4]`
+
+Instrumenting the **real** kernel rather than a probe -- dumping the state it
+actually arrives at, just before `safe_l_inv` -- narrows it much further than
+any single-stage probe did. At head_dim 192, `B=1 H=8 S=512`:
+
+| quantity | result |
+|---|---|
+| `m_row` | **finite for all 256 threads**, range [2.90, 6.17] |
+| `l_row` | **finite for all 256 threads**, range [12.7, 102] |
+| `v_o[dc=0]` | non-finite on **32 of 256 threads** |
+| `v_o[dc=1,2,3,5]` | finite everywhere |
+| `v_o[dc=4]` | finite but `4.1e+35` on the same threads -- garbage, not NaN |
+
+The 32 threads are **192..223: wave 3, lanes 0..31** -- the last wave's low
+half-wave, and nothing else.
+
+So the softmax survives the entire pipeline intact and the corruption is in the
+O accumulator alone, in one half-wave, in two of six chunks. That rules out
+everything scalar or per-row, and it is *not* a whole-tile or whole-chunk
+error -- `dc` 1, 2, 3 and 5 come through clean on the very same lanes.
+
+Two observations to start from next time:
+
+- **The V read address does not depend on the wave.**
+  `_v_lds_read_base_per_lane` takes only the within-wave lane, so all four
+  waves read identical LDS offsets. A wave-specific corruption therefore
+  cannot come from the read address; it has to come from what was *written*
+  there, or from when it was read. The DMA *write* line is
+  `wave + issue*NUM_WAVES + band*SMEM_N_RPT`, so wave 3 writes lines 3, 7, 11,
+  15, 19, 23.
+- **`dc = 0` and `dc = 4` are the two chunks with `dc % 2 == 0` and
+  `dc // 2 != 1`**, i.e. V LDS offsets 0 and 8704, while the clean even chunk
+  `dc = 2` sits at 4352. Whatever this is, it is periodic in the band index
+  rather than in `dc`.
+
+*Recipe, since it took a while to find.* Add a buffer store of `v_o[dc][0]`,
+`m_row` and `l_row` into `Workspace` immediately before `l_inv =
+safe_l_inv(...)`, and **pass a real `workspace=` tensor** -- `_args` defaults
+`Workspace` to `O`, so an un-wired dump silently overwrites the output and
+makes every head_dim look broken, which is exactly what happened on the first
+attempt.
+
+Also ruled out this round: `scf.for` loop-carried state, tested directly at 5,
+7, 9 and 11 carried values including `v16f32` and `v32f32` payloads -- all
+round-trip exactly, so the 9-value carry that head_dim 192 needs is not the
+problem.
+
 `LADDER` stays `(64, 128)`: 192/256 must not be reachable while this is open.
 
 **What family B still has to change**, none of it started:
