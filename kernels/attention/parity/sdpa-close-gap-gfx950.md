@@ -787,6 +787,52 @@ Also ruled out this round: `scf.for` loop-carried state, tested directly at 5,
 round-trip exactly, so the 9-value carry that head_dim 192 needs is not the
 problem.
 
+### P2 — correction: it is non-deterministic, but it is not a sync race either
+
+**Two earlier entries in this file were wrong and are retracted.** The failure
+was recorded as deterministic; it is not. Counting *non-finite elements* rather
+than comparing error values -- which are `nan` either way, and that is how the
+mistake was made -- gives, on one GPU, same input, eight consecutive runs:
+
+    6785  7098  6723  7046  7130  6657  7070  7174
+
+So the "deterministic under a full DMA drain" observation, and the conclusion
+drawn from it that synchronisation was not involved, were both artefacts of
+comparing `nan` to `nan`.
+
+The device is not implicated: all **eight** GPUs give the same picture
+(head_dim 128 bit-identical at 2.82e-03 on every one; 192 and 256 non-finite on
+every one, with counts varying 6097-6671 between devices exactly as they vary
+between runs).
+
+**But maximal serialisation does not fix it.** Adding `s_waitcnt(0)` plus
+`s_barrier` after *every* LDS write and before *every* LDS read -- far beyond
+the cluster-boundary sync the pipeline uses -- leaves head_dim 192 failing with
+the same varying counts, while head_dim 128 stays exact. So it is
+non-deterministic *and* not an LDS ordering problem.
+
+Nor is it codegen policy: `enable-post-misched` and `lsr-drop-solution` were
+toggled individually and together with no effect.
+
+What that combination leaves is **reading something that is never written** --
+non-determinism without a race means uninitialised storage, since the content
+is then whatever the previous kernel left. Against that:
+
+- the staging probes verify every K and V element round-trips for both LDS
+  buffers, and no read maps outside the tile (every `(token, D)` the probe
+  computes is in range, so nothing was silently skipped);
+- there are no spills, so it is not scratch;
+- LDS is not shared with another workgroup at head_dim 192 -- 102144 bytes
+  means one workgroup per CU, where head_dim 128's 68096 allows two, so if
+  anything the *working* case has more exposure.
+
+The narrowest description remains: wave 3's low half-wave, `v_o[0]` and
+`v_o[4]`, non-deterministic, surviving full serialisation. That is the shape of
+a register-allocation problem rather than a data-flow one, and the next step is
+to read the ISA around the `v_o[0]` and `v_o[4]` accumulator registers in the
+epilogue specifically -- not the whole-kernel statistics already gathered, but
+those two accumulators' live ranges.
+
 `LADDER` stays `(64, 128)`: 192/256 must not be reachable while this is open.
 
 **What family B still has to change**, none of it started:
