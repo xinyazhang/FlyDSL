@@ -31,6 +31,7 @@ import torch
 from fmha_dualwave_gfx950 import (
     ParityKernelContext,
     ParityQLoader,
+    ParitySoftmaxHelper,
     ParityKvGmemToLdsLoader,
     ParityKvLdsToVgprLoader,
 )
@@ -60,6 +61,7 @@ def build_probe(head_dim, num_heads=8, which="k"):
         "v": 4 * traits.D_CHUNKS,
         "q": traits.K_STEPS_QK,
         "s": 4,   # two v16f32 accumulators = 32 f32, dumped as 4 slots of 8
+        "pv": traits.D_CHUNKS * 2,   # D_CHUNKS v16f32 accumulators
     }[which] * traits.MFMA_LANE_K
 
     elem = dualwave.dtype_to_elem_type(traits.DTYPE_STR)
@@ -125,6 +127,9 @@ def build_probe(head_dim, num_heads=8, which="k"):
             loader.load_k(fx.Index(0), 0)
         elif const_expr(WHICH == "v"):
             loader.load_v(fx.Index(0), 0)
+        elif const_expr(WHICH == "pv"):
+            loader.load_k(fx.Index(0), 0)
+            loader.load_v(fx.Index(0), 1)
         dualwave._s_waitcnt(0)
         dualwave._sched_barrier(0)
         dualwave._s_barrier()
@@ -166,6 +171,25 @@ def build_probe(head_dim, num_heads=8, which="k"):
             for j in const_expr(range(2)):
                 dump(0 + j, Vec(s_lo).shuffle(Vec(s_lo), [j * 8 + t for t in range(8)]).ir_value())
                 dump(2 + j, Vec(s_hi).shuffle(Vec(s_hi), [j * 8 + t for t in range(8)]).ir_value())
+
+        if const_expr(WHICH == "pv"):
+            # Prologue softmax then one full P*V, on verified-correct operands.
+            sm = ParitySoftmaxHelper(ctx)
+            gemm = dualwave.DualwaveGemmHelper(ctx)
+            ql = ParityQLoader(ctx)
+            q_scaled = ql.scale_all(ql.load_all())
+            v_s = sm.v_s_vec_to_lists(gemm.qk(reader.load_k(0), q_scaled))
+            m = sm.reduce_max(v_s)
+            v_s = sm.sub_m(v_s, m)
+            v_p = sm.exp2(v_s, 0, 16)
+            v_p = sm.exp2(v_p, 16, 16)
+            v_p = sm.cast_p(v_p)
+            v_o = [ctx.c_zero_v16f32 for _ in const_expr(range(traits.D_CHUNKS))]
+            v_o = gemm.pv(v_p, reader.load_v(1), v_o)
+            for dc in const_expr(range(traits.D_CHUNKS)):
+                for j in const_expr(range(2)):
+                    vv = Vec(v_o[dc])
+                    dump(dc * 2 + j, vv.shuffle(vv, [j * 8 + t for t in range(8)]).ir_value())
 
     @flyc.jit
     def launch(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, Out: fx.Tensor,  # noqa: E741

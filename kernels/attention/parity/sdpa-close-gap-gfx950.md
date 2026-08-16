@@ -605,10 +605,51 @@ Two corrections the probes forced, both mine rather than the kernel's:
   stale buffer size. Running every probe against head_dim 128 as a control is
   what kept them from being reported as findings.
 
-Next step is the softmax and PV stages, by the same method. The harness now
-takes a `which=` selector and bypasses `LADDER` deliberately, so it can build
-the rungs the ladder keeps unreachable -- a probe that cannot build the broken
-thing is useless. The granule sweep still waits on this.
+The harness takes a `which=` selector and bypasses `LADDER` deliberately, so it
+can build the rungs the ladder keeps unreachable -- a probe that cannot build
+the broken thing is useless.
+
+### gfx1201's safe softmax adopted — landed, and not the head_dim>128 bug
+
+`ParitySoftmaxHelper.reduce_max` now seeds the reduction at `-3.0e38` instead
+of `-inf`. This is the correction `sdpa-feature-gap.md` asks for
+(`m_i = tl.full([BLOCK_M], -3.40282e+38)`, "do not use -inf"): a row whose
+scores are all `-inf` gives `m_i = -inf`, and `exp2(-inf - -inf)` is NaN rather
+than 0.
+
+Two choices worth recording. It is **unconditional**, where the production
+kernel floors the max only under `CAUSAL` -- seeding costs nothing, it swaps
+one constant for another, and it removes the case for every masking mode at
+once, including the windows and bias still to come. And it **seeds** rather
+than flooring the result: a floor applied afterwards still lets an all-`-inf`
+tile reach the subtract, whereas seeding means no lane ever holds `-inf` as a
+max.
+
+Safe by construction for existing behaviour, since `max(-3e38, x) == max(-inf,
+x)` for any finite `x` -- confirmed by the bitwise-vs-production oracle still
+passing.
+
+**It does not fix head_dim 192/256**, which remain NaN. Worth having anyway.
+
+### P2 — the PV probe did not discriminate
+
+Added a `which="pv"` mode that runs prologue softmax plus one full `P*V` on
+verified-correct operands and dumps `v_o`. With `Q = K = V = 1` the accumulator
+should be `4 steps x 16 K = 64` exactly. Measured medians: 64.0 at head_dim 64,
+**62.0 at 128**, 60.0 at 192, 62.0 at 256 -- uniform across every `dc` in each
+case.
+
+**head_dim 128 is a working configuration and also misses 64**, so the expected
+value is wrong again rather than the kernel (`P` is not exactly 1.0 after
+`cast_p`). The probe does not separate the cases and is left in place but not
+relied on. That is the third expectation error in this investigation; the
+control column is doing all the work.
+
+Remaining unprobed: the softmax *state* carried across tiles (`m_row`,
+`l_row`, the rescale), and the O store. Both are per-row rather than per-column
+quantities, which fits the one clue that has survived -- `V = 0` produces NaN
+when `O = sum P * 0` must be 0, and no row is correct while every column
+mapping is.
 
 `LADDER` stays `(64, 128)`: 192/256 must not be reachable while this is open.
 

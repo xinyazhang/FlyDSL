@@ -58,6 +58,7 @@ from fmha_dualwave_gfx950 import (
     ParityKvGmemToLdsLoader,
     ParityKvLdsToVgprLoader,
     ParityQLoader,
+    ParitySoftmaxHelper,
     ParityStoreHelper,
 )
 from fmha_tuning_gfx950 import FmhaInputMetadata, fmha_knobs
@@ -246,7 +247,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         page_ids = dualwave.DualwavePageIdLoader(ctx)
         q_loader = ParityQLoader(ctx)
         gemm_helper = dualwave.DualwaveGemmHelper(ctx)
-        softmax_helper = dualwave.DualwaveSoftmaxHelper(ctx)
+        softmax_helper = ParitySoftmaxHelper(ctx)
 
         def _main_body():
             # Paged: stage the block-table row into LDS before any page-id ds_read.

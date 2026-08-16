@@ -62,6 +62,7 @@ __all__ = [
     "ParityKvGmemToLdsLoader",
     "ParityKvLdsToVgprLoader",
     "ParityQLoader",
+    "ParitySoftmaxHelper",
     "ParityStoreHelper",
 ]
 
@@ -442,6 +443,32 @@ class ParityKvGmemToLdsLoader(_ParityKvStaging, dualwave.DualwaveKvGmemToLdsLoad
         """
         for d in range_constexpr(num_dma):
             self._issue_kv_dma(src_div, dma_m0[buf_id][d], self.kv_src_elem(src_base, d), soffset)
+
+
+class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
+    """Softmax whose running max can never be `-inf`.
+
+    The production `reduce_max` seeds the reduction with `-inf` and the kernel
+    floors the result to `-3.0e38` only under `CAUSAL`. That is the pattern
+    `sdpa-feature-gap.md` flags:
+
+        m_i = tl.full([BLOCK_M], -3.40282e+38)   # do NOT use -inf
+
+    A row whose scores are all `-inf` -- every key masked -- gives
+    `m_i = -inf`, and then `exp2(-inf - -inf)` is `NaN` rather than 0. On
+    gfx1201 this is *preventative* today and only becomes reachable with bias,
+    since causal tile 0 always contains `kv = 0 <= q_row`. Here it is cheaper
+    to be unconditional: seeding the reduction at the floor costs nothing (it
+    replaces one constant with another) and removes the case for every masking
+    mode at once, including the windows and bias still to come.
+
+    Seeding rather than flooring afterwards is the part that matters. A floor
+    applied to the *result* still lets an all-`-inf` tile reach the subtract;
+    seeding means no lane ever holds `-inf` as a max in the first place.
+    """
+
+    def reduce_max(self, v_s):
+        return dualwave._score_pair_max(v_s, self.c_neg_floor, self.fm_fast)
 
 
 class ParityStoreHelper(dualwave.DualwaveStoreHelper):
