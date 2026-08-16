@@ -50,8 +50,10 @@ change:
 """
 
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from fmha_common_gfx1201 import MaskedAxis
 from gfx950_standalone import dualwave
 
@@ -64,7 +66,67 @@ __all__ = [
 ]
 
 
-class ParityKernelContext(dualwave.DualwaveKernelContext):
+class _ParityKvStaging:
+    """KV DMA addressing that allows more than one issue per wave.
+
+    A mixin because **two objects need it**: the context builds the m0 tables
+    in `init_dma_m0_tables`, and the loader computes source addresses in
+    `_async_load_kv_linear`. The loader subclasses the *production* context
+    rather than `ParityKernelContext`, so inheritance alone would not share
+    them -- and a second copy is exactly how the write and read sides of an
+    LDS layout drift apart.
+
+    **What the production formula assumes.** It places one KV tile line per
+    wave per d-band, `line = wave + d * SMEM_N_RPT`, which is correct exactly
+    when `SMEM_N_RPT == NUM_WAVES`. Family A satisfies that by arithmetic
+    coincidence: 8 waves, and BLOCK_N 64 at 8 tokens per issue is 8 lines. A
+    4-wave family covering the same BLOCK_N needs **two issues per wave**, and
+    under the production formula lines 4..7 are never written at all -- the
+    reads then return whatever LDS happened to hold, which is how head_dim 192
+    produced non-deterministic NaN.
+
+    **The generalisation is a change of index, not of scheme.** The flat DMA
+    index is band-major, `d_flat = band * ISSUES + issue`, and
+
+        line  = (wave + issue * NUM_WAVES) + band * SMEM_N_RPT
+        token = n_in_warp * SMEM_N_RPT + (wave + issue * NUM_WAVES)
+
+    Both collapse to the production form at `ISSUES == 1`, where `SMEM_N_RPT`
+    and `NUM_WAVES` are equal. Verified against a model of the write/read
+    mapping before being written: the model reproduces family A exactly, and
+    is what ruled out the BLOCK_N 128 variants -- a wave's K read covers 64
+    tokens, so BLOCK_N 128 would need a doubled score accumulator.
+    """
+
+    def _issue_split(self, d_flat):
+        """`(band, issue)` for a flat DMA index. Band-major."""
+        return d_flat // self.ISSUES_PER_WAVE, d_flat % self.ISSUES_PER_WAVE
+
+    def _dma_line(self, d_flat):
+        """The KV tile line this wave writes for `d_flat`."""
+        band, issue = self._issue_split(d_flat)
+        return self.wave_id_uni + issue * self.traits.NUM_WAVES + band * self.traits.SMEM_N_RPT
+
+    def _dma_m0(self, buf_base_elems, line_stride, d_flat):
+        addr = self.lds_kv_base_idx + (buf_base_elems + self._dma_line(d_flat) * line_stride) * self.traits.BF16_BYTES
+        return rocdl.readfirstlane(T.i32, as_mlir_value(fx.Int32(addr)))
+
+    def k_dma_base(self, buf_id, d):
+        return self._dma_m0(dualwave._k_buf_base(self.traits, buf_id), self.traits.SMEM_K_LINE_STRIDE, d)
+
+    def v_dma_base(self, buf_id, d):
+        return self._dma_m0(dualwave._v_buf_base(self.traits, buf_id), self.traits.SMEM_V_LINE_STRIDE, d)
+
+    def kv_src_elem(self, src_base, d_flat):
+        """Global element index for this lane's `d_flat` chunk of a KV tile."""
+        band, issue = self._issue_split(d_flat)
+        line_n = self.wave_id + issue * self.traits.NUM_WAVES
+        n_in_tile = self.n_in_warp * self.traits.SMEM_N_RPT + line_n
+        global_d = self.d_bucket * self.traits.VEC_KV + band * self.traits.D_128B_SIZE
+        return src_base + n_in_tile * self.stride_kv_n_v + global_d
+
+
+class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
     """Dualwave context addressing arbitrary BHSD strides, with a runtime scale."""
 
     def __init__(
@@ -125,6 +187,12 @@ class ParityKernelContext(dualwave.DualwaveKernelContext):
 
     def init_types_and_constants(self, head_dim_runtime=None):
         super().init_types_and_constants(head_dim_runtime=head_dim_runtime)
+        # DMA issues each wave makes per d-band, and the flat count that
+        # follows. `NUM_DMA_*` feed both the m0 tables and the `s_waitcnt`
+        # budget the pipeline is balanced against, so they have to agree.
+        self.ISSUES_PER_WAVE = self.traits.SMEM_N_RPT // self.traits.NUM_WAVES
+        self.NUM_DMA_K = self.traits.SMEM_D_RPT * self.ISSUES_PER_WAVE
+        self.NUM_DMA_V = self.NUM_DMA_K
         self.c_sm_scale = fx.Float32(self.sm_scale_arg)
         self.c_sm_scale_log2e = fx.Float32(
             arith.mulf(
@@ -342,7 +410,7 @@ class ParityKvLdsToVgprLoader(dualwave.DualwaveKvLdsToVgprLoader):
         return (k_lo, k_hi)
 
 
-class ParityKvGmemToLdsLoader(dualwave.DualwaveKvGmemToLdsLoader):
+class ParityKvGmemToLdsLoader(_ParityKvStaging, dualwave.DualwaveKvGmemToLdsLoader):
     """K/V staging with independent per-tensor sequence strides.
 
     The production loader has one `stride_kv_n` for both tensors, which the
@@ -363,6 +431,17 @@ class ParityKvGmemToLdsLoader(dualwave.DualwaveKvGmemToLdsLoader):
     def load_v(self, tile_start, buf_id, page_id=None):
         self.stride_kv_n_v = self.stride_v2_v
         return super().load_v(tile_start, buf_id, page_id=page_id)
+
+    def _async_load_kv_linear(self, dma_m0, buf_id, src_div, src_base, soffset, num_dma):
+        """Issue this wave's KV DMAs, addressed through `kv_src_elem`.
+
+        The production version calls `_linear_kv_src_elem`, which interleaves
+        tokens across `NUM_WAVES` and offsets D by the flat index -- both true
+        only at one issue per wave. This is the same loop with the address
+        redirected, not a second copy of the DMA sequence.
+        """
+        for d in range_constexpr(num_dma):
+            self._issue_kv_dma(src_div, dma_m0[buf_id][d], self.kv_src_elem(src_base, d), soffset)
 
 
 class ParityStoreHelper(dualwave.DualwaveStoreHelper):

@@ -372,11 +372,12 @@ def test_cross_seqlen_is_an_ordinary_field():
 @pytest.mark.parametrize(
     "block_dmodel,want",
     [
-        (32, (8, 256, 128, 32)),  # family S
+        (32, (4, 128, 64, 32)),  # family S -- granule 32 for widths off the 64 grid
+        (96, (4, 128, 64, 32)),
         (64, (8, 256, 64, 64)),  # family A
         (128, (8, 256, 64, 64)),
-        (192, (4, 128, 128, 64)),  # family B
-        (512, (4, 128, 128, 64)),
+        (192, (4, 128, 64, 64)),  # family B -- 4 waves for the register file
+        (512, (4, 128, 64, 64)),
     ],
 )
 def test_wave_geometry_selects_the_family(block_dmodel, want):
@@ -390,7 +391,7 @@ def test_wave_geometry_selects_the_family(block_dmodel, want):
     assert (k.num_waves, k.block_m, k.block_n, k.head_dim_granule) == want
 
 
-@pytest.mark.parametrize("block_dmodel", [32, 64, 128, 192, 512])
+@pytest.mark.parametrize("block_dmodel", [32, 64, 96, 128, 192, 512])
 def test_every_family_stages_coherently(block_dmodel):
     """Each family's (granule, BLOCK_N, waves) must divide a KV tile evenly.
 
@@ -425,8 +426,8 @@ def test_wave_geometry_requires_widths_first():
 
 @pytest.mark.parametrize(
     "geom",
-    [(4, 128, 128, 64), (8, 256, 128, 32)],
-    ids=["family_b", "family_s"],
+    [(4, 128, 64, 32), (8, 256, 128, 64)],
+    ids=["family_s", "block_n_128"],
 )
 def test_unaddressable_geometry_fails_loudly(geom):
     """Describable is not the same as addressable, and the gap must not be silent.

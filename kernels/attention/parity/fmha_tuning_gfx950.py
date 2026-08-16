@@ -372,15 +372,15 @@ class Gfx950Knobs(FmhaKnobs):
             )
         if self.block_dmodel is None:
             raise ValueError("_with_wave_geometry runs after _with_widths; block_dmodel is not resolved")
-        if self.block_dmodel <= 32:
-            return replace(self, num_waves=8, block_m=256, block_n=128, head_dim_granule=32)  # family S
+        if self.block_dmodel % 64:
+            return replace(self, num_waves=4, block_m=128, block_n=64, head_dim_granule=32)  # family S
         if self.block_dmodel <= 128:
             return replace(self, num_waves=8, block_m=256, block_n=64, head_dim_granule=64)  # family A
-        return replace(self, num_waves=4, block_m=128, block_n=128, head_dim_granule=64)  # family B
+        return replace(self, num_waves=4, block_m=128, block_n=64, head_dim_granule=64)  # family B
 
     # Geometries whose *address helpers* are known correct, which is a stricter
     # set than the ones `make_traits` can describe.
-    _SUPPORTED_GEOMETRIES = ((8, 256, 64, 64),)
+    _SUPPORTED_GEOMETRIES = ((8, 256, 64, 64), (4, 128, 64, 64))
 
     def _check_helpers_support_geometry(self):
         """Refuse a geometry the kernel's addressing cannot actually serve.

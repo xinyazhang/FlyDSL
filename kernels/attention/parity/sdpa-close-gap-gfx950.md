@@ -425,6 +425,76 @@ BLOCK_N 128, head_dim 96 is 102 KB, inside the budget. So family S is not a
 small-head special case; it fixes head_dim 65-96 as well, where the measured
 loss is 0.44x.
 
+### P2 progress — the DMA blocker is gone; a V-read bug at D_CHUNKS > 4 is not
+
+**A model, not a guess.** The LDS write/read mapping is now modelled offline
+(`tooling/lds_model.py`): it builds the write map a geometry produces and
+checks that the K read recovers the right `(token, D)` exactly once. It
+reproduces family A -- the known-good production geometry -- and that is what
+makes its verdicts on the others worth anything.
+
+It immediately killed the family table this plan had written down:
+
+| candidate | verdict |
+|---|---|
+| A: granule 64, BLOCK_N 64, 8 waves | **OK** |
+| S: granule 32, BLOCK_N **128**, 8 waves | **fails** -- "never read: token 32" |
+| S': granule 32, BLOCK_N **64**, 4 waves | **OK** (head_dim 32 and 96) |
+| B: granule 64, BLOCK_N **128**, 4 waves | **fails** |
+| B': granule 64, BLOCK_N **64**, 4 waves | **OK** (2 issues/wave) |
+
+**BLOCK_N must stay 64.** A wave's K read covers exactly 64 tokens -- 32 lanes
+by lo/hi packs -- so BLOCK_N 128 needs the doubled score accumulator. Dropping
+to 4 waves reaches the same families with BLOCK_N 64 instead, which means
+**no softmax helper changes at all**. That is a much smaller job than this plan
+scoped, and it came from modelling rather than from building.
+
+Corrected family table (BLOCK_N 64 throughout):
+
+| family | tile width | waves | BLOCK_M | BLOCK_N | granule | issues/wave |
+|---|---|---|---|---|---|---|
+| S | off the 64 grid (32, 96, 160) | 4 | 128 | 64 | 32 | 1 |
+| A | multiple of 64, <= 128 | 8 | 256 | 64 | 64 | 1 |
+| B | multiple of 64, > 128 | 4 | 128 | 64 | 64 | 2 |
+
+**Landed and verified: the DMA generalisation.** The production formula places
+one tile line per wave per d-band, correct only when `SMEM_N_RPT == NUM_WAVES`.
+`_ParityKvStaging` splits the flat DMA index into `(band, issue)`, and both
+the line and the token collapse to the production form at one issue per wave.
+Two independent confirmations:
+
+- **The 4-wave geometry is correct at head_dim 128** (error 2.7e-3), where
+  family A also works. So the wave-count change and the DMA rewrite are sound
+  in isolation.
+- **head_dim 192 at 4 waves uses 434 VGPRs with zero spills**, against 256 and
+  506 spills at 8 waves. The register hypothesis this phase was built on is
+  now confirmed on our own kernel, and it matches
+  `fwd_hd192_hd128_bf16.co`'s 4-wave/512-VGPR shape.
+
+**Still failing: head_dim > 128.** With `V` all ones -- where every output must
+be exactly 1.0 regardless of the softmax -- the correct D columns at head_dim
+192 are exactly `[32, 128)`, i.e. chunks 1..3 of 6; chunk 0 and chunks 4..5 are
+wrong. At head_dim 256 no column is correct. Ruled out along the way:
+
+- not the register pressure (zero spills),
+- not the wave count (4 waves is correct at head_dim 128),
+- not the DMA line coverage (every line is written; the model agrees),
+- not a `s_waitcnt` race (forcing a full DMA drain does not change it, and the
+  failure is deterministic).
+
+That leaves the V LDS read at `D_CHUNKS > 4`, which is where `_swizzled_v_dc_off`
+and the `V_LDS_TO_REG_*` strides live -- three of which are flagged UNVERIFIED
+in `fmha_traits_gfx950.make_traits` precisely because they have more than one
+plausible parameterisation that coincides at family A. The column signature is
+not a uniform shift, so it is not simply a wrong band stride.
+
+**Next step is to extend `tooling/lds_model.py` to the V read**, which the K
+model does not cover. V is read through `ds_read_tr16_b64`, a transposing load,
+so the model needs that instruction's semantics -- more work than the K side,
+and the reason it was not done first. The granule sweep waits on it.
+
+`LADDER` stays `(64, 128)`: 192/256 must not be reachable while this is open.
+
 **What family B still has to change**, none of it started:
 
 - `_make_dualwave_swp_traits` hardcodes `num_waves=8`, `block_m=256`,
