@@ -48,7 +48,9 @@ Contracted over `q` it wants eight contiguous `q` at one `d` -- a transposed
 tile. Hence **four LDS tiles**, and `fmha_tuning_bwd_dkdv_gfx1201.lds_bytes` is
 what bounds `block_m`. Deriving one orientation from the other in LDS is the
 forward's `V_LDS_LAYOUT="row"` path: eight strided scalar reads per operand,
-which it measured 2.7% slower for a single tensor and would pay here twice.
+which it measured 2.7% slower for a single tensor and would pay here twice --
+that is `transposed_source="derived"` below, and above head_dim 256 the trade
+goes the other way because the four tiles simply do not fit.
 
 Two layout facts fall out and are worth stating because they are what makes the
 port cheap:
@@ -91,13 +93,43 @@ max(seqlen_q, seqlen_k)`, which makes the visited range the whole sequence and
 the leading masked run empty. One code path, and the tail masks are the same
 ones causal needs anyway.
 
+--- Wide head dims: `contraction_shards` and `transposed_source` ----------
+
+Per lane, wave32, one wave owning 16 KV rows, an f16 operand tile is
+`head_dim/4` VGPRs and an f32 accumulator `head_dim/2`. Measured ISA gives
+`vgpr = state + 62`, and the model reproduces the spill counts it can be
+checked against (head_dim 256 unsplit predicts 190, ISA reports 203). Above
+head_dim 256 *both* budgets fail, and BLOCK_M is already at the WMMA tile
+floor of 16, so neither is reachable by tuning:
+
+    head_dim 512, split alone   packs 128 + accs 256 = 384  (+62 = 446 / 256)
+    head_dim 512, four tiles                            90496 / 65536
+
+**`contraction_shards`** shards the contraction as well as the role. A team is
+`2C` waves and wave `(c, r)` holds only `K[:, c*D/C : (c+1)*D/C]` (r=0) or the
+V equivalent, so state falls to `0.75 * head_dim / C` -- 384, 192, 96 at C =
+1, 2, 4. Each wave then holds a *partial* S or dP, so the two-slot relay
+becomes a `2C`-slot reduction. It does not grow the exchange, which is one slot
+per wave either way.
+
+**`transposed_source="derived"`** drops the two transposed tiles. They were
+never performing a transpose -- `global_load_tr_b128` does that on the way in
+from global -- they are a redistribution shuffle, because the cooperative
+load's block-to-wave assignment does not match the d-ownership the GEMMs
+consume by. So the same eight halves are read strided out of the row-major
+tile: eight `ds_read_u16` against one `ds_read_b128`, since gfx1201 has no
+`ds_load_tr16_b128` (gfx1250 does). At head_dim 512 that is the 40960 B which
+makes the difference between 90496 and 49536.
+
+Both are off below head_dim 320 and both are measured losses there -- C=2
+costs 15-30% wherever C=1 does not spill, because a wider team means a
+narrower `BLOCK_N` and more Q/dO re-reads. `fmha_tuning_bwd_dkdv_gfx1201`
+holds the numbers and the policy.
+
 --- Not implemented -------------------------------------------------------
 
 - No bias. `BIAS_TYPE` has no dB output here and AOTriton computes it in a
   separate kernel.
-- No head-dimension sharding. The per-wave register floor is
-  `1.5 * head_dim` VGPRs (packs + accumulators), so head_dim 128 spills and
-  192 spills hard. Splitting `d` across waves is the fix.
 - `delta = rowsum(dO * O)` is the caller's, computed in torch. AOTriton has a
   fused `bwd_preprocess`; that is a later optimisation.
 """
@@ -198,15 +230,39 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     # WMMA_M)`. Two lanes share each row and split the K extent.
     WMMA_LANE_K = WMMA_K // (WARP_SIZE // WMMA_M)
 
-    # `split_head_dim` pairs the waves, so a workgroup covers half the KV rows.
+    CONTRACTION_SHARDS = knobs.contraction_shards
+    TRANSPOSED_SOURCE = knobs.transposed_source
+    KEEP_TR_TILES = TRANSPOSED_SOURCE == "tile"
+    assert TRANSPOSED_SOURCE in (
+        "tile",
+        "derived",
+    ), f"transposed_source must be 'tile' or 'derived', got {TRANSPOSED_SOURCE!r}"
+
+    # A *team* of waves cooperates on one set of 16 KV rows. Three regimes, one
+    # expression, which is why `split_head_dim` and `contraction_shards`
+    # compose rather than branching against each other:
+    #
+    #   split off      TEAM_WAVES 1   one wave owns its KV rows outright
+    #   split, C=1     TEAM_WAVES 2   two roles: K/S and V/dP
+    #   split, C>1     TEAM_WAVES 2C  those two roles times C contraction shards
+    #
+    # `NUM_TEAMS` is what used to be `NUM_PAIRS`, and at C=1 it is exactly that.
     if SPLIT_HEAD_DIM:
-        assert NUM_WAVES % 2 == 0, f"split_head_dim needs an even wave count, got {NUM_WAVES}"
         assert BLOCK_DMODEL == BLOCK_DMODEL_V, (
             f"split_head_dim gives both waves one operand array and one LDS stride, "
             f"so it needs head_dim == head_dim_v; got {BLOCK_DMODEL} and {BLOCK_DMODEL_V}"
         )
-    NUM_PAIRS = NUM_WAVES // 2 if SPLIT_HEAD_DIM else NUM_WAVES
-    BLOCK_N = ROWS_PER_WAVE * NUM_PAIRS
+        assert (
+            CONTRACTION_SHARDS >= 1 and (CONTRACTION_SHARDS & (CONTRACTION_SHARDS - 1)) == 0
+        ), f"contraction_shards must be a power of two, got {CONTRACTION_SHARDS}"
+    else:
+        assert (
+            CONTRACTION_SHARDS == 1
+        ), f"contraction_shards {CONTRACTION_SHARDS} needs split_head_dim: it shards the roles' contraction"
+    TEAM_WAVES = 2 * CONTRACTION_SHARDS if SPLIT_HEAD_DIM else 1
+    assert NUM_WAVES % TEAM_WAVES == 0, f"num_waves {NUM_WAVES} must be a multiple of the {TEAM_WAVES}-wave team"
+    NUM_TEAMS = NUM_WAVES // TEAM_WAVES
+    BLOCK_N = ROWS_PER_WAVE * NUM_TEAMS
     BLOCK_SIZE = NUM_WAVES * WARP_SIZE
 
     D_STEPS = BLOCK_DMODEL // WMMA_K  # k_packs, dk accumulators
@@ -262,14 +318,18 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     DORM_STRIDE = BLOCK_DMODEL_V + LDS_PAD
     DOTR_STRIDE = BLOCK_M + LDS_PAD
 
+    # Under `transposed_source="derived"` the two transposed tiles are not
+    # allocated and their operands are read strided out of the row-major pair.
+    # Sizes go to zero rather than the bases being skipped, so every downstream
+    # offset expression is the one the four-tile layout has.
     QRM_BASE = 0
     QRM_SIZE = BLOCK_M * QRM_STRIDE
     QTR_BASE = QRM_BASE + QRM_SIZE
-    QTR_SIZE = BLOCK_DMODEL * QTR_STRIDE
+    QTR_SIZE = (BLOCK_DMODEL * QTR_STRIDE) if KEEP_TR_TILES else 0
     DORM_BASE = QTR_BASE + QTR_SIZE
     DORM_SIZE = BLOCK_M * DORM_STRIDE
     DOTR_BASE = DORM_BASE + DORM_SIZE
-    DOTR_SIZE = BLOCK_DMODEL_V * DOTR_STRIDE
+    DOTR_SIZE = (BLOCK_DMODEL_V * DOTR_STRIDE) if KEEP_TR_TILES else 0
     # Per-row LSE and delta for the Q tile in flight, staged once per
     # iteration and read by every wave. Two BLOCK_M-long f32 runs, expressed in
     # 16-bit elements because the whole LDS block is typed to the kernel's
@@ -277,20 +337,29 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     ROWQ_BASE = ((DOTR_BASE + DOTR_SIZE) + 7) // 8 * 8
     ROWQ_ELEMS = 2 * BLOCK_M * 2  # f32 -> two 16-bit slots each
     ROWQ_BYTE0 = ROWQ_BASE * 2
-    # The pair exchange, only under `split_head_dim`. LDS is typed in 16-bit
+    # The team exchange, only under `split_head_dim`. LDS is typed in 16-bit
     # elements but `lds_f32_*` index in f32; the _F32 names are the indexing
     # unit and PDS_ELEMS the block size. Mixing them is a silent 2x overrun.
+    #
+    # One slot per wave whatever the team width -- two waves relaying S and dP,
+    # or `2C` waves reducing partials, is `NUM_WAVES` slots either way.
     PDS_BASE = (ROWQ_BASE + ROWQ_ELEMS + 7) // 8 * 8
     PDS_SLOT_F32 = WARP_SIZE * 8
-    PDS_PAIR_F32 = 2 * PDS_SLOT_F32
-    PDS_ELEMS = (NUM_PAIRS * PDS_PAIR_F32 * 2) if SPLIT_HEAD_DIM else 0
+    PDS_TEAM_F32 = TEAM_WAVES * PDS_SLOT_F32
+    PDS_ELEMS = (NUM_TEAMS * PDS_TEAM_F32 * 2) if SPLIT_HEAD_DIM else 0
     PDS_BYTE0 = PDS_BASE * 2
     _ROWQ_BATCHES = (BLOCK_M + BLOCK_SIZE - 1) // BLOCK_SIZE
     LDS_TOTAL = PDS_BASE + PDS_ELEMS
-    if SPLIT_HEAD_DIM:
-        assert D_STEPS % 2 == 0 and DV_STEPS % 2 == 0, "split_head_dim needs even D_STEPS/DV_STEPS"
-    D_STEPS_OWN = D_STEPS // 2 if SPLIT_HEAD_DIM else D_STEPS
-    DV_STEPS_OWN = DV_STEPS // 2 if SPLIT_HEAD_DIM else DV_STEPS
+
+    # A wave accumulates 1/TEAM_WAVES of the d range and, when sharded,
+    # contracts over 1/CONTRACTION_SHARDS of it. The two partitions are
+    # independent: each only has to *be* a partition.
+    assert (
+        D_STEPS % TEAM_WAVES == 0 and DV_STEPS % TEAM_WAVES == 0
+    ), f"a {TEAM_WAVES}-wave team needs D_STEPS/DV_STEPS divisible by {TEAM_WAVES}"
+    D_STEPS_OWN = D_STEPS // TEAM_WAVES
+    DV_STEPS_OWN = DV_STEPS // TEAM_WAVES
+    D_STEPS_SHARD = D_STEPS // CONTRACTION_SHARDS
 
     # Cooperative-load vector width, in elements. Fixed at 8 for the alignment
     # reason the forward records: the D-axis pitch is guaranteed a multiple of
@@ -518,22 +587,29 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         # This wave's 16 KV rows, and this lane's row inside them.
         # Under `split_head_dim` a *pair* owns the 16 KV rows and the two waves
         # differ only in which half of the head dim they accumulate.
-        if const_expr(SPLIT_HEAD_DIM):
-            group_of_wave = wave_id // fx.Index(2)
-            role = fx.Int32(wave_id % fx.Index(2))
-        else:
-            group_of_wave = wave_id
-            role = fx.Int32(0)
-        _half_i32 = role * fx.Int32(D_STEPS_OWN)
-        _vhalf_i32 = role * fx.Int32(DV_STEPS_OWN)
+        # wave -> (team, slot), then slot -> (shard, role):
+        #
+        #   role   0 holds K and produces S, 1 holds V and produces dP
+        #   shard  which 1/C of the contraction this wave reduces over
+        #   slot   which 1/TEAM_WAVES of the d range it accumulates for
+        #
+        # At `TEAM_WAVES == 1` every index is 0 and this is the unsharded
+        # kernel; at 2 it is `wave_id // 2` and `wave_id % 2`, the pair.
+        group_of_wave = wave_id // fx.Index(TEAM_WAVES)
+        _slot = wave_id % fx.Index(TEAM_WAVES)
+        role = fx.Int32(_slot % fx.Index(2)) if const_expr(SPLIT_HEAD_DIM) else fx.Int32(0)
+        _own_i32 = fx.Int32(_slot) * fx.Int32(D_STEPS_OWN)
+        _vown_i32 = fx.Int32(_slot) * fx.Int32(DV_STEPS_OWN)
         kv_row_in_tile = group_of_wave * fx.Index(ROWS_PER_WAVE) + lane16
         kv_row_abs = start_k + kv_row_in_tile
         kv_row_abs_i32 = start_k_i32 + fx.Int32(group_of_wave) * fx.Int32(ROWS_PER_WAVE) + fx.Int32(lane16)
         if const_expr(SPLIT_HEAD_DIM):
-            _pds_pair = fx.Int32(group_of_wave) * fx.Int32(PDS_PAIR_F32) + fx.Int32(lane) * fx.Int32(8)
-            _pds_mine = _pds_pair + role * fx.Int32(PDS_SLOT_F32)
-            _pds_theirs = _pds_pair + (fx.Int32(1) - role) * fx.Int32(PDS_SLOT_F32)
+            _pds_team = fx.Int32(group_of_wave) * fx.Int32(PDS_TEAM_F32) + fx.Int32(lane) * fx.Int32(8)
+            _pds_mine = _pds_team + fx.Int32(_slot) * fx.Int32(PDS_SLOT_F32)
+            _pds_theirs = _pds_team + (fx.Int32(1) - role) * fx.Int32(PDS_SLOT_F32)
             _rm_base_off = fx.Index(role) * fx.Index(DORM_BASE - QRM_BASE)
+            # First contraction step this wave's packs cover, in WMMA_K units.
+            _shard_k0 = fx.Int32(_slot // fx.Index(2)) * fx.Int32(D_STEPS_SHARD)
 
         k_tile_base = k_tbase(_k_start_addr)
         v_tile_base = v_tbase(_k_start_addr)
@@ -570,9 +646,16 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             def fetch_my(row, col):
                 return load_global_v8f16(my_ptr, my_tile_base, my_toff(row, col))
 
+            # `contraction_shards` cuts this again to the wave's own shard, so
+            # the packs are `D/(4C)` registers. The column is constexpr at C=1
+            # and only becomes a dynamic expression when there is a shard
+            # offset to add -- the unsharded build must emit what it always did.
             k_packs = []
-            for ks in range_constexpr(D_STEPS):
-                _c = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
+            for ks in range_constexpr(D_STEPS_SHARD):
+                if const_expr(CONTRACTION_SHARDS > 1):
+                    _c = fx.Index((_shard_k0 + fx.Int32(ks)) * fx.Int32(WMMA_K)) + klane * WMMA_LANE_K
+                else:
+                    _c = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
                 k_packs.append(k_ap.read_v8(fetch_my, _kv_safe, _c, _kv_in))
             v_packs = k_packs
         else:
@@ -734,13 +817,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             _, _, do_addr = fmha.make_addr_pair(do_st, head_q, _q_batch_v, _q_row_off_v, **_addr_kw_q)
 
             _fetch_q = fmha.reader(q_addr, lambda b, o: load_global_f16xN(q_ptr, b, o))(_q_row_start)
-            _fetch_q_tr = fmha.reader(q_addr, lambda b, o: fmha.global_load_tr_v8(q_ptr_i64, b, o, v8f16_type))(
-                _q_row_start
-            )
             _fetch_do = fmha.reader(do_addr, lambda b, o: load_global_f16xN(do_ptr, b, o))(_q_row_start)
-            _fetch_do_tr = fmha.reader(do_addr, lambda b, o: fmha.global_load_tr_v8(do_ptr_i64, b, o, v8f16_type))(
-                _q_row_start
-            )
 
             # VRAM -> LDS, both orientations of both tensors. Rows past
             # seqlen_q are clamped by the address closure, so what lands in LDS
@@ -748,10 +825,23 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             # what keeps it out of the answer.
             fmha.stage(q_rm_ap, lds_qdo, _fetch_q, q_row_in_batch, q_col_base, fx.Index(BLOCK_M))
             fmha.stage(do_rm_ap, lds_qdo, _fetch_do, do_row_in_batch, do_col_base, fx.Index(BLOCK_M))
-            fmha.publish_transposed(q_tr_ap, q_tiling, lds_qdo, fmha.read_transposed(q_tr_ap, q_tiling, _fetch_q_tr))
-            fmha.publish_transposed(
-                do_tr_ap, do_tiling, lds_qdo, fmha.read_transposed(do_tr_ap, do_tiling, _fetch_do_tr)
-            )
+            if const_expr(KEEP_TR_TILES):
+                # Under "derived" there is no transposed tile to fill, and the
+                # `global_load_tr_b128` fetches that fed it go with it -- the
+                # same eight halves are read out of the row-major tile at GEMM
+                # time instead.
+                _fetch_q_tr = fmha.reader(q_addr, lambda b, o: fmha.global_load_tr_v8(q_ptr_i64, b, o, v8f16_type))(
+                    _q_row_start
+                )
+                _fetch_do_tr = fmha.reader(do_addr, lambda b, o: fmha.global_load_tr_v8(do_ptr_i64, b, o, v8f16_type))(
+                    _q_row_start
+                )
+                fmha.publish_transposed(
+                    q_tr_ap, q_tiling, lds_qdo, fmha.read_transposed(q_tr_ap, q_tiling, _fetch_q_tr)
+                )
+                fmha.publish_transposed(
+                    do_tr_ap, do_tiling, lds_qdo, fmha.read_transposed(do_tr_ap, do_tiling, _fetch_do_tr)
+                )
             # LSE and delta for this Q tile. Q-indexed, so the same BLOCK_M
             # values serve every wave -- staging them once replaces 16 scalar
             # global loads *per lane per iteration*, and with them the 64-bit
@@ -783,25 +873,55 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                     # shape and accumulator, different operands -- and those
                     # were selected in the prologue, so this loop is branch-free.
                     _mine = fx.as_ir_value(c_zero_v8f32)
-                    for ks in range_constexpr(D_STEPS):
-                        _c = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
+                    for ks in range_constexpr(D_STEPS_SHARD):
+                        if const_expr(CONTRACTION_SHARDS > 1):
+                            _c = fx.Index((_shard_k0 + fx.Int32(ks)) * fx.Int32(WMMA_K)) + klane * WMMA_LANE_K
+                        else:
+                            _c = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
                         _a_op = fmha.lds_load_v8(
                             lds_qdo, q_rm_ap.lds_index(fx.Index(_qs) + lane16, _c) + _rm_base_off, _v4_ty
                         )
                         _mine = fmha.wmma_acc(_a_op, k_packs[ks], _mine)
 
-                    # Relay: write mine, read the partner's. After the barrier
-                    # both waves hold S and dP, so the P/dS arithmetic below is
-                    # identical in both and needs no branch of its own.
                     for _si in range_constexpr(8):
                         fmha.lds_f32_store(
                             _lds_byte_base, PDS_BYTE0, _pds_mine + fx.Int32(_si), fx.Float32(Vec(_mine)[_si])
                         )
                     gpu.barrier()
-                    _other = [
-                        fmha.lds_f32_load(_lds_byte_base, PDS_BYTE0, _pds_theirs + fx.Int32(_si))
-                        for _si in range_constexpr(8)
-                    ]
+                    if const_expr(CONTRACTION_SHARDS == 1):
+                        # Relay: write mine, read the partner's. After the
+                        # barrier both waves hold S and dP, so the P/dS
+                        # arithmetic below is identical in both and needs no
+                        # branch of its own. `_mine` stays in registers, so this
+                        # is one LDS read where the reduction below is two.
+                        _other = [
+                            fmha.lds_f32_load(_lds_byte_base, PDS_BYTE0, _pds_theirs + fx.Int32(_si))
+                            for _si in range_constexpr(8)
+                        ]
+                        _s_vals = None
+                    else:
+                        # Reduce: `slot = 2*shard + role`, so the even slots sum
+                        # to S and the odd ones to dP. Own slot is read back
+                        # rather than kept, which costs one LDS read and makes
+                        # every wave's arithmetic below identical.
+                        _s_vals = []
+                        _dp_vals = []
+                        for _si in range_constexpr(8):
+                            _s_sum = None
+                            _dp_sum = None
+                            for _c_sh in range_constexpr(CONTRACTION_SHARDS):
+                                _sv_c = fmha.lds_f32_load(
+                                    _lds_byte_base, PDS_BYTE0, _pds_team + fx.Int32((2 * _c_sh) * PDS_SLOT_F32 + _si)
+                                )
+                                _dv_c = fmha.lds_f32_load(
+                                    _lds_byte_base,
+                                    PDS_BYTE0,
+                                    _pds_team + fx.Int32((2 * _c_sh + 1) * PDS_SLOT_F32 + _si),
+                                )
+                                _s_sum = _sv_c if _c_sh == 0 else fastmath.add(_s_sum, _sv_c)
+                                _dp_sum = _dv_c if _c_sh == 0 else fastmath.add(_dp_sum, _dv_c)
+                            _s_vals.append(_s_sum)
+                            _dp_vals.append(_dp_sum)
                     s_acc = _mine
                     dp_acc = _mine
                 else:
@@ -845,8 +965,12 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                     # carries +inf here, which makes p exactly 0 -- which is
                     # why the forward writes +inf and not -inf.
                     # Under the split, S is mine when role 0 and the partner's
-                    # otherwise; dP the other way round.
-                    if const_expr(SPLIT_HEAD_DIM):
+                    # otherwise; dP the other way round. When the contraction is
+                    # sharded the reduction already gave every wave both, so
+                    # there is no role selection left to make.
+                    if const_expr(SPLIT_HEAD_DIM and CONTRACTION_SHARDS > 1):
+                        _sv = fx.Float32(_s_vals[si])
+                    elif const_expr(SPLIT_HEAD_DIM):
                         _mv = fx.Float32(Vec(_mine)[si])
                         _ov = fx.Float32(_other[si])
                         _sv = _mv if _role0 else _ov
@@ -870,7 +994,9 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                         _dead = _dead | (kv_row_abs_i32 < _q_row_i32 - _wl_i32)
                     _p = fx.as_ir_value(fx.Float32(0.0) if _dead else fx.Float32(_p))
 
-                    if const_expr(SPLIT_HEAD_DIM):
+                    if const_expr(SPLIT_HEAD_DIM and CONTRACTION_SHARDS > 1):
+                        _dpv = fx.Float32(_dp_vals[si])
+                    elif const_expr(SPLIT_HEAD_DIM):
                         _dpv = _ov if _role0 else _mv
                     else:
                         _dpv = fx.Float32(Vec(dp_acc)[si])
@@ -909,16 +1035,35 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                 _p_pack = _pack_v8(_p_vals)
                 _ds_pack = _pack_v8(_ds_vals)
 
+                # One transposed A operand, from whichever source the knob
+                # selects. "tile" reads the eight halves contiguously out of the
+                # transposed tile; "derived" reads the same eight out of the
+                # row-major tile, strided by its pitch -- which is why that tile
+                # need not exist. gfx1201 has no `ds_load_tr16_b128`, so the
+                # second form is eight reads rather than one.
+                def _tr_operand(rm_ap, tr_ap, d_pos, q0):
+                    if const_expr(KEEP_TR_TILES):
+                        return tr_ap.from_lds(lds_qdo, d_pos, q0)
+                    return Vec.from_elements(
+                        [
+                            fx.ptr_load(lds_qdo + fx.Int32(rm_ap.lds_index(q0 + fx.Index(j), d_pos)))
+                            for j in range_constexpr(8)
+                        ],
+                        elem_dtype,
+                    ).ir_value()
+
+                _q0 = fx.Index(_qs) + klane * WMMA_LANE_K
+
                 # ==== GEMM3: dV^T[d][kv] += dO^T . P ====
                 for dc in range_constexpr(DV_STEPS_OWN):
-                    _gd = fx.Index((fx.Int32(dc) + _vhalf_i32) * fx.Int32(WMMA_N))
-                    _a = do_tr_ap.from_lds(lds_qdo, _gd + lane16, fx.Index(_qs) + klane * WMMA_LANE_K)
+                    _gd = fx.Index((fx.Int32(dc) + _vown_i32) * fx.Int32(WMMA_N))
+                    _a = _tr_operand(do_rm_ap, do_tr_ap, _gd + lane16, _q0)
                     dv_accs[dc] = fmha.wmma_acc(_a, _p_pack, dv_accs[dc])
 
                 # ==== GEMM4: dK^T[d][kv] += Q^T . dS ====
                 for dc in range_constexpr(D_STEPS_OWN):
-                    _gd = fx.Index((fx.Int32(dc) + _half_i32) * fx.Int32(WMMA_N))
-                    _a = q_tr_ap.from_lds(lds_qdo, _gd + lane16, fx.Index(_qs) + klane * WMMA_LANE_K)
+                    _gd = fx.Index((fx.Int32(dc) + _own_i32) * fx.Int32(WMMA_N))
+                    _a = _tr_operand(q_rm_ap, q_tr_ap, _gd + lane16, _q0)
                     dk_accs[dc] = fmha.wmma_acc(_a, _ds_pack, dk_accs[dc])
 
             # Every wave must finish reading this Q/dO window before the next
@@ -956,11 +1101,11 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             for dc in range_constexpr(D_STEPS_OWN):
                 _v = fastmath.mul(loop_results[dc], _scale_vec)
                 _t = Vec(_v).to(elem_dtype).ir_value()
-                _gc = fx.Index((fx.Int32(dc) + _half_i32) * fx.Int32(WMMA_N)) + klane * WMMA_LANE_K
+                _gc = fx.Index((fx.Int32(dc) + _own_i32) * fx.Int32(WMMA_N)) + klane * WMMA_LANE_K
                 fmha.write_v8(dk_out_ap, write_dk, kv_row_in_tile, _gc, _t)
             for dc in range_constexpr(DV_STEPS_OWN):
                 _t = Vec(loop_results[D_STEPS_OWN + dc]).to(elem_dtype).ir_value()
-                _gc = fx.Index((fx.Int32(dc) + _vhalf_i32) * fx.Int32(WMMA_N)) + klane * WMMA_LANE_K
+                _gc = fx.Index((fx.Int32(dc) + _vown_i32) * fx.Int32(WMMA_N)) + klane * WMMA_LANE_K
                 fmha.write_v8(dv_out_ap, write_dv, kv_row_in_tile, _gc, _t)
 
     @flyc.jit

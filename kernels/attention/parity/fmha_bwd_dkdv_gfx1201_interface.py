@@ -37,7 +37,6 @@ from __future__ import annotations
 from functools import lru_cache
 
 import torch
-from fmha_bwd_dkdv512_gfx1201_kernel import build_bwd_dkdv_module_primary as build_bwd_dkdv_module_wide
 from fmha_bwd_dkdv_gfx1201_kernel import build_bwd_dkdv_module_primary
 from fmha_tuning_bwd_dkdv_gfx1201 import BwdDkDvKnobs, BwdDkDvMetadata
 from fmha_tuning_bwd_dkdv_gfx1201 import plan as _plan_build
@@ -54,24 +53,17 @@ def _torch_dtype_to_str(dtype: torch.dtype) -> str:
 
 
 def build_bwd_dkdv_module(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
-    """The right dK/dV kernel for these knobs.
+    """The dK/dV kernel for these knobs.
 
-    Two kernels behind one entry point. The primary one caps at head_dim 256,
-    where `0.75 * head_dim` of register state and four LDS staging tiles both
-    still fit; above that `fmha_tuning_bwd_dkdv_gfx1201`'s policy resolves
-    `contraction_shards` to 2 and `transposed_source` to "derived", neither of
-    which the primary kernel implements, so the build routes to the wide
-    variant. Dispatch is on the *knobs* rather than on head_dim so that forcing
-    either knob by hand picks the right builder too.
-
-    **Call this rather than either builder.** Reaching past it for
-    `build_bwd_dkdv_module_primary` and handing it wide knobs gets the four-tile
-    LDS layout at a width that policy sized for two, and the failure is a
-    `local memory (72064) exceeds limit (65536)` out of the backend rather than
-    anything that names the mistake.
+    One kernel now covers head_dim 16-512: `contraction_shards` and
+    `transposed_source` are compile-time knobs on it, resolved by
+    `fmha_tuning_bwd_dkdv_gfx1201`'s policy, and both are inert below head_dim
+    320. This indirection is kept because callers and tests should agree on one
+    entry point even when there is only one builder behind it -- the wide
+    widths lived in a second module for exactly one commit, and the tests that
+    reached past the dispatch to a builder directly were how head_dim 384 first
+    failed.
     """
-    if knobs.contraction_shards > 1 or knobs.transposed_source == "derived":
-        return build_bwd_dkdv_module_wide(meta, knobs)
     return build_bwd_dkdv_module_primary(meta, knobs)
 
 
