@@ -322,15 +322,27 @@ carefully and the *range* was not, on a bench shape where it happened to fit.
 
 ## Measurement discipline
 
-### This board drifts ~5% between whole-script runs
+### This board drifts up to ~15% between whole-script runs
 
 A non-interleaved A/B first measured the scheduler change at **+4.8%** when the
 truth was **+0.4%**; re-running the same binary gave 96.3 then 91.2 TFLOPS.
 
-**Always interleave arms (`for rep: for arm`) and repeat 3x.** Real effects come
-out flat to +/-0.1 TFLOPS across reps; anything that moves more than that
-between reps of the same arm is drift. Use `bench_one.py` (one config per
-process), not a multi-config sweep.
+**Revised upward 2026-08-16.** The 5% figure this section carried was an
+underestimate. Measuring the dQ kernel at head_dim 512, the *same build* read
+**23.8 and 27.7 TFLOPS** across whole-script runs -- 15%. Treat 5% as the
+floor of the drift band, not the width of it. Nothing derived from comparing
+two numbers taken in different processes is evidence, whatever the gap.
+
+**Always interleave arms (`for rep: for arm`) and repeat 3x**, taking a median
+rather than a best or a mean. Real effects come out flat to +/-0.1 TFLOPS
+across reps; anything that moves more than that between reps of the same arm
+is drift. Use `bench_one.py` (one config per process), not a multi-config
+sweep, and never compare across two invocations of it.
+
+The corollary is that the interesting range -- a 5-15% change -- is exactly
+the range this board cannot resolve across runs and *can* resolve within one.
+That is not a reason to skip the measurement; it is a reason the harness shape
+is load-bearing.
 
 ### Prove a no-op with an ISA byte-diff
 

@@ -8,10 +8,11 @@ file is about correctness and this one is about speed, and a number here moves
 when a sweep says so. It imports nothing from `flydsl`, so it is trivially
 stable-only and importable from anywhere.
 
-**Only `block_m` has been swept.** `num_waves` and the floating-point knobs are
-one default each, carried over from the forward or picked once; treat them as
-placeholders. `_lds_bytes` / `_fits_lds` is not a placeholder -- it is a
-legality calculation and must stay correct.
+`block_m`, `num_waves`, `split_head_dim`, `contraction_shards` and
+`transposed_source` have each been swept and carry their tables below. The
+floating-point knobs are one default each, carried over from the forward;
+treat those as placeholders. `lds_bytes` / `_fits_lds` is not a placeholder --
+it is a legality calculation and must stay correct.
 
 Geometry the kernel and this module must agree on
 -------------------------------------------------
@@ -20,26 +21,39 @@ The dK/dV kernel is the transpose of the forward's loop: it holds a K/V tile
 and streams Q/dO past it. That inverts which tensor is register-resident and
 which transits LDS, and it fixes the wave decomposition:
 
-- **one wave owns 16 KV rows**, the WMMA M extent, so `BLOCK_N = 16 *
-  num_waves`. Waves own *disjoint* KV rows, which is what keeps dK/dV
-  accumulators wave-private and removes any cross-wave reduction. The
-  alternative -- waves splitting the Q stream over a shared KV tile -- needs a
-  `BLOCK_N x head_dim` f32 reduction through LDS per workgroup, which does not
-  fit.
+- **a team of waves owns 16 KV rows.** A team is `1` wave unsplit, `2` under
+  `split_head_dim` (roles: K/S and V/dP), and `2 * contraction_shards` when
+  the contraction is sharded too -- so `BLOCK_N = 16 * num_waves /
+  TEAM_WAVES`. Teams own *disjoint* KV rows, which is what keeps the dK/dV
+  accumulators team-private. The alternative -- every wave over the same KV
+  tile, splitting the Q stream -- needs a `BLOCK_N x head_dim` f32 reduction
+  through LDS per workgroup, which does not fit.
 - **Q and dO are staged in LDS twice each**, row-major and transposed, because
   each is read once as a WMMA A operand along `d` (for S and dP) and once along
   `q` (for dK^T and dV^T). See the kernel's LDS-layout comment. That is what
-  makes `_lds_bytes` the binding constraint on `block_m`.
+  makes `lds_bytes` the binding constraint on `block_m` -- unless
+  `transposed_source="derived"` drops the transposed pair, which is what makes
+  head_dim 448 and 512 fit at all.
 
-Register floor, per wave, in VGPRs:
+Register floor, per wave, in VGPRs. An f16 operand tile over 16 KV rows is
+`head_dim/4` and an f32 accumulator `head_dim/2`, so with `C` contraction
+shards and a `2C`-wave team:
 
-    k_packs + v_packs    (head_dim + head_dim_v) / 4
-    dk + dv accumulators (head_dim + head_dim_v) / 2
+    packs         head_dim / (4 * C)
+    dk + dv accs  head_dim / (2 * C)
+    state         0.75 * head_dim / C
 
-i.e. **1.5 * head_dim** with head_dim_v == head_dim, before any transient. At
-head_dim 128 that is 192 of the 256 available and the kernel spills; at 192 the
-floor alone is 288 and it spills hard. Sharding `d` across waves is the fix and
-is not implemented -- see the module docstring of the kernel.
+Measured ISA gives `vgpr = state + 62`, and the model reproduces the spill
+counts it can be checked against -- at head_dim 256 unsplit it predicts a
+deficit of 190 and the ISA reports 203 spills. That is what the three
+decomposition knobs are for, and the crossovers are all spill boundaries:
+
+    head_dim   default            state   why
+    <= 128     split off            1.5D  fits; splitting costs BLOCK_N
+    192-256    split, C=1          0.75D  unsplit spills 79-203
+    >= 320     split, C=2, derived 0.375D C=1 spills, four tiles overflow
+
+`is_wide` is that last threshold. Nothing here is keyed on `causal`.
 """
 
 from dataclasses import dataclass, fields, replace
@@ -61,10 +75,17 @@ LDS_PAD = 4
 # *buildable but spill*; see the register floor in the module docstring.
 _BLOCK_DMODEL_LADDER = (16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512)
 
-# Above this the primary kernel cannot be made to fit and the build routes to
-# `fmha_bwd_dkdv512_gfx1201_kernel`. Both of its budgets fail at once at 320:
-# state is `0.75 * head_dim` = 240 against a ~194 budget, and the four staging
-# tiles pass 64 KiB. See that module's docstring for the two mechanisms.
+# At and above this the wide decomposition wins: `contraction_shards=2` and
+# `transposed_source="derived"`. See `default_contraction_shards` for the
+# measurement -- this is a *measured* crossover, not the legality boundary.
+#
+# The two are worth keeping apart. Legality alone would put the threshold at
+# 448, which is the first width where the four staging tiles cannot fit at any
+# `num_waves`; 320 and 384 admit all four combinations. The reason 320 routes
+# wide is that `0.75 * head_dim` = 240 exceeds the ~194 register budget there
+# and the unsharded build starts spilling, which costs more than the sharding
+# does. The crossover falls between the 256 and 320 rungs, and there is no
+# rung between them, so no finer threshold is expressible.
 _WIDE_HEAD_DIM_MIN = 320
 
 MAX_HEAD_DIM = _BLOCK_DMODEL_LADDER[-1]
@@ -172,22 +193,32 @@ def is_wide(head_dim: int, head_dim_v: int) -> bool:
 def default_contraction_shards(head_dim: int, head_dim_v: int) -> int:
     """Ways to split the S / dP contraction across a team.
 
-    1 below the wide threshold and 2 at or above it, and both halves of that
-    are measured rather than derived. Sharding costs `BLOCK_N`: a team is
-    `2 * shards` waves, so at fixed `num_waves` doubling the shard count halves
-    the KV rows per workgroup and doubles how often each workgroup re-reads the
-    Q/dO stream. B=1 H=8 N=4096 f16, percent of the 212.8 TFLOPS WMMA ceiling:
+    1 below the wide threshold and 2 at or above it, both halves measured.
+    Sharding costs `BLOCK_N`: a team is `2 * shards` waves, so at fixed
+    `num_waves` doubling the shard count halves the KV rows per workgroup and
+    doubles how often each workgroup re-reads the Q/dO stream. It buys the
+    register state back, at `0.75 * head_dim / C`.
 
-        head_dim   C=1        C=2
-        192        26.0/25.3  22.1/20.9
-        256        30.0/31.2  20.9/19.6
-        512        spills     26.7/24.0
+    The full crossover sweep, B=1 H=8 N=4096 f16 nw=16, percent of the 212.8
+    TFLOPS WMMA ceiling as full/causal, interleaved x3 and median. Blank where
+    the four staging tiles do not fit at any `num_waves`:
 
-    So it is a loss of 15-30% wherever C=1 does not spill, and the only reason
-    to pay it is that at 512 C=1 spills 230 registers. 4 shards is worse again
-    (15.5% at 512) -- spill-free, but `BLOCK_N` drops to 32 and the Q traffic
-    swamps the registers saved, the same trade `fmha_tuning_bwd_dq_gfx1201`
-    records at its own BLOCK_M.
+        head_dim   C=1 tile     C=1 derived  C=2 tile     C=2 derived
+        256        31.1/32.6    27.4/27.3    20.9/19.8    25.9/24.1
+        320        22.4/21.3    19.0/19.2    17.0/16.2    24.2/25.8
+        384             --      17.8/16.6         --      19.2/19.4
+        448             --      13.7/11.6         --      19.9/20.2
+
+    256 prefers the unsharded build by 17-26% and 320 prefers the sharded one
+    by 8-21%, so the crossover is between those two rungs and
+    `_WIDE_HEAD_DIM_MIN` sits on the lower edge of the sharded side. The
+    margin widens with head_dim -- 45-74% by 448 -- because that is the spill
+    curve: `0.75 * head_dim` passes the ~194 budget at 260 and keeps going.
+
+    4 shards is worse again (15.5% at head_dim 512) despite being the only
+    spill-free build there. `BLOCK_N` drops to 32 and the Q traffic swamps the
+    registers saved -- the same trade `fmha_tuning_bwd_dq_gfx1201` records at
+    its own BLOCK_M, where 16 cost it 2.2x.
     """
     return 2 if is_wide(head_dim, head_dim_v) else 1
 
@@ -197,11 +228,23 @@ def default_transposed_source(head_dim: int, head_dim_v: int) -> str:
 
     "derived" is what makes the wide widths fit -- it removes the two
     transposed tiles, which at head_dim 512 is 40960 of the 90496 B that
-    otherwise overflows. It is not free, but it is far cheaper than the read
-    counting suggests (1.0 -> ~4.5 LDS reads per WMMA): measured against
-    "tile" at C=1, B=1 H=8 N=4096, it costs about 10% at head_dim 256
-    (30.0 -> 26.8% of peak) and nothing measurable at 192 (26.0 -> 25.2, and
-    25.3 -> 26.3 causal, i.e. inside the board's drift).
+    otherwise overflows, and at 448 it is the difference between legal and not
+    at any `num_waves`.
+
+    It is not free, but it is far cheaper than the read counting suggests
+    (1.0 -> ~4.5 LDS reads per WMMA, against dq measured LDS-bound at 3.3).
+    Against "tile" at C=1, B=1 H=8 N=4096, full/causal percent of peak:
+
+        head_dim   tile         derived
+        192        26.0/25.3    25.2/26.3
+        256        31.1/32.6    27.4/27.3
+        320        22.4/21.3    19.0/19.2
+
+    So roughly 12% at 256 and 320 and nothing measurable at 192. It is tied to
+    `contraction_shards` in the policy only because the same threshold suits
+    both, not because either needs the other: the knobs are independent, and
+    the C=2 column of the table in `default_contraction_shards` shows "tile"
+    losing to "derived" at 320 even though both fit.
     """
     return "derived" if is_wide(head_dim, head_dim_v) else "tile"
 
