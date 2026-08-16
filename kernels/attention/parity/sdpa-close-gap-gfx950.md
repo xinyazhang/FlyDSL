@@ -687,9 +687,57 @@ the LDS footprint:
   assembled body, which the single-stage probes do not reproduce.
 
 Both are properties of the pipeline rather than of a stage, which is consistent
-with every stage passing. The next probe therefore has to stage **two tiles
-into alternating buffers with the reads interleaved**, rather than one tile in
-isolation.
+with every stage passing.
+
+Synchronisation is ruled out too: replacing every `_dualwave_sync_barrier` with
+a full `s_waitcnt(0)` plus `s_barrier` -- strictly stronger than the
+hand-tuned sync the pipeline relies on -- leaves head_dim 192 and 256 exactly
+as wrong. The failure is deterministic and is not an ordering problem.
+
+### P2 — the decoupling experiment cannot be run, and that decides the design
+
+`SMEM_D_RPT` and `D_CHUNKS` are the two candidates left, and at granule 64 they
+are **not independent**: `D_CHUNKS = head_dim/32` and `SMEM_D_RPT = head_dim/64`,
+so `D_CHUNKS == 2 * SMEM_D_RPT` identically. Granule 32 would separate them --
+head_dim 128 at granule 32 is `SMEM_D_RPT 4` with `D_CHUNKS 4` -- but granule 32
+is itself broken, and in its *simplest* configuration:
+
+| head_dim | granule | d_rpt | D_CHUNKS | result |
+|---|---|---|---|---|
+| 128 | 64 | 2 | 4 | 2.8e-3, correct |
+| 128 | 32 | 4 | 4 | 0.90, wrong |
+| 192 | 64 | 3 | 6 | NaN |
+| **64** | **32** | **2** | **2** | **0.735, wrong** |
+
+head_dim 64 at granule 32 has `d_rpt 2` and `D_CHUNKS 2` -- the same depths as
+the working granule-64 build -- and is still wrong, which confirms the
+`_check_helpers_support_geometry` guard was right to refuse it: the `% 8`,
+`// 8` and `// 4` constants in `_k_lds_read_base_per_lane` and
+`_swizzled_ks_offset` are `SMEM_N_RPT` and `granule // K_STEP_QK` at family A's
+numbers and were never generalised. So granule 32 cannot serve as the control.
+
+**This is what settles the architecture.** The way to hold `D_CHUNKS` at 4
+while `SMEM_D_RPT` grows is a **V/O column window** -- computing O in
+128-column slices while QK reduces over the full width -- and that is not a
+diagnostic trick, it is what both references already do:
+
+- `fwd_hd192_hd128_bf16.co`, the aiter asm for head_dim 192, is **hdim_qk 192
+  with hdim_vo 128**. It never builds six O accumulators.
+- aiw serves head_dim 384 and 512 the same way, through `BLOCK_DMODEL_V` and
+  `D_OFFSET`, repeating GEMM1 per window.
+- gfx1201's new head_dim 512 support (`fceea5a9`, `883adf03`) reaches the same
+  place from the other side: *sharding* the contraction across waves so
+  per-wave state falls to `0.75 * head_dim / C`, rather than scaling the tile.
+
+All three keep per-wave accumulator state bounded instead of letting it grow
+with head_dim. This port has been doing the opposite, and head_dim 192 is where
+that stops working.
+
+So the V/O column window moves from "a feature aiw has" to **the next piece of
+work**, and it is dual-purpose: it is a required parity feature
+(`hdim_qk != hdim_vo` is in the ABI), it is how the reference implementations
+serve large head_dim, and it is the only way to get a `D_CHUNKS = 4` build at
+`SMEM_D_RPT = 3` and so finally separate the two candidates.
 
 `LADDER` stays `(64, 128)`: 192/256 must not be reachable while this is open.
 
