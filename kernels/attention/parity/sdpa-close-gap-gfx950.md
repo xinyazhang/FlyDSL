@@ -338,6 +338,70 @@ entry rejected on spills or LDS earlier must be retried once the budget moves.
 
 ---
 
+## Owed before the PR
+
+Not a phase -- no new capability -- but a hard gate on filing. Ordering is
+free; correctness of the result is not.
+
+### R1 — Knobs and traits are one thing; make them one class
+
+**The observation.** `FmhaKnobs` and the dualwave traits returned by
+`make_parity_traits` both answer "how to compute it", at two points on the same
+axis: knobs are the *partially resolved* form (`None` means "policy decides")
+and traits are the *fully resolved* one. Keeping them as separate types with a
+free function between them means every new feature knob has to be declared
+twice and threaded through a converter, and it is why `varlen` and
+`cross_seqlen` currently travel as keyword-only arguments beside the knob
+object rather than inside it.
+
+**The shape to reach.**
+
+```python
+knobs = fmha_knobs(arch, **kwargs)   # factory -> arch-specific Knobs subclass
+cfg   = knobs.resolve(meta)          # fully-resolved, arch-specific config
+```
+
+`resolve` becomes a **method on the arch-specific knob class** and subsumes
+both `resolve_knobs` and `make_parity_traits`: it takes the caller's
+`FmhaInputMetadata` and returns the configuration the builder consumes. The
+split that survives is the one that was always right -- `FmhaInputMetadata` is
+*what to compute* and stays arch-neutral and shared; `Knobs` is *how*, and is
+arch-specific behind a common base.
+
+**What this deletes**, all of it currently in `fmha_tuning_gfx950.py`,
+`fmha_dualwave_gfx950.py` and `flash_attn_func_gfx950.py`:
+
+- the free function `resolve_knobs(meta, overrides)` -> `Knobs.resolve(meta)`
+- `make_parity_traits(meta, knobs, *, varlen, cross_seqlen)` -> folded into
+  `Gfx950Knobs.resolve`
+- `FmhaPlan` and `plan()` -- a resolved knob object *is* the plan
+- **`cross_seqlen`'s special treatment.** It becomes an ordinary field of the
+  gfx950 knob class, which removes the keyword-only parameter on
+  `build_..._primary`, the `kwargs.pop("cross_seqlen")` in the keyword front
+  end, and the argument threaded through `make_parity_traits`. `varlen` goes
+  the same way, which matters because P4 would otherwise add a third such
+  passenger.
+
+**The one risk, and it is about hardware, not design.** The API only unifies if
+gfx1201 adopts it too -- `fmha_tuning_gfx1201.py` has its own `FmhaKnobs`,
+`resolve_knobs`, `FmhaPlan` and `plan()`, and doing gfx950 alone yields the
+shape without the unification. But there is no gfx1201 board on this host, so
+its 298 tests cannot gate the change here. Two honest options, to pick when the
+work starts:
+
+1. Land the base class plus the gfx950 subclass now, and port gfx1201 on a
+   machine that can run its suite. Leaves two idioms in the tree meanwhile.
+2. Port both mechanically and have the gfx1201 suite run elsewhere before the
+   PR merges. Faster to a single idiom, but the gfx1201 half ships unverified
+   by whoever writes it.
+
+**Do it before P4.** Nothing forces it earlier, but each remaining phase adds
+knobs -- windows, the five varlen modes, bias, dropout -- and every one of them
+declared against the current split is a field written twice and a converter
+argument to thread. The cost of deferring grows with each phase; the cost of
+doing it now is one refactor over ~200 lines with 76 tests already covering the
+behaviour.
+
 ## Verification standard
 
 Three gates, mirroring plan1 §5:
@@ -578,6 +642,10 @@ needs nothing -- its D columns are O's columns, suppressed at the store.
 - **LSE uses `traits.NUM_HEADS_Q`**, a constexpr, where the rest of the kernel
   now reads head counts at runtime. Consistent today because the builder and
   launcher take the same value, but it is a latent AOT hazard.
+- **`cross_seqlen` travels beside the knobs rather than inside them**, as a
+  keyword-only argument on `build_..._primary` and a `kwargs.pop` in the
+  keyword front end. Owed to **R1**, which deletes the special case by making
+  it an ordinary field of the arch-specific knob class.
 
 ## Method note
 
