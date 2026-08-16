@@ -367,6 +367,64 @@ any geometry it cannot actually build. `32` is deliberately **not** in
 would never be reached, while putting it in `LADDER` would route head_dim <= 32
 to a tile that does not exist and break a path that works today, slowly.
 
+### P2 evidence — the baseline shape was still wrong, and the knob sweep
+
+**S=4096 saturates the grid but not the pipeline.** The P−1 outcome corrected
+the baseline from B=1 to B=4 on occupancy grounds and stopped there. That was
+not far enough: the dualwave epilogue drains three KV tiles, so at S=4096 there
+are only 16 tiles per q-block and the drain is a large fraction of the work.
+
+| shape (D=64 bf16 non-causal) | workgroups | vs 256 CUs | TFLOPS |
+|---|---|---|---|
+| B=4 H=8 S=4096 | 512 | 2.0x | 769 |
+| B=2 H=8 S=8192 | 512 | 2.0x | 864 |
+| B=2 H=16 S=8192 | 1024 | 4.0x | 919 |
+| B=1 H=16 S=16384 | 1024 | 4.0x | **936** |
+| B=2 H=16 S=16384 | 2048 | 8.0x | **937** |
+
+Rows 1 and 2 have *identical* grids and differ by 12% on sequence length
+alone, which is what identifies the pipeline rather than occupancy. Flat from
+4x to 8x CUs. **The standing baseline becomes B=1 H=16 S=16384**; 4096 is a
+tile-count measurement wearing an occupancy measurement's clothes.
+
+**Knob sweep**, at that shape, bf16 non-causal, real TFLOPS with the ratio
+against default:
+
+| hdim | default | wpe=1 | wpe=4 | no-stagger | no-setprio | no-lazy |
+|---|---|---|---|---|---|---|
+| 16 | 197.8 | 0.996 | **0.277** | 0.909 | 1.014 | 0.890 |
+| 32 | 386.7 | 1.002 | **0.282** | 0.916 | 1.006 | 0.889 |
+| 48 | 563.1 | 1.002 | **0.289** | 0.922 | 1.015 | 0.895 |
+| 64 | 934.2 | 1.002 | **0.213** | 0.895 | 0.984 | 0.849 |
+| 80 | 506.8 | 1.001 | **0.097** | 0.879 | 1.020 | 0.859 |
+| 96 | 601.3 | 0.998 | **0.096** | 0.888 | 1.011 | 0.866 |
+| 128 | 1158.2 | 1.004 | **0.062** | 0.894 | 1.005 | 0.876 |
+
+- **`waves_per_eu=4` is catastrophic** -- down to 0.06x at head_dim 128, i.e.
+  16x slower. It caps the register budget the schedule is built around. Never.
+- **`waves_per_eu=1` is neutral** everywhere (0.996-1.004). The kernel's own
+  VGPR use already fixes occupancy, so this knob has nothing to say; 2 is kept
+  only because it matches the production build.
+- **`stagger` is worth ~10%** and **`lazy_rescale` ~12%**, consistently across
+  the ladder. Both defaults confirmed.
+- **`setprio` is a wash**, and marginally *negative* at six of seven rungs
+  (up to 1.020 without it). **Not acted on:** the effect is 1-2% and this sweep
+  is not interleaved, while the gfx1201 record puts board drift at ~5%. It is a
+  candidate for an interleaved A/B, not a conclusion.
+
+**The dominant lever is the ladder, not any of these knobs.** Every rung that
+is not a compiled tile width runs at roughly its padding ratio: head_dim 16 is
+0.21x of 64, and head_dim 80 is 0.44x of 128. No schedule knob moves more than
+12%.
+
+**This raises the value of granule 32 beyond small heads.** At granule 64 the
+rungs can only be multiples of 64, so 80 and 96 both pad into 128. At granule
+32 the ladder becomes 32/64/96/128, which makes 96 native and pads 80 into 96
+instead of 128 -- from a 1.6x padding ratio to 1.2x. LDS at granule 32,
+BLOCK_N 128, head_dim 96 is 102 KB, inside the budget. So family S is not a
+small-head special case; it fixes head_dim 65-96 as well, where the measured
+loss is 0.44x.
+
 **What family B still has to change**, none of it started:
 
 - `_make_dualwave_swp_traits` hardcodes `num_waves=8`, `block_m=256`,
