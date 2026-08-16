@@ -13,16 +13,19 @@ It imports nothing from ``flydsl``, so it is trivially stable-only and can be
 read (or edited) without a GPU in the room. The forward tuning module has the
 same property; keep it.
 
-**Lightly tuned.** Two knobs were swept once, at B=1 H=8 N=4096 f16, both
-masking modes, on a single un-interleaved run: the wave count and
-``kt_lds_layout``. Those two tables are measurements. Everything else --
-``block_n``, ``kv_addr_hoist``, ``sched_strategy`` -- is an unswept default and
-says so at its definition. Treat those as hypotheses.
+**Lightly tuned.** Four knobs have been swept, all at B=1 H=8 N=4096 f16 in
+both masking modes: the wave count and ``kt_lds_layout`` on a single
+un-interleaved run, and ``shards`` and ``sched_strategy`` interleaved over
+3 reps at the two sharded widths. Those four tables are measurements.
+``kv_addr_hoist`` is an unswept default and says so at its definition; so is
+``block_n``, except at head_dim 512 where it is arithmetic rather than tuning.
+Treat the rest as hypotheses.
 
-One caveat on every number here: they come from one run each, and
-``sdpa_lore_gfx1201.md`` records that this board drifts about 5%, so
-alternatives closer than that are not separated. The two effects below are much
-larger than 5% where they matter at all.
+One caveat on the un-interleaved numbers: they come from one run each, and
+``sdpa_lore_gfx1201.md`` records that this board drifts about 5% -- measured
+here at up to 15% between whole-script runs of the *same* build -- so
+alternatives closer than that are not separated. The effects kept below are
+much larger than that where they matter at all.
 """
 
 from dataclasses import dataclass, fields, replace
@@ -30,22 +33,29 @@ from dataclasses import dataclass, fields, replace
 # ---------------------------------------------------------------------------
 # The compiled tile widths.
 #
-# Shorter than the forward's ladder, and the missing top is not an oversight.
-# A dQ wave carries, per lane:
+# The ladder now matches the forward's top. A dQ wave carries, per lane and per
+# head-dim shard:
 #
-#   q packs    head_dim / 4  VGPRs   (BLOCK_DMODEL/16 operands of v8f16)
-#   dO packs   head_dim / 4  VGPRs
-#   dq accs    head_dim / 2  VGPRs   (BLOCK_DMODEL/16 accumulators of v8f32)
+#   q packs    slice / 4  VGPRs   (slice/16 operands of v8f16)
+#   dO packs   slice / 4  VGPRs
+#   dq accs    slice / 2  VGPRs   (slice/16 accumulators of v8f32)
 #
-# i.e. head_dim VGPRs before the S and dP accumulators (32 more at BLOCK_N 32),
-# the addressing, and the LDS staging registers. 256 is therefore already at
-# the 256-VGPR wall and 384/512 cannot be expressed without either head-dim
-# sharding or a D-column window, neither of which this kernel implements yet.
-# The forward escapes this because it carries only *one* head_dim-proportional
-# register set (O) plus Q; dQ carries three.
+# with `slice = head_dim / shards`, i.e. `slice` VGPRs before the S and dP
+# accumulators, the addressing, and the LDS staging registers. Unsharded that
+# is `head_dim`, which is why 256 already sits exactly on the 256-VGPR wall
+# (measured: 256 VGPRs, 132 bytes of scratch, 133 spill instructions) and why
+# 512 -- which would need 544 -- is not merely slow but inexpressible.
+#
+# `shards` is the whole answer. It is the same mechanism the forward uses and
+# it applies more cleanly here, because GEMM1's reduction axis and GEMM3's
+# output axis are *the same axis*: a wave that reduces over head-dim columns
+# [s*slice, (s+1)*slice) also owns exactly those columns of dQ, so one offset
+# drives Q, dO, K, V, K^T and the output store, and the shards' output stores
+# are disjoint. The price is a cross-shard LDS reduction of the partial S and
+# dP -- twice the forward's, which reduces S only.
 # ---------------------------------------------------------------------------
 
-_BLOCK_DMODEL_LADDER = (16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256)
+_BLOCK_DMODEL_LADDER = (16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 384, 512)
 
 MAX_HEAD_DIM = _BLOCK_DMODEL_LADDER[-1]
 
@@ -101,16 +111,66 @@ _ROWS_PER_WAVE = 16
 #
 # 80 is a coin toss (w16 is +1.7% non-causal and -0.1% causal, inside the
 # drift) and stays at the default rather than gaining an entry for noise.
-_NUM_WAVES_BY_HEAD_DIM: dict[int, int] = {16: 16, 192: 16, 224: 16, 256: 16}
+#
+# 384 and 512 are the sharded widths, where `num_waves` no longer means
+# BLOCK_M: a workgroup is `num_waves / shards` Q row sub-tiles, so 8 waves at
+# 4 shards is BLOCK_M 32. Interleaved, 3 reps, same shape, TFLOPS non-causal /
+# causal:
+#
+#   head_dim   4 waves (m16)   8 waves (m32)   16 waves (m64)
+#   384             --          35.1/36.1       31.8/31.9
+#   512        10.8/11.9        24.1/28.5       LDS: 65792 B
+#
+# The 4-wave collapse at 512 is 2.2x, far outside the drift, and it is not a
+# register effect -- per-wave pressure is identical at every wave count. It is
+# K/V global traffic: BLOCK_M 16 quadruples the workgroup count over BLOCK_M
+# 64 and every workgroup re-reads the whole KV sequence. 16 waves does not
+# help either (measured at 384, -10%) and at 512 does not fit: the reduction
+# buffer scales with the wave count and stops aliasing V.
+#
+# 8 waves is therefore the answer at both, from opposite directions.
+_NUM_WAVES_BY_HEAD_DIM: dict[int, int] = {16: 16, 192: 16, 224: 16, 256: 16, 384: 8, 512: 8}
 _DEFAULT_NUM_WAVES = 8
+
+# Head-dim shards: waves cooperating on one Q row sub-tile, each holding only
+# `head_dim / shards` columns of Q, dO and the dQ accumulator.
+#
+# 1 everywhere it fits, because sharding is not free: it buys registers with
+# two cross-shard LDS reductions per KV tile and three extra barriers. It is
+# switched on only where the unsharded form does not exist -- 384 would need
+# 384 VGPRs of operands and 512 would need 512, against a 256-VGPR file.
+#
+# 4 and not 2 at both widths: 2 shards leave a 192-wide slice at 384 and a
+# 256-wide one at 512, which are the register profiles of the unsharded 192 and
+# 256 builds -- and 256 unsharded already spills 132 bytes. 4 shards give
+# 96- and 128-wide slices, and unsharded 128 measures 221 VGPRs with no spill.
+# Measured, 4 shards: 384 comes out at 217 VGPRs and 512 at 254, both with
+# **zero** spill.
+#
+# 8 is worse, and not for the reason the register table would suggest. It
+# halves the slice again (512 would be 64 wide) but it also halves BLOCK_M at
+# a fixed wave count, and BLOCK_M is what this kernel is sensitive to: 8
+# shards at 8 waves measured 13.8/14.0 TFLOPS at 512 against 24.1/28.5 for 4.
+# Going to 16 waves to recover BLOCK_M does not fit -- the reduction buffer
+# scales with the wave count.
+_SHARDS_BY_HEAD_DIM: dict[int, int] = {384: 4, 512: 4}
+_DEFAULT_SHARDS = 1
 
 # KV columns per tile.
 #
-# Pinned at 32 and the kernel asserts it. BLOCK_N is the width of the S and dP
+# 32 everywhere except 512, and the exception is arithmetic rather than
+# tuning. K and V are both staged row-major and padded by 4 elements, so the
+# pair costs `2 * BLOCK_N * (head_dim + 4) * 2` bytes: at head_dim 512 and
+# BLOCK_N 32 that is 66048, over the 64 KiB workgroup cap, and even removing
+# the padding entirely lands on exactly 65536 with no room for the reduction
+# buffer. BLOCK_N 16 halves it to 33024 and leaves the padding intact.
+#
+# Everywhere else 32 stands. BLOCK_N is the width of the S and dP
 # accumulators, which are *dead* register pressure in this kernel -- unlike the
 # forward, where a wider tile amortises the per-tile softmax. Widening it would
 # add 2 * BLOCK_N/16 * 8 VGPRs against a head_dim-proportional budget that is
 # already the binding constraint. Revisit only at head_dim <= 32.
+_BLOCK_N_BY_HEAD_DIM: dict[int, int] = {384: 16, 512: 16}
 _DEFAULT_BLOCK_N = 32
 
 # How K reaches GEMM3 (`dq += K^T @ dS^T`).
@@ -160,30 +220,75 @@ _DEFAULT_KT_LDS_LAYOUT = "scalar"
 # 64/128/192/256, so it fits everywhere except 256, which already spills 132.
 _DEFAULT_KV_PREFETCH_DIST = 0
 
+# LLVM's `amdgpu-sched-strategy` function attribute. Unset ("" -> the default
+# GCN scheduler) everywhere except head_dim 512.
+#
+# Interleaved, 3 reps, B=1 H=8 N=4096 f16, TFLOPS default -> max-memory-clause:
+#
+#   head_dim   non-causal        causal
+#   384       35.1 -> 35.0    36.1 -> 35.0
+#   512       23.8 -> 36.1    27.8 -> 35.9
+#
+# So it is worth +52% / +29% at 512 and nothing at 384, on two builds that
+# differ only in width -- same 4 shards, same BLOCK_N 16, same 8 waves. The
+# forward's copy of this knob is gated the same way and its comment gives the
+# mechanism: the default scheduler sinks each `ds_load` next to its consuming
+# WMMA and the WAR dependency then forces a full `s_wait_dscnt` drain between
+# every pair. 512 is the width where this kernel's LDS reads per KV tile are
+# densest, so it is where the drains cost the most.
+#
+# `kv_prefetch_dist=1` reaches the same place from the other side (36.2 / 34.3
+# at 512, measured in the same run) and the two do not compose -- together they
+# give 36.0 / 36.2, i.e. neither adds to the other. That is the signature of
+# both fixing one bottleneck: exposed load latency. The scheduler attribute is
+# preferred because it costs no registers and no loop-carried values.
+_SCHED_STRATEGY_BY_HEAD_DIM: dict[int, str] = {512: "max-memory-clause"}
+
+
+def default_sched_strategy(head_dim: int) -> str:
+    """LLVM scheduling strategy at this head_dim; "" is the default scheduler."""
+    return _SCHED_STRATEGY_BY_HEAD_DIM.get(head_dim, "")
+
 
 def default_num_waves(head_dim: int) -> int:
     """Waves per workgroup at this head_dim."""
     return _NUM_WAVES_BY_HEAD_DIM.get(head_dim, _DEFAULT_NUM_WAVES)
 
 
+def default_shards(head_dim: int) -> int:
+    """Waves cooperating on one Q row sub-tile at this head_dim."""
+    return _SHARDS_BY_HEAD_DIM.get(head_dim, _DEFAULT_SHARDS)
+
+
 def default_block_m(head_dim: int) -> int:
     """Q rows per workgroup at this head_dim."""
-    return _ROWS_PER_WAVE * default_num_waves(head_dim)
+    return _ROWS_PER_WAVE * (default_num_waves(head_dim) // default_shards(head_dim))
 
 
 def default_block_n(head_dim: int, causal: bool) -> int:
     """KV columns per tile at this head_dim."""
-    return _DEFAULT_BLOCK_N
+    return _BLOCK_N_BY_HEAD_DIM.get(head_dim, _DEFAULT_BLOCK_N)
 
 
 # Whether the KV address hoists `row * stride_seq` out of the loop; see
 # `kv_off` in `fmha_common_gfx1201.make_addr_pair` for the two forms.
 #
-# The forward keys this off head_dim from a measured table. Nothing here is
-# measured, and the two kernels have different loop bodies, so copying its
-# table would be borrowing a conclusion rather than a fact. Off everywhere
-# until swept.
-_KV_ADDR_HOIST_HEAD_DIMS: frozenset[int] = frozenset()
+# The forward keys this off head_dim from a measured table. Copying its table
+# would be borrowing a conclusion rather than a fact -- the two kernels have
+# different loop bodies -- so this one was swept where it was needed, which is
+# the two sharded widths. Interleaved, 4 reps, B=1 H=8 N=4096 f16, TFLOPS
+# off -> on:
+#
+#   head_dim   non-causal        causal
+#   384       35.0 -> 36.3    35.3 -> 36.3
+#   512       36.3 -> 37.6    35.8 -> 37.5
+#
+# +3 to +5%, which is inside this board's between-run drift and would not be
+# believable from one run. It is kept because it is *flat*: every rep after the
+# warmup reads 37.6/37.5 against 36.3/35.8 to within 0.1 TFLOPS, which is the
+# lore's stated signature of a real effect against drift. 16 to 256 remain
+# unswept and off.
+_KV_ADDR_HOIST_HEAD_DIMS: frozenset[int] = frozenset({384, 512})
 
 
 def _kv_addr_hoist(head_dim: int, causal: bool) -> bool:
@@ -222,6 +327,9 @@ class BwdDqKnobs:
     block_m: int | None = None
     block_n: int | None = None
     num_waves: int | None = None
+    # Waves cooperating on one Q row sub-tile. `num_waves // shards` Q row
+    # sub-tiles per workgroup, hence `block_m = 16 * num_waves // shards`.
+    shards: int | None = None
     kt_lds_layout: str | None = None
     kv_addr_hoist: bool | None = None
     kv_prefetch_dist: int | None = None
@@ -278,24 +386,32 @@ def resolve_knobs(meta: BwdDqInputMetadata, overrides: "BwdDqKnobs | None" = Non
         s = replace(s, block_dmodel=meta.head_dim)
     hd = s.block_dmodel
 
+    if s.shards is None:
+        s = replace(s, shards=default_shards(hd))
+    if s.sched_strategy is None:
+        s = replace(s, sched_strategy=default_sched_strategy(hd))
     if s.num_waves is None:
         s = replace(s, num_waves=default_num_waves(hd))
     if s.block_m is None:
-        s = replace(s, block_m=_ROWS_PER_WAVE * s.num_waves)
+        s = replace(s, block_m=_ROWS_PER_WAVE * (s.num_waves // s.shards))
     if s.block_n is None:
         s = replace(s, block_n=default_block_n(hd, meta.causal))
     if s.kv_addr_hoist is None:
         s = replace(s, kv_addr_hoist=_kv_addr_hoist(hd, meta.causal))
     if s.flat_work_group_size is None:
         s = replace(s, flat_work_group_size=32 * s.num_waves)
-    # `block_m` and `num_waves` state one fact twice, so they must agree. A
-    # caller who pins only `block_m` gets the wave count that goes with it.
-    if s.block_m != _ROWS_PER_WAVE * s.num_waves:
+    # `block_m`, `num_waves` and `shards` state one fact twice over, so they
+    # must agree. A caller who pins only `block_m` gets the wave count that
+    # goes with it, at whatever shard count is in force.
+    if s.block_m * s.shards != _ROWS_PER_WAVE * s.num_waves:
         if overrides is not None and overrides.num_waves is None:
-            s = replace(s, num_waves=s.block_m // _ROWS_PER_WAVE, flat_work_group_size=2 * s.block_m)
+            _nw = (s.block_m // _ROWS_PER_WAVE) * s.shards
+            s = replace(s, num_waves=_nw, flat_work_group_size=32 * _nw)
         else:
             raise ValueError(
-                f"block_m ({s.block_m}) must be {_ROWS_PER_WAVE} * num_waves " f"({s.num_waves}); one wave owns 16 rows"
+                f"block_m ({s.block_m}) must be {_ROWS_PER_WAVE} * num_waves "
+                f"({s.num_waves}) / shards ({s.shards}); one wave owns 16 rows "
+                f"of one head-dim shard"
             )
     return s
 

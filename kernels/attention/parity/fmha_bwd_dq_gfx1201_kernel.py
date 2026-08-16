@@ -72,13 +72,28 @@ The two are **bitwise identical** -- same values, same order -- which is what
 the test asserts, and is the reason it is safe to switch on the evidence of a
 benchmark alone.
 
+--- Head-dimension sharding -----------------------------------------------
+
+``QK_SHARDS`` waves cooperate on one Q row sub-tile, each holding only
+``head_dim / QK_SHARDS`` columns of Q, dO and the dQ accumulator. It is the
+forward's mechanism, and it fits dQ more neatly than it fits the forward:
+**GEMM1's reduction axis and GEMM3's output axis are the same axis**, so one
+column offset drives Q, dO, K, V, K^T and the output store, and the shards'
+output stores are disjoint -- there is nothing to combine at the end. What has
+to be combined is in the middle: the partial S from GEMM1 and the partial dP
+from GEMM2, both summed across the shards through LDS before the softmax.
+
+It is the only way head_dim 384 and 512 exist at all. Unsharded, a wave holds
+``head_dim`` VGPRs of operands and accumulators before addressing and staging;
+512 would need 544 against a 256-VGPR file. ``QK_SHARDS == 1`` is the
+unsharded kernel *exactly*, down to the emitted ISA.
+
 --- What this kernel does not do ------------------------------------------
 
-No prefetch (the forward's ``K_PREFETCH_DIST``), no head-dim sharding, no V/O
-column window, no row sub-tiles, no bias. Those are the forward's speed knobs
-and each is a separate correctness surface; this pass is scored on matching
-torch autograd. See ``fmha_tuning_bwd_dq_gfx1201.py`` for what is worth
-measuring first.
+No V/O column window, no row sub-tiles, no bias, and the distance-1 K/V
+prefetch is off by default. Those are the forward's speed knobs and each is a
+separate correctness surface; this pass is scored on matching torch autograd.
+See ``fmha_tuning_bwd_dq_gfx1201.py`` for what is worth measuring first.
 
 Shape:  Q/K/V/dO/dQ are BHSD (batch, num_heads, seq_len, head_dim); the memory
         layout is free so long as D is innermost. Strides arrive as
@@ -160,6 +175,7 @@ def build_bwd_dq_module_primary(meta, knobs):
     BLOCK_M = knobs.block_m
     BLOCK_N = knobs.block_n
     NUM_WAVES = knobs.num_waves
+    QK_SHARDS = knobs.shards
     KT_LDS_LAYOUT = knobs.kt_lds_layout
     KV_ADDR_HOIST = knobs.kv_addr_hoist
     KV_PREFETCH_DIST = knobs.kv_prefetch_dist
@@ -180,14 +196,35 @@ def build_bwd_dq_module_primary(meta, knobs):
     WMMA_M = 16
     WMMA_N = 16
     WMMA_K = 16
-    # KV columns spanned by one *pair* of S accumulators. Same unit the forward
-    # uses, and for the same reason: it is where two GEMMs meet.
-    COLS_PER_SUBTILE = 2 * WMMA_N
     # K elements each lane holds of a WMMA A/B operand: two lanes share a row
     # and split the K extent, so WMMA_K / (WARP_SIZE / WMMA_M) == 8.
     WMMA_LANE_K = WMMA_K // (WARP_SIZE // WMMA_M)
 
     ROWS_PER_WAVE = WMMA_M
+
+    # ---- Head-dimension sharding ----
+    #
+    # `QK_SHARDS` waves cooperate on one Q row sub-tile. Wave *s* holds only
+    # columns `[s*QK_SLICE, (s+1)*QK_SLICE)` of Q and dO, reduces GEMM1 and
+    # GEMM2 over that slice alone, and owns exactly those columns of the dQ
+    # output in GEMM3 -- so **one offset serves all three GEMMs**, because
+    # GEMM1's reduction axis and GEMM3's output axis are both the QK head dim.
+    # The partial S and dP are summed across the shards through LDS between
+    # GEMM2 and the softmax.
+    #
+    # This is the *only* way head_dim 384/512 is expressible. A wave carries
+    # `BLOCK_DMODEL/4` VGPRs of Q packs, the same of dO, and `BLOCK_DMODEL/2`
+    # of dQ accumulators -- `BLOCK_DMODEL` registers per lane before operands,
+    # addressing and staging. Measured from the ISA: head_dim 128 is 221 VGPRs
+    # with no spill, head_dim 256 is pinned at 256 with 132 bytes of scratch.
+    # 512 would need 544. Sharding divides all three sets by `QK_SHARDS` and
+    # nothing else does: `BLOCK_M` only sets how many waves are in the
+    # workgroup, and `BLOCK_N` sizes only the S/dP accumulators.
+    #
+    # `QK_SHARDS == 1` is the unsharded kernel exactly; every sharded construct
+    # below is behind `const_expr(QK_SHARDS > 1)`.
+    QK_SLICE = BLOCK_DMODEL // QK_SHARDS
+    Q_TILES_PER_BLOCK = NUM_WAVES // QK_SHARDS
 
     # ---- Validity predicate over the knob space ----
     #
@@ -196,11 +233,21 @@ def build_bwd_dq_module_primary(meta, knobs):
     # rather than a caller mistake. Caller input is checked in `plan` and in
     # the launcher.
     assert (
-        BLOCK_DMODEL % 16 == 0 and 16 <= BLOCK_DMODEL <= 256
-    ), f"bwd_dq needs 16 <= BLOCK_DMODEL <= 256 and BLOCK_DMODEL % 16 == 0, got {BLOCK_DMODEL}"
+        BLOCK_DMODEL % 16 == 0 and 16 <= BLOCK_DMODEL <= 512
+    ), f"bwd_dq needs 16 <= BLOCK_DMODEL <= 512 and BLOCK_DMODEL % 16 == 0, got {BLOCK_DMODEL}"
     assert dtype_str in ("f16", "bf16"), f"bwd_dq supports f16/bf16, got {dtype_str!r}"
-    assert BLOCK_N == 32, f"bwd_dq pins BLOCK_N at 32 (see the tuning module), got {BLOCK_N}"
-    assert BLOCK_M == ROWS_PER_WAVE * NUM_WAVES, f"BLOCK_M ({BLOCK_M}) must be {ROWS_PER_WAVE} * {NUM_WAVES}"
+    assert BLOCK_N in (16, 32), f"bwd_dq supports BLOCK_N 16 or 32 (see the tuning module), got {BLOCK_N}"
+    # A slice that is not a multiple of WMMA_K would silently drop part of the
+    # reduction rather than fail -- the forward measured 0.97 relative error
+    # from exactly this at head_dim 224 with 4 shards. Rejected at build time.
+    assert NUM_WAVES % QK_SHARDS == 0, f"num_waves ({NUM_WAVES}) must be a multiple of shards ({QK_SHARDS})"
+    assert BLOCK_DMODEL % QK_SHARDS == 0 and QK_SLICE % WMMA_K == 0, (
+        f"BLOCK_DMODEL {BLOCK_DMODEL} with {QK_SHARDS} shards gives a {QK_SLICE}-wide "
+        f"slice, which must be a multiple of WMMA_K={WMMA_K}"
+    )
+    assert (
+        BLOCK_M == ROWS_PER_WAVE * Q_TILES_PER_BLOCK
+    ), f"BLOCK_M ({BLOCK_M}) must be {ROWS_PER_WAVE} * {NUM_WAVES} / {QK_SHARDS}"
     assert KT_LDS_LAYOUT in (
         "scalar",
         "transposed",
@@ -209,20 +256,23 @@ def build_bwd_dq_module_primary(meta, knobs):
     BLOCK_SIZE = FLAT_WORK_GROUP_SIZE if FLAT_WORK_GROUP_SIZE else NUM_WAVES * WARP_SIZE
     assert BLOCK_SIZE == NUM_WAVES * WARP_SIZE, f"flat_work_group_size {BLOCK_SIZE} contradicts {NUM_WAVES} waves"
 
-    COL_SUBTILES = BLOCK_N // COLS_PER_SUBTILE
-    NUM_S_ACCS = COL_SUBTILES * 2
+    # One v8f32 S accumulator per 16 KV columns; accumulator `a` holds columns
+    # `[a*16, (a+1)*16)`. This used to be spelled as pairs of accumulators
+    # inside 32-column "sub-tiles", which was the same indexing written twice
+    # over and made BLOCK_N 16 inexpressible -- and BLOCK_N 16 is what fits
+    # head_dim 512's K and V tiles inside 64 KiB.
+    NUM_S_ACCS = BLOCK_N // WMMA_N
     NUM_S_VALS = NUM_S_ACCS * 8
 
     # GEMM1 reduces over the QK head dim, GEMM2 over the V/O one. They share a
     # tile width here -- there is no `head_dim_v` knob -- but the *runtime*
     # extents `hdim_qk` and `hdim_vo` may still differ, which is what the two
-    # separate column axes below are for.
-    K_STEPS_QK = BLOCK_DMODEL // WMMA_K
-    K_STEPS_VO = BLOCK_DMODEL // WMMA_K
-    # dQ accumulators: one v8f32 per 16 output columns.
-    D_CHUNKS = BLOCK_DMODEL // WMMA_N
-    # GEMM3 K-steps within one accumulator pair.
-    PV_K_STEPS = COLS_PER_SUBTILE // WMMA_K
+    # separate column axes below are for. Under sharding each wave covers only
+    # its own slice of that width, in all three GEMMs.
+    K_STEPS_QK = QK_SLICE // WMMA_K
+    K_STEPS_VO = QK_SLICE // WMMA_K
+    # dQ accumulators: one v8f32 per 16 output columns of this wave's slice.
+    D_CHUNKS = QK_SLICE // WMMA_N
 
     if sm_scale is None:
         sm_scale = 1.0 / host_math.sqrt(BLOCK_DMODEL)
@@ -245,9 +295,8 @@ def build_bwd_dq_module_primary(meta, knobs):
     fastmath = fmha.FastMath(FP_MODE)
 
     # LLVM's amdgpu-sched-strategy function attribute; "" leaves the default
-    # GCN scheduler in place. Not measured for this kernel -- the forward wants
-    # "max-memory-clause" whenever it prefetches or masks, and this kernel does
-    # neither the same way, so it takes the default until swept.
+    # GCN scheduler in place, which is what every width but 512 takes. See
+    # `_SCHED_STRATEGY_BY_HEAD_DIM` in the tuning module for the sweep.
     SCHED_STRATEGY = "" if SCHED_STRATEGY_KNOB is None else SCHED_STRATEGY_KNOB
 
     # Causal masking. `causal_type` is AOTriton's: 0 none, 1 top-left, 2
@@ -313,10 +362,27 @@ def build_bwd_dq_module_primary(meta, knobs):
     LDS_V_TILE_SIZE = BLOCK_N * V_STRIDE
     LDS_KT_BASE = LDS_V_BASE + LDS_V_TILE_SIZE
     LDS_KT_TILE_SIZE = BLOCK_DMODEL * KT_STRIDE if KT_TRANSPOSED else 0
-    LDS_TOTAL_SIZE = LDS_KT_BASE + LDS_KT_TILE_SIZE
+
+    # The cross-shard S/dP reduction buffer: one private slot per wave, holding
+    # both partials (`2 * NUM_S_VALS` f32 per lane).
+    #
+    # It **aliases the V tile** when it fits there, exactly as the forward's
+    # aliases its own V region, and for a reason that is specific to this
+    # kernel's GEMM order: V is read by GEMM2 and never again, while K is read
+    # again by GEMM3, so V's storage is dead from the moment the reduction
+    # starts. That costs one extra barrier -- every wave must be past GEMM2
+    # before the first partial lands on top of V -- and it is what keeps
+    # head_dim 512 inside 64 KiB.
+    RED_F32_PER_WAVE = 2 * NUM_S_VALS * WARP_SIZE
+    RED_F32_TOTAL = NUM_WAVES * RED_F32_PER_WAVE
+    RED_ALIASES_V = QK_SHARDS == 1 or RED_F32_TOTAL * 4 <= LDS_V_TILE_SIZE * 2
+    LDS_RED_SIZE = 0 if RED_ALIASES_V else (RED_F32_TOTAL * 4 + 1) // 2
+    LDS_TOTAL_SIZE = LDS_KT_BASE + LDS_KT_TILE_SIZE + LDS_RED_SIZE
+    RED_BYTE0 = (LDS_V_BASE if RED_ALIASES_V else LDS_KT_BASE + LDS_KT_TILE_SIZE) * 2
     assert LDS_TOTAL_SIZE * 2 <= 65536, (
         f"LDS tile is {LDS_TOTAL_SIZE * 2} B, over the 64 KiB workgroup cap "
-        f"(BLOCK_DMODEL {BLOCK_DMODEL}, kt_lds_layout {KT_LDS_LAYOUT!r})"
+        f"(BLOCK_DMODEL {BLOCK_DMODEL}, BLOCK_N {BLOCK_N}, num_waves {NUM_WAVES}, "
+        f"shards {QK_SHARDS}, kt_lds_layout {KT_LDS_LAYOUT!r})"
     )
 
     elem_numeric_cls = common_kernels.dtype_to_elem_type(dtype_str)
@@ -406,8 +472,22 @@ def build_bwd_dq_module_primary(meta, knobs):
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_kv = lds.kv.ptr
 
+        # f32 view of the reduction region. The kv array is elem_dtype
+        # (16-bit), so go through an addrspace(3) LLVM pointer: ptrtoint on a
+        # shared pointer yields the 32-bit LDS offset.
+        _lds_byte_base = fx.as_ir_value(fx.ptrtoint(lds_kv))
+
         tid, wave_id, lane, lane16, klane = fmha.wave_lanes(WARP_SIZE)
-        wave_q_offset = wave_id * ROWS_PER_WAVE
+
+        # (q_tile, shard) decomposition of the wave index. At QK_SHARDS == 1
+        # this is q_tile == wave_id and shard == 0, i.e. the unsharded mapping.
+        q_tile_in_block = wave_id // QK_SHARDS
+        shard_id = wave_id % QK_SHARDS
+        wave_q_offset = q_tile_in_block * ROWS_PER_WAVE
+        # Column origin of this wave's head-dim slice, 0 at QK_SHARDS == 1. It
+        # indexes Q, dO, K and V for the two reductions *and* dQ and K^T for
+        # the output, because both axes are the QK head dim.
+        shard_qk_off = shard_id * fx.Index(QK_SLICE)
 
         # 3D grid: (head_q, q_tile, batch). Same axis order as the forward, and
         # load-bearing for the same reason: the x axis dispatches fastest, so
@@ -589,9 +669,11 @@ def build_bwd_dq_module_primary(meta, knobs):
         q_packs = []
         do_packs = []
         for ks in range_constexpr(K_STEPS_QK):
-            q_packs.append(q_ap.read_v8(fetch_q, _q_safe, fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K, _q_in))
+            _c = shard_qk_off + fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
+            q_packs.append(q_ap.read_v8(fetch_q, _q_safe, _c, _q_in))
         for ks in range_constexpr(K_STEPS_VO):
-            do_packs.append(do_ap.read_v8(fetch_do, _q_safe, fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K, _q_in))
+            _c = shard_qk_off + fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
+            do_packs.append(do_ap.read_v8(fetch_do, _q_safe, _c, _q_in))
 
         # ---- logsumexp and delta, one scalar per Q row ----
         #
@@ -802,26 +884,46 @@ def build_bwd_dq_module_primary(meta, knobs):
             # Accumulator element si is KV column klane*8 + si at Q row lane16.
             s_accs = [fx.as_ir_value(c_zero_v8f32) for _ in range(NUM_S_ACCS)]
             for ks in range_constexpr(K_STEPS_QK):
-                k_col = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
-                for st_idx in range_constexpr(COL_SUBTILES):
-                    st_base_row = st_idx * COLS_PER_SUBTILE
-                    k_pack_a = k_ap.from_lds(lds_kv, lane16 + fx.Index(st_base_row), k_col)
-                    k_pack_b = k_ap.from_lds(lds_kv, lane16 + fx.Index(st_base_row + 16), k_col)
-                    s_accs[st_idx * 2] = fmha.wmma_acc(k_pack_a, q_packs[ks], s_accs[st_idx * 2])
-                    s_accs[st_idx * 2 + 1] = fmha.wmma_acc(k_pack_b, q_packs[ks], s_accs[st_idx * 2 + 1])
+                k_col = shard_qk_off + fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
+                for a_idx in range_constexpr(NUM_S_ACCS):
+                    k_pack = k_ap.from_lds(lds_kv, lane16 + fx.Index(a_idx * WMMA_N), k_col)
+                    s_accs[a_idx] = fmha.wmma_acc(k_pack, q_packs[ks], s_accs[a_idx])
 
             # ==== GEMM2: dP^T = V @ dO^T ====
             # The identical access pattern with V in place of K and dO in place
             # of Q, so the accumulators share GEMM1's element mapping.
             dp_accs = [fx.as_ir_value(c_zero_v8f32) for _ in range(NUM_S_ACCS)]
             for ks in range_constexpr(K_STEPS_VO):
-                v_col = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
-                for st_idx in range_constexpr(COL_SUBTILES):
-                    st_base_row = st_idx * COLS_PER_SUBTILE
-                    v_pack_a = v_ap.from_lds(lds_kv, lane16 + fx.Index(st_base_row), v_col)
-                    v_pack_b = v_ap.from_lds(lds_kv, lane16 + fx.Index(st_base_row + 16), v_col)
-                    dp_accs[st_idx * 2] = fmha.wmma_acc(v_pack_a, do_packs[ks], dp_accs[st_idx * 2])
-                    dp_accs[st_idx * 2 + 1] = fmha.wmma_acc(v_pack_b, do_packs[ks], dp_accs[st_idx * 2 + 1])
+                v_col = shard_qk_off + fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
+                for a_idx in range_constexpr(NUM_S_ACCS):
+                    v_pack = v_ap.from_lds(lds_kv, lane16 + fx.Index(a_idx * WMMA_N), v_col)
+                    dp_accs[a_idx] = fmha.wmma_acc(v_pack, do_packs[ks], dp_accs[a_idx])
+
+            # ==== Cross-shard reduction of S and dP ====
+            # Each shard-wave holds a partial sum over its own slice of the
+            # head dim; the full S and dP are their sums. Both go through one
+            # call so they share the two barriers -- they are needed at the
+            # same point and neither can start before GEMM2 ends.
+            if const_expr(QK_SHARDS > 1):
+                if const_expr(RED_ALIASES_V):
+                    # The partials land on top of the V tile, so every wave
+                    # must be past its GEMM2 reads first.
+                    gpu.barrier()
+                _red = fmha.reduce_s_across_shards(
+                    s_accs + dp_accs,
+                    lds_byte_base=_lds_byte_base,
+                    byte0=RED_BYTE0,
+                    wave_id=wave_id,
+                    lane=lane,
+                    shard_id=shard_id,
+                    q_tile_in_block=q_tile_in_block,
+                    num_shards=QK_SHARDS,
+                    f32_per_wave=RED_F32_PER_WAVE,
+                    warp_size=WARP_SIZE,
+                    fastmath=fastmath,
+                )
+                s_accs = _red[:NUM_S_ACCS]
+                dp_accs = _red[NUM_S_ACCS:]
 
             s_raw = []
             dp_raw = []
@@ -876,8 +978,7 @@ def build_bwd_dq_module_primary(meta, knobs):
                 # consecutive elements is eight contiguous KV columns, so each
                 # group is one span of the stream.
                 for _st in range_constexpr(NUM_S_ACCS):
-                    _c0 = (_st // 2) * COLS_PER_SUBTILE + (_st % 2) * 16
-                    _bcol = fx.Int64(kv_block_start) + _c0 + fx.Int64(fx.Int32(klane) * 8)
+                    _bcol = fx.Int64(kv_block_start) + _st * WMMA_N + fx.Int64(fx.Int32(klane) * 8)
                     _first = PHILOX.grid_offset(_ph_base, _ph_stride, q_row, _bcol)
                     _keep = PHILOX.keep_span(_ph_seed, _first, 8, idropout_p)
                     for _r in range_constexpr(8):
@@ -916,10 +1017,10 @@ def build_bwd_dq_module_primary(meta, knobs):
                         ).ir_value()
                     )
 
-            def _load_kt(dc_val, st_kv_base, pks_val):
+            def _load_kt(dc_val, acc_idx):
                 """One K^T WMMA A-operand: A[d = lane16][kv = klane*8 + j]."""
-                d_pos = fx.Index(dc_val * WMMA_N) + lane16
-                kv0 = fx.Index(st_kv_base + pks_val * WMMA_K) + klane * WMMA_LANE_K
+                d_pos = shard_qk_off + fx.Index(dc_val * WMMA_N) + lane16
+                kv0 = fx.Index(acc_idx * WMMA_N) + klane * WMMA_LANE_K
                 if const_expr(KT_TRANSPOSED):
                     # K^T[d][kv]: this lane's 8 kv values are contiguous, so
                     # one vector read replaces the eight scalar ones below.
@@ -934,10 +1035,8 @@ def build_bwd_dq_module_primary(meta, knobs):
             # contiguous d per lane at one Q row -- which is what makes the
             # epilogue a single v8 store per 16 columns.
             for dc in range_constexpr(D_CHUNKS):
-                for st_idx in range_constexpr(COL_SUBTILES):
-                    for pks in range_constexpr(PV_K_STEPS):
-                        kt_pack = _load_kt(dc, st_idx * COLS_PER_SUBTILE, pks)
-                        dq_accs[dc] = fmha.wmma_acc(kt_pack, ds_packs[st_idx * 2 + pks], dq_accs[dc])
+                for a_idx in range_constexpr(NUM_S_ACCS):
+                    dq_accs[dc] = fmha.wmma_acc(_load_kt(dc, a_idx), ds_packs[a_idx], dq_accs[dc])
 
             _out = [dq_accs[i] for i in range_constexpr(D_CHUNKS)]
             if const_expr(KV_PREFETCH_DIST):
@@ -1011,7 +1110,10 @@ def build_bwd_dq_module_primary(meta, knobs):
             for dc in range_constexpr(D_CHUNKS):
                 _scaled = fastmath.mul(loop_results[dc], sm_scale_vec)
                 _trunc = Vec(_scaled).to(elem_dtype).ir_value()
-                fmha.write_v8(dq_ap, write_dq, q_row_in_tile, fx.Index(dc * WMMA_N) + klane * 8, _trunc)
+                # Each shard owns a disjoint column range of dQ, so there is
+                # nothing to combine here -- the store is the reduction.
+                _col = shard_qk_off + fx.Index(dc * WMMA_N) + klane * 8
+                fmha.write_v8(dq_ap, write_dq, q_row_in_tile, _col, _trunc)
 
     @flyc.jit
     def launch_bwd_dq(

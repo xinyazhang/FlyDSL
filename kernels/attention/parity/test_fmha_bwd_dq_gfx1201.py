@@ -171,10 +171,12 @@ def _run(q, k, v, do, lse, delta, causal, ctype=None, dtype_str="f16", sm_scale=
 # 1. Against torch autograd, with an fp32 lse/delta
 # ---------------------------------------------------------------------------
 
-# The compiled tile widths this kernel ships. Shorter than the forward's: dQ
-# carries three head_dim-proportional register sets (Q, dO, dQ) where the
-# forward carries two, so 384 and 512 cannot be expressed without sharding.
-_LADDER = [16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256]
+# The compiled tile widths this kernel ships. dQ carries three
+# head_dim-proportional register sets (Q, dO, dQ) where the forward carries
+# two, so the top two rungs run head-dim *sharded* -- four waves cooperating on
+# one Q row sub-tile, each holding a quarter of all three sets and reducing the
+# partial S and dP through LDS. 384 and 512 are the only widths that shard.
+_LADDER = [16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 384, 512]
 
 
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
@@ -386,7 +388,7 @@ def test_delta_helper_matches_the_definition():
 
 
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-@pytest.mark.parametrize("head_dim", [32, 64, 128])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 512])
 def test_kt_layouts_are_bitwise_identical(head_dim, causal):
     """ "scalar" and "transposed" must agree bit for bit.
 
@@ -395,6 +397,11 @@ def test_kt_layouts_are_bitwise_identical(head_dim, causal):
     strided LDS reads out of the row-major tile against one vector read out of
     a hardware-transposed copy. A tolerance test would accept a transpose that
     is off by a lane, which is the failure this catches.
+
+    512 is here for a second reason: it is a *sharded* build, so it also says
+    the transposed staging still covers the whole K tile when each wave reads
+    only its own head-dim slice of it, and that BLOCK_N 16 tiles the transpose
+    correctly.
     """
     _require_env()
     q, k, v, do = _qkv(1, _NUM_HEADS, _NUM_HEADS, 160, 160, head_dim, torch.float16, seed=3)
@@ -898,20 +905,23 @@ def test_dropout_off_build_ignores_p():
 
 
 def test_rejects_head_dim_over_the_ladder():
-    """dQ tops out at 256, where the forward reaches 512.
+    """dQ tops out at 512, the same width the forward reaches.
 
-    Not an arbitrary limit: a dQ wave carries Q, dO *and* the dQ accumulator,
-    all proportional to head_dim, which is `head_dim` VGPRs per lane before
-    anything else. `plan` is where the ladder lives, so that is where the
-    rejection belongs -- a direct builder call trips the kernel's own
-    assertion instead, which is the tuning module contradicting itself rather
-    than a caller mistake.
+    It gets there by sharding: a dQ wave carries Q, dO *and* the dQ
+    accumulator, all proportional to head_dim, which is `head_dim` VGPRs per
+    lane before anything else, so 384 and 512 run four waves per Q row
+    sub-tile. Past 512 there is no rung. `plan` is where the ladder lives, so
+    that is where the rejection belongs -- a direct builder call trips the
+    kernel's own assertion instead, which is the tuning module contradicting
+    itself rather than a caller mistake.
     """
     from fmha_tuning_bwd_dq_gfx1201 import BwdDqInputMetadata
     from fmha_tuning_bwd_dq_gfx1201 import plan as _plan
 
+    # 384 was rejected before sharding existed; it is now a compiled width.
+    assert _plan(BwdDqInputMetadata(num_heads=1, head_dim=384)).knobs.shards == 4
     with pytest.raises(ValueError, match="head_dim"):
-        _plan(BwdDqInputMetadata(num_heads=1, head_dim=384))
+        _plan(BwdDqInputMetadata(num_heads=1, head_dim=640))
 
 
 def test_block_m_and_num_waves_must_agree():
