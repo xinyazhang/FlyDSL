@@ -870,12 +870,95 @@ which is why both reference implementations do it. `v_o` alone is
 `D_CHUNKS * 16` VGPRs -- 64 at four chunks, 96 at six -- and that difference is
 most of the gap between 248 and the ceiling.
 
-### P2 — ROOT CAUSE: an unmodelled WAR hazard on the LDS-DMA address VGPR
+### P2 — CONFIRMED: a wait-state hazard. NOT YET: which instruction pair
 
-**Found.** `buffer_load_dwordx4 ... lds` reads its address from a VGPR, and at
-head_dim >= 192 the compiler overwrites that VGPR one or two instructions
-later, before the DMA has consumed it. The DMA then fetches from a corrupted
-address and writes the wrong data into LDS.
+**Confirmed by construction.** `amdgpu-snop-padding=N` inserts `s_nop N` before
+every instruction, widening every hazard window, and fixes it exactly as
+register pressure predicts:
+
+| snop-padding | head_dim 128 | 192 | 256 |
+|---|---|---|---|
+| 0, 1, 2 | 2.82e-03 | **nan** | **nan** |
+| 4 | 2.82e-03 | **2.68e-03** | nan |
+| 8 | 2.82e-03 | 2.68e-03 | **1.94e-03** |
+
+head_dim 192 needs `N >= 4`, head_dim 256 needs `N >= 8`, and both then produce
+numerically correct results. `amdgpu-mfma-padding-ratio=100`, which pads only
+between neighbouring MFMAs, does **nothing** -- so it is not an MFMA-to-MFMA
+hazard.
+
+*Not shippable*: the global padding costs 3.7x. head_dim 128 falls from ~1158
+to 310 TFLOPS at B=1 H=16 S=16384.
+
+#### A candidate that was correlated and turned out to be wrong
+
+Worth recording, because the correlation was extremely strong and still
+misled. `buffer_load_dwordx4 ... lds` reads its address from a VGPR, and
+counting how soon that VGPR is redefined:
+
+| head_dim | LDS-DMA sites | addr redefined within 8 | **within 1-2** | result |
+|---|---|---|---|---|
+| 64 | 12 | 1 | **0** | correct |
+| 128 | 24 | 0 | **0** | correct |
+| 192 | 72 | 43 | **43** | NaN |
+| 256 | 96 | 72 | **72** | NaN |
+
+Zero tight WAR sites in both working builds, 43 and 72 in the failing ones, the
+redefining instruction being `v_accvgpr_read_b32` in 37 of 44 cases. LLVM does
+not model this: `GCNHazardRecognizer::createsVALUHazard` opens with
+`if (!MI.mayStore()) return -1;` and then inspects only `vdata`, which a
+`buffer_load ... lds` does not have -- so its `vaddr` is never treated as a WAR
+producer, on any subtarget. That is a real gap, and it is a perfect match for
+the head_dim split.
+
+**It is nevertheless not the mechanism.** Emitting `s_nop 8` from the DSL
+immediately after each LDS-DMA puts nine wait states and three instructions
+between the DMA and the overwrite --
+
+    v_accvgpr_read_b32 v1, a13            ; produces the address in v1
+    buffer_load_dwordx4 v1, ... offen lds ; DMA reads v1
+    s_nop 8                               ; ours, correctly placed
+    s_mov_b32 m0, s56
+    v_accvgpr_read_b32 v1, a14            ; overwrites v1
+
+-- and head_dim 192 still fails. The AGPR traffic that creates these WAR sites
+creates other tight pairs as well, and one of *those* is the real hazard. A
+correlation that splits the working and failing sets perfectly is still only a
+correlation.
+
+One useful thing the experiment established: **a DSL-emitted `s_nop` survives
+compilation exactly where it is placed.** So a targeted fix needs no LLVM
+change once the right pair is known.
+
+#### What the ISA offers
+
+There is no DMA barrier instruction. §4.5 Table 11, *Required Software-inserted
+Wait States*, is explicit that this hazard class is resolved only by inserted
+NOPs or independent instructions, alongside `S_WAITCNT` for the three counted
+dependencies. The closest documented entries are
+
+| First | Second | Wait |
+|---|---|---|
+| `BUFFER_STORE_DWORD_X3/X4`, `FLAT_STORE_X3/X4`, ... | write VGPRs holding their writedata | 1 |
+| same | **VALU** writes VGPRs holding their writedata | 2 |
+| VALU writes SGPR | VMEM reads that SGPR | 5 |
+
+with the note that *"operations that use an SGPR for 'offset' do not require
+any wait states"* -- which suggests an addressing change (§9.1.9's
+`ADD_TID_ENABLE`, moving the per-lane component off the VGPR) could sidestep
+the family entirely. `S_NOP` repeats in hardware up to 16 times, so `s_nop 15`
+is the largest single wait.
+
+#### Ways forward, none needing an upstream fix
+
+1. **V/O column window** -- stay under the 256 arch-VGPR cap so the AGPR
+   traffic that opens these windows never exists. Required parity feature
+   anyway, and what both references do.
+2. **Targeted `s_nop`**, once the pair is identified. Expressible from the DSL.
+3. **`amdgpu-snop-padding`** as a correctness stopgap at 3.7x, useful only to
+   unblock work on the upper rungs.
+
+#### The original (now superseded) framing
 
 The correlation is exact:
 
