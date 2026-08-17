@@ -870,7 +870,89 @@ which is why both reference implementations do it. `v_o` alone is
 `D_CHUNKS * 16` VGPRs -- 64 at four chunks, 96 at six -- and that difference is
 most of the gap between 248 and the ceiling.
 
-### P2 — CONFIRMED: a wait-state hazard. NOT YET: which instruction pair
+### P2 — ROOT CAUSE: `ds_read_b64_tr_b16` is inline asm, so LLVM never waits on it
+
+**Found, and independently verified.** It is a missing `s_waitcnt lgkmcnt`, not
+a fixed-latency wait state.
+
+`flash_attn_utils.py:90 _ds_read_tr16_b64_imm` emits the LDS transpose read as
+**inline asm**:
+
+```python
+raw = llvm.inline_asm(raw_type, [addr], "ds_read_b64_tr_b16 $0, $1 offset:N",
+                      "=v,v,~{memory}", has_side_effects=True)
+```
+
+`SIInsertWaitcnts` tracks LDS traffic by scanning MIR for DS instructions. An
+inline asm is opaque to it -- `~{memory}` is a memory clobber, not an lgkm
+event -- so LLVM does not know a read is in flight and never inserts a wait
+before a use of `$0`. The kernel compensates with an explicit DSL-level
+`_s_waitcnt(traits.LGKMCNT_0_ONLY)` at cluster boundaries. **That is sound only
+while no compiler-inserted copy of the destination appears before that wait.**
+
+Above head_dim 128 the kernel passes the 256 architectural-VGPR cap, the
+allocator starts spilling to AGPRs, and it places those copies immediately
+after the inline asm -- ahead of the explicit wait:
+
+    ds_read_b64_tr_b16 v[192:193], v156 offset:512   ; in flight
+    ds_read_b64_tr_b16 v[194:195], v156 offset:640
+    s_nop 0
+    v_accvgpr_write_b32 a12, v192      ; reads it, with no s_waitcnt lgkmcnt
+    ...
+    ds_read_b64_tr_b16 v[192:193], v156 offset:768   ; and reuses the dest
+
+Counting uses of a transpose-read destination reached before any `lgkmcnt` wait
+or barrier:
+
+| head_dim | `ds_read_b64_tr_b16` | unwaited uses | result |
+|---|---|---|---|
+| 64 | 96 | **0** | correct |
+| 128 | 192 | **0** | correct |
+| 192 | 288 | **22** | NaN |
+| 256 | 384 | **160** | NaN |
+
+Pinned by bisection over ISA-level nop injection, converging on
+`v_accvgpr_write` whose source came from a `ds_read`, and then confirmed by the
+decisive substitution: **`s_waitcnt lgkmcnt(0)` at those sites alone fixes it**
+-- a wait, not a delay.
+
+**This retroactively explains every earlier dead end.** The non-determinism is
+an LDS-latency race. DSL-level LDS serialisation did not help because the
+offending read is a *compiler-inserted copy* sitting before the DSL wait, not a
+DSL LDS access. `s_nop` padding masks it probabilistically by giving the read
+time to land. It looks like bad V data because the transpose read *is* the V
+path. And every stage probe passed because a probe has no register pressure, so
+no AGPR copies are inserted at all.
+
+**This is a latent bug in production code**, not something this port
+introduced. `flash_attn_utils.py` is shared by `flash_attn_gfx950.py` and
+`flash_attn_fp8_gfx950.py`; they are safe today only because they stay at
+head_dim 64/128 where no AGPR spilling occurs. `_ds_read_tr8_b64_imm`, the fp8
+V path, has the identical inline-asm shape and the identical exposure.
+
+#### Fix options, measured
+
+`B=1 H=16 S=16384`, bf16, non-causal:
+
+| build | 64 | 128 | 192 | 256 |
+|---|---|---|---|---|
+| baseline | 936 TF | 1168 TF | **NaN** | **NaN** |
+| ROCDL intrinsic instead of inline asm | 847 TF (-9.6%) | 1082 TF (-7.3%) | 819 TF | 815 TF |
+| `s_waitcnt lgkmcnt(0)` at the offending sites only | -- | -- | 943 TF | 879 TF |
+| `amdgpu-snop-padding=8` | -- | 310 TF | 256 TF | 253 TF |
+
+Replacing the inline asm with `rocdl.ds_read_tr16_b64` (result type must be
+`vector<4xf16>`) lets LLVM insert the waits itself and is correct at every
+rung, at a 7-10% cost on the rungs that work today -- LLVM's conservative
+automatic waits replacing hand-placed ones. The targeted wait is free at
+head_dim 192 and ~8% at 256, but needs the sites identified per build.
+
+**The inline-asm form is unsound at any register pressure that triggers AGPR
+spilling**, so the intrinsic is the correct fix even though it costs
+throughput; recovering that 7-10% is a scheduling problem, not a correctness
+one.
+
+#### Superseded: the hazard framing that led here
 
 **Confirmed by construction.** `amdgpu-snop-padding=N` inserts `s_nop N` before
 every instruction, widening every hazard window, and fixes it exactly as
