@@ -828,10 +828,57 @@ is then whatever the previous kernel left. Against that:
 
 The narrowest description remains: wave 3's low half-wave, `v_o[0]` and
 `v_o[4]`, non-deterministic, surviving full serialisation. That is the shape of
-a register-allocation problem rather than a data-flow one, and the next step is
-to read the ISA around the `v_o[0]` and `v_o[4]` accumulator registers in the
-epilogue specifically -- not the whole-kernel statistics already gathered, but
-those two accumulators' live ranges.
+a register-allocation problem rather than a data-flow one.
+
+### P2 — the discriminator is AGPRs: the failing builds exhaust the arch-VGPR pool
+
+Reading the ISA rather than the statistics finds a clean split. The two working
+head_dims use **no accumulation registers at all**; the two failing ones are
+pinned at the architectural ceiling and overflow into them:
+
+| head_dim | `.vgpr_count` (total) | `.agpr_count` | arch = total - acc | `accvgpr` moves | result |
+|---|---|---|---|---|---|
+| 64 | 164 | **0** | 164 | 0 | correct |
+| 128 | 248 | **0** | 248 | 0 | correct |
+| 192 | 434 | 178 | **256** | 540 | NaN |
+| 256 | 443 | 187 | **256** | 814 | NaN |
+
+CDNA4 ISA §3.6.4: *"VGPRs are allocated out of two pools: regular VGPRs and
+accumulation VGPRs... A wave may have up to **512 total VGPRs, 256 of each
+type**."* Both failing builds sit at exactly 256 architectural VGPRs -- the
+hard per-type cap -- and the allocator moves the remainder into AGPRs, adding
+540 and 814 `v_accvgpr_read`/`write` instructions interleaved with 288 MFMAs.
+Both working builds are under the cap and emit none.
+
+**AMD's own kernel does not do this.** `fwd_hd192_hd128_bf16.co` reports
+`.vgpr_count: 512` with **zero** `accvgpr` instructions in its disassembly. It
+avoids the AGPR path entirely -- and it does so by computing a *128-wide* O
+(`hdim_vo 128`) at `hdim_qk 192`, i.e. four O accumulators rather than six.
+
+§3.6.1 also describes exactly the observed failure mode for a register index
+that goes out of range: *"If a source VGPR is out of range, VGPR0 is used. If a
+destination VGPR is out-of-range, the instruction is ignored (treated as an
+NOP)."* Silent wrong data on reads, silently dropped writes -- confined to
+whichever accumulators land at the top of the allocation, non-deterministic in
+whatever VGPR0 happens to hold, and unaffected by any amount of
+synchronisation. That is the observed signature.
+
+**This makes the V/O column window mechanistic rather than aesthetic.** Capping
+`D_CHUNKS` at 4 is not a way of dodging an unexplained bug; it is what keeps
+the kernel inside the 256 arch-VGPR pool and off the AGPR path altogether,
+which is why both reference implementations do it. `v_o` alone is
+`D_CHUNKS * 16` VGPRs -- 64 at four chunks, 96 at six -- and that difference is
+most of the gap between 248 and the ceiling.
+
+Two mechanisms are still consistent with the evidence and are being separated:
+an allocation that genuinely runs past the pool, or a missing MFMA ->
+`v_accvgpr_read` hazard wait. `amdgpu-agpr-alloc=0` and
+`amdgpu-mfma-vgpr-form=1` were both tried and **neither reached the compiler**
+-- worth recording that the builder's `passthrough` list is inert: none of
+`denormal-fp-math-f32`, `no-nans-fp-math` or `unsafe-fp-math` appear in
+`20_llvm_ir.ll`, only the `rocdl.*` attributes do. That is true of the
+production kernel too, so its DAZ/fast-math passthrough has never had an
+effect.
 
 `LADDER` stays `(64, 128)`: 192/256 must not be reachable while this is open.
 
