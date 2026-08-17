@@ -870,7 +870,82 @@ which is why both reference implementations do it. `v_o` alone is
 `D_CHUNKS * 16` VGPRs -- 64 at four chunks, 96 at six -- and that difference is
 most of the gap between 248 and the ceiling.
 
-Two mechanisms are still consistent with the evidence and are being separated:
+### P2 — ROOT CAUSE: an unmodelled WAR hazard on the LDS-DMA address VGPR
+
+**Found.** `buffer_load_dwordx4 ... lds` reads its address from a VGPR, and at
+head_dim >= 192 the compiler overwrites that VGPR one or two instructions
+later, before the DMA has consumed it. The DMA then fetches from a corrupted
+address and writes the wrong data into LDS.
+
+The correlation is exact:
+
+| head_dim | LDS-DMA sites | address VGPR redefined within 8 | **within 1-2** | result |
+|---|---|---|---|---|
+| 64 | 12 | 1 | **0** | correct |
+| 128 | 24 | 0 | **0** | correct |
+| 192 | 72 | 43 | **43** | NaN |
+| 256 | 96 | 72 | **72** | NaN |
+
+Zero tight WAR sites in both working builds; 43 and 72 in the failing ones. The
+redefining instruction is `v_accvgpr_read_b32` in 37 of 44 cases, e.g.
+
+    v_accvgpr_read_b32 v96, a63
+    buffer_load_dwordx4 v96, s[8:11], s59 offen lds    ; v96 is the ADDRESS
+    ...
+    v_mfma_f32_32x32x16_bf16 v[96:111], ...            ; v96 reused as accumulator
+
+**Why LLVM allows it.** `GCNHazardRecognizer::createsVALUHazard`
+(`GCNHazardRecognizer.cpp:1325`) opens with `if (!MI.mayStore()) return -1;`
+and then inspects only the `vdata` operand. A `buffer_load ... lds` has **no
+`vdata`** -- the destination is LDS, not a register -- so it returns -1 and the
+instruction's `vaddr` source is never modelled as a WAR hazard producer, on any
+subtarget.
+
+**Why it only bites above head_dim 128.** This is the AGPR observation above,
+now with a mechanism. Below the cap the allocator has spare architectural
+VGPRs and never needs to reuse the DMA address register promptly. At 256 arch
+VGPRs it must, and the `v_accvgpr_read_b32` traffic that the AGPR overflow
+introduces is exactly what lands in the hazard window.
+
+**Every prior observation follows from this**, including the ones that
+misdirected the search:
+
+- *non-deterministic* -- the corruption depends on whether the DMA latched its
+  address before the overwrite;
+- *immune to `s_waitcnt` and `s_barrier`, at any density* -- it is a register
+  WAR, not a memory-ordering problem, so no amount of synchronisation touches
+  it;
+- *not fixed by `amdgpu-mfma-padding-ratio`* -- it is not an MFMA-to-MFMA
+  hazard;
+- *every stage probe passed* -- a probe issues one DMA under no register
+  pressure, so nothing overwrites the address register. **The probes were
+  correct and the pipeline was not, because the hazard only exists under
+  allocation pressure the probes do not create.**
+
+**Confirmed by construction:** `amdgpu-snop-padding=N`, which inserts `s_nop N`
+before every instruction and so widens every hazard window, fixes it exactly as
+the WAR distances predict -- head_dim 192 needs `N >= 4` and head_dim 256 needs
+`N >= 8`, and both then produce correct results (2.68e-03 and 1.94e-03 against
+fp32 SDPA).
+
+*Not a shippable fix on its own*: the global padding costs 3.7x. At
+B=1 H=16 S=16384, head_dim 128 falls from ~1158 to 310 TFLOPS.
+
+Three ways forward, in increasing order of goodness:
+
+1. **`amdgpu-snop-padding`** -- correct now, 3.7x slower. Useful only to unblock
+   correctness work on the upper rungs.
+2. **Stay off the AGPR path**, which is the V/O column window: fewer
+   accumulators keeps the kernel inside the 256 arch-VGPR pool, so there is no
+   `v_accvgpr_read` traffic to land in the window. This is also the required
+   parity feature and what both references do -- so it is the plan already, now
+   with a mechanism behind it rather than an analogy.
+3. **Fix the hazard model upstream** -- teach `createsVALUHazard` that an
+   LDS-DMA's `vaddr` is a WAR producer. This is a real LLVM gap affecting any
+   gfx9 kernel that combines `buffer_load ... lds` with high register pressure,
+   not just this one.
+
+Two mechanisms were considered and are now resolved in favour of the hazard:
 an allocation that genuinely runs past the pool, or a missing MFMA ->
 `v_accvgpr_read` hazard wait. `amdgpu-agpr-alloc=0` and
 `amdgpu-mfma-vgpr-form=1` were both tried and **neither reached the compiler**
