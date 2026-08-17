@@ -952,6 +952,60 @@ spilling**, so the intrinsic is the correct fix even though it costs
 throughput; recovering that 7-10% is a scheduling problem, not a correctness
 one.
 
+#### RESOLVED — the 7-10% was alias analysis, not scheduling
+
+The regression was not the cost of LLVM's waits being placed worse than the
+hand-written ones. It was **five extra `s_waitcnt vmcnt(0)`** that the inline-asm
+build did not have, at head_dim 64:
+
+```
+inline asm                      ROCDL op
+7 s_waitcnt vmcnt(2) lgkmcnt(0) 7 s_waitcnt vmcnt(2) lgkmcnt(0)
+7 s_waitcnt lgkmcnt(0)          7 s_waitcnt lgkmcnt(0)
+                                5 s_waitcnt vmcnt(0)     <-- full DMA drain
+```
+
+`SIInsertWaitcnts` treats `buffer_load ... lds` as an LDS-writing VMEM op and,
+before any DS read that *may alias* one still in flight, inserts `vmcnt(0)` --
+draining every outstanding KV DMA and collapsing the prefetch the whole pipeline
+is built on. It resolves "may alias" through the machine memory operand's AA
+info.
+
+The tell was that `_load_k_pack_aligned`'s `ds_read_b128` is an ordinary DS
+instruction in *both* builds and provokes no drain: it already carries
+`alias_scopes`/`noalias_scopes` from the `LDS_SCOPE_NAMES` scheme, which proves
+it disjoint from a DMA writing the other half of the double buffer. The new
+ROCDL reads carried no scopes, so AA had to assume the worst.
+
+`ROCDL_LDS_Read_Tr_IntrOp` is declared with `requiresAliasAnalysis = 1`, so the
+op accepts the same two attributes. Tagging the V transpose reads with
+`_dualwave_lds_scope("v", buf_id)` removes all five drains, and the ISA is then
+identical to the inline-asm build except for **two fewer `v_add_u32`**.
+
+Final, `B=1 H=16 S=16384`, bf16, non-causal, best of 3x30 iterations:
+
+| build | 64 | 128 | 192 | 256 |
+|---|---|---|---|---|
+| inline asm (unsound) | 939.8 TF | 1164.5 TF | **NaN** | **NaN** |
+| ROCDL op, no scopes | 848.9 TF | 1104.5 TF | 877.7 TF | 881.8 TF |
+| **ROCDL op + alias scopes** | **930.9 TF** | **1170.1 TF** | **974.1 TF** | **977.9 TF** |
+| vs. inline asm | -0.9% | +0.5% | -- | -- |
+
+Performance matched, and 192/256 gained ~11% over the naive port on the way.
+
+Two things this also settled:
+
+- **Zero spills at every rung** (64/128/192/256: 0 VGPR, 0 SGPR). The AGPRs
+  absorb the pressure -- which is exactly what surfaced the bug. So **the
+  register file was never the binding constraint**, and the 4-wave family B is
+  *not* a prerequisite for 192/256 as `LADDER_PLANNED` assumed. It stays
+  interesting as a tuning option, not a blocker. `LADDER` is now
+  `(64, 128, 192, 256)`.
+- Two scheduling hypotheses were tested and **falsified** before the AA one:
+  bracketing the read bursts with `_sched_barrier(0)` moved nothing (849 -> 839
+  at 64), and the hand-placed `LGKMCNT_0_ONLY` drains are not redundant with
+  LLVM's -- 12 of the 18 lgkm waits are still ours.
+
 #### Superseded: the hazard framing that led here
 
 **Confirmed by construction.** `amdgpu-snop-padding=N` inserts `s_nop N` before

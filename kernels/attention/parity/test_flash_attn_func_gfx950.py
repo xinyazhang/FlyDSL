@@ -107,6 +107,10 @@ def _run(q, k, v, *, causal=False, scale=None, lse=None, o=None):
 
 
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+# 192 and 256 are absent deliberately: `flash_attn_gfx950.py` still rejects them
+# in its own guard, so there is no oracle to compare against, not a comparison
+# that fails. The parity kernel's 192/256 rungs are covered by
+# `test_ladder_matches_sdpa` instead.
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_bitwise_matches_production_kernel(head_dim, causal):
     """An unpadded parity build must be bit-identical to the production kernel.
@@ -215,7 +219,7 @@ def test_logsumexp_matches_torch():
 # P1: runtime hdim, padded head, asymmetric hdim
 # ---------------------------------------------------------------------------
 
-_LADDER_CASES = [16, 17, 32, 33, 40, 48, 64, 80, 96, 100, 113, 128]
+_LADDER_CASES = [16, 17, 32, 33, 40, 48, 64, 80, 96, 100, 113, 128, 129, 160, 192, 200, 256]
 
 
 def _padded_qkv(b, h, s, hdim, hdim_v, poison=None):
@@ -248,7 +252,7 @@ def test_ladder_matches_sdpa(hdim, causal):
     assert _err(o, _ref(q, k, v, causal)) < TOL
 
 
-@pytest.mark.parametrize("hdim,hdim_v", [(128, 64), (96, 48), (64, 32), (128, 96)])
+@pytest.mark.parametrize("hdim,hdim_v", [(128, 64), (96, 48), (64, 32), (128, 96), (192, 128), (256, 128)])
 def test_asymmetric_hdim(hdim, hdim_v):
     """`hdim_qk != hdim_vo`. The reference asm ships this shape as hd192/hd128."""
     b, h, s = 2, 8, 512
@@ -301,7 +305,10 @@ def test_padded_head_never_writes_past_hdim_vo():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("hdim,want", [(1, 64), (16, 64), (64, 64), (65, 128), (128, 128)])
+@pytest.mark.parametrize(
+    "hdim,want",
+    [(1, 64), (16, 64), (64, 64), (65, 128), (128, 128), (129, 192), (192, 192), (193, 256), (256, 256)],
+)
 def test_tile_width_rounds_up(hdim, want):
     assert tile_width_for(hdim) == want
 
@@ -309,7 +316,7 @@ def test_tile_width_rounds_up(hdim, want):
 def test_tile_width_reports_planned_rungs_distinctly():
     """A rung that exists in the plan but is not built is not "unsupported"."""
     with pytest.raises(NotImplementedError, match="4-wave"):
-        tile_width_for(192)
+        tile_width_for(384)
     with pytest.raises(ValueError, match="exceeds"):
         tile_width_for(1024)
 

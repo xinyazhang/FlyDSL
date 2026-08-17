@@ -63,21 +63,29 @@ __all__ = [
 # The ladder
 # ---------------------------------------------------------------------------
 
-# Compiled tile widths. Only the first two exist today, and the reason is
-# measured rather than assumed -- see the P2 section of
-# `sdpa-close-gap-gfx950.md`. On the 8-wave geometry:
+# Compiled tile widths, all four measured on the 8-wave geometry:
 #
-#   head_dim   VGPR   spills   LDS
-#     64        164      0     34 KB
-#    128        248      0     68 KB     <- saturated, zero spills
-#    192        256    506    102 KB
-#    256        256    963    136 KB
+#   head_dim   arch VGPR   AGPR   spills   LDS      TFLOP/s
+#     64          160        0      0      34 KB      931
+#    128          238        0      0      68 KB     1170
+#    192          256      174      0     102 KB      974
+#    256          256      192      0     136 KB      978
 #
-# LDS is not the binding constraint at 192/256; the register file is. That is
-# why `fwd_hd192_hd128_bf16.co` runs 4 waves at 512 VGPRs/lane -- halving the
-# wave count doubles the per-lane register file. Listed here so
-# `tile_width_for` reports "not built yet" rather than "unsupported", which are
-# different problems for the caller.
+# 192 and 256 used to spill in the hundreds and produce non-deterministic NaN.
+# Both had the same cause, and it was not register pressure: `_ds_read_tr16_b64_imm`
+# emitted the LDS transpose read as inline asm, which `SIInsertWaitcnts` cannot
+# see, so no `s_waitcnt lgkmcnt` was inserted before uses. Below 128 nothing read
+# the destination before the kernel's own cluster-boundary wait; at 192 the
+# allocator starts using AGPRs and places `v_accvgpr_write` copies ahead of that
+# wait. Moving to the ROCDL op fixed it -- see the P2 section of
+# `sdpa-close-gap-gfx950.md`.
+#
+# So the register file is *not* the binding constraint here after all, and the
+# 4-wave family B is not needed to reach 192/256. It remains interesting as a
+# tuning option (`fwd_hd192_hd128_bf16.co` runs 4 waves at 512 VGPRs/lane), not
+# as a prerequisite. 384 and 512 are listed so `tile_width_for` reports "not
+# built yet" rather than "unsupported", which are different problems for the
+# caller.
 #
 # **32 is a planned rung too, below the built ones**, and it is deliberately
 # not in `LADDER_PLANNED`: that list is consulted only after `LADDER` misses,
@@ -85,8 +93,8 @@ __all__ = [
 # would route head_dim <= 32 to a tile that does not exist yet and break a path
 # that works today, slowly. It arrives when family S is built; until then
 # head_dim <= 32 rounds up to 64 and pays for it (see `_with_wave_geometry`).
-LADDER = (64, 128)
-LADDER_PLANNED = (192, 256, 384, 512)
+LADDER = (64, 128, 192, 256)
+LADDER_PLANNED = (384, 512)
 
 # The D-axis staging granule: how many bf16 elements of one token a single DMA
 # issue covers. **Not a constant, and not 64 by necessity** -- see
