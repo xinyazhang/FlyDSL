@@ -10,6 +10,10 @@ logsumexp layout `fmha.lse_token_pitch` describes. AOTriton's `cu_seqlens_q/k`
 + `batch_size` logic is deliberately *not* ported; the varlen prologue below
 is byte-for-byte the forward's.
 
+`sdpa_dkdv_dataflow_gfx1201.svg` draws all of the below as one picture: the
+VRAM / LDS / VGPR dataflow for a single workgroup, in the wide configuration,
+with the narrower ones as annotated special cases.
+
 --- Why the loop is inverted, and what that costs -------------------------
 
 The forward preloads Q into registers and streams K/V through LDS. dK/dV needs
