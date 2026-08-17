@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1582" viewBox="0 0 1280 1582" font-family="DejaVu Sans, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1850" viewBox="0 0 1280 1850" font-family="DejaVu Sans, Helvetica, Arial, sans-serif">
 <style>
   .t   { font-size: 20px; font-weight: 700; fill: #111827; }
   .st  { font-size: 13px; fill: #4b5563; }
@@ -14,6 +14,12 @@
   .sec { font-size: 13px; font-weight: 700; fill: #6b21a8; letter-spacing: .08em; }
   .bar { font-size: 11.5px; font-weight: 700; fill: #b91c1c; }
   .num { font-size: 11px; font-weight: 700; fill: #ffffff; }
+  .eq  { font-size: 14px; font-family: "DejaVu Serif", Georgia, serif; font-style: italic; fill: #111827; }
+  .eqs { font-size: 12.5px; font-family: "DejaVu Serif", Georgia, serif; font-style: italic; fill: #1f2937; }
+  .up  { font-style: normal; }
+  .gl  { font-size: 11px; font-weight: 700; fill: #6d28d9; }
+  .pn  { font-size: 11px; fill: #6b7280; }
+  .ph  { font-size: 12px; font-weight: 700; fill: #374151; letter-spacing: .04em; }
 </style>
 <defs>
   <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -24,228 +30,292 @@
   </marker>
 </defs>
 
-<rect width="1280" height="1582" fill="#ffffff"/>
+<rect width="1280" height="1850" fill="#ffffff"/>
 
 <text x="28" y="30" class="t">gfx1201 dK/dV backward — one workgroup, one KV tile</text>
 <text x="28" y="52" class="st">Dataflow view. Drawn in the default wide configuration; the narrower ones are special cases, listed at the bottom.</text>
 <text x="28" y="76" class="cfg">head_dim 512 · BLOCK_M 16 · num_waves 16 · split_head_dim · contraction_shards C=2 · transposed_source "derived"</text>
 <text x="28" y="94" class="cfg">TEAM_WAVES = 2C = 4 · NUM_TEAMS = 16/4 = 4 · BLOCK_N = 16 × NUM_TEAMS = 64 KV rows</text>
 
-<!-- column bands -->
-<rect x="28"  y="130" width="232" height="984" rx="8" fill="#eff6ff" stroke="#bfdbfe"/>
-<rect x="300" y="130" width="330" height="984" rx="8" fill="#fffbeb" stroke="#fde68a"/>
-<rect x="670" y="130" width="582" height="984" rx="8" fill="#ecfdf5" stroke="#a7f3d0"/>
 
-<text x="144" y="152" class="ch" fill="#1d4ed8" text-anchor="middle">VRAM (HBM)</text>
-<text x="144" y="168" class="cs" text-anchor="middle">global, buffer_load / store</text>
-<text x="465" y="152" class="ch" fill="#b45309" text-anchor="middle">LDS — 64 KiB / workgroup</text>
-<text x="465" y="168" class="cs" text-anchor="middle">49536 B used at head_dim 512</text>
-<text x="961" y="152" class="ch" fill="#047857" text-anchor="middle">VGPRs — 256 / lane, wave32</text>
-<text x="961" y="168" class="cs" text-anchor="middle">state 192 + ~62 overhead = 254</text>
+<!-- ============ GRADIENT MATH ============ -->
+<rect x="28" y="112" width="1224" height="256" rx="8" fill="#fcfcfd" stroke="#d1d5db"/>
+<line x1="648" y1="132" x2="648" y2="348" stroke="#e5e7eb"/>
+<text x="44" y="138" class="h">What the kernel computes — and why that is four GEMMs</text>
+
+<text x="44" y="164" class="ph">FORWARD, for reference</text>
+<text x="266" y="164" class="pn">σ = sm_scale · softmax is row-wise over k</text>
+<text x="44" y="188" class="eqs">S = Q K<tspan dy="-5" font-size="9.5px">T</tspan><tspan dy="5" font-size="12.5px"> </tspan>  ·  L = <tspan class="up">logsumexp</tspan>(σS)  ·  P = <tspan class="up">exp</tspan>(σS − L)  ·  O = P V</text>
+
+<text x="44" y="218" class="ph">BACKWARD, given dO</text>
+<text x="44" y="244" class="eq">dV = P<tspan dy="-5" font-size="9.5px">T</tspan><tspan dy="5" font-size="14px"> </tspan>dO</text>
+<text x="44" y="268" class="eq">dP = dO V<tspan dy="-5" font-size="9.5px">T</tspan><tspan dy="5" font-size="14px"> </tspan></text>
+<text x="44" y="292" class="eq">δ  = <tspan class="up">rowsum</tspan>(dO ⊙ O) = <tspan class="up">rowsum</tspan>(P ⊙ dP)</text>
+<text x="44" y="316" class="eq">dS = P ⊙ (dP − δ)</text>
+<text x="44" y="340" class="eq">dK = σ · dS<tspan dy="-5" font-size="9.5px">T</tspan><tspan dy="5" font-size="14px"> </tspan>Q</text>
+
+<text x="470" y="244" class="gl">GEMM 3</text>
+<text x="470" y="268" class="gl">GEMM 2</text>
+<text x="470" y="292" class="pn">step 2 + step 6</text>
+<text x="470" y="316" class="pn">step 6, registers</text>
+<text x="470" y="340" class="gl">GEMM 4</text>
+
+<text x="666" y="164" class="ph">THE FOUR GEMMs</text>
+<text x="666" y="184" class="pn">A WMMA operand's eight per-lane elements always run along the contraction axis.</text>
+
+<text x="666"  y="210" class="mm">#</text>
+<text x="692"  y="210" class="mm">expression</text>
+<text x="932"  y="210" class="mm">contracts</text>
+<text x="1022" y="210" class="mm">A operand</text>
+<text x="1122" y="210" class="mm">read from</text>
+<line x1="666" y1="216" x2="1236" y2="216" stroke="#e5e7eb"/>
+
+<text x="666"  y="236" class="gl">1</text>
+<text x="692"  y="236" class="eqs">S    = Q K<tspan dy="-5" font-size="9.5px">T</tspan><tspan dy="5" font-size="12.5px"> </tspan></text>
+<text x="956"  y="236" class="eqs">d</text>
+<text x="1022" y="236" class="eqs">Q</text>
+<text x="1122" y="236" class="mm">QRM</text>
+
+<text x="666"  y="260" class="gl">2</text>
+<text x="692"  y="260" class="eqs">dP   = dO V<tspan dy="-5" font-size="9.5px">T</tspan><tspan dy="5" font-size="12.5px"> </tspan></text>
+<text x="956"  y="260" class="eqs">d</text>
+<text x="1022" y="260" class="eqs">dO</text>
+<text x="1122" y="260" class="mm">DORM</text>
+
+<text x="666"  y="284" class="gl">3</text>
+<text x="692"  y="284" class="eqs">dV<tspan dy="-5" font-size="9.5px">T</tspan><tspan dy="5" font-size="12.5px"> </tspan>+= dO<tspan dy="-5" font-size="9.5px">T</tspan><tspan dy="5" font-size="12.5px"> </tspan>P</text>
+<text x="956"  y="284" class="eqs">q</text>
+<text x="1022" y="284" class="eqs">dO<tspan dy="-5" font-size="9.5px">T</tspan><tspan dy="5" font-size="12.5px"> </tspan></text>
+<text x="1122" y="284" class="mm">DORM, strided</text>
+
+<text x="666"  y="308" class="gl">4</text>
+<text x="692"  y="308" class="eqs">dK<tspan dy="-5" font-size="9.5px">T</tspan><tspan dy="5" font-size="12.5px"> </tspan>+= Q<tspan dy="-5" font-size="9.5px">T</tspan><tspan dy="5" font-size="12.5px"> </tspan>dS</text>
+<text x="956"  y="308" class="eqs">q</text>
+<text x="1022" y="308" class="eqs">Q<tspan dy="-5" font-size="9.5px">T</tspan><tspan dy="5" font-size="12.5px"> </tspan></text>
+<text x="1122" y="308" class="mm">QRM, strided</text>
+
+<text x="666" y="338" class="b">Q and dO each appear <tspan font-weight="700">twice</tspan>, contracted over a different axis each time — so each</text>
+<text x="666" y="355" class="b">needs two layouts. That, and nothing else, is why they are staged twice.</text>
+
+<text x="44" y="358" class="pn">δ is built from O, not P — P is never materialised in full; the two forms are equal because O = P V.</text>
+
+<text x="28" y="394" class="pn">σ enters exactly twice: inside the exponent, and once on dK in the epilogue. dV takes no scale — V sits downstream of the softmax, so P already carries it. dQ = σ · dS K is the other kernel.</text>
+
+<!-- column bands -->
+<rect x="28"  y="398" width="232" height="984" rx="8" fill="#eff6ff" stroke="#bfdbfe"/>
+<rect x="300" y="398" width="330" height="984" rx="8" fill="#fffbeb" stroke="#fde68a"/>
+<rect x="670" y="398" width="582" height="984" rx="8" fill="#ecfdf5" stroke="#a7f3d0"/>
+
+<text x="144" y="420" class="ch" fill="#1d4ed8" text-anchor="middle">VRAM (HBM)</text>
+<text x="144" y="436" class="cs" text-anchor="middle">global, buffer_load / store</text>
+<text x="465" y="420" class="ch" fill="#b45309" text-anchor="middle">LDS — 64 KiB / workgroup</text>
+<text x="465" y="436" class="cs" text-anchor="middle">49536 B used at head_dim 512</text>
+<text x="961" y="420" class="ch" fill="#047857" text-anchor="middle">VGPRs — 256 / lane, wave32</text>
+<text x="961" y="436" class="cs" text-anchor="middle">state 192 + ~62 overhead = 254</text>
 
 <!-- ================= PROLOGUE ================= -->
-<text x="28" y="200" class="sec">PROLOGUE — once per workgroup</text>
+<text x="28" y="468" class="sec">PROLOGUE — once per workgroup</text>
 
-<rect x="40" y="212" width="208" height="66" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
-<text x="144" y="234" class="h" text-anchor="middle">K, V</text>
-<text x="144" y="251" class="b" text-anchor="middle">this team's 16 KV rows</text>
-<text x="144" y="267" class="mm" text-anchor="middle">rows [t·16, t·16+16)</text>
+<rect x="40" y="480" width="208" height="66" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+<text x="144" y="502" class="h" text-anchor="middle">K, V</text>
+<text x="144" y="519" class="b" text-anchor="middle">this team's 16 KV rows</text>
+<text x="144" y="535" class="mm" text-anchor="middle">rows [t·16, t·16+16)</text>
 
-<rect x="690" y="212" width="546" height="66" rx="6" fill="#d1fae5" stroke="#34d399"/>
-<text x="702" y="233" class="h">my_packs — resident for the whole kernel</text>
-<text x="702" y="250" class="m">role 0 → K[:, shard] · role 1 → V[:, shard]</text>
-<text x="702" y="267" class="mm">head_dim/(4·C) = 512/8 = 64 VGPRs   (B operand of GEMM1, no transpose)</text>
+<rect x="690" y="480" width="546" height="66" rx="6" fill="#d1fae5" stroke="#34d399"/>
+<text x="702" y="501" class="h">my_packs — resident for the whole kernel</text>
+<text x="702" y="518" class="m">role 0 → K[:, shard] · role 1 → V[:, shard]</text>
+<text x="702" y="535" class="mm">head_dim/(4·C) = 512/8 = 64 VGPRs   (B operand of GEMM1, no transpose)</text>
 
-<path d="M252,245 L684,245" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
-<rect x="352" y="222" width="226" height="18" rx="4" fill="#ffffff" stroke="#9ca3af" stroke-dasharray="3 2"/>
-<text x="465" y="235" class="al" text-anchor="middle">straight to registers — skips LDS</text>
+<path d="M252,513 L684,513" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
+<rect x="352" y="490" width="226" height="18" rx="4" fill="#ffffff" stroke="#9ca3af" stroke-dasharray="3 2"/>
+<text x="465" y="503" class="al" text-anchor="middle">straight to registers — skips LDS</text>
 
 <!-- ================= LOOP ================= -->
-<rect x="28" y="300" width="1224" height="712" rx="10" fill="none" stroke="#7c3aed" stroke-width="2" stroke-dasharray="7 4"/>
-<text x="44" y="323" class="sec">LOOP — for each Q tile of BLOCK_M = 16 rows, over the whole visited Q range</text>
+<rect x="28" y="568" width="1224" height="712" rx="10" fill="none" stroke="#7c3aed" stroke-width="2" stroke-dasharray="7 4"/>
+<text x="44" y="591" class="sec">LOOP — for each Q tile of BLOCK_M = 16 rows, over the whole visited Q range</text>
 
 <!-- step 1 -->
-<circle cx="52" cy="360" r="10" fill="#7c3aed"/><text x="52" y="364" class="num" text-anchor="middle">1</text>
-<rect x="70" y="338" width="178" height="60" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
-<text x="159" y="358" class="h" text-anchor="middle">Q, dO tile</text>
-<text x="159" y="375" class="b" text-anchor="middle">16 rows × head_dim</text>
-<text x="159" y="390" class="mm" text-anchor="middle">cooperative, all 16 waves</text>
+<circle cx="52" cy="628" r="10" fill="#7c3aed"/><text x="52" y="632" class="num" text-anchor="middle">1</text>
+<rect x="70" y="606" width="178" height="60" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+<text x="159" y="626" class="h" text-anchor="middle">Q, dO tile</text>
+<text x="159" y="643" class="b" text-anchor="middle">16 rows × head_dim</text>
+<text x="159" y="658" class="mm" text-anchor="middle">cooperative, all 16 waves</text>
 
-<rect x="312" y="338" width="306" height="60" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
-<text x="324" y="357" class="h">QRM + DORM — row-major, 16 × (D+4)</text>
-<text x="324" y="374" class="mm">16512 B each · pad 4 spreads the banks</text>
-<text x="324" y="390" class="mm">A operand of GEMM1/2, contracted over d</text>
-<path d="M252,368 L306,368" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
+<rect x="312" y="606" width="306" height="60" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
+<text x="324" y="625" class="h">QRM + DORM — row-major, 16 × (D+4)</text>
+<text x="324" y="642" class="mm">16512 B each · pad 4 spreads the banks</text>
+<text x="324" y="658" class="mm">A operand of GEMM1/2, contracted over d</text>
+<path d="M252,636 L306,636" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
 
 <!-- step 2 -->
-<circle cx="52" cy="428" r="10" fill="#7c3aed"/><text x="52" y="432" class="num" text-anchor="middle">2</text>
-<rect x="70" y="410" width="178" height="46" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
-<text x="159" y="429" class="h" text-anchor="middle">L (lse), Delta</text>
-<text x="159" y="446" class="mm" text-anchor="middle">one f32 per Q row</text>
-<rect x="312" y="410" width="306" height="46" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
-<text x="324" y="429" class="h">ROWQ — 2 × 16 f32 = 128 B</text>
-<text x="324" y="446" class="mm">staged once, read by every wave</text>
-<path d="M252,433 L306,433" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
+<circle cx="52" cy="696" r="10" fill="#7c3aed"/><text x="52" y="700" class="num" text-anchor="middle">2</text>
+<rect x="70" y="678" width="178" height="46" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+<text x="159" y="697" class="h" text-anchor="middle">L (lse), Delta</text>
+<text x="159" y="714" class="mm" text-anchor="middle">one f32 per Q row</text>
+<rect x="312" y="678" width="306" height="46" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
+<text x="324" y="697" class="h">ROWQ — 2 × 16 f32 = 128 B</text>
+<text x="324" y="714" class="mm">staged once, read by every wave</text>
+<path d="M252,701 L306,701" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
 
-<line x1="312" y1="472" x2="1240" y2="472" stroke="#b91c1c" stroke-width="1.6" stroke-dasharray="6 4"/>
-<text x="1236" y="467" class="bar" text-anchor="end">s_barrier</text>
+<line x1="312" y1="740" x2="1240" y2="740" stroke="#b91c1c" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="1236" y="735" class="bar" text-anchor="end">s_barrier</text>
 
 <!-- step 3 -->
-<circle cx="52" cy="516" r="10" fill="#7c3aed"/><text x="52" y="520" class="num" text-anchor="middle">3</text>
-<rect x="312" y="488" width="306" height="70" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
-<text x="324" y="507" class="h">read A operand</text>
-<text x="324" y="524" class="m">role 0 → QRM · role 1 → DORM</text>
-<text x="324" y="541" class="mm">one ds_read_b128, 8 contiguous d</text>
-<rect x="690" y="488" width="546" height="70" rx="6" fill="#d1fae5" stroke="#34d399"/>
-<text x="702" y="507" class="h">GEMM1 — a PARTIAL, over this wave's shard only</text>
-<text x="702" y="524" class="m">role 0: S_c = Σ_(d ∈ shard) Q·Kᵀ     role 1: dP_c = Σ_(d ∈ shard) dO·Vᵀ</text>
-<text x="702" y="541" class="mm">D_STEPS/C = 16 WMMA · 8 f32 accumulator per lane</text>
-<path d="M622,523 L684,523" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
+<circle cx="52" cy="784" r="10" fill="#7c3aed"/><text x="52" y="788" class="num" text-anchor="middle">3</text>
+<rect x="312" y="756" width="306" height="70" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
+<text x="324" y="775" class="h">read A operand</text>
+<text x="324" y="792" class="m">role 0 → QRM · role 1 → DORM</text>
+<text x="324" y="809" class="mm">one ds_read_b128, 8 contiguous d</text>
+<rect x="690" y="756" width="546" height="70" rx="6" fill="#d1fae5" stroke="#34d399"/>
+<text x="702" y="775" class="h">GEMM1 — a PARTIAL, over this wave's shard only</text>
+<text x="702" y="792" class="m">role 0: S_c = Σ_(d ∈ shard) Q·Kᵀ     role 1: dP_c = Σ_(d ∈ shard) dO·Vᵀ</text>
+<text x="702" y="809" class="mm">D_STEPS/C = 16 WMMA · 8 f32 accumulator per lane</text>
+<path d="M622,791 L684,791" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
 
 <!-- step 4 : register -> LDS -->
-<circle cx="52" cy="596" r="10" fill="#7c3aed"/><text x="52" y="600" class="num" text-anchor="middle">4</text>
-<rect x="312" y="572" width="306" height="60" rx="6" fill="#fed7aa" stroke="#ea580c"/>
-<text x="324" y="591" class="h">PDS — the team exchange</text>
-<text x="324" y="608" class="m">2C = 4 slots × 32 lanes × 8 f32</text>
-<text x="324" y="624" class="mm">1024 B per wave · 16384 B total</text>
-<rect x="690" y="572" width="546" height="60" rx="6" fill="#d1fae5" stroke="#34d399"/>
-<text x="702" y="591" class="h">write my partial to my slot</text>
-<text x="702" y="608" class="m">slot = 2·shard + role</text>
-<text x="702" y="624" class="mm">the only computed value that ever round-trips through LDS</text>
-<path d="M684,600 L622,600" stroke="#b45309" stroke-width="2.4" marker-end="url(#ar)"/>
+<circle cx="52" cy="864" r="10" fill="#7c3aed"/><text x="52" y="868" class="num" text-anchor="middle">4</text>
+<rect x="312" y="840" width="306" height="60" rx="6" fill="#fed7aa" stroke="#ea580c"/>
+<text x="324" y="859" class="h">PDS — the team exchange</text>
+<text x="324" y="876" class="m">2C = 4 slots × 32 lanes × 8 f32</text>
+<text x="324" y="892" class="mm">1024 B per wave · 16384 B total</text>
+<rect x="690" y="840" width="546" height="60" rx="6" fill="#d1fae5" stroke="#34d399"/>
+<text x="702" y="859" class="h">write my partial to my slot</text>
+<text x="702" y="876" class="m">slot = 2·shard + role</text>
+<text x="702" y="892" class="mm">the only computed value that ever round-trips through LDS</text>
+<path d="M684,868 L622,868" stroke="#b45309" stroke-width="2.4" marker-end="url(#ar)"/>
 
-<line x1="312" y1="648" x2="1240" y2="648" stroke="#b91c1c" stroke-width="1.6" stroke-dasharray="6 4"/>
-<text x="1236" y="643" class="bar" text-anchor="end">s_barrier</text>
+<line x1="312" y1="916" x2="1240" y2="916" stroke="#b91c1c" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="1236" y="911" class="bar" text-anchor="end">s_barrier</text>
 
 <!-- step 5 -->
-<circle cx="52" cy="694" r="10" fill="#7c3aed"/><text x="52" y="698" class="num" text-anchor="middle">5</text>
-<rect x="312" y="664" width="306" height="60" rx="6" fill="#fed7aa" stroke="#ea580c"/>
-<text x="324" y="683" class="h">read all 4 slots</text>
-<text x="324" y="700" class="mm">even slots → S · odd slots → dP</text>
-<text x="324" y="716" class="mm">own slot read back too, so every wave matches</text>
-<rect x="690" y="664" width="546" height="60" rx="6" fill="#d1fae5" stroke="#34d399"/>
-<text x="702" y="683" class="h">REDUCE — every wave now holds the full S and dP</text>
-<text x="702" y="700" class="m">S = Σ_c S_c        dP = Σ_c dP_c</text>
-<text x="702" y="716" class="mm">a contracted index was split, so the partials must be summed</text>
-<path d="M622,694 L684,694" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
+<circle cx="52" cy="962" r="10" fill="#7c3aed"/><text x="52" y="966" class="num" text-anchor="middle">5</text>
+<rect x="312" y="932" width="306" height="60" rx="6" fill="#fed7aa" stroke="#ea580c"/>
+<text x="324" y="951" class="h">read all 4 slots</text>
+<text x="324" y="968" class="mm">even slots → S · odd slots → dP</text>
+<text x="324" y="984" class="mm">own slot read back too, so every wave matches</text>
+<rect x="690" y="932" width="546" height="60" rx="6" fill="#d1fae5" stroke="#34d399"/>
+<text x="702" y="951" class="h">REDUCE — every wave now holds the full S and dP</text>
+<text x="702" y="968" class="m">S = Σ_c S_c        dP = Σ_c dP_c</text>
+<text x="702" y="984" class="mm">a contracted index was split, so the partials must be summed</text>
+<path d="M622,962 L684,962" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
 
 <!-- step 6 : registers only -->
-<circle cx="52" cy="772" r="10" fill="#7c3aed"/><text x="52" y="776" class="num" text-anchor="middle">6</text>
-<rect x="690" y="740" width="546" height="80" rx="6" fill="#d1fae5" stroke="#34d399"/>
-<text x="702" y="759" class="h">P and dS — registers only, no memory touched</text>
-<text x="702" y="776" class="m">P = exp2(S·log2e − lse·log2e) · mask · dropout</text>
-<text x="702" y="793" class="m">dS = P · (dP − delta)          → packed to f16 as WMMA B operands</text>
-<text x="702" y="808" class="mm">lse and delta come from ROWQ; P needs no repacking — GEMM1 emits m'=q</text>
-<path d="M560,782 L684,782" fill="none" stroke="#9ca3af" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#a)"/>
-<text x="324" y="772" class="al">ROWQ (step 2) — lse, delta</text>
-<text x="324" y="789" class="al">read per Q row</text>
+<circle cx="52" cy="1040" r="10" fill="#7c3aed"/><text x="52" y="1044" class="num" text-anchor="middle">6</text>
+<rect x="690" y="1008" width="546" height="80" rx="6" fill="#d1fae5" stroke="#34d399"/>
+<text x="702" y="1027" class="h">P and dS — registers only, no memory touched</text>
+<text x="702" y="1044" class="m">P = exp2(S·log2e − lse·log2e) · mask · dropout</text>
+<text x="702" y="1061" class="m">dS = P · (dP − delta)          → packed to f16 as WMMA B operands</text>
+<text x="702" y="1076" class="mm">lse and delta come from ROWQ; P needs no repacking — GEMM1 emits m'=q</text>
+<path d="M560,1050 L684,1050" fill="none" stroke="#9ca3af" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#a)"/>
+<text x="324" y="1040" class="al">ROWQ (step 2) — lse, delta</text>
+<text x="324" y="1057" class="al">read per Q row</text>
 
 <!-- step 7 -->
-<circle cx="52" cy="872" r="10" fill="#7c3aed"/><text x="52" y="876" class="num" text-anchor="middle">7</text>
-<rect x="312" y="828" width="306" height="88" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
-<text x="324" y="847" class="h">re-read QRM / DORM, STRIDED</text>
-<text x="324" y="864" class="m">8 × ds_read_u16 → Qᵀ / dOᵀ operand</text>
-<text x="324" y="881" class="mm">same tile as step 3, read down the q axis</text>
-<text x="324" y="898" class="mm">"derived": no transposed tile exists — saves 40960 B</text>
-<rect x="690" y="828" width="546" height="88" rx="6" fill="#d1fae5" stroke="#34d399"/>
-<text x="702" y="847" class="h">GEMM3 / GEMM4 — accumulate, contracted over q</text>
-<text x="702" y="864" class="m">dVᵀ[d][kv] += dOᵀ · P        dKᵀ[d][kv] += Qᵀ · dS</text>
-<text x="702" y="881" class="m">only this wave's d window: d ∈ [slot·D/4, (slot+1)·D/4)</text>
-<text x="702" y="898" class="mm">accs = head_dim/(2·C) = 128 VGPRs · a free index, so no reduction</text>
-<path d="M622,872 L684,872" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
+<circle cx="52" cy="1140" r="10" fill="#7c3aed"/><text x="52" y="1144" class="num" text-anchor="middle">7</text>
+<rect x="312" y="1096" width="306" height="88" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
+<text x="324" y="1115" class="h">re-read QRM / DORM, STRIDED</text>
+<text x="324" y="1132" class="m">8 × ds_read_u16 → Qᵀ / dOᵀ operand</text>
+<text x="324" y="1149" class="mm">same tile as step 3, read down the q axis</text>
+<text x="324" y="1166" class="mm">"derived": no transposed tile exists — saves 40960 B</text>
+<rect x="690" y="1096" width="546" height="88" rx="6" fill="#d1fae5" stroke="#34d399"/>
+<text x="702" y="1115" class="h">GEMM3 / GEMM4 — accumulate, contracted over q</text>
+<text x="702" y="1132" class="m">dVᵀ[d][kv] += dOᵀ · P        dKᵀ[d][kv] += Qᵀ · dS</text>
+<text x="702" y="1149" class="m">only this wave's d window: d ∈ [slot·D/4, (slot+1)·D/4)</text>
+<text x="702" y="1166" class="mm">accs = head_dim/(2·C) = 128 VGPRs · a free index, so no reduction</text>
+<path d="M622,1140 L684,1140" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
 
-<line x1="312" y1="944" x2="1240" y2="944" stroke="#b91c1c" stroke-width="1.6" stroke-dasharray="6 4"/>
-<text x="1236" y="939" class="bar" text-anchor="end">s_barrier — before the next tile overwrites QRM/DORM</text>
+<line x1="312" y1="1212" x2="1240" y2="1212" stroke="#b91c1c" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="1236" y="1207" class="bar" text-anchor="end">s_barrier — before the next tile overwrites QRM/DORM</text>
 
-<path d="M1252,972 L1268,972 L1268,318 L1252,318" fill="none" stroke="#7c3aed" stroke-width="2" marker-end="url(#a)"/>
-<text x="1246" y="988" class="n" text-anchor="end">accumulators stay in registers across every iteration — never spilled to LDS</text>
+<path d="M1252,1240 L1268,1240 L1268,586 L1252,586" fill="none" stroke="#7c3aed" stroke-width="2" marker-end="url(#a)"/>
+<text x="1246" y="1256" class="n" text-anchor="end">accumulators stay in registers across every iteration — never spilled to LDS</text>
 
 <!-- ================= EPILOGUE ================= -->
-<text x="28" y="1040" class="sec">EPILOGUE — once</text>
+<text x="28" y="1308" class="sec">EPILOGUE — once</text>
 
-<rect x="690" y="1050" width="546" height="52" rx="6" fill="#d1fae5" stroke="#34d399"/>
-<text x="702" y="1069" class="h">dK / dV accumulators, f32 → f16</text>
-<text x="702" y="1086" class="mm">dᵀ comes out per-lane-contiguous, so one v8 store per 16 columns</text>
-<rect x="40" y="1050" width="208" height="52" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
-<text x="144" y="1069" class="h" text-anchor="middle">dK, dV</text>
-<text x="144" y="1086" class="mm" text-anchor="middle">disjoint — no atomics</text>
-<path d="M684,1076 L252,1076" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
-<rect x="352" y="1053" width="226" height="18" rx="4" fill="#ffffff" stroke="#9ca3af" stroke-dasharray="3 2"/>
-<text x="465" y="1066" class="al" text-anchor="middle">straight from registers — skips LDS</text>
+<rect x="690" y="1318" width="546" height="52" rx="6" fill="#d1fae5" stroke="#34d399"/>
+<text x="702" y="1337" class="h">dK / dV accumulators, f32 → f16</text>
+<text x="702" y="1354" class="mm">dᵀ comes out per-lane-contiguous, so one v8 store per 16 columns</text>
+<rect x="40" y="1318" width="208" height="52" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+<text x="144" y="1337" class="h" text-anchor="middle">dK, dV</text>
+<text x="144" y="1354" class="mm" text-anchor="middle">disjoint — no atomics</text>
+<path d="M684,1344 L252,1344" stroke="#374151" stroke-width="2.2" marker-end="url(#a)"/>
+<rect x="352" y="1321" width="226" height="18" rx="4" fill="#ffffff" stroke="#9ca3af" stroke-dasharray="3 2"/>
+<text x="465" y="1334" class="al" text-anchor="middle">straight from registers — skips LDS</text>
 
 <!-- ================= TEAM PANEL ================= -->
-<rect x="28" y="1134" width="600" height="200" rx="8" fill="#f9fafb" stroke="#d1d5db"/>
-<text x="44" y="1158" class="h">The 4-wave team — slot = 2·shard + role</text>
-<text x="44" y="1176" class="n">4 teams per workgroup, each owning a disjoint 16 KV rows</text>
+<rect x="28" y="1402" width="600" height="200" rx="8" fill="#f9fafb" stroke="#d1d5db"/>
+<text x="44" y="1426" class="h">The 4-wave team — slot = 2·shard + role</text>
+<text x="44" y="1444" class="n">4 teams per workgroup, each owning a disjoint 16 KV rows</text>
 
-<rect x="44"  y="1188" width="136" height="82" rx="5" fill="#d1fae5" stroke="#34d399"/>
-<text x="112" y="1206" class="h" text-anchor="middle">slot 0</text>
-<text x="112" y="1222" class="mm" text-anchor="middle">shard 0 · role 0</text>
-<text x="112" y="1238" class="m" text-anchor="middle">K[:, 0:D/2]</text>
-<text x="112" y="1255" class="mm" text-anchor="middle">→ partial S_0</text>
+<rect x="44"  y="1456" width="136" height="82" rx="5" fill="#d1fae5" stroke="#34d399"/>
+<text x="112" y="1474" class="h" text-anchor="middle">slot 0</text>
+<text x="112" y="1490" class="mm" text-anchor="middle">shard 0 · role 0</text>
+<text x="112" y="1506" class="m" text-anchor="middle">K[:, 0:D/2]</text>
+<text x="112" y="1523" class="mm" text-anchor="middle">→ partial S_0</text>
 
-<rect x="188" y="1188" width="136" height="82" rx="5" fill="#d1fae5" stroke="#34d399"/>
-<text x="256" y="1206" class="h" text-anchor="middle">slot 1</text>
-<text x="256" y="1222" class="mm" text-anchor="middle">shard 0 · role 1</text>
-<text x="256" y="1238" class="m" text-anchor="middle">V[:, 0:D/2]</text>
-<text x="256" y="1255" class="mm" text-anchor="middle">→ partial dP_0</text>
+<rect x="188" y="1456" width="136" height="82" rx="5" fill="#d1fae5" stroke="#34d399"/>
+<text x="256" y="1474" class="h" text-anchor="middle">slot 1</text>
+<text x="256" y="1490" class="mm" text-anchor="middle">shard 0 · role 1</text>
+<text x="256" y="1506" class="m" text-anchor="middle">V[:, 0:D/2]</text>
+<text x="256" y="1523" class="mm" text-anchor="middle">→ partial dP_0</text>
 
-<rect x="332" y="1188" width="136" height="82" rx="5" fill="#d1fae5" stroke="#34d399"/>
-<text x="400" y="1206" class="h" text-anchor="middle">slot 2</text>
-<text x="400" y="1222" class="mm" text-anchor="middle">shard 1 · role 0</text>
-<text x="400" y="1238" class="m" text-anchor="middle">K[:, D/2:D]</text>
-<text x="400" y="1255" class="mm" text-anchor="middle">→ partial S_1</text>
+<rect x="332" y="1456" width="136" height="82" rx="5" fill="#d1fae5" stroke="#34d399"/>
+<text x="400" y="1474" class="h" text-anchor="middle">slot 2</text>
+<text x="400" y="1490" class="mm" text-anchor="middle">shard 1 · role 0</text>
+<text x="400" y="1506" class="m" text-anchor="middle">K[:, D/2:D]</text>
+<text x="400" y="1523" class="mm" text-anchor="middle">→ partial S_1</text>
 
-<rect x="476" y="1188" width="136" height="82" rx="5" fill="#d1fae5" stroke="#34d399"/>
-<text x="544" y="1206" class="h" text-anchor="middle">slot 3</text>
-<text x="544" y="1222" class="mm" text-anchor="middle">shard 1 · role 1</text>
-<text x="544" y="1238" class="m" text-anchor="middle">V[:, D/2:D]</text>
-<text x="544" y="1255" class="mm" text-anchor="middle">→ partial dP_1</text>
+<rect x="476" y="1456" width="136" height="82" rx="5" fill="#d1fae5" stroke="#34d399"/>
+<text x="544" y="1474" class="h" text-anchor="middle">slot 3</text>
+<text x="544" y="1490" class="mm" text-anchor="middle">shard 1 · role 1</text>
+<text x="544" y="1506" class="m" text-anchor="middle">V[:, D/2:D]</text>
+<text x="544" y="1523" class="mm" text-anchor="middle">→ partial dP_1</text>
 
-<text x="44" y="1294" class="b">Every slot also owns dK and dV for <tspan class="m">d ∈ [slot·D/4, (slot+1)·D/4)</tspan> — a quarter each, disjoint.</text>
-<text x="44" y="1314" class="n">Pack partition (by shard) and accumulator partition (by slot) are independent.</text>
+<text x="44" y="1562" class="b">Every slot also owns dK and dV for <tspan class="m">d ∈ [slot·D/4, (slot+1)·D/4)</tspan> — a quarter each, disjoint.</text>
+<text x="44" y="1582" class="n">Pack partition (by shard) and accumulator partition (by slot) are independent.</text>
 
 <!-- ================= WHY PANEL ================= -->
-<rect x="652" y="1134" width="600" height="200" rx="8" fill="#f5f3ff" stroke="#c4b5fd"/>
-<text x="668" y="1158" class="h">Why the two splits differ in cost</text>
-<text x="668" y="1180" class="b"><tspan font-weight="700">Free index</tspan> — appears in the output. Partitions with no communication.</text>
-<text x="682" y="1198" class="m">dKᵀ[d][kv] += Qᵀ·dS      d is free  →  slots write disjoint columns</text>
-<text x="668" y="1222" class="b"><tspan font-weight="700">Contracted index</tspan> — summed away. Partitions only with a reduction.</text>
-<text x="682" y="1240" class="m">S[q][kv] = Σ_d Q·Kᵀ      d is contracted  →  partials must be summed</text>
-<text x="668" y="1268" class="b">Same axis <tspan class="m">d</tspan>, two different costs — which is why <tspan class="m">split_head_dim</tspan> is free</text>
-<text x="668" y="1286" class="b">and <tspan class="m">contraction_shards</tspan> needs the PDS round-trip at step 4-5.</text>
-<text x="668" y="1314" class="n">state = 0.75 · head_dim / C. C=1 → 384 VGPRs (spills); C=2 → 192 (fits).</text>
+<rect x="652" y="1402" width="600" height="200" rx="8" fill="#f5f3ff" stroke="#c4b5fd"/>
+<text x="668" y="1426" class="h">Why the two splits differ in cost</text>
+<text x="668" y="1448" class="b"><tspan font-weight="700">Free index</tspan> — appears in the output. Partitions with no communication.</text>
+<text x="682" y="1466" class="m">dKᵀ[d][kv] += Qᵀ·dS      d is free  →  slots write disjoint columns</text>
+<text x="668" y="1490" class="b"><tspan font-weight="700">Contracted index</tspan> — summed away. Partitions only with a reduction.</text>
+<text x="682" y="1508" class="m">S[q][kv] = Σ_d Q·Kᵀ      d is contracted  →  partials must be summed</text>
+<text x="668" y="1536" class="b">Same axis <tspan class="m">d</tspan>, two different costs — which is why <tspan class="m">split_head_dim</tspan> is free</text>
+<text x="668" y="1554" class="b">and <tspan class="m">contraction_shards</tspan> needs the PDS round-trip at step 4-5.</text>
+<text x="668" y="1582" class="n">state = 0.75 · head_dim / C. C=1 → 384 VGPRs (spills); C=2 → 192 (fits).</text>
 
 <!-- ================= SPECIAL CASES ================= -->
-<rect x="28" y="1354" width="1224" height="200" rx="8" fill="#ffffff" stroke="#d1d5db"/>
-<text x="44" y="1378" class="h">Special cases — the same diagram with pieces removed</text>
+<rect x="28" y="1622" width="1224" height="200" rx="8" fill="#ffffff" stroke="#d1d5db"/>
+<text x="44" y="1646" class="h">Special cases — the same diagram with pieces removed</text>
 
-<rect x="44" y="1392" width="386" height="146" rx="6" fill="#fafafa" stroke="#e5e7eb"/>
-<text x="58" y="1412" class="h">head_dim 192–256 — <tspan class="m">C = 1</tspan>, tile</text>
-<text x="58" y="1431" class="b">Team is 2 waves. One shard, so step 3's GEMM1 is</text>
-<text x="58" y="1448" class="b">the <tspan font-weight="700">whole</tspan> contraction and there is nothing to reduce.</text>
-<text x="58" y="1465" class="b">Steps 4–5 become a <tspan font-weight="700">relay</tspan>: keep mine in registers,</text>
-<text x="58" y="1482" class="b">read only the partner's one slot.</text>
-<text x="58" y="1502" class="mm">state 0.75·D · step 7 reads a real Qᵀ/dOᵀ tile,</text>
-<text x="58" y="1518" class="mm">one ds_read_b128 instead of eight ds_read_u16.</text>
+<rect x="44" y="1660" width="386" height="146" rx="6" fill="#fafafa" stroke="#e5e7eb"/>
+<text x="58" y="1680" class="h">head_dim 192–256 — <tspan class="m">C = 1</tspan>, tile</text>
+<text x="58" y="1699" class="b">Team is 2 waves. One shard, so step 3's GEMM1 is</text>
+<text x="58" y="1716" class="b">the <tspan font-weight="700">whole</tspan> contraction and there is nothing to reduce.</text>
+<text x="58" y="1733" class="b">Steps 4–5 become a <tspan font-weight="700">relay</tspan>: keep mine in registers,</text>
+<text x="58" y="1750" class="b">read only the partner's one slot.</text>
+<text x="58" y="1770" class="mm">state 0.75·D · step 7 reads a real Qᵀ/dOᵀ tile,</text>
+<text x="58" y="1786" class="mm">one ds_read_b128 instead of eight ds_read_u16.</text>
 
-<rect x="446" y="1392" width="386" height="146" rx="6" fill="#fafafa" stroke="#e5e7eb"/>
-<text x="460" y="1412" class="h">head_dim ≤ 128 — split off</text>
-<text x="460" y="1431" class="b">Team is <tspan font-weight="700">1 wave</tspan>. It holds both K and V packs and</text>
-<text x="460" y="1448" class="b">computes both S and dP itself.</text>
-<text x="460" y="1465" class="b">PDS is not allocated; steps 4–5 vanish entirely,</text>
-<text x="460" y="1482" class="b">and with them two of the barriers.</text>
-<text x="460" y="1502" class="mm">state 1.5·D — fits at 128 (192 VGPRs), spills at 192.</text>
-<text x="460" y="1518" class="mm">BLOCK_N = 16 × num_waves, the widest tile of the three.</text>
+<rect x="446" y="1660" width="386" height="146" rx="6" fill="#fafafa" stroke="#e5e7eb"/>
+<text x="460" y="1680" class="h">head_dim ≤ 128 — split off</text>
+<text x="460" y="1699" class="b">Team is <tspan font-weight="700">1 wave</tspan>. It holds both K and V packs and</text>
+<text x="460" y="1716" class="b">computes both S and dP itself.</text>
+<text x="460" y="1733" class="b">PDS is not allocated; steps 4–5 vanish entirely,</text>
+<text x="460" y="1750" class="b">and with them two of the barriers.</text>
+<text x="460" y="1770" class="mm">state 1.5·D — fits at 128 (192 VGPRs), spills at 192.</text>
+<text x="460" y="1786" class="mm">BLOCK_N = 16 × num_waves, the widest tile of the three.</text>
 
-<rect x="848" y="1392" width="388" height="146" rx="6" fill="#fafafa" stroke="#e5e7eb"/>
-<text x="862" y="1412" class="h"><tspan class="m">transposed_source = "tile"</tspan></text>
-<text x="862" y="1431" class="b">Two more LDS tiles, QTR and DOTR, filled in step 1</text>
-<text x="862" y="1448" class="b">by <tspan class="m">global_load_tr_b128</tspan> — the hardware transposes on</text>
-<text x="862" y="1465" class="b">the way in from VRAM, so the tile is a redistribution</text>
-<text x="862" y="1482" class="b">shuffle, not a transpose.</text>
-<text x="862" y="1502" class="mm">Step 7 then reads them contiguously. Costs 40960 B at</text>
-<text x="862" y="1518" class="mm">head_dim 512, which is why it cannot be used there.</text>
+<rect x="848" y="1660" width="388" height="146" rx="6" fill="#fafafa" stroke="#e5e7eb"/>
+<text x="862" y="1680" class="h"><tspan class="m">transposed_source = "tile"</tspan></text>
+<text x="862" y="1699" class="b">Two more LDS tiles, QTR and DOTR, filled in step 1</text>
+<text x="862" y="1716" class="b">by <tspan class="m">global_load_tr_b128</tspan> — the hardware transposes on</text>
+<text x="862" y="1733" class="b">the way in from VRAM, so the tile is a redistribution</text>
+<text x="862" y="1750" class="b">shuffle, not a transpose.</text>
+<text x="862" y="1770" class="mm">Step 7 then reads them contiguously. Costs 40960 B at</text>
+<text x="862" y="1786" class="mm">head_dim 512, which is why it cannot be used there.</text>
 
-<text x="28" y="1572" class="n">Sources: fmha_bwd_dkdv_gfx1201_kernel.py (structure) · fmha_tuning_bwd_dkdv_gfx1201.py (which case applies) · sdpa_lore_gfx1201.md (measurements)</text>
+<text x="28" y="1840" class="n">Sources: fmha_bwd_dkdv_gfx1201_kernel.py (structure) · fmha_tuning_bwd_dkdv_gfx1201.py (which case applies) · sdpa_lore_gfx1201.md (measurements)</text>
 </svg>
