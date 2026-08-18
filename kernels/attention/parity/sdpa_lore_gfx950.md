@@ -122,7 +122,19 @@ Independent Instructions"). LLVM recognised the hazard and emitted `s_nop 1`;
 this needs more. head_dim 96 is simply the width whose allocation puts a
 freshly-packed P register inside an MFMA's SrcB range.
 
-**Status: open.** Two fixes were tried and neither is shippable:
+**Status: FIXED.** `ParityGemmHelper.qk` now emits `s_nop 1` after the QK
+burst. It costs +1.6% at head_dim 64 and +0.8% at 128 (both inside noise) and
+buys head_dim 96 at 932 TF against 579 for the padded 128 tile.
+
+The location came from bisection, not from identifying the pair: a wait state
+after `qk`, `exp2` or `reduce_sum` each fix it; after `cast_p`,
+`lazy_rescale_o`, `load_k`, `load_v`, `reduce_max`, `sub_m` or `pv_step_k` none
+do. So the producer is at or before the QK MFMAs and the consumer is before the
+P cast. **The exact instruction pair is still unidentified** -- scans of every
+documented hazard class found no difference between a broken and a working
+build -- so this is a correct fix with an incomplete explanation.
+
+Two earlier attempts, for the record:
 
 - Anchoring the K packs fixes it (579 -> 944 TF) but pins all `2*K_STEPS_QK`
   packs live at once -- 28 packs, 112 VGPRs at head_dim 224 -- and costs
@@ -132,9 +144,7 @@ freshly-packed P register inside an MFMA's SrcB range.
   packs out, so the `v_perm_b32` is emitted after the anchor and the nop lands
   in the wrong place.
 
-head_dim 96 is therefore excluded from `LADDER`; 65..128 rounds to the 128
-tile. The next step is to place the wait state *after* the pack shuffles and
-immediately before the consuming MFMA, which the DSL cannot currently express.
+head_dim 96 is a normal rung again.
 
 ---
 
@@ -159,6 +169,11 @@ immediately before the consuming MFMA, which the DSL cannot currently express.
 - **Cap builds at ~8 minutes.** A configuration whose register allocator runs
   away is telling you it does not fit; head_dim 512 at `d_stages` 4 or 8 never
   finished. Treat a slow build as a result, not an inconvenience.
+- **Check which GPU you are on, and its temperature.** A shared board at 100 C
+  junction reported 218 TF where a cool one reports 1101 -- and that nearly
+  produced the conclusion that a single `s_nop` cost 80%. Any perf result that
+  looks structurally impossible is a machine-state result until proven
+  otherwise; `rocm-smi --showtemp` first, re-measure second.
 - **Check `agpr_count` alongside spills.** On this kernel the allocator either
   uses the AGPR file for the O accumulator or abandons it entirely and spills
   to scratch, and the difference is 1.4-1.6x. Four waves keeps it; eight loses

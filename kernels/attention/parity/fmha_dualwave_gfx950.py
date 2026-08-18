@@ -163,8 +163,32 @@ class ParityGemmHelper(dualwave.DualwaveGemmHelper):
     def qk(self, v_k, q_all_scaled_bf16, stage=0):
         """Unstaged entry point: seed at zero and run the one stage there is."""
         if const_expr(self.traits.D_STAGES == 1):
-            return super().qk(v_k, q_all_scaled_bf16)
-        return self.qk_stage(v_k, q_all_scaled_bf16, (self.c_zero_v16f32, self.c_zero_v16f32), stage)
+            out = super().qk(v_k, q_all_scaled_bf16)
+        else:
+            out = self.qk_stage(v_k, q_all_scaled_bf16, (self.c_zero_v16f32, self.c_zero_v16f32), stage)
+        # One software wait state after the QK burst. **A hazard fix, not
+        # scheduling.** Without it head_dim 96 computes a wrong answer whose
+        # instruction *and register* stream is byte-identical to a correct one
+        # -- `amdgpu-snop-padding=1` fixes it, and with nops stripped both
+        # builds are the same 2817 instructions. So the arithmetic, the
+        # addressing and the allocation are all already right; only the timing
+        # is wrong.
+        #
+        # Located by bisection, not from the pair: a wait state here, after
+        # `exp2`, or after `reduce_sum` each fix it, while after `cast_p`,
+        # `lazy_rescale_o`, `load_k`, `load_v`, `reduce_max`, `sub_m` or
+        # `pv_step_k` do not -- so the producer is at or before the QK MFMAs
+        # and the consumer is before the P cast. Scans of every documented
+        # hazard class (VALU->MFMA SrcA/B, MFMA->VALU, MFMA->MFMA by operand
+        # position, VALU->DPP) found no difference between a broken and a
+        # working build, so the exact instruction pair is still unidentified.
+        # See `sdpa_lore_gfx950.md`.
+        #
+        # Costs nothing: +1.6% at head_dim 64 and +0.8% at 128, both inside
+        # run-to-run noise, and it buys head_dim 96 at 932 TF against 579 for
+        # the padded 128 tile.
+        dualwave._s_nop(1)
+        return out
 
     def pv_step_k(self, step, v_p, v_v, v_o, stage=0):
         if const_expr(self.traits.D_STAGES == 1):

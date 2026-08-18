@@ -128,7 +128,7 @@ __all__ = [
 # The error is sparse (~9% of elements), scattered in both row and column, and
 # appears with a single KV tile, so it is inside one tile's QK/softmax/PV
 # rather than an accumulation across them.
-LADDER = (32, 64, 128, 160, 192, 224, 256, 384, 512)
+LADDER = (32, 64, 96, 128, 160, 192, 224, 256, 384, 512)
 LADDER_PLANNED = ()
 
 # The D-axis staging granule: how many bf16 elements of one token a single DMA
