@@ -24,6 +24,7 @@ Three kinds of test, and the distinction is what makes the suite worth having:
   the pad is not read.
 """
 
+import itertools
 import math
 import time
 from dataclasses import replace
@@ -164,6 +165,80 @@ def test_memory_layout_is_free(layout, causal):
 
     got = _run(q, k, v, causal=causal)
     assert _err(got, _ref(q, k, v, causal)) < TOL
+
+
+_LAYOUTS = ("bhsd", "bshd")
+
+
+def _mk_layout(kind, b, h, s, d, *, gap=0):
+    """A `(B, H, S, D)`-shaped tensor whose *memory* is laid out as `kind`.
+
+    `gap` over-allocates the sequence axis and slices it back, so the strides
+    outside the sliced axis no longer follow from the shape. That is the case
+    a kernel deriving strides instead of reading them gets wrong, and it is
+    invisible to a contiguous test: with `gap=0` a BHSD head stride is `s*d`,
+    which is exactly what a derivation would guess.
+    """
+    if kind == "bhsd":
+        return _rand(b, h, s + gap, d)[:, :, :s, :]
+    return _rand(b, s + gap, h, d)[:, :s, :, :].transpose(1, 2)
+
+
+@pytest.mark.parametrize("ql,kl,vl,ol", list(itertools.product(_LAYOUTS, repeat=4)))
+def test_every_qkvo_layout_combination(ql, kl, vl, ol):
+    """All 16 layouts of the four tensors, chosen independently.
+
+    Q, K, V and O each carry their own three strides, so nothing forces them to
+    agree -- and in practice they do not: PyTorch's SDPA shim hands down BHSD
+    *views* of BSHD memory for the inputs while the caller may well have
+    allocated O contiguously. `test_memory_layout_is_free` covered three of
+    these sixteen.
+
+    One build serves them all, because `strides_constexpr` is off in the parity
+    ABI and the strides are runtime arguments -- so this is 16 dispatches over
+    two compiles, not sixteen compiles.
+    """
+    b, h, s, d = 2, 4, 256, 64
+    q = _mk_layout(ql, b, h, s, d)
+    k = _mk_layout(kl, b, h, s, d)
+    v = _mk_layout(vl, b, h, s, d)
+    o = _mk_layout(ol, b, h, s, d)
+    _run(q, k, v, o=o)
+    assert _err(o, _ref(q, k, v)) < TOL
+
+
+@pytest.mark.parametrize("kind", _LAYOUTS)
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_layout_with_gapped_outer_strides(kind, causal):
+    """Strides that do not follow from the shape must still be honoured.
+
+    Every layout test above allocates exactly what it uses, so a head stride is
+    always `seq * head_dim` (BHSD) or `head_dim` (BSHD) -- both of which a
+    kernel could have *derived* rather than read. Slicing an over-allocated
+    sequence axis breaks that coincidence on all four tensors at once.
+    """
+    b, h, s, d = 2, 4, 256, 64
+    q, k, v = (_mk_layout(kind, b, h, s, d, gap=37) for _ in range(3))
+    o = _mk_layout(kind, b, h, s, d, gap=37)
+    assert q.stride(1) not in (s * d, d) or q.stride(0) != h * s * d, "the gap must actually perturb a stride"
+    _run(q, k, v, causal=causal, o=o)
+    assert _err(o, _ref(q, k, v, causal)) < TOL
+
+
+@pytest.mark.parametrize("ql,kl", list(itertools.product(_LAYOUTS, repeat=2)))
+def test_layout_combinations_under_gqa(ql, kl):
+    """K/V carry `num_kv_heads`, so their head stride differs from Q's by shape.
+
+    Worth its own case because the two families of stride are derived from
+    different head counts: a kernel that reused Q's head stride for K would
+    pass every MHA layout test here and fail only under GQA.
+    """
+    b, hq, hk, s, d = 2, 8, 2, 256, 64
+    q = _mk_layout(ql, b, hq, s, d)
+    k = _mk_layout(kl, b, hk, s, d)
+    v = _mk_layout(kl, b, hk, s, d)
+    got = _run(q, k, v, causal=True)
+    assert _err(got, _ref(q, k, v, causal=True, gqa=True)) < TOL
 
 
 def test_stride_slots_are_batch_head_seq():

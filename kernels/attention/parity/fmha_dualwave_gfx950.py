@@ -321,18 +321,18 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         # Numerically named per `sdpa-feature-gap.md`'s porting instruction --
         # the `z/h/m/k` suffixes it warns about have caused real bugs.
         (
-            self.stride_q0,
-            self.stride_q1,
-            self.stride_q2,
-            self.stride_k0,
-            self.stride_k1,
-            self.stride_k2,
-            self.stride_v0,
-            self.stride_v1,
-            self.stride_v2,
-            self.stride_o0,
-            self.stride_o1,
-            self.stride_o2,
+            self.stride_q_batch,
+            self.stride_q_head,
+            self.stride_q_seq,
+            self.stride_k_batch,
+            self.stride_k_head,
+            self.stride_k_seq,
+            self.stride_v_batch,
+            self.stride_v_head,
+            self.stride_v_seq,
+            self.stride_o_batch,
+            self.stride_o_head,
+            self.stride_o_seq,
         ) = strides
         self.sm_scale_arg = sm_scale
         self.num_head_q = num_head_q
@@ -496,14 +496,14 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
 
     def init_runtime_indices(self, **kwargs):
         super().init_runtime_indices(**kwargs)
-        self.stride_q2_v = fx.Index(self.stride_q2)
-        self.stride_k2_v = fx.Index(self.stride_k2)
-        self.stride_v2_v = fx.Index(self.stride_v2)
-        self.stride_o2_v = fx.Index(self.stride_o2)
+        self.stride_q_seq_v = fx.Index(self.stride_q_seq)
+        self.stride_k_seq_v = fx.Index(self.stride_k_seq)
+        self.stride_v_seq_v = fx.Index(self.stride_v_seq)
+        self.stride_o_seq_v = fx.Index(self.stride_o_seq)
         # The production helpers read these two names. Q's seq stride is the
         # default; `ParityKvGmemToLdsLoader` swaps the KV one per tensor.
-        self.stride_q_n_v = self.stride_q2_v
-        self.stride_kv_n_v = self.stride_k2_v
+        self.stride_q_n_v = self.stride_q_seq_v
+        self.stride_kv_n_v = self.stride_k_seq_v
 
     def _slab_byte_base(self, s0, s1, s2, row_off, head_idx):
         """Byte offset of this workgroup's (batch, head) slab.
@@ -559,35 +559,47 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         self.kv_row_off = fx.Index(0)
 
         # Head folded into the base, so what remains per access is `s * stride`.
-        self.q_gmem_elem_offset = self.q_start * self.stride_q2_v
+        self.q_gmem_elem_offset = self.q_start * self.stride_q_seq_v
         self.kv_gmem_elem_offset = fx.Index(0)
 
         # First element past O's descriptor. A store redirected here is dropped
         # by the hardware bound, which is how `ParityStoreHelper` suppresses
         # the D-tail chunks without branching.
-        self.o_oob_off = self.seqlen_q_v * self.stride_o2_v
+        self.o_oob_off = self.seqlen_q_v * self.stride_o_seq_v
 
         self.q_div = self._slab_view(
-            self.Q, self.stride_q0, self.stride_q1, self.stride_q2, self.q_row_off, self.q_head_idx, self.seqlen_q_v
+            self.Q,
+            self.stride_q_batch,
+            self.stride_q_head,
+            self.stride_q_seq,
+            self.q_row_off,
+            self.q_head_idx,
+            self.seqlen_q_v,
         )
         self.o_div = self._slab_view(
-            self.O, self.stride_o0, self.stride_o1, self.stride_o2, self.q_row_off, self.q_head_idx, self.seqlen_q_v
+            self.O,
+            self.stride_o_batch,
+            self.stride_o_head,
+            self.stride_o_seq,
+            self.q_row_off,
+            self.q_head_idx,
+            self.seqlen_q_v,
         )
         if const_expr(not traits.PAGED):
             self.k_div = self._slab_view(
                 self.K,
-                self.stride_k0,
-                self.stride_k1,
-                self.stride_k2,
+                self.stride_k_batch,
+                self.stride_k_head,
+                self.stride_k_seq,
                 self.kv_row_off,
                 self.kv_head_idx,
                 self.seqlen_kv_v,
             )
             self.v_div = self._slab_view(
                 self.V,
-                self.stride_v0,
-                self.stride_v1,
-                self.stride_v2,
+                self.stride_v_batch,
+                self.stride_v_head,
+                self.stride_v_seq,
                 self.kv_row_off,
                 self.kv_head_idx,
                 self.seqlen_kv_v,
@@ -825,12 +837,12 @@ class ParityKvGmemToLdsLoader(_ParityKvStaging, dualwave.DualwaveKvGmemToLdsLoad
     """
 
     def load_k(self, tile_start, buf_id, page_id=None, stage=0):
-        self.stride_kv_n_v = self.stride_k2_v
+        self.stride_kv_n_v = self.stride_k_seq_v
         self.dma_stage = stage
         return super().load_k(tile_start, buf_id, page_id=page_id)
 
     def load_v(self, tile_start, buf_id, page_id=None, stage=0):
-        self.stride_kv_n_v = self.stride_v2_v
+        self.stride_kv_n_v = self.stride_v_seq_v
         self.dma_stage = stage
         return super().load_v(tile_start, buf_id, page_id=page_id)
 
@@ -1002,7 +1014,7 @@ class ParityStoreHelper(dualwave.DualwaveStoreHelper):
     """
 
     def _final_o_base(self, q_row):
-        return q_row * self.stride_o2_v + self.lane_div_32 * 8
+        return q_row * self.stride_o_seq_v + self.lane_div_32 * 8
 
     def _final_o_global(self, o_base, dc, g):
         """The store's element offset, redirected out of the buffer if past `hdim_vo`.

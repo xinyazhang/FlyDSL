@@ -34,12 +34,26 @@ should match it numerically, and the two can be diffed at the ISA level.
 --- Argument order is the ABI ----------------------------------------------
 
 The launch order below is the contract, not a convenience: the eventual caller
-dispatches the compiled hsaco directly. Strides are named numerically
-(`stride_q0/q1/q2`) per `sdpa-feature-gap.md`'s porting instruction -- the
-`z/h/m/k` suffixes it warns about have caused real bugs -- and mean
-`(batch, head, seq)` of a **BHSD-shaped** tensor. Only the shape is fixed; any
-memory layout with D innermost is accepted, which is why the strides are read
-rather than derived.
+dispatches the compiled hsaco directly.
+
+Strides arrive in **BHSD slot order** -- batch, head, sequence -- for all four
+tensors. Axis 3 is `D`, contiguous by contract, so it is never passed. Only the
+*shape* is fixed; any memory layout with D innermost is accepted, which is why
+the strides are read rather than derived.
+
+**Named for the axis, not the slot**, matching the gfx1201 kernel. These were
+`stride_q0/q1/q2` on the reasoning in `sdpa-feature-gap.md`, which warns
+against the `z/h/m/k` suffixes inherited from the maths because they caused
+real mix-ups during AOTriton's development. That objection was to *cryptic*
+letters, and numeric slots trade one unreadable convention for another -- which
+gets actively dangerous here, where BHSD-shaped views of BSHD memory are the
+common case and `stride_q2` reads as "Q's third something".
+
+Nothing at runtime distinguishes a head stride from a sequence stride, so a
+caller that swaps them gets finite garbage rather than an error. Spelling the
+axis out is the only check there is, and the split-K combine bug -- heads
+aliasing tokens because a shared helper took `stride_q_n` to be the BSHD token
+pitch -- is what its absence costs.
 
 --- head_dim: 32xD tiles, 8xD inputs ----------------------------------------
 
@@ -215,35 +229,35 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
         sm_scale: fx.Float32,
-        stride_q0: fx.Int64,
-        stride_q1: fx.Int64,
-        stride_q2: fx.Int64,
-        stride_k0: fx.Int64,
-        stride_k1: fx.Int64,
-        stride_k2: fx.Int64,
-        stride_v0: fx.Int64,
-        stride_v1: fx.Int64,
-        stride_v2: fx.Int64,
-        stride_o0: fx.Int64,
-        stride_o1: fx.Int64,
-        stride_o2: fx.Int64,
+        stride_q_batch: fx.Int64,
+        stride_q_head: fx.Int64,
+        stride_q_seq: fx.Int64,
+        stride_k_batch: fx.Int64,
+        stride_k_head: fx.Int64,
+        stride_k_seq: fx.Int64,
+        stride_v_batch: fx.Int64,
+        stride_v_head: fx.Int64,
+        stride_v_seq: fx.Int64,
+        stride_o_batch: fx.Int64,
+        stride_o_head: fx.Int64,
+        stride_o_seq: fx.Int64,
         block_table_stride: fx.Int32,
     ):
         ctx = (WideKernelContext if WIDE else ParityKernelContext)(
             traits,
             strides=(
-                stride_q0,
-                stride_q1,
-                stride_q2,
-                stride_k0,
-                stride_k1,
-                stride_k2,
-                stride_v0,
-                stride_v1,
-                stride_v2,
-                stride_o0,
-                stride_o1,
-                stride_o2,
+                stride_q_batch,
+                stride_q_head,
+                stride_q_seq,
+                stride_k_batch,
+                stride_k_head,
+                stride_k_seq,
+                stride_v_batch,
+                stride_v_head,
+                stride_v_seq,
+                stride_o_batch,
+                stride_o_head,
+                stride_o_seq,
             ),
             sm_scale=sm_scale,
             num_head_q=num_head_q,
@@ -264,8 +278,8 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             BlockTable=BlockTable,
             seq_len=max_seqlen_q,
             seq_len_kv=max_seqlen_k,
-            stride_q_n=stride_q2,
-            stride_kv_n=stride_k2,
+            stride_q_n=stride_q_seq,
+            stride_kv_n=stride_k_seq,
             head_dim_runtime=hdim_qk,
             block_table_stride=block_table_stride,
             LSE=LSE,
@@ -815,9 +829,16 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         LSE: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
-        stride_q_n: fx.Int32,
+        # `fx.Int64`, and named for the axis like every other stride here. It
+        # was `stride_q_n: fx.Int32`, which was wrong twice over: the argument
+        # handed in is O's *sequence* stride, an i64, so every launch warned
+        # that the annotation did not match and was ignored; and `stride_q_n`
+        # is the production kernel's name for the BSHD token pitch, which is
+        # the very conflation that makes this kernel alias heads onto tokens on
+        # a BHSD output. See the guard in `_args`.
+        stride_o_seq: fx.Int64,
     ):
-        ctx = dualwave.DualwaveSplitKCombineContext(traits, O, WS, batch_size, seq_len, stride_q_n, LSE=LSE)
+        ctx = dualwave.DualwaveSplitKCombineContext(traits, O, WS, batch_size, seq_len, stride_o_seq, LSE=LSE)
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
         ctx.init_thread_mapping(COMBINE_ROWS_PER_BLOCK, COMBINE_LANES_PER_ROW)
@@ -890,18 +911,18 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
         sm_scale: fx.Float32,
-        stride_q0: fx.Int64,
-        stride_q1: fx.Int64,
-        stride_q2: fx.Int64,
-        stride_k0: fx.Int64,
-        stride_k1: fx.Int64,
-        stride_k2: fx.Int64,
-        stride_v0: fx.Int64,
-        stride_v1: fx.Int64,
-        stride_v2: fx.Int64,
-        stride_o0: fx.Int64,
-        stride_o1: fx.Int64,
-        stride_o2: fx.Int64,
+        stride_q_batch: fx.Int64,
+        stride_q_head: fx.Int64,
+        stride_q_seq: fx.Int64,
+        stride_k_batch: fx.Int64,
+        stride_k_head: fx.Int64,
+        stride_k_seq: fx.Int64,
+        stride_v_batch: fx.Int64,
+        stride_v_head: fx.Int64,
+        stride_v_seq: fx.Int64,
+        stride_o_batch: fx.Int64,
+        stride_o_head: fx.Int64,
+        stride_o_seq: fx.Int64,
         block_table_stride: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -946,18 +967,18 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             hdim_qk,
             hdim_vo,
             sm_scale,
-            stride_q0,
-            stride_q1,
-            stride_q2,
-            stride_k0,
-            stride_k1,
-            stride_k2,
-            stride_v0,
-            stride_v1,
-            stride_v2,
-            stride_o0,
-            stride_o1,
-            stride_o2,
+            stride_q_batch,
+            stride_q_head,
+            stride_q_seq,
+            stride_k_batch,
+            stride_k_head,
+            stride_k_seq,
+            stride_v_batch,
+            stride_v_head,
+            stride_v_seq,
+            stride_o_batch,
+            stride_o_head,
+            stride_o_seq,
             block_table_stride,
             value_attrs={
                 "rocdl.waves_per_eu": traits.WAVES_PER_EU,
@@ -971,7 +992,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         )
         if const_expr(traits.SPLITK):
             combine_rows = bs_idx * fx.Index(num_head_q) * sl_idx
-            flash_attn_splitk_combine_kernel(O, Workspace, LSE, batch_size, max_seqlen_q, stride_q2).launch(
+            flash_attn_splitk_combine_kernel(O, Workspace, LSE, batch_size, max_seqlen_q, stride_q_seq).launch(
                 grid=(combine_rows // COMBINE_ROWS_PER_BLOCK, 1, 1),
                 block=(COMBINE_BLOCK, 1, 1),
                 stream=stream,
@@ -1079,7 +1100,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         # tolerance, with no NaN and no fault.
         #
         # It is *correct* whenever the heads really are packed adjacently, i.e.
-        # `stride_o1 == HEAD_DIM`, which is exactly the layout PyTorch's SDPA
+        # `stride_o_head == HEAD_DIM`, which is exactly the layout PyTorch's SDPA
         # shim hands down. Verified at 2 and 4 splits and batch 3. So this
         # refuses the broken case rather than the feature.
         if traits.SPLITK and O.stride(1) != BLOCK_DMODEL:
