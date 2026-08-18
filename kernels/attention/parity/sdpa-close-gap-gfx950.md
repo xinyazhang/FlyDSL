@@ -1846,3 +1846,77 @@ what is missing.
 That is now the whole remaining story at 512: `s_waitcnt lgkmcnt(0)` is the top
 cost at **33.9%** (5,008 hits, 43.1 cyc/hit), and it is LDS read latency that
 no amount of DMA prefetching touches.
+
+## P9 — family S: granule-32 staging, and what it cost to find
+
+Three pieces, in order.
+
+**1. `hdim_mode` deleted.** A `"runtime_qk_steps"` mode was declared and never
+implemented -- the flag reached `ctx.RUNTIME_QK_STEPS`, which nothing read, and
+both modes emitted byte-identical ISA. Deleted rather than implemented: at
+head_dim 32 the padded build does carry the same 96 MFMAs as an unpadded 64,
+but it also carries +419 `v_cndmask`, +208 `v_lshrrev` and +192 `v_perm`, and
+shortening QK would have cut 8 of 16 MFMAs and left that alone.
+
+**2. Padded-head masking by bit mask.** Two thirds of the padding overhead was
+the register file being taken apart and put back, because a per-element select
+over 16-bit lanes packed two to a VGPR forces repacking. AND-ing a precomputed
+dword mask says the same thing in one `v_and_b32`. Opt-in, because the masks
+hoist and then stay live -- `width/2` registers per masked access, which is
++21% in the 64 tile and **-43%** in the 128 tile, where 32 extra live registers
+turn a spill-free build into 61 spills.
+
+**3. Family S.** Granule 32 needed four sites generalised. Three were
+mechanical -- `SMEM_D_BUCKETS`, `K_STEPS_PER_BAND`, `D_CHUNKS_PER_BAND` in
+place of literals 8, 4 and 2 -- and `tooling/lds_model.py` validated the K read
+offline before any of it was written.
+
+The V read was the hard part, and the framing was wrong twice. The traits file
+had four constants flagged `UNVERIFIED` with two candidate formulas each; all
+sixteen combinations were built and measured, and **none was correct**. Two
+things were wrong with that approach: `dc_in_pair` is *dead* at granule 32
+(`D_CHUNKS_PER_BAND == 1`, so `dc % 1` never fires), and
+`TRANSPOSE_PAIR_STRIDE` was not in the sweep at all because it looked like a
+derivation rather than a guess.
+
+The probe settled it. Three of those constants are the same thing -- advance
+the KV token by *t* -- and a line holds `512 // granule` token slots, so
+
+    tok_off(t) = (t // SMEM_N_RPT) * granule + (t % SMEM_N_RPT) * line
+
+|  | t | granule 64 (n_rpt 8) | granule 32 (n_rpt 4) |
+|---|---|---|---|
+| `HALF_WAVE` | 4 | `0*64 + 4*line` = 2176 | `1*32 + 0` = 32 |
+| `TRANSPOSE_PAIR` | 8 | `1*64 + 0` = 64 | `2*32 + 0` = 64 |
+| `K_SUBSTEP` | 16 | `2*64 + 0` = 128 | `4*32 + 0` = 128 |
+
+All three reproduce family A exactly, which is why each survived as a
+granule-64 identity and each was wrong differently at 32. After that the probe
+reports 0 failures on all nine staging checks at granule 32.
+
+| head_dim | 16 | 32 | 160 | 224 |
+|---|---|---|---|---|
+| before | 230 | 447 | -- | -- |
+| after | **301** | **618** | **917** | **939** |
+| | +31% | +38% | new rung | new rung |
+
+64-256 stay bit-identical; 140/140 parity tests and the production suite pass.
+
+### head_dim 96 is excluded, and it is an open bug
+
+96 is the one granule-32 width that computes the wrong answer, in **both**
+kernel bodies, so 65..128 keeps rounding to the 128 tile. What is ruled out:
+staging (probe: 0/6144 wrong for K, V and Q on both buffers), masking (a
+*no-op* mask at an exact width is bit-identical to unpadded at 32/64/128/160/224
+and differs only at 96), scheduling (`waves_per_eu`, `setprio`, `stagger`,
+`lazy_rescale` all leave the identical error), and the neighbours (every other
+multiple of 32 up to 256 is correct, including 192, whose shape is exactly
+twice 96's).
+
+The error is sparse (~9% of elements), scattered in row and column, and present
+with a single KV tile -- so it is inside one tile's QK/softmax/PV.
+
+**A note on method.** An earlier pass concluded "the wide body is correct at
+96" from one small shape; at `B=4 H=8 S=4096` it is wrong too. That is the
+third time in this work that a single-shape check produced a confident wrong
+answer. Every claim above is over five shapes in both masking modes.

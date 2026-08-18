@@ -78,6 +78,17 @@ class ParityDualwaveTraits(dualwave.DualwaveSwpTraits):
     D_CHUNKS_PER_STAGE_SHARD: int = 0
     Q_TILES: int = 0  # NUM_WAVES // VO_SHARDS
 
+    # How a granule subdivides, for the three sites that hardcoded granule 64.
+    # Each is 1 at the smallest legal granule and equals family A's literal at
+    # 64, which is why the production code could get away with a constant:
+    #
+    #   SMEM_D_BUCKETS    lanes covering one token's granule   64/8  = 8
+    #   K_STEPS_PER_BAND  16-wide QK steps inside a granule    64/16 = 4
+    #   D_CHUNKS_PER_BAND 32-wide PV chunks inside a granule   64/32 = 2
+    SMEM_D_BUCKETS: int = 0
+    K_STEPS_PER_BAND: int = 0
+    D_CHUNKS_PER_BAND: int = 0
+
 
 # Hardware constants. Not parameters: these are the wave, the DMA width and the
 # MFMA shape, and a build that changed one would not be this algorithm.
@@ -104,6 +115,10 @@ def make_traits(
     d_stages=1,
     qk_shards=1,
     vo_shards=1,
+    v_half_wave=None,
+    v_n_group=None,
+    v_k_substep=None,
+    v_dc_in_pair=None,
     causal=True,
     dtype_str="bf16",
     waves_per_eu=2,
@@ -163,9 +178,9 @@ def make_traits(
             "each (stage, shard) owns a whole number of 32-column PV output chunks"
         )
     d_chunks_per_stage_shard = d_chunks // (d_stages * vo_shards)
-    if d_chunks_per_stage_shard % 2:
+    if vo_shards > 1 and d_chunks_per_stage_shard % 2:
         raise ValueError(
-            f"D_CHUNKS per (stage, shard) is {d_chunks_per_stage_shard}, which must be even: the shard's "
+            f"D_CHUNKS per (stage, shard) is {d_chunks_per_stage_shard}, which must be even once sharded: the "
             "LDS offset is folded into `urv_base`, and `_swizzled_v_dc_off` only decomposes that way "
             "when the shard starts on an even chunk"
         )
@@ -213,19 +228,40 @@ def make_traits(
     k_lds_to_reg_kstep_inner_stride = K_STEP_QK
     k_lds_to_reg_kstep_outer_stride = smem_n_rpt * smem_k_line_stride
 
-    # V LDS->VGPR. UNVERIFIED parameterizations, all exact at granule 64:
-    #   half_wave  = (smem_n_rpt // 2) * line   -- could be a fixed 4 lines
-    #   n_group    = granule // 4               -- could be 2 * VEC_KV
-    #   k_substep  = 2 * granule                -- could be 4 * D_CHUNK
-    #   dchunk_in_pair = D_CHUNK                -- could be granule // 2
-    v_lds_to_reg_half_wave_stride = (smem_n_rpt // 2) * smem_v_line_stride
+    # V LDS->VGPR. Three of these are the same thing -- "advance the KV token
+    # by t" -- and the old code spelled each as a separate granule-64 identity.
+    #
+    # A line holds `512 // granule` token slots; slot s, line n is token
+    # `s * SMEM_N_RPT + n`. So advancing t tokens moves `t // N_RPT` slots and
+    # `t % N_RPT` lines:
+    #
+    #     tok_off(t) = (t // N_RPT) * granule + (t % N_RPT) * line
+    #
+    #                    t   granule 64 (n_rpt 8)   granule 32 (n_rpt 4)
+    #   half_wave        4   0*64 + 4*line = 2176   1*32 + 0      =   32
+    #   transpose_pair   8   1*64 + 0      =   64   2*32 + 0      =   64
+    #   k_substep       16   2*64 + 0      =  128   4*32 + 0      =  128
+    #
+    # At granule 64 that reproduces `4 * line`, `granule` and `2 * granule`
+    # exactly, which is why those three literals survived -- and why they were
+    # each wrong in a different way at granule 32. The probe caught it: a lane
+    # was handed tokens 4 apart where the PV MFMA's B operand needs 8, because
+    # `granule` advances one *slot*, which is `N_RPT` tokens, not eight.
+    #
+    # `n_group` is a D offset rather than a token one, and `granule // 4`
+    # coincided with `2 * VEC_KV` at 64. The probe says 16 is the one the MFMA
+    # wants (lane 16 must receive D 16, not 8).
+    def _tok_off(t):
+        return (t // smem_n_rpt) * granule + (t % smem_n_rpt) * smem_v_line_stride
+
+    v_lds_to_reg_half_wave_stride = _tok_off(4) if v_half_wave is None else v_half_wave
     v_lds_to_reg_lane_quad_stride = smem_v_line_stride
-    v_lds_to_reg_n_group_stride = granule // 4
+    v_lds_to_reg_n_group_stride = (2 * VEC_KV) if v_n_group is None else v_n_group
     v_lds_to_reg_lane_in_quad_stride = 4
-    v_lds_to_reg_k_substep_stride = 2 * granule
+    v_lds_to_reg_k_substep_stride = _tok_off(16) if v_k_substep is None else v_k_substep
     v_lds_to_reg_dchunk_pair_stride = smem_n_rpt * smem_v_line_stride
-    v_lds_to_reg_dchunk_in_pair_stride = D_CHUNK
-    v_lds_to_reg_transpose_pair_stride = granule
+    v_lds_to_reg_dchunk_in_pair_stride = D_CHUNK if v_dc_in_pair is None else v_dc_in_pair
+    v_lds_to_reg_transpose_pair_stride = _tok_off(8)
 
     kv_vec_size = DMA_BYTES // BF16_BYTES
     # Stored verbatim, `None` included -- the production constructor does the
@@ -239,6 +275,9 @@ def make_traits(
         VO_SHARDS=vo_shards,
         D_CHUNKS_PER_STAGE_SHARD=d_chunks_per_stage_shard,
         Q_TILES=q_tiles,
+        SMEM_D_BUCKETS=granule // VEC_KV,
+        K_STEPS_PER_BAND=granule // K_STEP_QK,
+        D_CHUNKS_PER_BAND=granule // D_CHUNK,
         STAGE_DIM=stage_dim,
         K_STEPS_PER_STAGE=k_steps_per_stage,
         D_CHUNKS_PER_STAGE=d_chunks_per_stage,

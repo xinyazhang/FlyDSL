@@ -71,6 +71,67 @@ __all__ = [
 ]
 
 
+# --- granule-general addressing --------------------------------------------
+#
+# Three production helpers fold constants that are only correct at granule 64.
+# Each is replaced here by the same expression with the constant named, so at
+# granule 64 they are the *same* arithmetic and a default build is unchanged --
+# the bit-identity gate is what holds that claim.
+#
+# `_k_read_base` and `_ks_offset` are validated offline by
+# `tooling/lds_model.py`, which reproduces family A exactly and confirms the
+# granule-32 K read covers the tile once. The V pair below has no such model;
+# it is measured instead.
+
+
+def _anchor_v_o(traits, v_o):
+    """`dualwave._anchor_v_o`, with the one-accumulator case spelled out.
+
+    The production anchor asks for `!llvm.struct<(vector<16xf32>) x D_CHUNKS>`
+    from an inline asm with `D_CHUNKS` outputs. At `D_CHUNKS == 1` LLVM rejects
+    that outright -- *"inline asm with one output cannot return struct"* -- and
+    the compiler aborts rather than diagnosing, so it surfaces as a crash.
+
+    head_dim 32 is the first width to reach it: `D_CHUNKS = 32 / PV_MFMA_N = 1`.
+    A single output returns the value's own type, so this is the same anchor
+    with the struct wrapper dropped, not a weaker one.
+    """
+    if const_expr(traits.D_CHUNKS != 1):
+        return dualwave._anchor_v_o(traits, v_o)
+    acc = as_mlir_value(v_o[0])
+    return [dualwave.llvm.inline_asm(acc.type, [acc], "", "=v,0", has_side_effects=True)]
+
+
+def _k_read_base(traits, lane_mod_32, lane_div_32):
+    """`_k_lds_read_base_per_lane` with `SMEM_N_RPT` in place of a literal 8."""
+    return (
+        (lane_mod_32 % traits.SMEM_N_RPT) * traits.SMEM_K_LINE_STRIDE
+        + (lane_mod_32 // traits.SMEM_N_RPT) * traits.D_128B_SIZE
+        + lane_div_32 * traits.VEC_KV
+    )
+
+
+def _ks_offset(traits, ks):
+    """`_swizzled_ks_offset` with `K_STEPS_PER_BAND` in place of a literal 4."""
+    per_band = traits.K_STEPS_PER_BAND
+    return (ks // per_band) * traits.K_LDS_TO_REG_KSTEP_OUTER_STRIDE + (
+        ks % per_band
+    ) * traits.K_LDS_TO_REG_KSTEP_INNER_STRIDE
+
+
+def _v_dc_offset(traits, dc):
+    """`_swizzled_v_dc_off` with `D_CHUNKS_PER_BAND` in place of a literal 2."""
+    per_band = traits.D_CHUNKS_PER_BAND
+    return (dc // per_band) * traits.V_LDS_TO_REG_DCHUNK_PAIR_STRIDE + (
+        dc % per_band
+    ) * traits.V_LDS_TO_REG_DCHUNK_IN_PAIR_STRIDE
+
+
+def _v_imm_lo(traits, dc, k_substep):
+    """`_swizzled_v_imm_lo`, in bytes, over the general dc offset."""
+    return (k_substep * traits.V_LDS_TO_REG_K_SUBSTEP_STRIDE + _v_dc_offset(traits, dc)) * traits.BF16_BYTES
+
+
 class ParityGemmHelper(dualwave.DualwaveGemmHelper):
     """The two GEMMs, addressed one D stage at a time.
 
@@ -288,6 +349,27 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         self.q_head_idx = self.h_kv_idx * gqa_group + self.group_id
         self.kv_head_idx = self.h_kv_idx
 
+    # -- granule-general staging ------------------------------------------
+
+    def init_dma_thread_offsets(self):
+        """Split a lane into (token, d-bucket) for the granule it stages.
+
+        Production splits `lane // VEC_KV` by `lane % VEC_KV`, which is right
+        only when a granule spans exactly `VEC_KV` lanes -- true at 64, which
+        is `VEC_KV * VEC_KV`, and nowhere else. A lane always moves `VEC_KV`
+        contiguous D elements, so `granule // VEC_KV` lanes cover one token's
+        granule and the rest of the wave advances the token.
+        """
+        traits = self.traits
+        self.lane_in_warp = self.tid % traits.WARP_SIZE
+        self.n_in_warp = self.lane_in_warp // traits.SMEM_D_BUCKETS
+        self.d_bucket = self.lane_in_warp % traits.SMEM_D_BUCKETS
+
+    def init_lds_read_bases(self):
+        super().init_lds_read_bases()
+        # `_k_lds_read_base_per_lane` folds `SMEM_N_RPT` as a literal 8.
+        self.k_lds_read_base_per_lane = _k_read_base(self.traits, self.lane_mod_32, self.lane_div_32)
+
     # -- per-tensor strides ----------------------------------------------
 
     def init_runtime_indices(self, **kwargs):
@@ -502,9 +584,29 @@ class ParityKvLdsToVgprLoader(dualwave.DualwaveKvLdsToVgprLoader):
         finally:
             self.traits = full
 
+    def _read_k_packs(self, buf_id, urk_base):
+        """The inherited non-vectorized K read, with a granule-general swizzle.
+
+        Six lines rather than a `super()` call because the production loop
+        calls `_swizzled_ks_offset`, which folds `K_STEPS_PER_BAND` as a
+        literal 4 -- a module function, so there is nothing to override but the
+        loop that calls it. Identical arithmetic at granule 64.
+        """
+        traits = self.traits
+        k_base = dualwave._k_buf_base(traits, buf_id)
+        k_lo = [None] * traits.K_STEPS_QK
+        k_hi = [None] * traits.K_STEPS_QK
+        for ks in range_constexpr(traits.K_STEPS_QK):
+            k_lo[ks], k_hi[ks] = self._load_k_pair(buf_id, k_base + urk_base + _ks_offset(traits, ks))
+        return k_lo, k_hi
+
     def load_k(self, buf_id, urk_base=None, stage=0):
         with self._scoped_to_stage():
-            k_lo, k_hi = super().load_k(buf_id, urk_base=urk_base)
+            if const_expr(self.traits.KV_VECTORIZED):
+                k_lo, k_hi = super().load_k(buf_id, urk_base=urk_base)
+            else:
+                base = self.k_lds_read_base_per_lane if urk_base is None else urk_base
+                k_lo, k_hi = self._read_k_packs(buf_id, base)
             steps = self.traits.K_STEPS_QK
         if const_expr(not self.PADDED_HEAD):
             return (k_lo, k_hi)
@@ -526,9 +628,39 @@ class ParityKvLdsToVgprLoader(dualwave.DualwaveKvLdsToVgprLoader):
             k_hi[ks] = cols.discard(k_hi[ks], col_base, width)
         return (k_lo, k_hi)
 
+    def read_v_packs(self, buf_id, urv_base):
+        """The inherited non-vectorized V read, with a granule-general swizzle.
+
+        Same reason as `_read_k_packs`: the production loop calls
+        `_swizzled_v_imm_lo`, which reaches `_swizzled_v_dc_off` and its
+        literal 2. Identical arithmetic at granule 64.
+        """
+        traits = self.traits
+        lds_base = dualwave._v_buf_base(traits, buf_id) + urv_base
+        v_scope = dualwave._dualwave_lds_scope("v", buf_id)
+        packs = [[None] * traits.D_CHUNKS for _ in range(4)]
+        for dc in range_constexpr(traits.D_CHUNKS):
+            for k_substep in range_constexpr(4):
+                imm_lo = _v_imm_lo(traits, dc, k_substep)
+                pair = traits.V_LDS_TO_REG_TRANSPOSE_PAIR_STRIDE * traits.BF16_BYTES
+                read = lambda off: dualwave._ds_read_tr_v4f16_imm(  # noqa: E731
+                    lds_base,
+                    off,
+                    lds_kv_base_idx=self.lds_kv_base_idx,
+                    v_lds_read_vec4_type=self.v_lds_read_vec4_type,
+                    scope_name=v_scope,
+                    scope_names=traits.LDS_SCOPE_NAMES,
+                )
+                a, b = read(imm_lo), read(imm_lo + pair)
+                packs[k_substep][dc] = Vec(a).shuffle(Vec(b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+        return packs
+
     def load_v(self, buf_id, urv_base=None, stage=0):
         with self._scoped_to_stage():
-            return super().load_v(buf_id, urv_base=urv_base)
+            if const_expr(self.traits.KV_VECTORIZED):
+                return super().load_v(buf_id, urv_base=urv_base)
+            base = self.v_lds_read_base_per_lane if urv_base is None else urv_base
+            return self.read_v_packs(buf_id, base)
 
 
 class ParityKvGmemToLdsLoader(_ParityKvStaging, dualwave.DualwaveKvGmemToLdsLoader):
@@ -615,7 +747,7 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
         m_new = dualwave._fmax(m_row, m_tile_max, self.fm_fast)
         corr = rocdl.exp2(T.f32, as_mlir_value(dualwave._fsub(m_row, m_new, self.fm_fast)))
         self.scale_o(v_o, corr)
-        v_o = dualwave._anchor_v_o(self.traits, v_o)
+        v_o = _anchor_v_o(self.traits, v_o)
         l_row = dualwave._fmul(l_row, corr, self.fm_fast)
         return v_o, m_new, l_row
 

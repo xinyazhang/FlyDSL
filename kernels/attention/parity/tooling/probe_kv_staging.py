@@ -46,6 +46,12 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from gfx950_standalone import dualwave
 
 
+# `(waves, BLOCK_M, BLOCK_N, granule)` to pin, or None for the policy default.
+# A probe has to be able to build the geometry under investigation, which is
+# the whole reason it bypasses `_with_widths` below.
+GEOM = None
+
+
 def build_probe(head_dim, num_heads=8, which="k", buf=0):
     """A kernel that stages KV tile 0 and dumps the register packs to `Out`."""
     meta = FmhaInputMetadata(num_heads=num_heads, head_dim=head_dim, causal=False, dtype_str="bf16")
@@ -54,6 +60,9 @@ def build_probe(head_dim, num_heads=8, which="k", buf=0):
     # That is the whole point of a probe: it must be able to build the thing
     # under investigation.
     pinned = replace(fmha_knobs("gfx950"), block_dmodel=head_dim, block_dmodel_v=head_dim, padded_head=False)
+    if GEOM is not None:
+        nw, bm, bn, gran = GEOM
+        pinned = replace(pinned, num_waves=nw, block_m=bm, block_n=bn, head_dim_granule=gran)
     knobs = _GFX950_FALLBACK.merge(pinned)._checked_modes()._with_wave_geometry()._with_traits(meta)
     traits = knobs.traits
     WHICH = which

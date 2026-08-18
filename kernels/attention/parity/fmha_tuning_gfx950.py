@@ -63,20 +63,28 @@ __all__ = [
 # The ladder
 # ---------------------------------------------------------------------------
 
-# Compiled tile widths. All six measured, `B=1 H=16 S=16384` bf16 non-causal:
+# Compiled tile widths, all measured at `B=4 H=8 S=4096` bf16 non-causal on
+# real FLOPs (not the padded tile):
 #
-#   head_dim  waves  BLOCK_M  stages  shards   AGPR  spills    LDS   TFLOP/s
-#      64       8      256      1       1        0     0     34 KB     930
-#     128       8      256      1       1        0     0     68 KB    1167
-#     192       4      128      1       1      174     0    102 KB     973
-#     256       4      128      1       1      192     0    136 KB     979
-#     384       4      128      2       1      112     0    100 KB     803
-#     512       4       64      2       2       91     0    133 KB     479
+#   tile  waves  BLOCK_M  gran  stages  shards   AGPR  spills    LDS   TFLOP/s
+#     32    4      128     32     1       1        -     0     17 KB     618
+#     64    8      256     64     1       1        0     0     33 KB     889
+#    128    8      256     64     1       1        0     0     67 KB    1117
+#    160    4      128     32     1       1        -     0     83 KB     917
+#    192    4      128     64     1       1      174     0    100 KB     936
+#    224    4      128     32     1       1        -     0    116 KB     939
+#    256    4      128     64     1       1      192     0    133 KB     940
+#    384    4      128     64     2       1      112     0    100 KB     803
+#    512    4       64     64     2       2       91     0    133 KB     479
 #
-# The first four run the dual-wave pipeline; 384 and 512 cannot, and run the
-# separate body in `fmha_wide_gfx950.py` instead. The break is not a tuning
-# preference, it is LDS: two KV tiles in flight need `2 * BLOCK_N * head_dim *
-# ~8.3 B`, which is 199.5 KB at 384 and 266 KB at 512 against a 163840 B cap.
+# Three families. **A** (granule 64, 8 waves) serves 64 and 128; **B/S**
+# (4 waves) serve the rest up to 256, with granule 32 where the width is not a
+# multiple of 64; **W** stages the D axis (`D_STAGES`) and shards it
+# (`VO_SHARDS`) for 384 and 512, on the separate body in `fmha_wide_gfx950.py`.
+#
+# The break at 384 is not a tuning preference, it is LDS: two KV tiles in
+# flight need `2 * BLOCK_N * head_dim * ~8.3 B`, which is 199.5 KB at 384 and
+# 266 KB at 512 against a 163840 B cap.
 #
 # 192 and 256 used to spill in the hundreds and produce non-deterministic NaN.
 # Both had the same cause, and it was not register pressure: `_ds_read_tr16_b64_imm`
@@ -99,7 +107,28 @@ __all__ = [
 # would route head_dim <= 32 to a tile that does not exist yet and break a path
 # that works today, slowly. It arrives when family S is built; until then
 # head_dim <= 32 rounds up to 64 and pays for it (see `_with_wave_geometry`).
-LADDER = (64, 128, 192, 256, 384, 512)
+# **96 is deliberately absent, and it is a bug rather than a decision.** It is
+# the one granule-32 width that computes the wrong answer, and it does so in
+# both kernel bodies, so head_dim 65..128 keeps rounding to the 128 tile as it
+# always has. What is established about it:
+#
+#   - Staging is not the cause. `tooling/probe_kv_staging.py` at head_dim 96,
+#     granule 32 reports 0/6144 wrong for K, V and Q, on both LDS buffers.
+#   - It is not the masking. Enabling `padded_head` at an *exact* width makes a
+#     no-op mask, and that output is bit-identical to the unpadded one at 32,
+#     64, 128, 160 and 224 -- and differs only at 96, where it happens to be
+#     correct.
+#   - It is not a scheduling hazard. `waves_per_eu`, `setprio`, `stagger` and
+#     `lazy_rescale` all leave it broken with the *identical* error, and the
+#     error is deterministic across runs.
+#   - It is not the ladder neighbours: every other multiple of 32 from 32 to
+#     256 is correct at granule 32, including 192, whose shape is exactly twice
+#     96's. 32, 160 and 224 hold across five shapes in both masking modes.
+#
+# The error is sparse (~9% of elements), scattered in both row and column, and
+# appears with a single KV tile, so it is inside one tile's QK/softmax/PV
+# rather than an accumulation across them.
+LADDER = (32, 64, 128, 160, 192, 224, 256, 384, 512)
 LADDER_PLANNED = ()
 
 # The D-axis staging granule: how many bf16 elements of one token a single DMA
@@ -318,6 +347,14 @@ class Gfx950Knobs(FmhaKnobs):
     qk_shards: int | None = None
     vo_shards: int | None = None
 
+    # The four V-layout constants whose formula family A cannot pin down; see
+    # `make_traits`. Exposed so a sweep can settle them by measurement instead
+    # of picking one. `None` keeps the default formula.
+    v_half_wave: int | None = None
+    v_n_group: int | None = None
+    v_k_substep: int | None = None
+    v_dc_in_pair: int | None = None
+
     # Set by `resolve`; never by a caller. Holding the traits *on* the resolved
     # knobs is what makes "knobs and traits are one thing" true at the use
     # site: the builder takes one object and reads both from it.
@@ -498,6 +535,7 @@ class Gfx950Knobs(FmhaKnobs):
         (8, 128, 64, 64),
         (4, 64, 64, 64),
         (8, 64, 64, 64),
+        (4, 128, 64, 32),  # family S -- granule 32, for widths off the 64 grid
     )
 
     def _check_helpers_support_geometry(self):
@@ -586,6 +624,10 @@ class Gfx950Knobs(FmhaKnobs):
             d_stages=self.d_stages,
             qk_shards=self.qk_shards,
             vo_shards=self.vo_shards,
+            v_half_wave=self.v_half_wave,
+            v_n_group=self.v_n_group,
+            v_k_substep=self.v_k_substep,
+            v_dc_in_pair=self.v_dc_in_pair,
             causal=meta.causal,
             dtype_str=meta.dtype_str,
             waves_per_eu=self.waves_per_eu,

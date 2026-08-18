@@ -79,7 +79,7 @@ KERNEL_NAME = "flash_attn_func_gfx950_kernel"
 # it does there. Imported, not re-implemented -- these are the scheduling
 # primitives the hand-built pipeline is made of, and a second copy of any of
 # them would be a second thing to keep in step.
-_anchor_v_o = dualwave._anchor_v_o
+from fmha_dualwave_gfx950 import _anchor_v_o  # noqa: E402  (one-accumulator safe)
 _anchor_v_p = dualwave._anchor_v_p
 _dualwave_sync_barrier = dualwave._dualwave_sync_barrier
 _s_barrier = dualwave._s_barrier

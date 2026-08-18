@@ -219,7 +219,7 @@ def test_logsumexp_matches_torch():
 # P1: runtime hdim, padded head, asymmetric hdim
 # ---------------------------------------------------------------------------
 
-_LADDER_CASES = [16, 17, 32, 33, 40, 48, 64, 80, 96, 100, 113, 128, 129, 160, 192, 200, 256, 300, 384, 448, 512]
+_LADDER_CASES = [16, 17, 32, 33, 40, 48, 64, 80, 96, 100, 113, 128, 129, 160, 192, 200, 224, 256, 300, 384, 448, 512]
 
 
 def _padded_qkv(b, h, s, hdim, hdim_v, poison=None):
@@ -310,8 +310,9 @@ def test_padded_head_never_writes_past_hdim_vo():
 @pytest.mark.parametrize(
     "hdim,want",
     [
-        (1, 64), (16, 64), (64, 64), (65, 128), (128, 128), (129, 192), (192, 192),
-        (193, 256), (256, 256), (257, 384), (384, 384), (385, 512), (512, 512),
+        (1, 32), (16, 32), (32, 32), (33, 64), (64, 64), (65, 128), (128, 128),
+        (129, 160), (160, 160), (161, 192), (192, 192), (193, 224), (224, 224),
+        (225, 256), (256, 256), (257, 384), (384, 384), (385, 512), (512, 512),
     ],
 )
 def test_tile_width_rounds_up(hdim, want):
@@ -444,11 +445,11 @@ def test_wave_geometry_requires_widths_first():
         fmha_knobs("gfx950")._with_wave_geometry()
 
 
-@pytest.mark.parametrize(
-    "geom",
-    [(4, 128, 64, 32), (8, 256, 128, 64)],
-    ids=["family_s", "block_n_128"],
-)
+# Family S -- (4, 128, 64, 32) -- used to be here. It is addressable now, so
+# only the geometries that remain unbuilt belong in this test. BLOCK_N 128 is
+# not an oversight: `tooling/lds_model.py` shows a wave's K read covers 64
+# tokens, so a 128-token tile would need a doubled score accumulator.
+@pytest.mark.parametrize("geom", [(8, 256, 128, 64)], ids=["block_n_128"])
 def test_unaddressable_geometry_fails_loudly(geom):
     """Describable is not the same as addressable, and the gap must not be silent.
 
@@ -477,7 +478,10 @@ def test_traits_constructor_matches_production_exactly():
             for splits in (1, 2):
                 for paged, layout in ((False, "linear"), (True, "linear"), (True, "vectorized")):
                     assert_matches_production(
-                        head_dims=LADDER,
+                        # Family A's geometry is granule 64, so only the rungs
+                        # that are multiples of 64 can be expressed in it --
+                        # and production only builds 64/128 anyway.
+                        head_dims=tuple(h for h in LADDER if h % 64 == 0),
                         num_heads=8,
                         num_kv_heads=8,
                         causal=causal,
@@ -487,8 +491,9 @@ def test_traits_constructor_matches_production_exactly():
                         kv_cache_layout=layout,
                         kv_vectorized=paged and layout == "vectorized",
                     )
-    assert_matches_production(head_dims=LADDER, num_heads=8, num_kv_heads=2, kv_vectorized=False)
-    assert_matches_production(head_dims=LADDER, num_heads=8, num_kv_heads=8, dtype_str="f16", kv_vectorized=False)
+    fam_a = tuple(h for h in LADDER if h % 64 == 0)
+    assert_matches_production(head_dims=fam_a, num_heads=8, num_kv_heads=2, kv_vectorized=False)
+    assert_matches_production(head_dims=fam_a, num_heads=8, num_kv_heads=8, dtype_str="f16", kv_vectorized=False)
 
 
 def test_wave_geometry_must_be_pinned_whole():

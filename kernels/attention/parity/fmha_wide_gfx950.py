@@ -156,7 +156,7 @@ class WideKvLdsToVgprLoader(ParityKvLdsToVgprLoader):
         full = self.traits
         self.traits = replace(full, D_CHUNKS=per, K_STEPS_QK=full.K_STEPS_PER_STAGE)
         try:
-            return dualwave.DualwaveKvLdsToVgprLoader.load_v(self, buf_id, urv_base=urv)
+            return self.read_v_packs(buf_id, urv)
         finally:
             self.traits = full
 
