@@ -325,7 +325,14 @@ def make_wide_body(
         )
         owned = traits.D_CHUNKS // traits.VO_SHARDS
 
-        loop_lb = ctx.split_tile(0) if const_expr(traits.SPLITK) else fx.Index(0)
+        # `split_tile(0)` unconditionally: split-K used to be the only thing
+        # that moved this workgroup's tile base, and a window moves it too --
+        # `_skip_dead_leading_tiles` starts the walk at the window's left edge.
+        # Spelling the non-split arm as a literal 0 does not make a window
+        # *wrong* here, because this body masks every tile it visits and a dead
+        # one contributes nothing; it just walks the dead ones anyway and
+        # throws the whole saving away. Identical wherever the base is zero.
+        loop_lb = ctx.split_tile(0)
         init_args = [softmax_helper.c_neg_floor, ctx.c_zero_f]
         for _ in range_constexpr(owned):
             init_args.append(ctx.c_zero_v16f32)

@@ -2097,6 +2097,31 @@ lane ever holds `-inf` as a max and `exp2` gives a clean zero. Its docstring
 predicted this ("removes the case for every masking mode at once, including
 the windows and bias still to come") one phase early.
 
+## Both kernel bodies, and the wide one needed a second look
+
+A window reaches the staged/sharded body in `fmha_wide_gfx950.py` too, and the
+support is inherited rather than duplicated: `WideKernelContext` subclasses
+`ParityKernelContext` and `WideSoftmaxHelper` subclasses `ParitySoftmaxHelper`,
+so the resolution, the left bound and the two-sided guard all carry with no
+new code. Every rung 32..512 passes the bitwise sentinel oracle.
+
+**Correct is not the same as done.** The wide body's KV loop began at a literal
+tile 0, so the window's tile cut was simply ignored: every dead tile was
+visited, masked to `-inf`, and contributed nothing. The output was right at
+every width, and a narrow window measured **0.92x** -- marginally *slower* than
+an unbounded one, because the mask guard now fired on tiles that used to be
+skipped. This is the fourth instance of the same literal-zero base in this
+phase, and the only one that a correctness test could never have caught.
+
+| body | width | left=127 | unbounded | speedup |
+|---|---|---|---|---|
+| dual-wave | 256 | 20.3 us | 135.6 us | 6.67x |
+| wide | 384 | 31.3 us (was 266.6) | 251.4 us | 8.04x |
+| wide | 512 | 35.8 us (was 264.2) | 249.4 us | 6.97x |
+
+`test_window_skips_leading_dead_tiles` is parametrized over both bodies for
+exactly this reason.
+
 ## Not done
 
 - **Split-K + window.** `_skip_dead_leading_tiles` is gated off under

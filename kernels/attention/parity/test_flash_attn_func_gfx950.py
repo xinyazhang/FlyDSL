@@ -478,7 +478,7 @@ def _window_ref(q, k, v, left, right):
     return F.scaled_dot_product_attention(q.float(), k.float(), v.float(), attn_mask=bias)
 
 
-@pytest.mark.parametrize("hdim", [64, 128])
+@pytest.mark.parametrize("hdim", LADDER)
 def test_window_sentinel_is_bitwise_causal(hdim):
     """A window build fed the causal sentinels must reproduce causal exactly.
 
@@ -489,12 +489,28 @@ def test_window_sentinel_is_bitwise_causal(hdim):
     enough that no row loses a key. So the left bound is exercised -- the
     compares are emitted and executed -- while masking nothing, and any
     disagreement is the window machinery rather than a tolerance.
+
+    Parametrized over the whole ladder because a window reaches **both kernel
+    bodies**. Widths up to 256 run the dual-wave pipeline; 384 and 512 run the
+    staged/sharded one in `fmha_wide_gfx950.py`, which has its own KV loop and
+    its own tile base. The window support is inherited by subclassing rather
+    than duplicated, and this is what holds that claim at every rung -- the
+    two extra checks below are here so a rung cannot pass on the sentinel path
+    alone, which leaves the left bound inert by construction.
     """
-    b, h, s = 2, 8, 512
+    b, h, s = 1, 4, 512
     q, k, v = (_rand(b, h, s, hdim) for _ in range(3))
     want = _run(q, k, v, causal=True)
     got = _run_window(q, k, v, (fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT))
     assert torch.equal(got, want), (got.float() - want.float()).abs().max().item()
+    # A real band at the same width, so a rung cannot pass on the sentinel path
+    # alone -- the sentinels leave the left bound inert by construction.
+    got = _run_window(q, k, v, (127, 0))
+    assert _err(got, _window_ref(q, k, v, 127, 0)) < TOL
+    # And the degenerate window that leaves every row with no key at all.
+    got = _run_window(q, k, v, (-32, 0))
+    assert not torch.isnan(got.float()).any()
+    assert torch.count_nonzero(got) == 0, "a window admitting no key must give exactly zero"
 
 
 @pytest.mark.parametrize("causal_shape", [(2, 8, 512), (1, 4, 1024)], ids=["s512", "s1024"])
@@ -561,7 +577,8 @@ def test_window_negative_bounds(left, right):
     assert _err(got, want) < TOL
 
 
-def test_window_skips_leading_dead_tiles():
+@pytest.mark.parametrize("hdim", [64, 512], ids=["dualwave", "wide"])
+def test_window_skips_leading_dead_tiles(hdim):
     """A narrow window must be *faster*, not merely correct.
 
     A dead tile masks to `-inf`, contributes zero and changes no output bit, so
@@ -571,8 +588,14 @@ def test_window_skips_leading_dead_tiles():
     The margin is deliberately loose. At `left=127` over 8192 tokens the walk
     covers a handful of tiles instead of the full lower triangle and measures
     around 7x; anything under 3x means the tile range is not being cut.
+
+    Both bodies, because they cut the range in different code. The wide body
+    shipped with its KV loop starting at a literal tile 0, which masks every
+    dead tile correctly and walks all of them -- so it was *correct* and got no
+    speedup at all (0.92x measured). Only a timing test distinguishes that from
+    a working cut.
     """
-    b, h, s, d = 1, 8, 8192, 64
+    b, h, s, d = 1, 4, 4096, hdim
     q, k, v = (_rand(b, h, s, d) for _ in range(3))
     o = torch.empty(b, h, s, d, device="cuda", dtype=DT)
     fn = build(num_heads=h, head_dim=d, causal=True, window=True, dtype_str="bf16", num_kv_heads=h)
