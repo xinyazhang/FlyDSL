@@ -41,6 +41,24 @@ dispatches the compiled hsaco directly. Strides are named numerically
 memory layout with D innermost is accepted, which is why the strides are read
 rather than derived.
 
+--- head_dim: 32xD tiles, 8xD inputs ----------------------------------------
+
+The compiled tiles are multiples of 32 (`LADDER`), because the PV MFMA writes
+32 D columns and the LDS staging granule cannot go below that. A head_dim off
+that grid is served by the next tile up, with the real extent passed at runtime
+and the surplus columns masked.
+
+**The input contract is 8xD, not 32xD.** Loads and stores are 8 columns wide,
+so a head_dim that is a multiple of 8 is a whole number of chunks: the kernel
+never touches a column it was not given, whatever the layout, and a plainly
+contiguous `(B, H, S, 24)` needs no padding of any kind. Every multiple of 8
+from 8 to 512 is covered by `test_grid8_contiguous_is_exact_and_writes_nothing_past_o`.
+
+An odd head_dim -- 100, or a prime -- still works, but only in an allocation
+with slack: the kernel rounds each row up to `ceil8(head_dim)`, so those extra
+columns must belong to the caller. `_args` checks this and refuses otherwise
+rather than corrupting the neighbouring row.
+
 --- Phase status -----------------------------------------------------------
 
 P0 (this ABI, runtime scale/head counts/strides, LSE) and P1 (runtime
@@ -924,6 +942,55 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         )
         del ptrs  # gfx950 addresses through buffer descriptors, so it wants the tensors
         num_head_q, num_head_k, hdim_qk, hdim_vo = shape_meta
+
+        # **The 8-element D pitch is the alignment contract.** Loads and stores
+        # are 8 columns wide, so the kernel touches `ceil8(hdim)` columns of
+        # every row. An 8-aligned pitch puts that inside the row's own slack;
+        # a tightly-packed odd width -- contiguous (B, H, S, 100), pitch 100 --
+        # has no slack, and the chunk at column 96 runs into the *next row*.
+        #
+        # Every head_dim that is a multiple of 8 satisfies this contiguously,
+        # which is what makes 8xD the natural input contract even though the
+        # compiled tiles are 32xD. Only the odd widths need a padded view, and
+        # only those are checked -- an exact tile width touches nothing past
+        # its own columns whatever the pitch.
+        #
+        # gfx1201 checks the same thing in its interface layer; this kernel is
+        # dispatched directly, so the check belongs here. Raising beats the
+        # alternative, which is silently corrupting the next row.
+        if PADDED_HEAD:
+            for _name, _t in (("Q", Q), ("K", K), ("V", V), ("O", O)):
+                _d = _t.shape[3]
+                _need = (_d + 7) // 8 * 8
+                if _need == _d:
+                    continue  # 8xD: the row is a whole number of chunks
+                # Two separate requirements, and `stride(2) % 8` -- what
+                # gfx1201's interface checks -- is only the first of them.
+                #
+                # *Alignment*: a row starts at `sum(index * stride)`, so every
+                # non-D stride must be a multiple of 8 for the 16-byte access
+                # to land aligned.
+                #
+                # *Slack*: the tail chunk needs `ceil8(D) - D` unused elements
+                # after the row. The gap to whatever comes next in memory is
+                # the smallest non-D stride, which for a BHSD tensor is the D
+                # pitch but for a BSHD one is `D` itself -- consecutive heads
+                # of the same token are adjacent, so there is no slack at all
+                # and the pitch check would wave it through while the store
+                # corrupted the next head.
+                _outer = [_t.stride(i) for i in range(3) if _t.shape[i] > 1]
+                _aligned = _t.stride(3) == 1 and all(s % 8 == 0 for s in _outer)
+                _slack = min(_outer, default=_need)
+                if not _aligned or _slack < _need:
+                    raise ValueError(
+                        f"{_name} has shape {tuple(_t.shape)} strides {tuple(_t.stride())}, which "
+                        f"cannot hold a head_dim of {_d}. {_d} is not a multiple of 8, so the "
+                        f"kernel reads and writes {_need} columns per row and needs the D axis "
+                        f"innermost, every other stride a multiple of 8, and {_need - _d} unused "
+                        f"element(s) after each row. Allocate the last dimension as {_need} and "
+                        f"pass a [..., :{_d}] view, as PyTorch's SDPA shim does -- or use a "
+                        f"head_dim that is a multiple of 8, which needs no padding at all."
+                    )
 
         # The kernel skips masking the D columns at or below the floor, so a
         # narrower call would silently reduce over the caller's padding. Cheap

@@ -313,6 +313,12 @@ head_dim 96 is a normal rung again.
   padded build to its rung's native rate exactly. Widening the ladder to a
   16-element grid would have been weeks of staging work for the ~7% that was
   actually arithmetic.
+- **Never edit a source file while a run is in flight.** The AST rewriter
+  reads the kernel source by line number at *trace* time, not at import, so
+  inserting a docstring into a file a background pytest is still tracing shifts
+  every line under it and fails 168 tests in 72 seconds with no coherent error.
+  It looks exactly like a catastrophic regression. Two clean reruns said 259
+  passed. Let the run finish, or edit a copy.
 - **Check `agpr_count` alongside spills.** On this kernel the allocator either
   uses the AGPR file for the O accumulator or abandons it entirely and spills
   to scratch, and the difference is 1.4-1.6x. Four waves keeps it; eight loses

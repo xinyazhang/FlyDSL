@@ -290,6 +290,70 @@ def test_padded_head_ignores_pad_contents(hdim, poison):
     assert math.isfinite(err) and err < TOL
 
 
+# The input contract is 8xD even though the compiled tiles are 32xD: loads and
+# stores are 8 columns wide, so a head_dim that is a multiple of 8 is a whole
+# number of chunks and the kernel never touches a column it was not given.
+# Every multiple of 8 the ladder can reach, so a rung that mishandles its
+# sub-8-grid widths cannot hide behind the ones the suite happens to name.
+_GRID8 = list(range(8, 513, 8))
+
+
+@pytest.mark.parametrize("hdim", _GRID8)
+def test_grid8_contiguous_is_exact_and_writes_nothing_past_o(hdim):
+    """A plainly contiguous 8xD tensor -- no padded view -- must just work.
+
+    Separate from `test_ladder_matches_sdpa` because that one allocates through
+    `_padded_qkv`, so every tensor it builds is a view into a wider allocation
+    and the D pitch is 8-aligned *by construction*. That is the easy case and
+    it cannot fail the way a tight `(B, H, S, 24)` can. What a caller actually
+    passes is `torch.randn(b, h, s, hdim)`, whose pitch is `hdim` itself.
+
+    The extra O row is a canary: it is contiguous with the last real row, so a
+    tail chunk overrunning the final row lands in it and nowhere else.
+    """
+    b, h, s = 1, 4, 256
+    q, k, v = (_rand(b, h, s, hdim) for _ in range(3))
+    assert q.stride(2) == hdim, "the point of this test is a tight pitch"
+    sentinel = -12345.0
+    obuf = torch.full((b, h, s + 1, hdim), sentinel, device="cuda", dtype=DT)
+    o = obuf[:, :, :s, :]
+    _run(q, k, v, o=o)
+    assert torch.all(obuf[:, :, s, :] == sentinel), "a store ran past the last O row"
+    assert _err(o, _ref(q, k, v)) < TOL
+
+
+def test_tight_odd_hdim_is_refused_not_corrupted():
+    """An odd head_dim in a tight allocation has nowhere to put the tail chunk.
+
+    `ceil8(100)` is 104, so the kernel touches four columns that belong to the
+    next row. Refusing is the contract; the alternative is a wrong answer in a
+    tensor the caller never suspected.
+    """
+    b, h, s, hdim = 1, 4, 256, 100
+    q, k, v = (_rand(b, h, s, hdim) for _ in range(3))
+    o = torch.empty(b, h, s, hdim, device="cuda", dtype=DT)
+    with pytest.raises(ValueError, match="not a multiple of 8"):
+        _run(q, k, v, o=o)
+
+
+def test_odd_hdim_bshd_without_slack_is_refused():
+    """BSHD hides the overrun from a pitch check, so the check is not a pitch.
+
+    Heads of one token are adjacent in BSHD, so the gap after a D row is `hdim`
+    itself and there is no slack -- while `stride(2)` is `num_heads * hdim`,
+    which is a tidy multiple of 8 whenever `num_heads` is even. Checking the
+    pitch alone (what the gfx1201 interface does) would accept this and let the
+    tail chunk write into the next head.
+    """
+    b, h, s, hdim = 1, 4, 256, 100
+    assert (h * hdim) % 8 == 0, "the case is only interesting when the pitch looks fine"
+    q, k, v = (torch.randn(b, s, h, hdim, device="cuda", dtype=DT).transpose(1, 2) for _ in range(3))
+    o = torch.empty(b, s, h, hdim, device="cuda", dtype=DT).transpose(1, 2)
+    assert q.stride(2) % 8 == 0, "the pitch check would pass here"
+    with pytest.raises(ValueError, match="unused element"):
+        _run(q, k, v, o=o)
+
+
 def test_padded_head_never_writes_past_hdim_vo():
     """O's D-tail chunk may spill into the caller's pad, but not past it.
 
@@ -363,10 +427,12 @@ def test_hdim_below_floor_is_refused_not_computed():
     b, h, s, hdim = 1, 4, 256, 240
     q, k, v, pitch = _padded_qkv(b, h, s, hdim, hdim)
     fn = build(num_heads=h, head_dim=hdim, head_dim_v=hdim, causal=False, dtype_str="bf16", num_kv_heads=h)
-    narrow = q[..., :100].contiguous()
-    o = torch.empty(b, h, s, 100, device="cuda", dtype=DT)
+    # 104, not an odd width: a tight odd tensor would trip the D-pitch guard
+    # first and this test would pass without ever reaching the floor check.
+    narrow = [t[..., :104].contiguous() for t in (q, k, v)]
+    o = torch.empty(b, h, s, 104, device="cuda", dtype=DT)
     with pytest.raises(ValueError, match=r"serves hdim_qk in \(224, 256\]"):
-        fn(narrow, k[..., :100].contiguous(), v[..., :100].contiguous(), o, b, s, seqlen_k=s, scale=None, lse=None)
+        fn(*narrow, o, b, s, seqlen_k=s, scale=None, lse=None)
 
 
 def test_padded_head_is_derived_not_guessed():
