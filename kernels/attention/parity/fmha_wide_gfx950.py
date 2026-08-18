@@ -26,7 +26,9 @@ LDS buffers the dual-wave path uses for two tiles. ATT is what forced that:
 the first cut drained after every DMA, and
 `s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)` came to 26% of runtime at 749
 cycles a hit, against 10.8% for every MFMA combined. Pipelining the stages
-was worth +27% at 384 and +21% at 512.
+was worth +27% at 384 and +21% at 512, and prefetching *across* the two
+phases -- V's first stage during QK, the next tile's first K stage during PV --
+a further +9%. Only the loop prologue now exposes a DMA.
 
 --- The two D-axis cuts, and why both are needed -----------------------------
 
@@ -329,6 +331,11 @@ def make_wide_body(
             init_args.append(ctx.c_zero_v16f32)
         loop_results = init_args
 
+        # Prime the pipeline. From here every tile's first K stage is issued by
+        # the *previous* tile's PV phase, so this is the only DMA in the kernel
+        # whose latency is not covered by compute.
+        kv_gmem_to_lds.load_k_tile(loop_lb, 0, stage=0)
+
         for j, loop_args in range(loop_lb, ctx.split_t_end, fx.Index(1), init=init_args):
             m_row = loop_args[0]
             l_row = loop_args[1]
@@ -337,21 +344,23 @@ def make_wide_body(
             # -- GEMM1. D is the reduction axis, so every stage feeds the same S
             #    and the softmax cannot start until the last one has landed.
             v_s = (ctx.c_zero_v16f32, ctx.c_zero_v16f32)
-            kv_gmem_to_lds.load_k_tile(j, 0, stage=0)
             for st in range_constexpr(traits.D_STAGES):
                 cur = st % 2
-                if const_expr(st + 1 < traits.D_STAGES):
-                    # Everyone is done reading the buffer about to be
-                    # overwritten -- it was last read at stage st-1, and the
-                    # barrier below closed that.
+                more = st + 1 < traits.D_STAGES
+                if const_expr(more or st == 0):
+                    # Gates every buffer written below: each was last read a
+                    # stage (or a phase) ago, and this closes those readers.
                     _s_barrier()
+                if const_expr(more):
                     kv_gmem_to_lds.load_k_tile(j, (st + 1) % 2, stage=st + 1)
-                    # Counted, not a drain: stage st's issues are the *older*
-                    # ones, so leaving `NUM_DMA_K` outstanding retires exactly
-                    # them and lets stage st+1 stay in flight.
-                    _waitcnt_vm_n(ctx.NUM_DMA_K)
-                else:
-                    _s_waitcnt(0)
+                if const_expr(st == 0):
+                    # Cross-phase: V's first stage rides the whole QK phase.
+                    kv_gmem_to_lds.load_v_tile(j, 0, stage=0)
+                # `vmcnt` retires in issue order, so leaving exactly the
+                # newer groups outstanding retires stage `st` and nothing
+                # else. This is the dual-wave body's `NUM_DMA_K + NUM_DMA_V`
+                # idiom, at stage granularity rather than tile.
+                _waitcnt_vm_n((ctx.NUM_DMA_K if more else 0) + ctx.NUM_DMA_V)
                 _sched_barrier(0)
                 _s_barrier()  # every wave's stage-st DMA has landed, not just mine
                 v_k = kv_lds_to_regs.load_k(cur, stage=st)
@@ -375,15 +384,22 @@ def make_wide_body(
 
             # -- GEMM2. D is an output axis here: each (stage, shard) owns a
             #    disjoint run of O, so nothing is combined afterwards.
-            kv_gmem_to_lds.load_v_tile(j, 0, stage=0)
             for st in range_constexpr(traits.D_STAGES):
                 cur = st % 2
-                if const_expr(st + 1 < traits.D_STAGES):
+                more = st + 1 < traits.D_STAGES
+                if const_expr(more or st == 0):
                     _s_barrier()
+                if const_expr(more):
                     kv_gmem_to_lds.load_v_tile(j, (st + 1) % 2, stage=st + 1)
-                    _waitcnt_vm_n(ctx.NUM_DMA_V)
-                else:
-                    _s_waitcnt(0)
+                if const_expr(st == 0):
+                    # Cross-phase, across the tile boundary: the next tile's
+                    # first K stage rides this whole PV phase, so the KV loop
+                    # never exposes a DMA after its prologue. Reading past the
+                    # last tile is harmless -- the buffer descriptor bounds it
+                    # and that staging is never read. The dual-wave body
+                    # prefetches `j_idx + 1` the same way.
+                    kv_gmem_to_lds.load_k_tile(j + fx.Index(1), 0, stage=0)
+                _waitcnt_vm_n((ctx.NUM_DMA_V if more else 0) + ctx.NUM_DMA_K)
                 _sched_barrier(0)
                 _s_barrier()
                 v_v = kv_lds_to_regs.load_v_shard(cur, ctx.vo_shard_id)

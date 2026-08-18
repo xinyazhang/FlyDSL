@@ -1794,3 +1794,55 @@ rather than anything hand-placed. Two candidates, neither attempted:
   tile.
 - **Interleaving DS reads with MFMA inside a stage**, which is what the
   dual-wave cluster structure does and this body does not.
+
+## P8.2 — cross-phase prefetch: +9% more, and the idiom was already in the tree
+
+Deferred once as "delicate bookkeeping that wants its own verification pass".
+That was wrong, and checking the existing helpers is what showed it: **the
+dual-wave body has done cross-phase prefetch all along.**
+
+```
+kv_gmem_to_lds.load_v_tile(j-2, 1)             # issue V's DMA...
+v_k = kv_lds_to_regs.load_k(1)                 # ...while reading K from LDS
+_waitcnt_vm_n(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
+```
+
+That combined counted wait appears **7 times in each of the two dual-wave
+kernels** and has been shipping. `NUM_DMA_K + NUM_DMA_V` is the steady-state
+count for one K and one V in flight -- nothing to derive. And because
+`D_STAGES` made `SMEM_D_RPT` per-stage, `ParityKernelContext`'s
+`NUM_DMA_K = SMEM_D_RPT * ISSUES_PER_WAVE` already means *one stage's worth*,
+which is exactly the unit the wide loop needs.
+
+So the wide body now mirrors that pattern at stage granularity: V stage 0 is
+issued during the QK phase, the next tile's K stage 0 during the PV phase, and
+each stage waits `(newer same-tensor group) + (cross-phase group)`. Only the
+loop prologue still exposes a DMA.
+
+| head_dim | first cut | + stage pipeline | + cross-phase | total |
+|---|---|---|---|---|
+| 384 | 579 | 734 | **803** | **+39%** |
+| 512 | 366 | 442 | **479** | **+31%** |
+
+Zero spills, builds 4-5 s, 133/133 parity tests and the production suite pass,
+64-256 unchanged. ATT total latency at 512: 737,784 -> 665,960 -> **637,816**,
+and no `vmcnt` wait appears in the top eight any more.
+
+### What the survey also found, and did not use
+
+`GenericGemmHelper` (the `flash_attn_generic.py` family) already implements the
+*other* outstanding item, in two forms:
+
+- `gemm1_accumulate` rolls a `QK_PREFETCH_DEPTH`-deep LDS read prefetch
+  (`load_k_pack_at(ks + depth)`) through the QK MFMAs, and issues
+  `coop_dma_v` at the GEMM's midpoint.
+- `gemm2_pv` reads V pack `si+1` while the MFMAs for `si` run.
+
+Not reusable directly -- different traits, LDS layout and loader API -- but a
+working reference. The dual-wave loader already has the K-side primitive
+(`_load_k_pair`); a single-pack **V** read and an interleaved `qk`/`pv` are
+what is missing.
+
+That is now the whole remaining story at 512: `s_waitcnt lgkmcnt(0)` is the top
+cost at **33.9%** (5,008 hits, 43.1 cyc/hit), and it is LDS read latency that
+no amount of DMA prefetching touches.

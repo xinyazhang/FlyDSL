@@ -70,8 +70,8 @@ __all__ = [
 #     128       8      256      1       1        0     0     68 KB    1167
 #     192       4      128      1       1      174     0    102 KB     973
 #     256       4      128      1       1      192     0    136 KB     979
-#     384       4      128      2       1      112     0    100 KB     734
-#     512       4       64      2       2       91     0    133 KB     442
+#     384       4      128      2       1      112     0    100 KB     803
+#     512       4       64      2       2       91     0    133 KB     479
 #
 # The first four run the dual-wave pipeline; 384 and 512 cannot, and run the
 # separate body in `fmha_wide_gfx950.py` instead. The break is not a tuning
