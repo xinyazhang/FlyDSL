@@ -1920,3 +1920,44 @@ with a single KV tile -- so it is inside one tile's QK/softmax/PV.
 96" from one small shape; at `B=4 H=8 S=4096` it is wrong too. That is the
 third time in this work that a single-shape check produced a confident wrong
 answer. Every claim above is over five shapes in both masking modes.
+
+### head_dim 96, localised: it is the softmax normaliser, not the D axis
+
+Two structured-input tests narrow it much further than the random-input error
+map could, and they rule the D axis out entirely.
+
+**Uniform Q and K** make S constant, so softmax is uniform and
+`O[r][d] = mean_t V[t][d]`. With `V[t][d] = d`, head_dim 96 is **exact**. So the
+QK reduction, PV, the store and all of the granule-32 staging are correct.
+
+**V constant across tokens** makes `O[r][d] = d * (sum_t p) / l` for *any*
+weights, so it tests the normaliser alone. head_dim 96 is off by 28 on values
+that should be 0..95; head_dim 160 is off by exactly 0.
+
+The ratio `O[r][d] / d` says which term:
+
+    chunk 0: mean 0.9927     row 0: 0.993
+    chunk 1: mean 0.9926     row 1: 0.970
+    chunk 2: mean 0.9936     row 2: 1.000
+                             row 3: 0.984
+
+**Uniform in D, varying per row.** A partial `v_o` rescale would be
+chunk-dependent; this is a per-row scalar, which is `l_row`. The affected rows
+are the same `row % 8 < 4` lane groups the random-input map showed, and the
+error is 0.5-3% -- `l` is slightly wrong, not structurally broken.
+
+That points at the pipelined softmax rather than anything D-shaped: `l_row` is
+accumulated by a cross-lane `reduce_sum` over `v_p` in one cluster, while the
+same `v_p` is rescaled by `corr` and consumed by PV in another. If the two ever
+see different scalings of `p`, `l` and the numerator disagree by exactly a
+per-row factor. Both rescale paths fail (`lazy_rescale` on and off give
+different wrong answers), and `l_row` itself has no D dependence at all -- so
+what varies with head_dim is the cluster balance around it, not the arithmetic.
+
+**Consequence for the 64+32 idea.** Decomposing head_dim 96 into a granule-64
+half and a granule-32 half is mathematically clean -- QK's D is a reduction and
+PV's D is disjoint output columns -- but it would not fix this. The bug is in
+the softmax, which the D axis does not touch: a decomposed 96 has the same
+`D_CHUNKS = 3`, the same `l_row`, and the same pipelined schedule around it.
+The decomposition is worth building only if a *staging* limit ever needs it,
+and staging is the one thing here that is proven correct.
