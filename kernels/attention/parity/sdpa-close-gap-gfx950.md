@@ -1961,3 +1961,56 @@ the softmax, which the D axis does not touch: a decomposed 96 has the same
 `D_CHUNKS = 3`, the same `l_row`, and the same pipelined schedule around it.
 The decomposition is worth building only if a *staging* limit ever needs it,
 and staging is the one thing here that is proven correct.
+
+### head_dim 96, further: not the softmax -- a register-allocation clobber of the K packs
+
+The softmax framing above was wrong, and the correction is worth stating
+plainly. `l` and `m` are **exactly right** at 96: building with `return_lse`
+and comparing against `torch.logsumexp` gives a residual of 3e-4 with *zero*
+rows deviating, the same as 160. So the normaliser is fine and the PV numerator
+is ~2% short.
+
+What actually fixes it: **anchoring the K packs** -- an inline asm that takes
+each pack and returns it, forcing a register copy -- makes head_dim 96 correct
+across five shapes in both masking modes, and lifts it 579 -> 944 TF.
+
+What does *not* fix it, and this is what identifies the mechanism:
+
+| attempted | 96 | cost elsewhere |
+|---|---|---|
+| `sched_barrier(0)` after the reads | no change | free |
+| empty asm with `~{memory}` (IR-level load fence) | no change | free |
+| anchor every pack, `has_side_effects=True` | **fixed** | **-59% at 224** |
+| anchor every pack, `has_side_effects=False` | **fixed** | **-61% at 224** |
+
+Two different barriers -- one machine-level, one IR-level -- change nothing,
+so the reads are not being *moved*. Only materialising the values helps, which
+makes this register allocation: at `K_STEPS_QK == 6` the allocator picks
+something that loses pack contents, and forcing a copy prevents it.
+
+The cost also explains the mechanism from the other side. Anchoring pins all
+`2 * K_STEPS_QK` packs live simultaneously -- 28 of them at head_dim 224, or
+112 VGPRs -- which defeats the staggered read/consume the allocator normally
+does. That stagger is presumably what lets a pack's register be reused too
+early at 96.
+
+**Not shipped.** A width-gated anchor would fix 96 and cost nothing elsewhere,
+but it is a heuristic patch on a correctness bug whose mechanism is not
+understood, and the same hazard is latent at every other width -- the allocator
+merely happens to be lucky there. 96 stays out of `LADDER`, and 65..128 keeps
+rounding to the 128 tile.
+
+Next step for whoever picks this up: diff the head_dim 96 ISA with and without
+the anchor and find which pack's register is reused before its MFMA. The
+`v_o` / `v_p` anchors that already exist in the production body suggest this
+class of problem has been hit before and papered over the same way.
+
+### Decomposition is still worth building, and not only for 96
+
+Splitting a head dim into supported blocks -- 96 = 64 + 32 -- would not fix the
+bug above, because the bug is not on the D axis. But it stays useful
+independently: head_dim 80 is `64 + 16`, which is not a multiple of 32, so even
+after a 16-wide-N PV lands (tier 2 of "16xD") a *uniform* granule cannot serve
+it. Decomposition is the general mechanism for any head dim that is a sum of
+supported blocks, and it composes with both families rather than replacing
+either.
