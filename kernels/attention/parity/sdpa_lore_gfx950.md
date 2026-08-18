@@ -35,12 +35,26 @@ minutes' work:
 |---|---|---|
 | `rocdl.sched_barrier(0)` | machine-scheduler ordering | instruction motion, late |
 | empty asm, `~{memory}` clobber | IR-level ordering; no registers | instruction motion, early (LICM/sink) |
+| a source-level `s_nop` | scheduling **and** allocation | inconclusive -- see below |
 | identity asm on the value (`"=v,0"`) | forces a register copy | register allocation |
 | `amdgpu-snop-padding=1` (LLVM option) | a wait state before every instruction | **hardware wait state** |
 
 `amdgpu-snop-padding` is the sharpest instrument here and the cheapest to try.
 It is far too blunt to ship -- it costs ~3x at head_dim 128 -- but a one-line
 answer to "is this a hazard at all?" is worth a lot.
+
+**Neither of the first two can ever fix a wait-state hazard**, so a negative
+from them rules out instruction motion and nothing else. `SCHED_BARRIER` emits
+zero bytes and `SIInstrInfo::getNumWaitStates` returns 0 for meta instructions;
+inline asm is *explicitly skipped* by both wait-state walkers
+(`GCNHazardRecognizer.cpp:986` and `:1037`), whatever it clobbers.
+
+**A source-level `s_nop` is not the same experiment as `amdgpu-snop-padding`.**
+The padding option is post-RA, so it adds wait states and leaves registers
+byte-identical -- that is what makes it a clean probe. An `s_nop` written in
+the kernel is a side-effecting intrinsic present during scheduling, so it also
+moves the allocator. If it fixes something, diff the nop-stripped streams
+before believing you added timing.
 
 Note the asymmetry: an **identity asm emits no instruction**. It pins
 scheduling and liveness, and it changes which registers the allocator picks,
@@ -106,8 +120,30 @@ twice 96's.
 - not scheduling knobs -- `waves_per_eu`, `setprio`, `stagger` and
   `lazy_rescale` all leave the *identical* error.
 
-**What it is.** `amdgpu-snop-padding=1` fixes it, which makes it a hardware
-wait state. The offending pair, from the failing ISA:
+**What it is.** `amdgpu-snop-padding=1` fixes it and leaves the register
+assignment byte-identical, which makes it a hardware wait state. But the
+*documented* hazards are all satisfied. `v_mfma_f32_32x32x16_bf16` is XDL
+**8-pass** on gfx950 (`SISchedule.td:363`, `Write8PassMAI`), not 16-pass, so
+via the `GFX940_*` tables in `GCNHazardRecognizer.cpp:3167-3214` the
+requirements are 12 (MFMA write -> MFMA SrcA/B), 10 (-> SrcC on a non-matching
+opcode; 0 for same-opcode forwarding), 12 (-> VALU/DS/VMEM/EXP) and 2
+(VALU -> MFMA). A scan of the failing ISA against those exact numbers finds
+**zero violations**.
+
+Leading hypothesis: **`ds_read_b64_tr_b16` is not modeled by
+`GCNHazardRecognizer` at all** (no `DS_READ_B64_TR` anywhere in it), and this
+kernel issues 144 of them at head_dim 96. Unproven.
+
+Ruled out: the gfx940-family MUBUF/MTBUF store-data WAR hazard fixed upstream
+in `62b7cf9623fc` (2026-06-01, `main` and `release/23.x` only, so absent from
+every ROCm 7.x LLVM). It is a tempting match -- the commit says it was
+characterised on gfx950 by Triton's fused-attention kernel -- but this kernel
+has six `buffer_store_dwordx4` and none has a VALU overwriting its vdata inside
+the window.
+
+An earlier draft of this section blamed the pair below. That was wrong: the
+*working* build contains the same pattern, and 2 wait states is exactly what
+the VALU -> MFMA rule requires.
 
 ```
 v_perm_b32 v119, v157, v158, s14      <- VALU writes v119 (P bf16 packing)
@@ -122,8 +158,8 @@ Independent Instructions"). LLVM recognised the hazard and emitted `s_nop 1`;
 this needs more. head_dim 96 is simply the width whose allocation puts a
 freshly-packed P register inside an MFMA's SrcB range.
 
-**Status: FIXED.** `ParityGemmHelper.qk` now emits `s_nop 1` after the QK
-burst. It costs +1.6% at head_dim 64 and +0.8% at 128 (both inside noise) and
+**Status: worked around, mechanism still unknown.** `ParityGemmHelper.qk`
+emits `s_nop 1` after the QK burst. It costs +1.6% at head_dim 64 and +0.8% at 128 (both inside noise) and
 buys head_dim 96 at 932 TF against 579 for the padded 128 tile.
 
 The location came from bisection, not from identifying the pair: a wait state
@@ -139,6 +175,10 @@ Two earlier attempts, for the record:
 - Anchoring the K packs fixes it (579 -> 944 TF) but pins all `2*K_STEPS_QK`
   packs live at once -- 28 packs, 112 VGPRs at head_dim 224 -- and costs
   **-59% there**. It works by shifting registers, not by adding time.
+- The shipped `s_nop` is **also** a register perturbation, not a wait state:
+  nop-stripped, it gives the same 2817 instructions with 88 differing register
+  assignments. It is a workaround of the same kind as the anchor, just a free
+  one. The defect remains latent at other widths.
 - Putting `s_nop 0` inside `_anchor_v_p`'s asm body **does not fix it**. The
   production anchor pins the *concatenated* P vector and then shuffles the
   packs out, so the `v_perm_b32` is emitted after the anchor and the nop lands

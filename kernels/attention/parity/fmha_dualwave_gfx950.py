@@ -166,13 +166,24 @@ class ParityGemmHelper(dualwave.DualwaveGemmHelper):
             out = super().qk(v_k, q_all_scaled_bf16)
         else:
             out = self.qk_stage(v_k, q_all_scaled_bf16, (self.c_zero_v16f32, self.c_zero_v16f32), stage)
-        # One software wait state after the QK burst. **A hazard fix, not
-        # scheduling.** Without it head_dim 96 computes a wrong answer whose
-        # instruction *and register* stream is byte-identical to a correct one
-        # -- `amdgpu-snop-padding=1` fixes it, and with nops stripped both
-        # builds are the same 2817 instructions. So the arithmetic, the
-        # addressing and the allocation are all already right; only the timing
-        # is wrong.
+        # Works, and **not for the reason it looks like.** Without it head_dim
+        # 96 computes a wrong answer; with it, 96 is correct across five shapes
+        # in both masking modes at ~0 cost.
+        #
+        # It is *not* supplying a wait state. `s_nop` here is a side-effecting
+        # intrinsic present during scheduling, and stripping nops from the two
+        # builds gives the same 2817 instructions with **88 differing register
+        # assignments** -- so this perturbs allocation, the same way anchoring
+        # the K packs does, and not the same way `amdgpu-snop-padding=1` does
+        # (that one is post-RA and leaves registers byte-identical).
+        #
+        # The underlying defect is therefore still latent. Every *documented*
+        # gfx950 MFMA hazard is satisfied in the failing build: for
+        # `v_mfma_f32_32x32x16_bf16`, which is XDL 8-pass on gfx950, the
+        # requirements are 12 (write -> MFMA SrcA/B), 10 (-> SrcC, non-matching
+        # opcode), 12 (-> VALU/DS/VMEM) and 2 (VALU -> MFMA), and a scan finds
+        # zero violations. The leading hypothesis is `ds_read_b64_tr_b16`,
+        # which `GCNHazardRecognizer` does not model at all.
         #
         # Located by bisection, not from the pair: a wait state here, after
         # `exp2`, or after `reduce_sum` each fix it, while after `cast_p`,
