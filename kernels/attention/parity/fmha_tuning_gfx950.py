@@ -193,16 +193,24 @@ class FmhaKnobs:
     block_dmodel_v: int | None = None
     padded_head: bool | None = None
 
-    # How a head_dim narrower than the tile is handled. The two GEMMs are not
-    # symmetric about this:
+    # There is no `hdim_mode`. A `"runtime_qk_steps"` mode used to be declared
+    # here -- shorten the QK reduction to `ceil(hdim_qk/16)` MFMA K-steps at
+    # runtime, against `"zero_fill"`'s tile-shaped count -- and it was **never
+    # implemented**: the flag threaded through three files into
+    # `ctx.RUNTIME_QK_STEPS`, which nothing read. The two modes produced
+    # byte-identical ISA.
     #
-    #   "zero_fill"        loads skip whole chunks past hdim and zero those
-    #                      registers; the MFMA count stays tile-shaped.
-    #   "runtime_qk_steps" additionally shortens the QK reduction to
-    #                      ceil(hdim_qk/16) MFMA K-steps at runtime. Legal
-    #                      because the S accumulator shape depends on
-    #                      BLOCK_M/BLOCK_N, not on D.
-    hdim_mode: str | None = None
+    # Deleted rather than implemented, because measurement says it was aimed at
+    # the wrong term. At head_dim 32 in the 64 tile the padded build has the
+    # same 96 MFMAs as an unpadded 64 -- the 2x waste is real -- but it also has
+    # 565 `v_cndmask` against 145 and 3584 instructions against 2562. The
+    # masking, not the MFMA count, is what makes head_dim 32 *slower in
+    # wall-clock* than head_dim 64 (185 us against 155). Shortening QK would cut
+    # 8 of the 16 MFMAs per tile and leave that untouched.
+    #
+    # The fix that would matter is a tile that does not pad: `PV_MFMA_N` is 32
+    # and `K_STEP_QK` is 16, so rungs at multiples of 32 are legal in principle
+    # and need only granule-32 staging (family S).
 
     # Whether the strides fold to literals. False is the parity ABI; True
     # exists so the fast path can be shown to emit unchanged code.
@@ -227,8 +235,8 @@ class FmhaKnobs:
     # get reassembled. Three things follow, and each removes a class of bug:
     #
     # - **The field names appear once.** Returning `(block_dmodel,
-    #   block_dmodel_v, padded_head, hdim_mode)` and `replace`-ing them at the
-    #   call site spelled all four twice, in an order nothing checked.
+    #   block_dmodel_v, padded_head)` and `replace`-ing them at the call site
+    #   spelled them all twice, in an order nothing checked.
     # - **The step order is the data dependency.** `_with_wave_geometry` reads
     #   `self.block_dmodel`, so it *must* run after `_with_widths`; it no
     #   longer takes it as an argument and cannot be handed a stale one.
@@ -237,7 +245,7 @@ class FmhaKnobs:
     #   arch-specific steps freely.
 
     def _with_widths(self, meta):
-        """Decide `block_dmodel`, `block_dmodel_v`, `padded_head`, `hdim_mode`.
+        """Decide `block_dmodel`, `block_dmodel_v` and `padded_head`.
 
         Every arch has a ladder and a padded-head rule; only the ladder's
         contents differ, and those are `tile_width_for`'s. Kept on the base so
@@ -260,16 +268,11 @@ class FmhaKnobs:
         if padded_head is None:
             padded_head = (meta.head_dim != block_dmodel) or (head_dim_v != block_dmodel_v)
 
-        hdim_mode = "zero_fill" if self.hdim_mode is None else self.hdim_mode
-        if hdim_mode not in ("zero_fill", "runtime_qk_steps"):
-            raise ValueError(f"hdim_mode must be 'zero_fill' or 'runtime_qk_steps', got {hdim_mode!r}")
-
         return replace(
             self,
             block_dmodel=block_dmodel,
             block_dmodel_v=block_dmodel_v,
             padded_head=bool(padded_head),
-            hdim_mode=hdim_mode,
         )
 
 

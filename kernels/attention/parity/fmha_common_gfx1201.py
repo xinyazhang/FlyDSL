@@ -516,11 +516,14 @@ class MaskedAxis:
     to be a multiple of the access width.
     """
 
-    __slots__ = ("extent", "active", "elem_dtype")
+    __slots__ = ("extent", "active", "elem_dtype", "bitmask")
 
-    def __init__(self, extent, active=True, elem_dtype=None):
+    def __init__(self, extent, active=True, elem_dtype=None, bitmask=False):
         self.extent = extent
         self.active = active
+        # See `discard`. Off by default: it trades in-loop instructions for
+        # live registers, and only the caller knows whether that is affordable.
+        self.bitmask = bitmask
         # Only `discard` needs this, so the row axis leaves it unset. It is a
         # property of the tensor and every access along an axis shares it.
         #
@@ -586,11 +589,59 @@ class MaskedAxis:
         return fx.Index(self.valid(idx).select(addressed, fx.Index(0)))
 
     def discard(self, vec, idx, width):
-        """Zero the elements of `vec` whose index is past the extent."""
+        """Zero the elements of `vec` whose index is past the extent.
+
+        **AND with a precomputed bit mask, not a per-element select**, whenever
+        the elements are 16-bit and pair up evenly into dwords.
+
+        The obvious spelling -- `mask(idx, width).select(vec, zeros)` -- asks
+        for a *per-element* choice over 16-bit lanes that live packed two to a
+        VGPR, so the backend has to take them apart and put them back. Measured
+        on a head_dim 32 build in the 64 tile, against an unpadded 64:
+
+            v_cndmask_b32   +419
+            v_lshrrev_b32   +208     <- pure repacking
+            v_perm_b32      +192     <- pure repacking
+            total          +1022 instructions (3585 against 2563)
+
+        Two thirds of that is the register file being shuffled rather than any
+        masking work. A dword whose two halves are `0xFFFF` or `0` expresses the
+        same choice with one `v_and_b32` and no repacking, and the mask itself
+        is loop-invariant -- it depends on the extent and a loop-invariant
+        column base -- so it hoists out and costs nothing inside the loop.
+
+        Exact for any extent, including one that splits a pair: the two halves
+        of a dword carry independent masks.
+
+        **Opt-in, because it is not free and not always a win.** The masks are
+        loop-invariant, so they hoist -- and then stay *live* for the whole
+        loop, `width/2` registers per masked access. Measured on the gfx950
+        parity kernel, that is 16 registers in the 64-wide tile and 32 in the
+        128-wide one, and the 128 build already sits at 238 of 256:
+
+            tile    spills   TFLOP/s at the padded rungs
+             64        0     +21% (head_dim 16/32/48)
+            128       61     -43% (head_dim 80/96/112)
+
+        So the caller decides. `bitmask=False` keeps the per-element select,
+        which is also the path the fp8 and odd-width callers were verified on.
+        """
         if not self.active:
             return vec
-        zeros = Vec.filled(width, 0.0, self.elem_dtype)
-        return self.mask(idx, width).select(Vec(vec), zeros).ir_value()
+        if not self.bitmask or self.elem_dtype is None or self.elem_dtype.width != 16 or width % 2:
+            zeros = Vec.filled(width, 0.0, self.elem_dtype)
+            return self.mask(idx, width).select(Vec(vec), zeros).ir_value()
+
+        keep_lo = fx.Int32(0x0000FFFF)
+        keep_hi = fx.Int32(0xFFFF0000)
+        zero_i32 = fx.Int32(0)
+        dwords = [
+            self.valid(idx + fx.Index(2 * d)).select(keep_lo, zero_i32)
+            | self.valid(idx + fx.Index(2 * d + 1)).select(keep_hi, zero_i32)
+            for d in range_constexpr(width // 2)
+        ]
+        raw = Vec(vec).bitcast(fx.Int32)
+        return (raw & Vec.from_elements(dwords, fx.Int32)).bitcast(self.elem_dtype).ir_value()
 
     def gate(self, idx, addressed=None):
         """`(valid(idx), safe(idx, addressed))` -- the two halves together.

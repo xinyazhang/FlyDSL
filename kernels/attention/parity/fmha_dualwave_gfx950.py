@@ -212,7 +212,6 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         hdim_qk,
         hdim_vo,
         padded_head=False,
-        runtime_qk_steps=False,
         **kwargs,
     ):
         super().__init__(traits, **kwargs)
@@ -243,7 +242,6 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         self.hdim_qk = hdim_qk
         self.hdim_vo = hdim_vo
         self.PADDED_HEAD = bool(padded_head)
-        self.RUNTIME_QK_STEPS = bool(runtime_qk_steps)
 
     # -- runtime softmax scale -------------------------------------------
     #
@@ -414,7 +412,9 @@ class ParityQLoader(dualwave.DualwaveQLoader):
         if const_expr(not self.PADDED_HEAD):
             return pack
         col_base = fx.Index(ks * self.traits.K_STEP_QK) + self.lane_div_32 * fx.Index(self.traits.MFMA_LANE_K)
-        return MaskedAxis(fx.Index(self.hdim_qk), elem_dtype=self.elem_dtype).discard(
+        # Q is masked once, before the KV loop, so the mask registers die
+        # immediately and the bitmask form is pure win here.
+        return MaskedAxis(fx.Index(self.hdim_qk), elem_dtype=self.elem_dtype, bitmask=True).discard(
             pack, col_base, self.traits.MFMA_LANE_K
         )
 
@@ -508,7 +508,15 @@ class ParityKvLdsToVgprLoader(dualwave.DualwaveKvLdsToVgprLoader):
             steps = self.traits.K_STEPS_QK
         if const_expr(not self.PADDED_HEAD):
             return (k_lo, k_hi)
-        cols = MaskedAxis(fx.Index(self.hdim_qk), elem_dtype=self.elem_dtype)
+        # K is masked *inside* the KV loop, so the hoisted masks stay live and
+        # compete with everything else. Worth it only where they fit: measured
+        # +21% in the 64-wide tile and -43% in the 128-wide one, where 32 extra
+        # live registers turn a spill-free build into 61 spills.
+        cols = MaskedAxis(
+            fx.Index(self.hdim_qk),
+            elem_dtype=self.elem_dtype,
+            bitmask=self.traits.K_STEPS_QK * (self.traits.MFMA_LANE_K // 2) <= 16,
+        )
         width = self.traits.MFMA_LANE_K
         for ks in range_constexpr(steps):
             # The mask is against the *global* D column, so the stage's base

@@ -122,9 +122,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
 
     BLOCK_DMODEL = knobs.block_dmodel
     PADDED_HEAD = knobs.padded_head
-    HDIM_MODE = knobs.hdim_mode
     STRIDES_CONSTEXPR = knobs.strides_constexpr
-    RUNTIME_QK_STEPS = PADDED_HEAD and HDIM_MODE == "runtime_qk_steps"
 
     # Which algorithm this build is. `D_STAGES > 1` is the discriminator rather
     # than a width threshold: staging is what the dual-wave schedule cannot
@@ -144,7 +142,6 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         traits.cache_tag,
         BLOCK_DMODEL,
         PADDED_HEAD,
-        HDIM_MODE,
         STRIDES_CONSTEXPR,
         BUILD_SM_SCALE,
         (knobs.num_waves, knobs.block_m, knobs.block_n, knobs.head_dim_granule),
@@ -218,7 +215,6 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             hdim_qk=hdim_qk,
             hdim_vo=hdim_vo,
             padded_head=PADDED_HEAD,
-            runtime_qk_steps=RUNTIME_QK_STEPS,
             Q=Q,
             K=K,
             V=V,
