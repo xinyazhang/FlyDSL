@@ -52,15 +52,16 @@ change:
 import contextlib
 from dataclasses import replace
 
+import fmha_common_gfx1201 as fmha
+from fmha_common_gfx1201 import MaskedAxis
+from gfx950_standalone import dualwave
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
-import fmha_common_gfx1201 as fmha
-from fmha_common_gfx1201 import MaskedAxis
-from gfx950_standalone import dualwave
 
 __all__ = [
     "ParityGemmHelper",

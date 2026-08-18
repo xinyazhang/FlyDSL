@@ -72,9 +72,6 @@ output columns are no longer contiguous, so the store walks one run per stage.
 import contextlib
 from dataclasses import replace
 
-import flydsl.compiler as flyc
-import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr
 from fmha_common_gfx1201 import MaskedAxis
 from fmha_dualwave_gfx950 import (
     ParityGemmHelper,
@@ -84,6 +81,10 @@ from fmha_dualwave_gfx950 import (
     ParityStoreHelper,
 )
 from gfx950_standalone import dualwave
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import const_expr, range_constexpr
 
 __all__ = [
     "WideGemmHelper",
@@ -423,4 +424,5 @@ def make_wide_body(
         _s_barrier()
 
         output_store.store_final_o_runs(v_o, ctx.q_row, runs, ctx.vo_shard_id, m_row, l_row)
+
     return _wide_body

@@ -2126,7 +2126,33 @@ exactly this reason.
 
 - **Split-K + window.** `_skip_dead_leading_tiles` is gated off under
   `SPLITK`, which already owns `split_t0`. Composing them means intersecting
-  two tile ranges rather than assigning one, and split-K is an optimization
-  rather than a parity feature (see the split-K note above).
+  two tile ranges rather than assigning one.
+
+  Chasing that gate turned up something larger and **pre-existing**: parity
+  split-K returns wrong answers with no window involved at all, and did so
+  before this phase started. The control is decisive -- the *production*
+  dual-wave kernel passes the identical harness at 2 and 4 splits, and the
+  parity kernel fails it at both.
+
+  Root cause, confirmed by layout: `DualwaveSplitKCombineHelper.store_output`
+  is shared production code and stores at
+  `seq * stride_q_n + head * HEAD_DIM + col`, the BSHD-flattened form. This
+  port exists precisely because `(batch, head, seq)` are free strides, and the
+  combine path never received that change of variables. On a BHSD-contiguous
+  O the head term is `head * HEAD_DIM` and the sequence term is
+  `seq * HEAD_DIM`, so **heads alias tokens** -- error 3.5 against a 2e-2
+  tolerance, finite, deterministic, no fault. Laying the same tensors out BSHD
+  makes every split count pass, at batch 3 as well as 1.
+
+  It went unnoticed because split-K had **no device-level test**: the only
+  coverage was `assert_matches_production` with `num_kv_splits=splits`, which
+  compares the resolved *configuration* and never runs the kernel. Two tests
+  now cover it, and the dispatcher refuses a head stride the combine cannot
+  address rather than returning plausible numbers.
+
+  Fixing it means a parity subclass of the combine helper that reads the real
+  `stride_o0/1/2`, the same change of variables the rest of the port already
+  made. Not done here: split-K is an optimization rather than a parity feature
+  (see the split-K note above), and the guard removes the hazard.
 - `CAUSAL_TYPE` is not surfaced as an integer. The two values AOTriton ships,
   0 and 3, are `causal=False` and `window=True` here.

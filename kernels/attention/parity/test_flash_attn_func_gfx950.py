@@ -28,19 +28,18 @@ import math
 import time
 from dataclasses import replace
 
+import fmha_common_gfx1201 as fmha
 import pytest
 import torch
 import torch.nn.functional as F
 from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module as build
-import fmha_common_gfx1201 as fmha
 from fmha_tuning_gfx950 import LADDER, LADDER_PLANNED, FmhaInputMetadata, fmha_knobs, tile_width_for
 from gfx950_standalone import dualwave  # noqa: F401  (puts the repo root on sys.path)
 
 from kernels.attention.flash_attn_gfx950 import build_flash_attn_dualwave_swp_module as build_prod
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx950"),
+    not torch.cuda.is_available() or not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx950"),
     reason="requires a gfx950 device",
 )
 
@@ -382,9 +381,27 @@ def test_padded_head_never_writes_past_hdim_vo():
 @pytest.mark.parametrize(
     "hdim,want",
     [
-        (1, 32), (16, 32), (32, 32), (33, 64), (64, 64), (65, 96), (96, 96), (97, 128), (128, 128),
-        (129, 160), (160, 160), (161, 192), (192, 192), (193, 224), (224, 224),
-        (225, 256), (256, 256), (257, 384), (384, 384), (385, 512), (512, 512),
+        (1, 32),
+        (16, 32),
+        (32, 32),
+        (33, 64),
+        (64, 64),
+        (65, 96),
+        (96, 96),
+        (97, 128),
+        (128, 128),
+        (129, 160),
+        (160, 160),
+        (161, 192),
+        (192, 192),
+        (193, 224),
+        (224, 224),
+        (225, 256),
+        (256, 256),
+        (257, 384),
+        (384, 384),
+        (385, 512),
+        (512, 512),
     ],
 )
 def test_tile_width_rounds_up(hdim, want):
@@ -442,6 +459,53 @@ def test_padded_head_is_derived_not_guessed():
         assert fmha_knobs("gfx950").resolve(FmhaInputMetadata(num_heads=8, head_dim=hdim)).padded_head is False
     assert fmha_knobs("gfx950").resolve(FmhaInputMetadata(num_heads=8, head_dim=40)).padded_head is True
     assert fmha_knobs("gfx950").resolve(FmhaInputMetadata(num_heads=8, head_dim=64, head_dim_v=32)).padded_head is True
+
+
+# ---------------------------------------------------------------------------
+# Split-K: correct only in the production output layout
+# ---------------------------------------------------------------------------
+
+
+def _splitk_workspace(b, h, s, splits, head_dim):
+    from kernels.attention.flash_attn_utils import dualwave_splitk_workspace_elems
+
+    n = dualwave_splitk_workspace_elems(b, h, s, splits, head_dim=head_dim)
+    return torch.zeros(n, device="cuda", dtype=torch.float32)
+
+
+@pytest.mark.parametrize("splits", [2, 4])
+def test_splitk_matches_sdpa_in_production_layout(splits):
+    """Split-K works, but only where the heads are packed adjacently.
+
+    There was no device-level split-K test at all before this -- only a traits
+    comparison, which checks the *configuration* matches production and never
+    runs the kernel. That is why a wrong answer went unnoticed: `num_kv_splits`
+    resolved, built and returned finite garbage.
+    """
+    b, h, s, d = 3, 4, 2048, 64
+    q, k, v = (_rand(b, s, h, d).transpose(1, 2) for _ in range(3))
+    o = torch.empty(b, s, h, d, device="cuda", dtype=DT).transpose(1, 2)
+    assert o.stride(1) == d, "the point of this layout is heads adjacent"
+    fn = build(num_heads=h, head_dim=d, causal=True, dtype_str="bf16", num_kv_heads=h, num_kv_splits=splits)
+    fn(q, k, v, o, b, s, seqlen_k=s, scale=None, lse=None, workspace=_splitk_workspace(b, h, s, splits, d))
+    assert _err(o, _ref(q, k, v, causal=True)) < TOL
+
+
+def test_splitk_refuses_a_bhsd_output():
+    """A BHSD-contiguous O must raise, because the combine would alias heads.
+
+    The shared combine kernel stores at `seq * stride_q_n + head * HEAD_DIM`,
+    which is the production BSHD form. With BHSD both terms scale by `HEAD_DIM`
+    and heads land on top of tokens: measured error 3.5 against a 2e-2
+    tolerance, finite, deterministic, no fault. Refusing is the only honest
+    behaviour until the combine path is made stride-general.
+    """
+    b, h, s, d = 1, 4, 2048, 64
+    q, k, v = (_rand(b, h, s, d) for _ in range(3))
+    o = torch.empty(b, h, s, d, device="cuda", dtype=DT)
+    fn = build(num_heads=h, head_dim=d, causal=True, dtype_str="bf16", num_kv_heads=h, num_kv_splits=2)
+    with pytest.raises(ValueError, match="head stride"):
+        fn(q, k, v, o, b, s, seqlen_k=s, scale=None, lse=None, workspace=_splitk_workspace(b, h, s, 2, d))
 
 
 # ---------------------------------------------------------------------------

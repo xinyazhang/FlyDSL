@@ -67,12 +67,8 @@ P0 (this ABI, runtime scale/head counts/strides, LSE), P1 (runtime
 five varlen modes, bias and dropout are not; see `sdpa-close-gap-gfx950.md`.
 """
 
-import flydsl.compiler as flyc
-import flydsl.expr as fx
 import fmha_abi_gfx1201 as abi
 import fmha_common_gfx1201 as fmha
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import const_expr, range_constexpr
 from fmha_dualwave_gfx950 import (
     ParityGemmHelper,
     ParityKernelContext,
@@ -85,13 +81,18 @@ from fmha_dualwave_gfx950 import (
 from fmha_tuning_gfx950 import FmhaInputMetadata, fmha_knobs
 from fmha_wide_gfx950 import (
     WideGemmHelper,
-    WideSoftmaxHelper,
     WideKernelContext,
     WideKvLdsToVgprLoader,
+    WideSoftmaxHelper,
     WideStoreHelper,
     make_wide_body,
 )
 from gfx950_standalone import dualwave
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import const_expr, range_constexpr
 
 KERNEL_NAME = "flash_attn_func_gfx950_kernel"
 
@@ -100,6 +101,7 @@ KERNEL_NAME = "flash_attn_func_gfx950_kernel"
 # primitives the hand-built pipeline is made of, and a second copy of any of
 # them would be a second thing to keep in step.
 from fmha_dualwave_gfx950 import _anchor_v_o  # noqa: E402  (one-accumulator safe)
+
 _anchor_v_p = dualwave._anchor_v_p
 _dualwave_sync_barrier = dualwave._dualwave_sync_barrier
 _s_barrier = dualwave._s_barrier
@@ -783,7 +785,6 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         else:
             _body = _main_body
 
-
         if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN and not traits.SPLITK):
             output_store.zero_o_block_if_needed()
 
@@ -1063,6 +1064,34 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
                 f"this build serves hdim_qk in ({HDIM_QK_FLOOR}, {BLOCK_DMODEL}], got {hdim_qk}; "
                 f"build for the narrower head_dim, or pin hdim_qk_floor=0 to mask every column"
             )
+        # **Split-K's combine kernel is not stride-general, and this is the
+        # only place that can say so.** `DualwaveSplitKCombineHelper` is shared
+        # production code, and its store is the BSHD-flattened form the
+        # dual-wave kernel was written for:
+        #
+        #     o_global = seq * stride_q_n + head * HEAD_DIM + col
+        #
+        # The whole point of this port is that (batch, head, seq) are free
+        # strides, and the combine path never got that change of variables. On
+        # a BHSD-contiguous O the head term is `head * HEAD_DIM` while the
+        # sequence term is `seq * HEAD_DIM` too, so the heads alias the tokens
+        # and the answer is silently wrong -- measured 3.5 against a 2e-2
+        # tolerance, with no NaN and no fault.
+        #
+        # It is *correct* whenever the heads really are packed adjacently, i.e.
+        # `stride_o1 == HEAD_DIM`, which is exactly the layout PyTorch's SDPA
+        # shim hands down. Verified at 2 and 4 splits and batch 3. So this
+        # refuses the broken case rather than the feature.
+        if traits.SPLITK and O.stride(1) != BLOCK_DMODEL:
+            raise ValueError(
+                f"num_kv_splits > 1 needs O's head stride to be {BLOCK_DMODEL} (heads adjacent, the "
+                f"BSHD-flattened layout), got {O.stride(1)} from strides {tuple(O.stride())}. The "
+                f"split-K combine kernel is shared with the production dual-wave kernel and is not "
+                f"stride-general; a BHSD-contiguous O would alias heads onto tokens and return "
+                f"plausible wrong numbers. Pass a (B, S, H, D) allocation transposed to (B, H, S, D), "
+                f"or build with num_kv_splits=1."
+            )
+
         if traits.RETURN_LSE and lse is None:
             raise ValueError("this build has return_lse=True and requires an fp32 `lse` tensor")
         if traits.SPLITK and workspace is None:

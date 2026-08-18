@@ -416,13 +416,7 @@ class Gfx950Knobs(FmhaKnobs):
         answer, since every derived field is recomputed from `meta` and the
         pinned fields rather than read back.
         """
-        return (
-            _GFX950_FALLBACK.merge(self)
-            ._checked_modes()
-            ._with_widths(meta)
-            ._with_wave_geometry()
-            ._with_traits(meta)
-        )
+        return _GFX950_FALLBACK.merge(self)._checked_modes()._with_widths(meta)._with_wave_geometry()._with_traits(meta)
 
     def _checked_modes(self):
         """Reject mode combinations the kernel does not implement.
@@ -509,9 +503,7 @@ class Gfx950Knobs(FmhaKnobs):
         #
         # `ROWS_PER_WAVE` stays 32 (the MFMA's M extent), so BLOCK_M is
         # `Q_TILES * 32` and the shards eat the waves rather than the rows.
-        return replace(
-            me, num_waves=4, block_m=(4 // me.vo_shards) * 32, block_n=64, head_dim_granule=64
-        )
+        return replace(me, num_waves=4, block_m=(4 // me.vo_shards) * 32, block_n=64, head_dim_granule=64)
 
     # LDS is `BLOCK_N * head_dim * ~8.3 B` for a double-buffered K+V pair, and
     # the addressable cap is 163840 B. Measured, not inferred: the compiler

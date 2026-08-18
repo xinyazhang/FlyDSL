@@ -27,10 +27,17 @@ def geometry(gran, block_n, num_waves, head_dim):
     assert block_n % n_per_wave == 0, "BLOCK_N not a multiple of tokens/issue"
     assert n_rpt % num_waves == 0, "lines do not divide across waves"
     return dict(
-        gran=gran, block_n=block_n, num_waves=num_waves, head_dim=head_dim,
-        n_per_wave=n_per_wave, n_rpt=n_rpt, d_rpt=d_rpt,
-        buckets=gran // VEC, kspb=gran // KSTEP,
-        issues=n_rpt // num_waves, k_steps=head_dim // KSTEP,
+        gran=gran,
+        block_n=block_n,
+        num_waves=num_waves,
+        head_dim=head_dim,
+        n_per_wave=n_per_wave,
+        n_rpt=n_rpt,
+        d_rpt=d_rpt,
+        buckets=gran // VEC,
+        kspb=gran // KSTEP,
+        issues=n_rpt // num_waves,
+        k_steps=head_dim // KSTEP,
     )
 
 
@@ -42,11 +49,11 @@ def write_map(g):
             line_n = w + j * g["num_waves"]
             for d in range(g["d_rpt"]):
                 line = line_n + d * g["n_rpt"]
-                for l in range(64):
+                for lane in range(64):
                     for i in range(VEC):
-                        tok = (l // g["buckets"]) * g["n_rpt"] + line_n
-                        D = (l % g["buckets"]) * VEC + d * g["gran"] + i
-                        m[(line, l * VEC + i)] = (tok, D)
+                        tok = (lane // g["buckets"]) * g["n_rpt"] + line_n
+                        D = (lane % g["buckets"]) * VEC + d * g["gran"] + i
+                        m[(line, lane * VEC + i)] = (tok, D)
     return m
 
 

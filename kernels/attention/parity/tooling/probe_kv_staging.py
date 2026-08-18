@@ -30,21 +30,20 @@ import _bootstrap  # noqa: F401  (puts parity/ on sys.path)
 import torch
 from fmha_dualwave_gfx950 import (
     ParityKernelContext,
+    ParityKvGmemToLdsLoader,
+    ParityKvLdsToVgprLoader,
     ParityQLoader,
     ParitySoftmaxHelper,
     ParityStoreHelper,
-    ParityKvGmemToLdsLoader,
-    ParityKvLdsToVgprLoader,
 )
 from fmha_tuning_gfx950 import _GFX950_FALLBACK, FmhaInputMetadata, fmha_knobs
+from gfx950_standalone import dualwave
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
-from gfx950_standalone import dualwave
-
 
 # `(waves, BLOCK_M, BLOCK_N, granule)` to pin, or None for the policy default.
 # A probe has to be able to build the geometry under investigation, which is
@@ -71,10 +70,10 @@ def build_probe(head_dim, num_heads=8, which="k", buf=0):
         "k": traits.K_STEPS_QK * 2,
         "v": 4 * traits.D_CHUNKS,
         "q": traits.K_STEPS_QK,
-        "s": 4,   # two v16f32 accumulators = 32 f32, dumped as 4 slots of 8
-        "pv": traits.D_CHUNKS * 2,   # D_CHUNKS v16f32 accumulators
-        "ml": 1,                     # [m_row, l_row] padded to one slot
-        "store": 1,                  # writes O directly; Out is unused
+        "s": 4,  # two v16f32 accumulators = 32 f32, dumped as 4 slots of 8
+        "pv": traits.D_CHUNKS * 2,  # D_CHUNKS v16f32 accumulators
+        "ml": 1,  # [m_row, l_row] padded to one slot
+        "store": 1,  # writes O directly; Out is unused
     }[which] * traits.MFMA_LANE_K
 
     elem = dualwave.dtype_to_elem_type(traits.DTYPE_STR)
@@ -235,8 +234,16 @@ def build_probe(head_dim, num_heads=8, which="k", buf=0):
                     dump(dc * 2 + j, vv.shuffle(vv, [j * 8 + t for t in range(8)]).ir_value())
 
     @flyc.jit
-    def launch(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, Out: fx.Tensor,  # noqa: E741
-               seq_len: fx.Int32, stride_s: fx.Int64, stream: fx.Stream = fx.Stream(None)):
+    def launch(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,  # noqa: E741
+        Out: fx.Tensor,
+        seq_len: fx.Int32,
+        stride_s: fx.Int64,
+        stream: fx.Stream = fx.Stream(None),
+    ):
         probe_kernel(Q, K, V, O, Out, seq_len, stride_s).launch(
             grid=(1, 1, 1), block=(traits.BLOCK_SIZE, 1, 1), stream=stream
         )
@@ -257,8 +264,9 @@ def run(head_dim, num_heads=8):
             T[0, 0, t, :] = encode(t, torch.arange(head_dim, device=dev, dtype=torch.float32))
         assert T.stride(1) == head_dim and T.stride(2) == head_dim * H
         Z = torch.zeros_like(T)
-        per_lane = {"k": traits.K_STEPS_QK * 2, "v": 4 * traits.D_CHUNKS,
-                    "q": traits.K_STEPS_QK}[which] * traits.MFMA_LANE_K
+        per_lane = {"k": traits.K_STEPS_QK * 2, "v": 4 * traits.D_CHUNKS, "q": traits.K_STEPS_QK}[
+            which
+        ] * traits.MFMA_LANE_K
         Out = torch.full((traits.BLOCK_SIZE * per_lane,), -1.0, device=dev, dtype=torch.float32)
         if src == "q":
             launch(T, Z, Z, Z, Out, S, head_dim * H)
@@ -311,9 +319,11 @@ def run(head_dim, num_heads=8):
         return tok, dc * 32 + (lane % 32)
 
     launch, traits = build_probe(head_dim, num_heads)
-    print(f"head_dim={head_dim}  geom=(waves {traits.NUM_WAVES}, BM {traits.BLOCK_M}, BN {traits.BLOCK_N}, "
-          f"gran {traits.D_128B_SIZE})  d_rpt={traits.SMEM_D_RPT} K_STEPS={traits.K_STEPS_QK} "
-          f"D_CHUNKS={traits.D_CHUNKS}")
+    print(
+        f"head_dim={head_dim}  geom=(waves {traits.NUM_WAVES}, BM {traits.BLOCK_M}, BN {traits.BLOCK_N}, "
+        f"gran {traits.D_128B_SIZE})  d_rpt={traits.SMEM_D_RPT} K_STEPS={traits.K_STEPS_QK} "
+        f"D_CHUNKS={traits.D_CHUNKS}"
+    )
     n = 0
     n += measure("k", lambda t, d: d, k_expect, "K stage: K[t][d]=d  (D map)")
     n += measure("k", lambda t, d: t * torch.ones_like(d), k_expect, "K stage: K[t][d]=t  (token map)")
