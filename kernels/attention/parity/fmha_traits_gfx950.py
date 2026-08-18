@@ -24,11 +24,60 @@ plausible formula that coincide at granule 64, and the ones below are flagged
 but wrong numbers, and none of them is exercised until one is built.
 """
 
-from dataclasses import fields
+from dataclasses import dataclass, fields
 
 from gfx950_standalone import dualwave
 
-__all__ = ["make_traits", "assert_matches_production"]
+__all__ = ["make_traits", "assert_matches_production", "ParityDualwaveTraits"]
+
+
+@dataclass(frozen=True)
+class ParityDualwaveTraits(dualwave.DualwaveSwpTraits):
+    """Production's traits plus the two axes that let a tile exceed head_dim 256.
+
+    A subclass rather than new fields on `DualwaveSwpTraits`, because that
+    dataclass lives in `flash_attn_utils.py` and is shared by four production
+    kernels. Subclassing is free here: the parent is `frozen=True` with no
+    defaulted fields, so added fields need defaults and those defaults are
+    exactly the "behave like today" values. `assert_matches_production`
+    iterates the *parent's* fields, so it keeps pinning family A to production
+    without knowing these exist.
+
+    Both default to 1, and **1 must mean the kernel is unchanged** -- every
+    construct they gate sits behind `const_expr(... > 1)` so a default build
+    traces to identical IR. That is what makes the four working rungs safe.
+
+    - `D_STAGES` -- how many passes the KV tile's D axis is staged through LDS
+      in. LDS is `BLOCK_N * head_dim * ~8.3 B` and the cap is 163840, so
+      head_dim 384 (204288 B) and 512 (272384 B) do not fit in one pass. It
+      also bounds the K/V register window, since only one stage is live.
+    - `VO_SHARDS` -- how many waves split the *output* D axis of one Q tile.
+      Wave *s* accumulates only `O[:, slice_s]`, so O drops by the shard count.
+      Every wave still computes the whole S, which is why this needs **no
+      cross-wave reduction at all** -- the shards never have to agree on
+      anything, they just write disjoint columns. The price is that QK is
+      recomputed per shard.
+    - `QK_SHARDS` -- additionally splits the *reduction* D axis, so wave *s*
+      holds only `Q[:, slice_s]` and computes a partial S that must then be
+      summed across shards through LDS. Strictly more powerful than
+      `VO_SHARDS` (it is the only thing that shrinks Q) and strictly more
+      machinery. Not implemented yet; `VO_SHARDS` alone is what makes head_dim
+      512 fit, because O is 256 VGPRs against Q's 128.
+
+    The two are separate fields rather than one number because they buy
+    different things at different prices, and conflating them would hide that
+    the cheap one is sufficient today.
+    """
+
+    D_STAGES: int = 1
+    QK_SHARDS: int = 1
+    VO_SHARDS: int = 1
+    STAGE_DIM: int = 0  # head_dim // D_STAGES; 0 means "unset", fixed up below
+    K_STEPS_PER_STAGE: int = 0
+    D_CHUNKS_PER_STAGE: int = 0
+    D_CHUNKS_PER_STAGE_SHARD: int = 0
+    Q_TILES: int = 0  # NUM_WAVES // VO_SHARDS
+
 
 # Hardware constants. Not parameters: these are the wave, the DMA width and the
 # MFMA shape, and a build that changed one would not be this algorithm.
@@ -52,6 +101,9 @@ def make_traits(
     block_m,
     block_n,
     granule,
+    d_stages=1,
+    qk_shards=1,
+    vo_shards=1,
     causal=True,
     dtype_str="bf16",
     waves_per_eu=2,
@@ -70,19 +122,59 @@ def make_traits(
     xcd_swizzle=False,
 ):
     """Dualwave traits for an arbitrary (waves, BLOCK_M, BLOCK_N, granule)."""
-    if block_m % num_waves:
-        raise ValueError(f"BLOCK_M {block_m} does not divide across {num_waves} waves")
+    if num_waves % vo_shards:
+        raise ValueError(f"vo_shards {vo_shards} must divide num_waves {num_waves}")
+    # With `vo_shards` waves sharing one Q tile, the workgroup covers
+    # `num_waves // vo_shards` tiles, not `num_waves`. Rows per wave is *not*
+    # what shrinks -- it is pinned at 32 by the MFMA's M extent -- so BLOCK_M
+    # falls instead, and what each wave saves is D columns of O.
+    q_tiles = num_waves // vo_shards
+    if block_m % q_tiles:
+        raise ValueError(f"BLOCK_M {block_m} does not divide across {q_tiles} Q tiles")
     if head_dim % granule:
         raise ValueError(f"head_dim {head_dim} is not a multiple of the granule {granule}")
     if head_dim % D_CHUNK:
         raise ValueError(f"head_dim {head_dim} is not a multiple of the PV MFMA width {D_CHUNK}")
 
     block_size = num_waves * WARP_SIZE
-    rows_per_wave = block_m // num_waves
+    rows_per_wave = block_m // q_tiles
 
     k_steps_qk = head_dim // K_STEP_QK
     d_chunks = head_dim // D_CHUNK
     pv_k_steps = K_SUB_N // PV_K_STEP
+
+    # The D axis is cut two independent ways, and they compose: `d_stages`
+    # splits it *in time* (one LDS residency per pass) and `qk_shards` splits
+    # it *across waves* (one Q/O slice per wave). Validated together here so an
+    # illegal pair fails at the decision rather than at an address.
+    if d_stages < 1 or head_dim % d_stages:
+        raise ValueError(f"head_dim {head_dim} is not a multiple of d_stages {d_stages}")
+    stage_dim = head_dim // d_stages
+    if stage_dim % granule:
+        raise ValueError(f"stage extent {stage_dim} (head_dim/{d_stages}) is not a multiple of granule {granule}")
+    if k_steps_qk % d_stages or d_chunks % d_stages:
+        raise ValueError(
+            f"d_stages {d_stages} must divide both K_STEPS_QK {k_steps_qk} and D_CHUNKS {d_chunks}; "
+            "a stage that splits an MFMA step has no meaning"
+        )
+    if vo_shards < 1 or d_chunks % (d_stages * vo_shards):
+        raise ValueError(
+            f"vo_shards {vo_shards} x d_stages {d_stages} must divide D_CHUNKS {d_chunks}; "
+            "each (stage, shard) owns a whole number of 32-column PV output chunks"
+        )
+    d_chunks_per_stage_shard = d_chunks // (d_stages * vo_shards)
+    if d_chunks_per_stage_shard % 2:
+        raise ValueError(
+            f"D_CHUNKS per (stage, shard) is {d_chunks_per_stage_shard}, which must be even: the shard's "
+            "LDS offset is folded into `urv_base`, and `_swizzled_v_dc_off` only decomposes that way "
+            "when the shard starts on an even chunk"
+        )
+    if qk_shards < 1 or head_dim % qk_shards:
+        raise ValueError(f"head_dim {head_dim} is not a multiple of qk_shards {qk_shards}")
+    if num_waves % qk_shards:
+        raise ValueError(f"qk_shards {qk_shards} must divide num_waves {num_waves}")
+    k_steps_per_stage = k_steps_qk // d_stages
+    d_chunks_per_stage = d_chunks // d_stages
 
     gqa_group_size = num_heads // num_kv_heads
     default_stride_q_n = num_heads * head_dim
@@ -93,7 +185,12 @@ def make_traits(
     smem_linear_wave = WARP_SIZE * DMA_BYTES // BF16_BYTES
     smem_n_per_wave = smem_linear_wave // granule
     smem_n_rpt = block_n // smem_n_per_wave
-    smem_d_rpt = head_dim // granule
+    # `stage_dim`, not `head_dim`: this is the sole term through which
+    # `d_stages` reaches LDS. Everything downstream (tile elems, buffer bases,
+    # LDS_KV_TOTAL_SIZE) is derived from it, so one substitution sizes the
+    # whole allocation to a single pass. At `d_stages == 1` it is `head_dim`
+    # and every derived number is bit-for-bit what it was.
+    smem_d_rpt = stage_dim // granule
     if smem_n_rpt == 0 or block_n % smem_n_per_wave:
         raise ValueError(f"BLOCK_N {block_n} is not a multiple of {smem_n_per_wave} tokens per DMA issue")
     if smem_n_rpt % num_waves:
@@ -136,7 +233,15 @@ def make_traits(
     # defensive and would make this a *different* traits object, which the
     # field-by-field check would then have to be loosened to accept.
 
-    return dualwave.DualwaveSwpTraits(
+    return ParityDualwaveTraits(
+        D_STAGES=d_stages,
+        QK_SHARDS=qk_shards,
+        VO_SHARDS=vo_shards,
+        D_CHUNKS_PER_STAGE_SHARD=d_chunks_per_stage_shard,
+        Q_TILES=q_tiles,
+        STAGE_DIM=stage_dim,
+        K_STEPS_PER_STAGE=k_steps_per_stage,
+        D_CHUNKS_PER_STAGE=d_chunks_per_stage,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_N_OUT=block_n,

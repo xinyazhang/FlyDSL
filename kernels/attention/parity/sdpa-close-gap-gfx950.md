@@ -1627,3 +1627,105 @@ shows the same error to within 6% at every scale measured** -- which is what
 identified it as bf16 output precision rather than anything the port did. The
 fix was the metric, not the tolerance: normalise by `|ref|` when it exceeds 1,
 which leaves every O(1) case bounded exactly as before.
+
+## P8 — head_dim 384 and 512, on a second kernel body
+
+Both widths now build and run. `LADDER` is `(64, 128, 192, 256, 384, 512)` and
+`LADDER_PLANNED` is empty.
+
+| head_dim | waves | BLOCK_M | stages | shards | AGPR | spills | LDS | TFLOP/s | build |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 | 8 | 256 | 1 | 1 | 0 | 0 | 34 KB | 930 | 3 s |
+| 128 | 8 | 256 | 1 | 1 | 0 | 0 | 68 KB | 1167 | 3 s |
+| 192 | 4 | 128 | 1 | 1 | 174 | 0 | 102 KB | 973 | 3 s |
+| 256 | 4 | 128 | 1 | 1 | 192 | 0 | 136 KB | 979 | 4 s |
+| **384** | 4 | 128 | 2 | 1 | 150 | 0 | 100 KB | **579** | 4 s |
+| **512** | 4 | 64 | 2 | 2 | 183 | 0 | 133 KB | **366** | 5 s |
+
+64-256 are **bit-identical** to before, and `tests/kernels/test_flash_attn_fwd.py`
+still passes.
+
+### The blocker was LDS, and it blocked 384 as hard as 512
+
+Two KV tiles in flight need `2 * BLOCK_N * head_dim * ~8.3 B`. The compiler is
+explicit:
+
+```
+head_dim 384: local memory (204288) exceeds limit (163840)
+head_dim 512: local memory (272384) exceeds limit (163840)
+```
+
+The obvious lever, `BLOCK_N`, is **not a working knob**: at head_dim 64 against
+SDPA, BLOCK_N 32 gives 2.66e-01 and BLOCK_N 128 gives 7.34e-01, against
+1.70e-03 for the two supported geometries. The kernel body assumes a 64-token
+tile split into two 32-strips (`k_lo`/`k_hi`, ~10 `range_constexpr(2)` sites in
+shared production code).
+
+So the fix is `D_STAGES`, staging the D axis through LDS in passes, in a
+separate body (`fmha_wide_gfx950.py`) with no dual-wave pipeline.
+
+### Removing dual-wave was necessary and not sufficient
+
+With the pipeline already gone, 512 still spilled 286 registers, took **61 s**
+to build, and ran at 138 TF. The ISA said why: **525 `v_accvgpr_write` and 515
+`v_accvgpr_read` against 128 MFMAs** -- the AGPR file used as a spill area. The
+residue is per-wave data, not pipelining, and `ROWS_PER_WAVE` is pinned at 32
+by the MFMA's M extent:
+
+    Q = 32 * 512 / 64 / 2 = 128 VGPR      O = 32 * 512 / 64 = 256 VGPR
+
+`VO_SHARDS` splits the *output* D axis across waves. Sharding only the output
+means the shards write disjoint columns and never reconcile, so unlike
+gfx1201's `QK_SHARDS` there is **no cross-wave reduction, no extra barrier and
+no summation order**. Since O is twice Q, the cheap cut is the one that pays.
+
+### The wave count was worth more than the sharding
+
+Measured on the wide path:
+
+| head_dim | waves | shards | AGPR | spills | TFLOP/s |
+|---|---|---|---|---|---|
+| 384 | 4 | 1 | 150 | 0 | **579** |
+| 384 | 8 | 1 | 0 | 104 | 372 |
+| 512 | 4 | 2 | 183 | 0 | **366** |
+| 512 | 8 | 2 | 0 | 96 | 266 |
+| 512 | 8 | 4 | 0 | 30 | 252 |
+| 512 | 4 | 1 | 256 | 286 | 138 |
+
+At 8 waves the allocator abandons AGPRs entirely and spills to scratch; at 4 it
+puts O where it belongs. More sharding does not recover it -- 8 waves at 4
+shards still lands at zero AGPRs with 252 TF.
+
+The same cliff explains why `D_STAGES` should be the *least* that fits LDS:
+384 at 3 or 6 stages spills 113 with zero AGPRs, and 512 at 4 or 8 stages never
+finished building (killed at 480 s).
+
+### Three bugs, and what found each
+
+- **Non-idempotent scoping.** `rescale_o_serial` calls `scale_o`, so the
+  `D_CHUNKS // VO_SHARDS` scope composed: 8 -> 4 -> 2, and half the accumulators
+  were never rescaled. Not a crash and not a NaN -- an output merely too large
+  (|o| 1.47x). Found by per-chunk error, which showed local indices 2 and 3
+  wrong at *every* stage/shard combination. The scope now states its target
+  absolutely.
+- **Padded-head store suppression keyed to a local index.**
+  `_final_o_global` bounds-checks `dc * D_CHUNK` against `hdim_vo`, correct
+  while `dc` is absolute. A run hands down a slice, so it under-suppressed, and
+  because the descriptor spans the tensor rather than a row those stores landed
+  in the *next row*. head_dim 300 read 5.8e-01.
+- **A module-level loop body silently does nothing.** The `for ... init=[...]`
+  / `yield` protocol only exists after the AST rewrite. A `@flyc.jit` function
+  that *delegates* to a plain module function loses it, and the loop is skipped
+  rather than erroring -- `l_row` stays 0 and `safe_l_inv` returns 2.1e37.
+
+Every one was caught by running the new geometry at head_dim 256 first, where
+the answer is already known. Nothing here would have been visible at 512 alone.
+
+### Not done
+
+- `QK_SHARDS` is defined in the traits and guarded with `NotImplementedError`.
+  It is the only lever that shrinks Q, and it needs the LDS S-reduction. Worth
+  revisiting if 512 has to go past 366 TF.
+- The wide body allocates two LDS buffers and uses one. Halving the allocation
+  would free ~66 KB at 512 -- headroom a `QK_SHARDS` reduction would need.
+- No K/V prefetch on the wide path; each stage is a barrier pair.

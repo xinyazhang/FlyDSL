@@ -63,13 +63,20 @@ __all__ = [
 # The ladder
 # ---------------------------------------------------------------------------
 
-# Compiled tile widths, all four measured on the 8-wave geometry:
+# Compiled tile widths. All six measured, `B=1 H=16 S=16384` bf16 non-causal:
 #
-#   head_dim   arch VGPR   AGPR   spills   LDS      TFLOP/s
-#     64          160        0      0      34 KB      931
-#    128          238        0      0      68 KB     1170
-#    192          256      174      0     102 KB      974
-#    256          256      192      0     136 KB      978
+#   head_dim  waves  BLOCK_M  stages  shards   AGPR  spills    LDS   TFLOP/s
+#      64       8      256      1       1        0     0     34 KB     930
+#     128       8      256      1       1        0     0     68 KB    1167
+#     192       4      128      1       1      174     0    102 KB     973
+#     256       4      128      1       1      192     0    136 KB     979
+#     384       4      128      2       1      150     0    100 KB     579
+#     512       4       64      2       2      183     0    133 KB     366
+#
+# The first four run the dual-wave pipeline; 384 and 512 cannot, and run the
+# separate body in `fmha_wide_gfx950.py` instead. The break is not a tuning
+# preference, it is LDS: two KV tiles in flight need `2 * BLOCK_N * head_dim *
+# ~8.3 B`, which is 199.5 KB at 384 and 266 KB at 512 against a 163840 B cap.
 #
 # 192 and 256 used to spill in the hundreds and produce non-deterministic NaN.
 # Both had the same cause, and it was not register pressure: `_ds_read_tr16_b64_imm`
@@ -80,12 +87,11 @@ __all__ = [
 # wait. Moving to the ROCDL op fixed it -- see the P2 section of
 # `sdpa-close-gap-gfx950.md`.
 #
-# So the register file is *not* the binding constraint here after all, and the
-# 4-wave family B is not needed to reach 192/256. It remains interesting as a
-# tuning option (`fwd_hd192_hd128_bf16.co` runs 4 waves at 512 VGPRs/lane), not
-# as a prerequisite. 384 and 512 are listed so `tile_width_for` reports "not
-# built yet" rather than "unsupported", which are different problems for the
-# caller.
+# So the register file was not the binding constraint at 192/256 after all.
+# It becomes one at 384 and 512, where a wave's Q (128 VGPR) and O (256 VGPR,
+# the whole AGPR file) do not leave room for the K/V working set -- which is
+# what `VO_SHARDS` answers. See `_with_wave_geometry` for the wave-count
+# measurement, which is worth 1.6x on its own.
 #
 # **32 is a planned rung too, below the built ones**, and it is deliberately
 # not in `LADDER_PLANNED`: that list is consulted only after `LADDER` misses,
@@ -93,8 +99,8 @@ __all__ = [
 # would route head_dim <= 32 to a tile that does not exist yet and break a path
 # that works today, slowly. It arrives when family S is built; until then
 # head_dim <= 32 rounds up to 64 and pays for it (see `_with_wave_geometry`).
-LADDER = (64, 128, 192, 256)
-LADDER_PLANNED = (384, 512)
+LADDER = (64, 128, 192, 256, 384, 512)
+LADDER_PLANNED = ()
 
 # The D-axis staging granule: how many bf16 elements of one token a single DMA
 # issue covers. **Not a constant, and not 64 by necessity** -- see
@@ -139,10 +145,11 @@ def tile_width_for(head_dim):
     for rung in LADDER_PLANNED:
         if head_dim <= rung:
             raise NotImplementedError(
-                f"head_dim {head_dim} needs the {rung}-wide tile, which is the 4-wave "
-                f"geometry (P2 in sdpa-close-gap-gfx950.md). Built rungs: {LADDER}."
+                f"head_dim {head_dim} needs the {rung}-wide tile, which is designed but not built. "
+                f"Built rungs: {LADDER}."
             )
-    raise ValueError(f"head_dim {head_dim} exceeds the largest planned tile ({LADDER_PLANNED[-1]})")
+    widest = max(LADDER + LADDER_PLANNED)
+    raise ValueError(f"head_dim {head_dim} exceeds the widest tile ({widest})")
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +307,14 @@ class Gfx950Knobs(FmhaKnobs):
     block_n: int | None = None
     head_dim_granule: int | None = None
 
+    # The two D-axis splits. Deliberately *not* part of the four-field geometry
+    # pinning rule above: those four are one indivisible choice (a family),
+    # while these are per-width policy that a sweep wants to vary on its own.
+    # `None` means "the width decides", as everywhere else here.
+    d_stages: int | None = None
+    qk_shards: int | None = None
+    vo_shards: int | None = None
+
     # Set by `resolve`; never by a caller. Holding the traits *on* the resolved
     # knobs is what makes "knobs and traits are one thing" true at the use
     # site: the builder takes one object and reads both from it.
@@ -371,24 +386,116 @@ class Gfx950Knobs(FmhaKnobs):
         ordering is the whole reason the width is no longer an argument: an
         argument can be stale, a field the previous step wrote cannot.
         """
-        pinned = (self.num_waves, self.block_m, self.block_n, self.head_dim_granule)
+        me = self._with_d_axis_splits()
+        pinned = (me.num_waves, me.block_m, me.block_n, me.head_dim_granule)
         if all(x is not None for x in pinned):
-            return self
+            return me
         if any(x is not None for x in pinned):
             raise ValueError(
                 f"pin num_waves, block_m, block_n and head_dim_granule together or not at all, got {pinned}"
             )
         if self.block_dmodel is None:
             raise ValueError("_with_wave_geometry runs after _with_widths; block_dmodel is not resolved")
-        if self.block_dmodel % 64:
-            return replace(self, num_waves=4, block_m=128, block_n=64, head_dim_granule=32)  # family S
-        if self.block_dmodel <= 128:
-            return replace(self, num_waves=8, block_m=256, block_n=64, head_dim_granule=64)  # family A
-        return replace(self, num_waves=4, block_m=128, block_n=64, head_dim_granule=64)  # family B
+        if me.block_dmodel % 64:
+            return replace(me, num_waves=4, block_m=128, block_n=64, head_dim_granule=32)  # family S
+        if me.block_dmodel <= 128:
+            return replace(me, num_waves=8, block_m=256, block_n=64, head_dim_granule=64)  # family A
+        if me.block_dmodel <= 256:
+            return replace(me, num_waves=4, block_m=128, block_n=64, head_dim_granule=64)  # family B
+        # Family W, the wide path. Four waves, like B and for the same reason
+        # -- halving the wave count doubles the per-lane register file -- but
+        # here the effect is larger than "more registers", and it is the single
+        # biggest lever measured on this path:
+        #
+        #   head_dim   waves   shards   BLOCK_M   AGPR   spills   TFLOP/s
+        #      384       4        1       128      150      0       579
+        #      384       8        1       256        0    104       372
+        #      512       4        2        64      183      0       366
+        #      512       8        2       128        0     96       266
+        #      512       8        4        64        0     30       252
+        #
+        # At 8 waves the allocator stops using AGPRs *entirely* and spills to
+        # scratch instead; at 4 it puts the O accumulator where it belongs and
+        # spills nothing. That is worth 1.4-1.6x, and no amount of extra
+        # sharding recovers it -- 8 waves at 4 shards still lands at zero AGPRs.
+        #
+        # `ROWS_PER_WAVE` stays 32 (the MFMA's M extent), so BLOCK_M is
+        # `Q_TILES * 32` and the shards eat the waves rather than the rows.
+        return replace(
+            me, num_waves=4, block_m=(4 // me.vo_shards) * 32, block_n=64, head_dim_granule=64
+        )
+
+    # LDS is `BLOCK_N * head_dim * ~8.3 B` for a double-buffered K+V pair, and
+    # the addressable cap is 163840 B. Measured, not inferred: the compiler
+    # rejects head_dim 384 at 204288 B and 512 at 272384 B.
+    LDS_CAP_BYTES = 163840
+
+    def _with_d_axis_splits(self):
+        """Decide `d_stages` and `qk_shards` from the tile width.
+
+        Both stay 1 through head_dim 256, which is what keeps the four rungs
+        that work today tracing to identical IR -- every construct these gate
+        sits behind `const_expr(... > 1)`.
+
+        The wider rungs need them for *different* reasons, and conflating the
+        two is the mistake this split exists to prevent:
+
+        - `d_stages` answers **LDS**. One pass of head_dim 384 needs 199.5 KB
+          against a 160 KB cap, so the D axis has to be staged in time.
+        - `qk_shards` answers **registers**. At head_dim 512 a wave's
+          loop-invariant Q is 128 VGPRs and its O accumulator is 256 -- exactly
+          the whole AGPR file -- so the D axis also has to be split across
+          waves. 384 does not need this; 512 does.
+        """
+        d_stages, qk_shards, vo_shards = self.d_stages, self.qk_shards, self.vo_shards
+        if d_stages is not None and qk_shards is not None and vo_shards is not None:
+            return self
+        if self.block_dmodel is None:
+            raise ValueError("_with_d_axis_splits runs after _with_widths; block_dmodel is not resolved")
+        if d_stages is None:
+            # 2 for both wide rungs -- the least staging that fits LDS, and
+            # measurement says least is also best. More stages shrink the live
+            # K/V window, so the obvious guess is that more is safer. The
+            # opposite happens, and sharply:
+            #
+            #   head_dim   stages   AGPR   spills   compile
+            #      384        2      150      0        4 s
+            #      384        3        0    113        4 s
+            #      384        6        0    113        4 s
+            #      512        2      256    286       61 s
+            #      512        4        0      -     > 480 s (killed)
+            #      512        8        0      -     > 480 s (killed)
+            #
+            # Past 2 the allocator stops using AGPRs *at all* and spills to
+            # scratch instead, and at 512 that makes the register allocator
+            # itself run away -- a build nobody will wait for. The AGPR file is
+            # where the O accumulator has to live at these widths, so anything
+            # that scares the allocator off it is a loss however small the
+            # working set gets.
+            d_stages = 2 if self.block_dmodel > 256 else 1
+        if vo_shards is None:
+            # Only 512 needs it. O is `ROWS_PER_WAVE * head_dim / 64` = 256
+            # VGPRs there -- the entire AGPR file -- and no amount of staging
+            # touches that, because staging bounds the K/V *window* and O is
+            # loop-carried. 384's O is 192 and fits with zero spills, so it
+            # pays the QK duplication for nothing.
+            vo_shards = 2 if self.block_dmodel > 384 else 1
+        if qk_shards is None:
+            qk_shards = 1
+        return replace(self, d_stages=d_stages, qk_shards=qk_shards, vo_shards=vo_shards)
 
     # Geometries whose *address helpers* are known correct, which is a stricter
     # set than the ones `make_traits` can describe.
-    _SUPPORTED_GEOMETRIES = ((8, 256, 64, 64), (4, 128, 64, 64))
+    # BLOCK_M is in this tuple but does not affect KV addressing at all --
+    # `SMEM_N_RPT` follows BLOCK_N and the granule. (8, 128, ...) is family W
+    # at 2 shards and reuses family A's staging exactly.
+    _SUPPORTED_GEOMETRIES = (
+        (8, 256, 64, 64),
+        (4, 128, 64, 64),
+        (8, 128, 64, 64),
+        (4, 64, 64, 64),
+        (8, 64, 64, 64),
+    )
 
     def _check_helpers_support_geometry(self):
         """Refuse a geometry the kernel's addressing cannot actually serve.
@@ -414,6 +521,12 @@ class Gfx950Knobs(FmhaKnobs):
         this whole guard exists to avoid -- P2 measured exactly that at
         head_dim 192.
         """
+        if self.qk_shards > 1:
+            raise NotImplementedError(
+                f"qk_shards {self.qk_shards} is described by the traits but not yet implemented in the "
+                "kernel body: it needs the wave index split into (q_tile, shard), Q/O restricted to the "
+                "wave's D slice, and an explicit-partial S reduction through LDS. See P8.2."
+            )
         geom = (self.num_waves, self.block_m, self.block_n, self.head_dim_granule)
         if geom not in self._SUPPORTED_GEOMETRIES:
             raise NotImplementedError(
@@ -467,6 +580,9 @@ class Gfx950Knobs(FmhaKnobs):
             block_m=self.block_m,
             block_n=self.block_n,
             granule=self.head_dim_granule,
+            d_stages=self.d_stages,
+            qk_shards=self.qk_shards,
+            vo_shards=self.vo_shards,
             causal=meta.causal,
             dtype_str=meta.dtype_str,
             waves_per_eu=self.waves_per_eu,
@@ -482,6 +598,15 @@ class Gfx950Knobs(FmhaKnobs):
             kv_vectorized=self.paged and self.kv_cache_layout == "vectorized",
             return_lse=self.return_lse,
         )
+        lds_bytes = traits.LDS_KV_TOTAL_SIZE * traits.BF16_BYTES
+        if lds_bytes > self.LDS_CAP_BYTES:
+            raise ValueError(
+                f"KV staging needs {lds_bytes} B of LDS, over the {self.LDS_CAP_BYTES} B cap, for "
+                f"block_dmodel {self.block_dmodel} at BLOCK_N {self.block_n} with d_stages "
+                f"{self.d_stages}. Raise d_stages (LDS scales as 1/d_stages) or lower BLOCK_N. "
+                "Left to the compiler this surfaces as 'local memory (N) exceeds limit (163840)' "
+                "with no indication of which knob to move."
+            )
         return replace(self, traits=traits)
 
 

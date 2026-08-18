@@ -54,6 +54,7 @@ import fmha_abi_gfx1201 as abi
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr
 from fmha_dualwave_gfx950 import (
+    ParityGemmHelper,
     ParityKernelContext,
     ParityKvGmemToLdsLoader,
     ParityKvLdsToVgprLoader,
@@ -62,6 +63,14 @@ from fmha_dualwave_gfx950 import (
     ParityStoreHelper,
 )
 from fmha_tuning_gfx950 import FmhaInputMetadata, fmha_knobs
+from fmha_wide_gfx950 import (
+    WideGemmHelper,
+    WideSoftmaxHelper,
+    WideKernelContext,
+    WideKvLdsToVgprLoader,
+    WideStoreHelper,
+    make_wide_body,
+)
 from gfx950_standalone import dualwave
 
 KERNEL_NAME = "flash_attn_func_gfx950_kernel"
@@ -117,6 +126,11 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
     STRIDES_CONSTEXPR = knobs.strides_constexpr
     RUNTIME_QK_STEPS = PADDED_HEAD and HDIM_MODE == "runtime_qk_steps"
 
+    # Which algorithm this build is. `D_STAGES > 1` is the discriminator rather
+    # than a width threshold: staging is what the dual-wave schedule cannot
+    # express, so anything staged is on the wide path by construction.
+    WIDE = traits.D_STAGES > 1 or traits.VO_SHARDS > 1
+
     # A scale baked into the build configuration. `None` means "derive it",
     # which `abi.resolve_scale` then does from the *real* head dim rather than
     # the compiled tile -- the distinction that matters under a padded head.
@@ -134,6 +148,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         STRIDES_CONSTEXPR,
         BUILD_SM_SCALE,
         (knobs.num_waves, knobs.block_m, knobs.block_n, knobs.head_dim_granule),
+        (knobs.d_stages, knobs.qk_shards, knobs.vo_shards),
     )
 
     _lds_elem_dtype = dualwave.dtype_to_elem_type(traits.DTYPE_STR)
@@ -181,7 +196,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         stride_o2: fx.Int64,
         block_table_stride: fx.Int32,
     ):
-        ctx = ParityKernelContext(
+        ctx = (WideKernelContext if WIDE else ParityKernelContext)(
             traits,
             strides=(
                 stride_q0,
@@ -242,12 +257,12 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         v_o_zero = ctx.c_zero_v16f32
 
         kv_gmem_to_lds = ParityKvGmemToLdsLoader(ctx)
-        kv_lds_to_regs = ParityKvLdsToVgprLoader(ctx)
-        output_store = ParityStoreHelper(ctx)
+        kv_lds_to_regs = (WideKvLdsToVgprLoader if WIDE else ParityKvLdsToVgprLoader)(ctx)
+        output_store = (WideStoreHelper if WIDE else ParityStoreHelper)(ctx)
         page_ids = dualwave.DualwavePageIdLoader(ctx)
         q_loader = ParityQLoader(ctx)
-        gemm_helper = dualwave.DualwaveGemmHelper(ctx)
-        softmax_helper = ParitySoftmaxHelper(ctx)
+        gemm_helper = (WideGemmHelper if WIDE else ParityGemmHelper)(ctx)
+        softmax_helper = (WideSoftmaxHelper if WIDE else ParitySoftmaxHelper)(ctx)
 
         def _main_body():
             # Paged: stage the block-table row into LDS before any page-id ds_read.
@@ -712,17 +727,35 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             else:
                 output_store.store_splitk_partial_o(v_o, m_row, l_row, ctx.q_row)
 
+        # head_dim > 256 runs a different algorithm, in its own file: no
+        # dual-wave pipeline, D staged through LDS and sharded across waves.
+        # See `fmha_wide_gfx950.py` for why none of the schedule above ports.
+        if const_expr(WIDE):
+            _body = make_wide_body(
+                ctx,
+                traits,
+                q_loader=q_loader,
+                kv_gmem_to_lds=kv_gmem_to_lds,
+                kv_lds_to_regs=kv_lds_to_regs,
+                gemm_helper=gemm_helper,
+                softmax_helper=softmax_helper,
+                output_store=output_store,
+            )
+        else:
+            _body = _main_body
+
+
         if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN and not traits.SPLITK):
             output_store.zero_o_block_if_needed()
 
         if active is None:
-            _main_body()
+            _body()
         else:
 
             @flyc.jit
             def _run_body_if_active():
                 if active:
-                    _main_body()
+                    _body()
 
             _run_body_if_active()
 

@@ -31,7 +31,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module as build
-from fmha_tuning_gfx950 import LADDER, FmhaInputMetadata, fmha_knobs, tile_width_for
+from fmha_tuning_gfx950 import LADDER, LADDER_PLANNED, FmhaInputMetadata, fmha_knobs, tile_width_for
 from gfx950_standalone import dualwave  # noqa: F401  (puts the repo root on sys.path)
 
 from kernels.attention.flash_attn_gfx950 import build_flash_attn_dualwave_swp_module as build_prod
@@ -219,7 +219,7 @@ def test_logsumexp_matches_torch():
 # P1: runtime hdim, padded head, asymmetric hdim
 # ---------------------------------------------------------------------------
 
-_LADDER_CASES = [16, 17, 32, 33, 40, 48, 64, 80, 96, 100, 113, 128, 129, 160, 192, 200, 256]
+_LADDER_CASES = [16, 17, 32, 33, 40, 48, 64, 80, 96, 100, 113, 128, 129, 160, 192, 200, 256, 300, 384, 448, 512]
 
 
 def _padded_qkv(b, h, s, hdim, hdim_v, poison=None):
@@ -252,7 +252,9 @@ def test_ladder_matches_sdpa(hdim, causal):
     assert _err(o, _ref(q, k, v, causal)) < TOL
 
 
-@pytest.mark.parametrize("hdim,hdim_v", [(128, 64), (96, 48), (64, 32), (128, 96), (192, 128), (256, 128)])
+@pytest.mark.parametrize(
+    "hdim,hdim_v", [(128, 64), (96, 48), (64, 32), (128, 96), (192, 128), (256, 128), (384, 256), (512, 256)]
+)
 def test_asymmetric_hdim(hdim, hdim_v):
     """`hdim_qk != hdim_vo`. The reference asm ships this shape as hd192/hd128."""
     b, h, s = 2, 8, 512
@@ -307,17 +309,24 @@ def test_padded_head_never_writes_past_hdim_vo():
 
 @pytest.mark.parametrize(
     "hdim,want",
-    [(1, 64), (16, 64), (64, 64), (65, 128), (128, 128), (129, 192), (192, 192), (193, 256), (256, 256)],
+    [
+        (1, 64), (16, 64), (64, 64), (65, 128), (128, 128), (129, 192), (192, 192),
+        (193, 256), (256, 256), (257, 384), (384, 384), (385, 512), (512, 512),
+    ],
 )
 def test_tile_width_rounds_up(hdim, want):
     assert tile_width_for(hdim) == want
 
 
-def test_tile_width_reports_planned_rungs_distinctly():
-    """A rung that exists in the plan but is not built is not "unsupported"."""
-    with pytest.raises(NotImplementedError, match="4-wave"):
-        tile_width_for(384)
-    with pytest.raises(ValueError, match="exceeds"):
+def test_tile_width_rejects_past_the_widest_tile():
+    """Every planned rung is built now, so only "too wide" is left to report.
+
+    `LADDER_PLANNED` is empty, which makes the `NotImplementedError` branch of
+    `tile_width_for` unreachable rather than wrong -- it stays for the next
+    rung that gets designed before it is built.
+    """
+    assert not LADDER_PLANNED
+    with pytest.raises(ValueError, match="exceeds the widest tile"):
         tile_width_for(1024)
 
 
@@ -384,7 +393,11 @@ def test_cross_seqlen_is_an_ordinary_field():
         (64, (8, 256, 64, 64)),  # family A
         (128, (8, 256, 64, 64)),
         (192, (4, 128, 64, 64)),  # family B -- 4 waves for the register file
-        (512, (4, 128, 64, 64)),
+        (256, (4, 128, 64, 64)),
+        # Family W. Also 4 waves, but BLOCK_M is `Q_TILES * 32` and the VO
+        # shards consume waves, so 512 at 2 shards covers 64 rows, not 128.
+        (384, (4, 128, 64, 64)),
+        (512, (4, 64, 64, 64)),
     ],
 )
 def test_wave_geometry_selects_the_family(block_dmodel, want):

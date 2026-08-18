@@ -49,6 +49,9 @@ change:
   as the measured baseline does.
 """
 
+import contextlib
+from dataclasses import replace
+
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -58,6 +61,7 @@ from fmha_common_gfx1201 import MaskedAxis
 from gfx950_standalone import dualwave
 
 __all__ = [
+    "ParityGemmHelper",
     "ParityKernelContext",
     "ParityKvGmemToLdsLoader",
     "ParityKvLdsToVgprLoader",
@@ -65,6 +69,58 @@ __all__ = [
     "ParitySoftmaxHelper",
     "ParityStoreHelper",
 ]
+
+
+class ParityGemmHelper(dualwave.DualwaveGemmHelper):
+    """The two GEMMs, addressed one D stage at a time.
+
+    Under `D_STAGES > 1` a KV tile's D axis is covered in several passes, so
+    neither GEMM sees all of it at once. The two are asymmetric about what that
+    means, because D is a *reduction* axis for QK and an *output* axis for PV:
+
+    - `qk_stage` accumulates into a running S that the caller carries across
+      the stages, rather than seeding a fresh zero. All stages contribute to
+      every element of S, and softmax cannot run until the last one has.
+    - `pv_step_k` writes a disjoint slice of the O accumulator per stage, so
+      the stages never meet; the stage only shifts which `v_o[dc]` is hit.
+
+    Both take stage-relative register lists (that is what the loaders return)
+    and map them to global indices here, so a stage index never has to be
+    threaded into the loaders' addressing.
+    """
+
+    def qk_stage(self, v_k, q_all_scaled_bf16, acc, stage=0):
+        k_lo, k_hi = v_k
+        v_s_lo, v_s_hi = acc
+        steps = self.traits.K_STEPS_PER_STAGE
+        for ks in range_constexpr(steps):
+            q_pack = dualwave._get_q_pack(self.traits, q_all_scaled_bf16, stage * steps + ks)
+            v_s_lo = dualwave._mfma_acc(k_lo[ks], q_pack, v_s_lo, self.mma_atom, self.mfma_acc_vec_type)
+            v_s_hi = dualwave._mfma_acc(k_hi[ks], q_pack, v_s_hi, self.mma_atom, self.mfma_acc_vec_type)
+        return (v_s_lo, v_s_hi)
+
+    def qk(self, v_k, q_all_scaled_bf16, stage=0):
+        """Unstaged entry point: seed at zero and run the one stage there is."""
+        if const_expr(self.traits.D_STAGES == 1):
+            return super().qk(v_k, q_all_scaled_bf16)
+        return self.qk_stage(v_k, q_all_scaled_bf16, (self.c_zero_v16f32, self.c_zero_v16f32), stage)
+
+    def pv_step_k(self, step, v_p, v_v, v_o, stage=0):
+        if const_expr(self.traits.D_STAGES == 1):
+            return super().pv_step_k(step, v_p, v_v, v_o)
+        v_p_lo, v_p_hi = v_p
+        v_pk = v_v[step]
+        p_pk = v_p_lo[step] if const_expr(step < 2) else v_p_hi[step - 2]
+        per_stage = self.traits.D_CHUNKS_PER_STAGE
+        for dc in range_constexpr(per_stage):
+            out = stage * per_stage + dc
+            v_o[out] = dualwave._mfma_acc(v_pk[dc], p_pk, v_o[out], self.mma_atom, self.mfma_acc_vec_type)
+        return v_o
+
+    def pv(self, v_p, v_v, v_o, stage=0):
+        for step in range_constexpr(4):
+            v_o = self.pv_step_k(step, v_p, v_v, v_o, stage=stage)
+        return v_o
 
 
 class _ParityKvStaging:
@@ -118,12 +174,27 @@ class _ParityKvStaging:
     def v_dma_base(self, buf_id, d):
         return self._dma_m0(dualwave._v_buf_base(self.traits, buf_id), self.traits.SMEM_V_LINE_STRIDE, d)
 
+    # Which D stage the next DMA reads from global. Set by the loader
+    # immediately before delegating, the same way `stride_kv_n_v` is, and safe
+    # for the same reason: tracing is eager, so it is read while `super()`
+    # runs and no branch is open across the swap.
+    dma_stage = 0
+
     def kv_src_elem(self, src_base, d_flat):
-        """Global element index for this lane's `d_flat` chunk of a KV tile."""
+        """Global element index for this lane's `d_flat` chunk of a KV tile.
+
+        `band` only spans `SMEM_D_RPT` d-bands, and under `D_STAGES > 1` that
+        is one *stage* of the head dim rather than all of it -- LDS holds a
+        stage at a time. So the stage's base offset is the single term that
+        makes staging reach global memory; everything else is unchanged, and
+        at `D_STAGES == 1` the term is zero.
+        """
         band, issue = self._issue_split(d_flat)
         line_n = self.wave_id + issue * self.traits.NUM_WAVES
         n_in_tile = self.n_in_warp * self.traits.SMEM_N_RPT + line_n
         global_d = self.d_bucket * self.traits.VEC_KV + band * self.traits.D_128B_SIZE
+        if const_expr(self.traits.D_STAGES > 1):
+            global_d = global_d + self.dma_stage * self.traits.STAGE_DIM
         return src_base + n_in_tile * self.stride_kv_n_v + global_d
 
 
@@ -398,17 +469,58 @@ class ParityKvLdsToVgprLoader(dualwave.DualwaveKvLdsToVgprLoader):
     `K_LDS_TO_REG_N_STRIP_STRIDE`, an N offset, so it carries the same columns.
     """
 
-    def load_k(self, buf_id, urk_base=None):
-        k_lo, k_hi = super().load_k(buf_id, urk_base=urk_base)
+    @contextlib.contextmanager
+    def _scoped_to_stage(self):
+        """Narrow `K_STEPS_QK` / `D_CHUNKS` to one stage for the duration.
+
+        Under `D_STAGES > 1` an LDS buffer holds one stage of the head dim, so
+        the inherited readers -- which loop to `K_STEPS_QK` and `D_CHUNKS` --
+        would run off the end of it. The *offsets* need no adjustment:
+        `_swizzled_ks_offset` and `_swizzled_v_dc_off` address d-bands within
+        the buffer, and a stage-sized buffer has exactly `SMEM_D_RPT` of them.
+        Only the counts are wrong.
+
+        So this swaps the two counts rather than reimplementing the read
+        loops. Copying them is the specific thing to avoid here: the write side
+        (`kv_src_elem`) and the read side have to describe one LDS layout, and
+        a second copy of either is how they drift apart.
+
+        A no-op at `D_STAGES == 1`, where the two values are already equal --
+        deliberately not merely equivalent, so a default build cannot differ.
+        """
+        if const_expr(self.traits.D_STAGES == 1):
+            yield
+            return
+        full = self.traits
+        self.traits = replace(
+            full,
+            K_STEPS_QK=full.K_STEPS_PER_STAGE,
+            D_CHUNKS=full.D_CHUNKS_PER_STAGE,
+        )
+        try:
+            yield
+        finally:
+            self.traits = full
+
+    def load_k(self, buf_id, urk_base=None, stage=0):
+        with self._scoped_to_stage():
+            k_lo, k_hi = super().load_k(buf_id, urk_base=urk_base)
+            steps = self.traits.K_STEPS_QK
         if const_expr(not self.PADDED_HEAD):
             return (k_lo, k_hi)
         cols = MaskedAxis(fx.Index(self.hdim_qk), elem_dtype=self.elem_dtype)
         width = self.traits.MFMA_LANE_K
-        for ks in range_constexpr(self.traits.K_STEPS_QK):
-            col_base = fx.Index(ks * self.traits.K_STEP_QK) + self.lane_div_32 * fx.Index(width)
+        for ks in range_constexpr(steps):
+            # The mask is against the *global* D column, so the stage's base
+            # has to come back in here -- `ks` is stage-relative above.
+            col_base = fx.Index((stage * steps + ks) * self.traits.K_STEP_QK) + self.lane_div_32 * fx.Index(width)
             k_lo[ks] = cols.discard(k_lo[ks], col_base, width)
             k_hi[ks] = cols.discard(k_hi[ks], col_base, width)
         return (k_lo, k_hi)
+
+    def load_v(self, buf_id, urv_base=None, stage=0):
+        with self._scoped_to_stage():
+            return super().load_v(buf_id, urv_base=urv_base)
 
 
 class ParityKvGmemToLdsLoader(_ParityKvStaging, dualwave.DualwaveKvGmemToLdsLoader):
@@ -425,13 +537,23 @@ class ParityKvGmemToLdsLoader(_ParityKvStaging, dualwave.DualwaveKvGmemToLdsLoad
     and no branch is open across the swap.
     """
 
-    def load_k(self, tile_start, buf_id, page_id=None):
+    def load_k(self, tile_start, buf_id, page_id=None, stage=0):
         self.stride_kv_n_v = self.stride_k2_v
+        self.dma_stage = stage
         return super().load_k(tile_start, buf_id, page_id=page_id)
 
-    def load_v(self, tile_start, buf_id, page_id=None):
+    def load_v(self, tile_start, buf_id, page_id=None, stage=0):
         self.stride_kv_n_v = self.stride_v2_v
+        self.dma_stage = stage
         return super().load_v(tile_start, buf_id, page_id=page_id)
+
+    # `load_*_tile` resolve a tile index to a token offset and delegate; the
+    # stage has to ride along or it is lost at that hop.
+    def load_k_tile(self, tile_idx, buf_id, page_id=None, stage=0):
+        self.load_k(self.tile_start(tile_idx), buf_id, page_id=page_id, stage=stage)
+
+    def load_v_tile(self, tile_idx, buf_id, page_id=None, stage=0):
+        self.load_v(self.tile_start(tile_idx), buf_id, page_id=page_id, stage=stage)
 
     def _async_load_kv_linear(self, dma_m0, buf_id, src_div, src_base, soffset, num_dma):
         """Issue this wave's KV DMAs, addressed through `kv_src_elem`.
@@ -469,6 +591,25 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
 
     def reduce_max(self, v_s):
         return dualwave._score_pair_max(v_s, self.c_neg_floor, self.fm_fast)
+
+    def rescale_o_serial(self, v_o, m_row, l_row, m_tile_max):
+        """`rescale_o` without the `v_p` term, for the staged (unpipelined) loop.
+
+        The dualwave schedule rescales O *and* the previous tile's P, because
+        its softmax is split across clusters and a P from the last iteration is
+        still in flight. The staged loop has no such P: it finishes each tile
+        before starting the next, so at rescale time the only live state is O,
+        the running max and the running sum. Passing a dummy `v_p` to
+        `rescale_o` would work and would also emit a real multiply over it.
+
+        Otherwise identical to `rescale_o`, term for term.
+        """
+        m_new = dualwave._fmax(m_row, m_tile_max, self.fm_fast)
+        corr = rocdl.exp2(T.f32, as_mlir_value(dualwave._fsub(m_row, m_new, self.fm_fast)))
+        self.scale_o(v_o, corr)
+        v_o = dualwave._anchor_v_o(self.traits, v_o)
+        l_row = dualwave._fmul(l_row, corr, self.fm_fast)
+        return v_o, m_new, l_row
 
 
 class ParityStoreHelper(dualwave.DualwaveStoreHelper):
