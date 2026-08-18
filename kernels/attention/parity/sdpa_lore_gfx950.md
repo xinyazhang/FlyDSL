@@ -303,6 +303,16 @@ head_dim 96 is a normal rung again.
   produced the conclusion that a single `s_nop` cost 80%. Any perf result that
   looks structurally impossible is a machine-state result until proven
   otherwise; `rocm-smi --showtemp` first, re-measure second.
+- **Measure the tax before designing the tile that avoids it.** A head_dim off
+  the rung grid ran 27-54% below its own rung, and the obvious reading -- the
+  padded columns are wasted MFMA work -- was wrong. The giveaway was that the
+  penalty barely moved with the amount of pad: 240-in-256 pads by 6% and was
+  the *worst* case at 54%. Cost that does not scale with the thing you blame is
+  not that thing. It was the per-K-step mask inside the KV loop, and deleting
+  it outright (a one-line experiment, incorrect but decisive) restored every
+  padded build to its rung's native rate exactly. Widening the ladder to a
+  16-element grid would have been weeks of staging work for the ~7% that was
+  actually arithmetic.
 - **Check `agpr_count` alongside spills.** On this kernel the allocator either
   uses the AGPR file for the O accumulator or abandons it entirely and spills
   to scratch, and the difference is 1.4-1.6x. Four waves keeps it; eight loses

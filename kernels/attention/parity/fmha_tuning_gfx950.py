@@ -160,6 +160,22 @@ DMA_BYTES = 16
 BF16_BYTES = 2
 
 
+def rung_below(block_dmodel):
+    """The widest rung strictly narrower than `block_dmodel`, or 0.
+
+    `tile_width_for` rounds *up* to the first rung that fits, so a build it
+    chose serves exactly the half-open range `(rung_below(R), R]`. That lower
+    bound is what lets the kernel skip masking the D columns it knows are real
+    -- see `HDIM_QK_FLOOR` in `flash_attn_func_gfx950.py`.
+
+    It is a property of the ladder rather than of any one build, so it lives
+    next to `LADDER`: adding a rung silently tightens every wider build's
+    floor, and that is the correct behaviour.
+    """
+    below = [r for r in LADDER if r < block_dmodel]
+    return max(below) if below else 0
+
+
 def tile_width_for(head_dim):
     """The compiled tile width serving `head_dim`, or raise saying why not.
 
@@ -222,6 +238,15 @@ class FmhaKnobs:
     block_dmodel_v: int | None = None
     padded_head: bool | None = None
 
+    # A compile-time *lower* bound on the runtime `hdim_qk`, exclusive. The
+    # build promises nothing about hdim at or below it, and the dispatcher
+    # rejects a call that violates it, so the kernel may treat D columns below
+    # it as real data and skip masking them.
+    #
+    # Derived, not a taste knob, but pinnable to 0 to force the old
+    # mask-everything behaviour if a floor is ever suspected of hiding a bug.
+    hdim_qk_floor: int | None = None
+
     # There is no `hdim_mode`. A `"runtime_qk_steps"` mode used to be declared
     # here -- shorten the QK reduction to `ceil(hdim_qk/16)` MFMA K-steps at
     # runtime, against `"zero_fill"`'s tile-shaped count -- and it was **never
@@ -281,7 +306,8 @@ class FmhaKnobs:
         a second arch cannot accidentally decide `padded_head` by another rule.
         """
         block_dmodel = self.block_dmodel
-        if block_dmodel is None:
+        derived = block_dmodel is None
+        if derived:
             block_dmodel = tile_width_for(meta.head_dim)
         elif block_dmodel not in LADDER:
             raise ValueError(f"block_dmodel must be one of the built rungs {LADDER}, got {block_dmodel}")
@@ -297,11 +323,26 @@ class FmhaKnobs:
         if padded_head is None:
             padded_head = (meta.head_dim != block_dmodel) or (head_dim_v != block_dmodel_v)
 
+        # Only a *derived* tile carries the ladder's guarantee. A caller that
+        # pins `block_dmodel` may pin 256 for head_dim 64, so there is no floor
+        # to claim and the kernel masks everything, as before.
+        hdim_qk_floor = self.hdim_qk_floor
+        if hdim_qk_floor is None:
+            hdim_qk_floor = rung_below(block_dmodel) if derived else 0
+        if not 0 <= hdim_qk_floor < block_dmodel:
+            raise ValueError(f"hdim_qk_floor {hdim_qk_floor} must be in [0, block_dmodel={block_dmodel})")
+        if meta.head_dim <= hdim_qk_floor:
+            raise ValueError(
+                f"head_dim {meta.head_dim} is at or below this build's hdim_qk_floor {hdim_qk_floor}; "
+                f"the {block_dmodel}-wide tile only serves ({hdim_qk_floor}, {block_dmodel}]"
+            )
+
         return replace(
             self,
             block_dmodel=block_dmodel,
             block_dmodel_v=block_dmodel_v,
             padded_head=bool(padded_head),
+            hdim_qk_floor=int(hdim_qk_floor),
         )
 
 

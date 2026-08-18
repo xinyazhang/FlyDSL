@@ -122,6 +122,9 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
 
     BLOCK_DMODEL = knobs.block_dmodel
     PADDED_HEAD = knobs.padded_head
+    # D columns at or below this are guaranteed real, so the K mask can skip
+    # them. See `rung_below` and `ParityKvLdsToVgprLoader.load_k`.
+    HDIM_QK_FLOOR = knobs.hdim_qk_floor
     STRIDES_CONSTEXPR = knobs.strides_constexpr
 
     # Which algorithm this build is. `D_STAGES > 1` is the discriminator rather
@@ -142,6 +145,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         traits.cache_tag,
         BLOCK_DMODEL,
         PADDED_HEAD,
+        HDIM_QK_FLOOR,
         STRIDES_CONSTEXPR,
         BUILD_SM_SCALE,
         (knobs.num_waves, knobs.block_m, knobs.block_n, knobs.head_dim_granule),
@@ -215,6 +219,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             hdim_qk=hdim_qk,
             hdim_vo=hdim_vo,
             padded_head=PADDED_HEAD,
+            hdim_qk_floor=HDIM_QK_FLOOR,
             Q=Q,
             K=K,
             V=V,
@@ -920,6 +925,14 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         del ptrs  # gfx950 addresses through buffer descriptors, so it wants the tensors
         num_head_q, num_head_k, hdim_qk, hdim_vo = shape_meta
 
+        # The kernel skips masking the D columns at or below the floor, so a
+        # narrower call would silently reduce over the caller's padding. Cheap
+        # host-side check; the alternative is a plausible wrong answer.
+        if HDIM_QK_FLOOR and hdim_qk <= HDIM_QK_FLOOR:
+            raise ValueError(
+                f"this build serves hdim_qk in ({HDIM_QK_FLOOR}, {BLOCK_DMODEL}], got {hdim_qk}; "
+                f"build for the narrower head_dim, or pin hdim_qk_floor=0 to mask every column"
+            )
         if traits.RETURN_LSE and lse is None:
             raise ValueError("this build has return_lse=True and requires an fp32 `lse` tensor")
         if traits.SPLITK and workspace is None:

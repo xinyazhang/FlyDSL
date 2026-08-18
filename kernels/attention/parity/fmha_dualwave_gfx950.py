@@ -308,6 +308,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         hdim_qk,
         hdim_vo,
         padded_head=False,
+        hdim_qk_floor=0,
         **kwargs,
     ):
         super().__init__(traits, **kwargs)
@@ -338,6 +339,9 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         self.hdim_qk = hdim_qk
         self.hdim_vo = hdim_vo
         self.PADDED_HEAD = bool(padded_head)
+        # Compile-time lower bound on `hdim_qk`, exclusive. The dispatcher
+        # enforces it, so D columns below it need no mask.
+        self.HDIM_QK_FLOOR = int(hdim_qk_floor)
 
     # -- runtime softmax scale -------------------------------------------
     #
@@ -645,17 +649,42 @@ class ParityKvLdsToVgprLoader(dualwave.DualwaveKvLdsToVgprLoader):
             steps = self.traits.K_STEPS_QK
         if const_expr(not self.PADDED_HEAD):
             return (k_lo, k_hi)
-        # K is masked *inside* the KV loop, so the hoisted masks stay live and
-        # compete with everything else. Worth it only where they fit: measured
+        # K is masked *inside* the KV loop, once per KV tile per K-step, so
+        # unlike Q's prologue mask this one is on the hot path and its masks
+        # stay live across everything else. Masking every step is what made a
+        # padded head cost 27-54% against its own rung -- and near-independent
+        # of how much pad there was, since 240-in-256 paid the same tax as
+        # 129-in-192. Removing it entirely restored every padded build to its
+        # rung's native rate exactly, which is what identifies this loop, and
+        # nothing else about padding, as the whole cost.
+        #
+        # **Most of the steps cannot contain pad.** The build serves
+        # `(HDIM_QK_FLOOR, BLOCK_DMODEL]` and the dispatcher enforces it, so a
+        # step whose columns all lie at or below the floor is reading real
+        # data. On the 32-spaced rungs consecutive rungs are 32 apart and
+        # `K_STEP_QK` is 16, so exactly two steps survive at every width --
+        # 2 of 16 at the 256 rung rather than 16.
+        #
+        # Skipping is `continue`, not a narrower loop bound: under `D_STAGES`
+        # the surviving steps are the last ones globally but sit at arbitrary
+        # stage-relative indices, so there is no contiguous stage-local range
+        # to iterate.
+        width = self.traits.MFMA_LANE_K
+        masked = [ks for ks in range(steps) if ((stage * steps + ks) + 1) * self.traits.K_STEP_QK > self.HDIM_QK_FLOOR]
+        if const_expr(not masked):
+            return (k_lo, k_hi)
+        # The bitmask form ANDs one precomputed dword instead of selecting per
+        # element, but each mask is a live register. Gated on the number of
+        # steps that actually survive rather than on `K_STEPS_QK`: measured
         # +21% in the 64-wide tile and -43% in the 128-wide one, where 32 extra
-        # live registers turn a spill-free build into 61 spills.
+        # live registers turned a spill-free build into 61 spills. With two
+        # steps left the wide tiles are back under that limit.
         cols = MaskedAxis(
             fx.Index(self.hdim_qk),
             elem_dtype=self.elem_dtype,
-            bitmask=self.traits.K_STEPS_QK * (self.traits.MFMA_LANE_K // 2) <= 16,
+            bitmask=len(masked) * (width // 2) <= 16,
         )
-        width = self.traits.MFMA_LANE_K
-        for ks in range_constexpr(steps):
+        for ks in masked:
             # The mask is against the *global* D column, so the stage's base
             # has to come back in here -- `ks` is stage-relative above.
             col_base = fx.Index((stage * steps + ks) * self.traits.K_STEP_QK) + self.lane_div_32 * fx.Index(width)

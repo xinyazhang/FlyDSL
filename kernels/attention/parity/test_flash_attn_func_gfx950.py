@@ -265,7 +265,7 @@ def test_asymmetric_hdim(hdim, hdim_v):
 
 
 @pytest.mark.parametrize("poison", [0.0, 1e4, float("inf"), float("nan")], ids=["zero", "big", "inf", "nan"])
-@pytest.mark.parametrize("hdim", [17, 33, 80, 100, 113])
+@pytest.mark.parametrize("hdim", [17, 33, 80, 100, 113, 129, 193, 225, 241])
 def test_padded_head_ignores_pad_contents(hdim, poison):
     """The answer must not depend on what sits in the D-axis padding.
 
@@ -275,6 +275,12 @@ def test_padded_head_ignores_pad_contents(hdim, poison):
     `0 * NaN` is NaN. K carries its own mask now (`ParityKvLdsToVgprLoader`);
     without it these two ids fail and the other two do not, which is why the
     poison values are parametrized rather than folded into one case.
+
+    The wide `hdim` values are here for `HDIM_QK_FLOOR`, which lets K skip the
+    steps it knows are real. Each is one past a rung -- 129, 193, 225, 241 sit
+    at `floor + 1` for the 192, 224, 256 and 256 tiles -- so all but the two
+    surviving steps are skipped and any off-by-one in the floor lets poison
+    straight through.
     """
     b, h, s = 2, 8, 256
     q, k, v, pitch = _padded_qkv(b, h, s, hdim, hdim, poison=poison)
@@ -329,6 +335,38 @@ def test_tile_width_rejects_past_the_widest_tile():
     assert not LADDER_PLANNED
     with pytest.raises(ValueError, match="exceeds the widest tile"):
         tile_width_for(1024)
+
+
+def test_hdim_qk_floor_is_the_ladder_gap():
+    """The floor is the rung below, and only for a tile the ladder chose.
+
+    Pinning `block_dmodel` is allowed to be arbitrarily wide for the head_dim
+    -- 256 for a head_dim of 64 is legal -- so no floor can be claimed there,
+    and claiming one would silently unmask the pad.
+    """
+    k = fmha_knobs("gfx950")
+    for hdim, want in [(64, 32), (65, 64), (129, 128), (240, 224), (500, 384)]:
+        got = k.resolve(FmhaInputMetadata(num_heads=8, head_dim=hdim)).hdim_qk_floor
+        assert got == want, f"head_dim {hdim}: floor {got}, want {want}"
+    assert k.resolve(FmhaInputMetadata(num_heads=8, head_dim=17)).hdim_qk_floor == 0  # narrowest rung
+    pinned = replace(k, block_dmodel=256).resolve(FmhaInputMetadata(num_heads=8, head_dim=64))
+    assert pinned.hdim_qk_floor == 0
+
+
+def test_hdim_below_floor_is_refused_not_computed():
+    """A call narrower than the build's floor must raise, not return numbers.
+
+    The kernel leaves the low D columns unmasked on the strength of the floor,
+    so this call would reduce over the caller's padding. It is the one way to
+    reach that state, and it is a host-side check away from being an error.
+    """
+    b, h, s, hdim = 1, 4, 256, 240
+    q, k, v, pitch = _padded_qkv(b, h, s, hdim, hdim)
+    fn = build(num_heads=h, head_dim=hdim, head_dim_v=hdim, causal=False, dtype_str="bf16", num_kv_heads=h)
+    narrow = q[..., :100].contiguous()
+    o = torch.empty(b, h, s, 100, device="cuda", dtype=DT)
+    with pytest.raises(ValueError, match=r"serves hdim_qk in \(224, 256\]"):
+        fn(narrow, k[..., :100].contiguous(), v[..., :100].contiguous(), o, b, s, seqlen_k=s, scale=None, lse=None)
 
 
 def test_padded_head_is_derived_not_guessed():
