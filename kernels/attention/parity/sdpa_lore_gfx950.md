@@ -63,6 +63,98 @@ not *timing*. Do not conclude you have found a wait-state bug from that alone.
 
 ---
 
+## Where the wait-state rules live
+
+Once the ladder says "hardware wait state", stop guessing and read the source.
+The rules are all in LLVM, they are gfx950-specific, and they are not in any
+ISA doc at this resolution. A local checkout is at `~/dockerhome/meff/`.
+
+**Numbers are deliberately not reproduced here.** They change -- the gfx950
+requirements were raised twice in 2025 -- and a stale constant in a lore file
+is worse than no constant. Look them up in *your* toolchain's tree, and check
+the toolchain actually compiling the kernel, not upstream `main`.
+
+### The three files
+
+| file (`llvm/lib/Target/AMDGPU/`) | scope |
+|---|---|
+| `GCNHazardRecognizer.{h,cpp}` | everything that matters to us; post-RA |
+| `AMDGPUHazardLatency.{h,cpp}` | gfx1250 co-execution only |
+| `AMDGPUWaitSGPRHazards.{h,cpp}` | GFX12 only |
+
+### Reading order
+
+1. **`PreEmitNoopsCommon`** is the dispatch table -- one `check*Hazards` call
+   per hazard class. Read it first: it tells you which classes *exist*, which
+   is how you find out that the thing you suspect is not modelled at all.
+2. Follow the checker for your class. For gfx950 MFMA the live ones are
+   `checkMAIHazards` (which forwards to the `90A` variant), `checkMAIVALUHazards`,
+   `checkVALUHazards`, `checkVMEMHazards`, `checkDPPHazards`,
+   `checkPermlaneHazards`. Two are **dead on gfx950** and will waste your time:
+   the `908` MAI variant (gfx908 AGPRs) and `checkMAILdStHazards` (returns 0 on
+   gfx90a and later, at its first line).
+3. The actual counts are in `GFX940_*`-named helper lambdas inside the MAI
+   checkers, keyed on **number of passes** and an `IsGFX950` flag. Read the
+   lambda, do not transcribe it.
+4. `grep hasGFX950Insts() GCNHazardRecognizer.cpp` -- nine sites -- enumerates
+   every gfx950 divergence in one shot.
+
+### Get the pass count right first
+
+This is the step that invalidated a day of my analysis. **The pass count is not
+in the hazard recognizer.** It comes from the scheduling model:
+`SIInstrInfo::isXDL` classifies XDL vs DGEMM, and `SISchedule.td` maps an
+opcode regex to `WriteNPassMAI` under the per-subtarget model -- gfx950 has its
+own. `v_mfma_f32_32x32x16_bf16` is **8-pass on gfx950**, and I spent a long
+time checking it against 16-pass requirements, which are roughly double. Every
+derived number was wrong and the scan reported violations that did not exist.
+
+`VOP3PInstructions.td` (predicate `HasGFX950Insts`, flag `is_gfx940_xdl`) tells
+you which MFMA opcodes exist on the target at all.
+
+### Limits, and a real off-by-one
+
+`getWaitStatesSince` walks backwards under a caller-supplied bound, and each
+checker declares a local `MaxWaitStates`. Those bounds were **not raised** when
+the gfx950 requirements went up in early 2025, so for 16-pass XDL the required
+distance now exceeds what the walker can even measure. It is a genuine upstream
+bug (the bound blames to 2021), it is still present at the head of `main`, and
+it does **not** affect this kernel because we are 8-pass. It would affect a
+16-pass MFMA kernel silently.
+
+### The two padding options, and why one is a trap
+
+Both are hidden `cl::opt`s declared at the top of `GCNHazardRecognizer.cpp`.
+
+- `amdgpu-snop-padding` is applied unconditionally in `PreEmitNoops`. It is a
+  **clean probe**: pre-emit, so it adds wait states without moving a single
+  register.
+- `amdgpu-mfma-padding-ratio` runs inside `checkMFMAPadding`, which is called
+  from only two sites and **bails early** if the instruction is not an MFMA or
+  if `getOccupancy() < 2`. A negative result from it may therefore be vacuous.
+  Check the occupancy in your metadata before believing one.
+
+### Finding the gaps
+
+The productive query is the negative one: grep the recognizer for the opcode
+you suspect. `DS_READ_B64_TR` returns nothing, which is how the current
+leading hypothesis for Hazard 2 was formed. Similarly `buffer_load ... lds` is
+recognised as LDS DMA (`isLdsDma`) but `createsVALUHazard` returns -1 for it,
+so it is not modelled as a hazard source.
+
+### Version skew is the point
+
+The checkout surveyed here (`83e1178daa12`, 2026-08-15) is upstream `main` and
+is **ahead of every ROCm 7.x**. That cuts both ways: a fix you find may not be
+in your compiler. The concrete example is the gfx940-family MUBUF store-data
+WAR hazard (see Hazard 2) -- fixed upstream in June 2026, `main` and
+`release/23.x` only.
+
+`git log --oneline llvm/lib/Target/AMDGPU/GCNHazardRecognizer.cpp` filtered for
+gfx950 is a five-minute survey and tells you what your toolchain is missing.
+
+---
+
 ## Hazard 1: inline asm hides memory ops from `SIInsertWaitcnts`
 
 **Symptom.** Non-deterministic NaN at head_dim 192 and 256; head_dim 64 and 128
@@ -121,25 +213,22 @@ twice 96's.
   `lazy_rescale` all leave the *identical* error.
 
 **What it is.** `amdgpu-snop-padding=1` fixes it and leaves the register
-assignment byte-identical, which makes it a hardware wait state. But the
-*documented* hazards are all satisfied. `v_mfma_f32_32x32x16_bf16` is XDL
-**8-pass** on gfx950 (`SISchedule.td:363`, `Write8PassMAI`), not 16-pass, so
-via the `GFX940_*` tables in `GCNHazardRecognizer.cpp:3167-3214` the
-requirements are 12 (MFMA write -> MFMA SrcA/B), 10 (-> SrcC on a non-matching
-opcode; 0 for same-opcode forwarding), 12 (-> VALU/DS/VMEM/EXP) and 2
-(VALU -> MFMA). A scan of the failing ISA against those exact numbers finds
-**zero violations**.
+assignment byte-identical, which makes it a hardware wait state. But every
+*modelled* hazard is already satisfied: scanning the failing ISA against the
+gfx950 MFMA requirements -- looked up as described above, and note that
+`v_mfma_f32_32x32x16_bf16` is **8-pass** here, not 16 -- finds **zero
+violations**.
 
-Leading hypothesis: **`ds_read_b64_tr_b16` is not modeled by
-`GCNHazardRecognizer` at all** (no `DS_READ_B64_TR` anywhere in it), and this
-kernel issues 144 of them at head_dim 96. Unproven.
+Leading hypothesis: **`ds_read_b64_tr_b16` is not modelled by
+`GCNHazardRecognizer` at all** (`DS_READ_B64_TR` appears nowhere in it), and
+this kernel issues 144 of them at head_dim 96. Unproven.
 
 Ruled out: the gfx940-family MUBUF/MTBUF store-data WAR hazard fixed upstream
-in `62b7cf9623fc` (2026-06-01, `main` and `release/23.x` only, so absent from
-every ROCm 7.x LLVM). It is a tempting match -- the commit says it was
-characterised on gfx950 by Triton's fused-attention kernel -- but this kernel
-has six `buffer_store_dwordx4` and none has a VALU overwriting its vdata inside
-the window.
+in `62b7cf9623fc` (2026-06-01; `main` and `release/23.x` only, so absent from
+every ROCm 7.x LLVM). A tempting match -- that commit says it was characterised
+on gfx950 by Triton's fused-attention kernel -- but this kernel has six
+`buffer_store_dwordx4` and none has a VALU overwriting its vdata inside the
+window.
 
 An earlier draft of this section blamed the pair below. That was wrong: the
 *working* build contains the same pattern, and 2 wait states is exactly what
