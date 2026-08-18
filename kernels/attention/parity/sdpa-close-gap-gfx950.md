@@ -1729,3 +1729,68 @@ the answer is already known. Nothing here would have been visible at 512 alone.
 - The wide body allocates two LDS buffers and uses one. Halving the allocation
   would free ~66 KB at 512 -- headroom a `QK_SHARDS` reduction would need.
 - No K/V prefetch on the wide path; each stage is a barrier pair.
+
+## P8.1 — the wide path was waiting, not computing (ATT)
+
+`rocprofv3 --att` on the head_dim 512 build, one CU, one dispatch. **A single
+instruction was a quarter of the runtime:**
+
+| instruction | hits | latency | share | cyc/hit |
+|---|---|---|---|---|
+| `s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)` | 256 | 191,672 | **26.0%** | 748.7 |
+| `s_waitcnt lgkmcnt(0)` | 2,704 | 121,092 | 16.4% | 44.8 |
+| `s_barrier` | 1,032 | 15,080 | 2.0% | 14.6 |
+| **all MFMA** | 6,144 | 79,696 | 10.8% | 13.0 |
+
+The kernel spent 2.5x longer in one wait than in all its MFMAs, and the hit
+count identifies it exactly: 16 KV tiles x 4 drains per tile (2 K stages + 2 V
+stages) x 4 waves = 256, which is the `_s_waitcnt(0)` the first cut wrote after
+every DMA. head_dim 384 showed the same shape (24.9%, 704.6 cyc/hit).
+
+PMC ruled out the alternatives -- `LdsBankConflict` 0, `MemUnitStalled` ~0, and
+occupancy ~23% at *every* width including the tuned 256. Not bandwidth, not LDS
+layout, not occupancy: ~750 cycles of DMA latency exposed with nothing over it.
+
+| head_dim | path | MfmaUtil | WAIT_ANY / WAVE_CYCLES |
+|---|---|---|---|
+| 256 | dualwave | 71.9% | 16% |
+| 384 | wide | 49.2% | 61% |
+| 512 | wide | 53.1% | 54% |
+
+### Fix: a 2-deep stage pipeline, in LDS that was already paid for
+
+Issue stage `st+1`'s DMA before consuming stage `st`, alternating the two LDS
+buffers, and replace the drain with the counted `_waitcnt_vm_n(NUM_DMA_K)` --
+stage `st`'s issues are the older ones, so leaving `NUM_DMA_K` outstanding
+retires exactly them. **`NUM_PREFETCH_K` is already 2 and the first cut used
+only buffer 0**, so the prefetch cost no extra LDS: at 512 that was 68 KB
+allocated and idle.
+
+| head_dim | before | after | |
+|---|---|---|---|
+| 256 (wide path) | 627 | **692** | +10% |
+| 384 | 579 | **734** | **+27%** |
+| 512 | 366 | **442** | **+21%** |
+
+Zero spills at both widths, builds still 5 s. The full drain leaves the ATT top
+ten entirely; total traced latency falls 737,784 -> 665,960.
+
+Removing the now-redundant explicit `_s_waitcnt(LGKMCNT_0_ONLY)` after each LDS
+read measured **neutral** (+0.4% / +0.05%) -- LLVM's own counted waits were
+already doing the work, which is what the ROCDL-op change bought. Kept anyway,
+as fewer redundant drains.
+
+### What is left
+
+`s_waitcnt lgkmcnt(0)` is now the top cost at **35.7%** (5,008 hits, 47.5
+cyc/hit) -- LDS read latency, mostly LLVM's necessary waits before each MFMA
+rather than anything hand-placed. Two candidates, neither attempted:
+
+- **Cross-phase prefetch.** Each phase's *first* stage still exposes its DMA:
+  V stage 0 could be issued during the QK phase, and the next tile's K stage 0
+  during the PV phase. K and V occupy separate LDS regions so there is no
+  conflict, but the `vmcnt` bookkeeping then spans phases -- delicate enough to
+  want its own verification pass. Worth roughly the 2 remaining exposures per
+  tile.
+- **Interleaving DS reads with MFMA inside a stage**, which is what the
+  dual-wave cluster structure does and this body does not.

@@ -20,8 +20,13 @@ cannot be paid for above it, for two independent reasons:
 - **Registers.** Two tiles in flight also means two of everything the loop
   carries -- `v_s_0/v_s_1`, `v_p_0/v_p_1`, two K sets, two V sets.
 
-So this body runs one tile at a time and interleaves within it instead. What
-it gives up is the K/V prefetch; what it buys is fitting at all.
+So this body runs one tile at a time. It does *not* give up prefetching --
+`D_STAGES` buys back a 2-deep pipeline over stages, alternating the same two
+LDS buffers the dual-wave path uses for two tiles. ATT is what forced that:
+the first cut drained after every DMA, and
+`s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)` came to 26% of runtime at 749
+cycles a hit, against 10.8% for every MFMA combined. Pipelining the stages
+was worth +27% at 384 and +21% at 512.
 
 --- The two D-axis cuts, and why both are needed -----------------------------
 
@@ -90,6 +95,7 @@ __all__ = [
 _s_barrier = dualwave._s_barrier
 _s_waitcnt = dualwave._s_waitcnt
 _sched_barrier = dualwave._sched_barrier
+_waitcnt_vm_n = dualwave._waitcnt_vm_n
 
 
 class WideKernelContext(ParityKernelContext):
@@ -331,14 +337,24 @@ def make_wide_body(
             # -- GEMM1. D is the reduction axis, so every stage feeds the same S
             #    and the softmax cannot start until the last one has landed.
             v_s = (ctx.c_zero_v16f32, ctx.c_zero_v16f32)
+            kv_gmem_to_lds.load_k_tile(j, 0, stage=0)
             for st in range_constexpr(traits.D_STAGES):
-                _s_barrier()  # every wave has finished reading the stage this overwrites
-                kv_gmem_to_lds.load_k_tile(j, 0, stage=st)
-                _s_waitcnt(0)
+                cur = st % 2
+                if const_expr(st + 1 < traits.D_STAGES):
+                    # Everyone is done reading the buffer about to be
+                    # overwritten -- it was last read at stage st-1, and the
+                    # barrier below closed that.
+                    _s_barrier()
+                    kv_gmem_to_lds.load_k_tile(j, (st + 1) % 2, stage=st + 1)
+                    # Counted, not a drain: stage st's issues are the *older*
+                    # ones, so leaving `NUM_DMA_K` outstanding retires exactly
+                    # them and lets stage st+1 stay in flight.
+                    _waitcnt_vm_n(ctx.NUM_DMA_K)
+                else:
+                    _s_waitcnt(0)
                 _sched_barrier(0)
-                _s_barrier()
-                v_k = kv_lds_to_regs.load_k(0, stage=st)
-                _s_waitcnt(traits.LGKMCNT_0_ONLY)
+                _s_barrier()  # every wave's stage-st DMA has landed, not just mine
+                v_k = kv_lds_to_regs.load_k(cur, stage=st)
                 v_s = gemm_helper.qk_stage(v_k, q_all_scaled_bf16, v_s, st)
 
             if const_expr(traits.CAUSAL):
@@ -359,14 +375,18 @@ def make_wide_body(
 
             # -- GEMM2. D is an output axis here: each (stage, shard) owns a
             #    disjoint run of O, so nothing is combined afterwards.
+            kv_gmem_to_lds.load_v_tile(j, 0, stage=0)
             for st in range_constexpr(traits.D_STAGES):
-                _s_barrier()
-                kv_gmem_to_lds.load_v_tile(j, 0, stage=st)
-                _s_waitcnt(0)
+                cur = st % 2
+                if const_expr(st + 1 < traits.D_STAGES):
+                    _s_barrier()
+                    kv_gmem_to_lds.load_v_tile(j, (st + 1) % 2, stage=st + 1)
+                    _waitcnt_vm_n(ctx.NUM_DMA_V)
+                else:
+                    _s_waitcnt(0)
                 _sched_barrier(0)
                 _s_barrier()
-                v_v = kv_lds_to_regs.load_v_shard(0, ctx.vo_shard_id)
-                _s_waitcnt(traits.LGKMCNT_0_ONLY)
+                v_v = kv_lds_to_regs.load_v_shard(cur, ctx.vo_shard_id)
                 v_o = gemm_helper.pv_shard(v_p, v_v, v_o, st * traits.D_CHUNKS_PER_STAGE_SHARD)
 
             loop_results = yield [m_row, l_row] + v_o
