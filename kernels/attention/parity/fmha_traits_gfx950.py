@@ -89,6 +89,20 @@ class ParityDualwaveTraits(dualwave.DualwaveSwpTraits):
     K_STEPS_PER_BAND: int = 0
     D_CHUNKS_PER_BAND: int = 0
 
+    # P3. Generalized sliding-window attention: AOTriton's `CAUSAL_TYPE == 3`.
+    #
+    # **A window is causal plus a left bound**, which is why this is a flag on
+    # top of `CAUSAL` rather than a mode beside it. The existing causal path
+    # already masks `col <= row + delta` with `delta = seqlen_kv - seqlen_q`,
+    # and that is exactly `window_right` under bottom-right alignment -- so
+    # `WINDOW` re-points `delta` at the resolved right bound and adds the
+    # second comparison for the left one.
+    #
+    # The bounds themselves are *runtime* i32 arguments, not fields here: they
+    # carry sentinels that must be resolved against each sequence's own
+    # lengths, which under varlen differ per sequence. See `resolve_window`.
+    WINDOW: bool = False
+
 
 # Hardware constants. Not parameters: these are the wave, the DMA width and the
 # MFMA shape, and a build that changed one would not be this algorithm.
@@ -120,6 +134,7 @@ def make_traits(
     v_k_substep=None,
     v_dc_in_pair=None,
     causal=True,
+    window=False,
     dtype_str="bf16",
     waves_per_eu=2,
     daz=True,
@@ -137,6 +152,12 @@ def make_traits(
     xcd_swizzle=False,
 ):
     """Dualwave traits for an arbitrary (waves, BLOCK_M, BLOCK_N, granule)."""
+    if window and not causal:
+        # A window without the causal machinery has no masked region to apply
+        # itself to, and silently dropping it would return dense attention --
+        # the right shape, finite, and wrong. An unbounded `window_right`
+        # expresses a pure left-band, so nothing is lost by requiring this.
+        raise ValueError("window=True requires causal=True; it is a left bound on top of the causal one")
     if num_waves % vo_shards:
         raise ValueError(f"vo_shards {vo_shards} must divide num_waves {num_waves}")
     # With `vo_shards` waves sharing one Q tile, the workgroup covers
@@ -301,6 +322,7 @@ def make_traits(
         NUM_HEADS_KV=num_kv_heads,
         GQA_GROUP_SIZE=gqa_group_size,
         CAUSAL=causal,
+        WINDOW=window,
         DTYPE_STR=dtype_str,
         WAVES_PER_EU=waves_per_eu,
         DAZ=bool(daz),

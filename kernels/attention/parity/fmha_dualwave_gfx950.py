@@ -52,11 +52,13 @@ change:
 import contextlib
 from dataclasses import replace
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
+import fmha_common_gfx1201 as fmha
 from fmha_common_gfx1201 import MaskedAxis
 from gfx950_standalone import dualwave
 
@@ -309,6 +311,8 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         hdim_vo,
         padded_head=False,
         hdim_qk_floor=0,
+        window_left=None,
+        window_right=None,
         **kwargs,
     ):
         super().__init__(traits, **kwargs)
@@ -342,6 +346,11 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         # Compile-time lower bound on `hdim_qk`, exclusive. The dispatcher
         # enforces it, so D columns below it need no mask.
         self.HDIM_QK_FLOOR = int(hdim_qk_floor)
+        # P3. Raw window bounds, still carrying their sentinels; resolved in
+        # `init_runtime_indices`, which is the first point the sequence lengths
+        # this build will use are known.
+        self.window_left_arg = window_left
+        self.window_right_arg = window_right
 
     # -- runtime softmax scale -------------------------------------------
     #
@@ -410,6 +419,79 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         self.k_lds_read_base_per_lane = _k_read_base(self.traits, self.lane_mod_32, self.lane_div_32)
 
     # -- per-tensor strides ----------------------------------------------
+
+    def init_tile_bounds(self, **kwargs):
+        """Resolve the window, then let the causal bound derive from it.
+
+        Here and not in `init_runtime_indices` for an ordering reason: a
+        sentinel resolves against the sequence lengths, and those are not
+        settled until `init_sequence_lengths`, which runs in between. This is
+        also the first place `delta_i32` is *read* -- `causal_end_raw_i32` and
+        `max_num_tiles` both come from it -- so overriding it immediately
+        before `super()` is what makes the tile count follow the window's right
+        bound with no further change.
+        """
+        if const_expr(self.traits.WINDOW):
+            # **`delta_i32` *is* the right bound.** The base class sets it to
+            # `seqlen_kv - seqlen_q`, which is bottom-right causal spelled as a
+            # diagonal offset, and every causal site downstream -- the mask's
+            # `rel`, `causal_end_raw_i32`, `max_num_tiles` -- reads it from
+            # here. Re-pointing it at the resolved `window_right` therefore
+            # generalizes all of them at once, and is why a window is a flag on
+            # top of causal rather than a second masking mode.
+            #
+            # Resolution is on the device, not the host: a sentinel resolves
+            # against *this sequence's* lengths, and under varlen those differ
+            # per sequence. `fmha.resolve_window` is gfx1201's, reused unedited.
+            left, right = fmha.resolve_window(
+                self.window_left_arg,
+                self.window_right_arg,
+                fx.Int32(self.seqlen_q_v),
+                self.seqlen_kv_i32,
+            )
+            self.window_left_i32 = fx.Int32(left)
+            self.delta_i32 = fx.Int32(right)
+        super().init_tile_bounds(**kwargs)
+        if const_expr(self.traits.WINDOW and not self.traits.SPLITK):
+            self._skip_dead_leading_tiles()
+
+    def _skip_dead_leading_tiles(self):
+        """Start the KV walk at the window's left edge instead of at tile 0.
+
+        The right bound already truncates the walk, through `max_num_tiles`.
+        The left bound is the mirror image and needs the *base* to move, and
+        the machinery for that is already here: `[split_t0, split_t_end)` is
+        the tile range the whole pipeline is written against -- the prologue
+        loads `split_tile(0..2)`, the loop runs from `split_tile(3)`, and only
+        split-K ever moved the base before. So this is a new *value* for an
+        existing knob, not new control flow.
+
+        A dead tile is not a wrong answer, it is a masked one: every column
+        fails the left bound, `exp2` gives zero, and the tile contributes
+        nothing. That is exactly why correctness cannot show this works --
+        skipping is invisible to the output and only a measurement sees it.
+
+        The lowest column any row of this Q block can reach is
+        `q_start - window_left`, since `q_start` is the smallest row. Tiles
+        entirely below that are dead for the whole block.
+        """
+        traits = self.traits
+        # Clamp before dividing rather than after: `q_start - window_left` is
+        # negative whenever the window reaches past the start of the sequence,
+        # and `fx.Index` is unsigned, so a negative would come out enormous and
+        # skip the entire range. i32 until the value is known non-negative --
+        # the same rule `resolve_window` states.
+        first_col_i32 = fx.Int32(self.q_start) - self.window_left_i32
+        first_col_i32 = fx.Int32((first_col_i32 > fx.Int32(0)).select(first_col_i32, fx.Int32(0)))
+        t0 = fx.Index(first_col_i32) // fx.Index(traits.BLOCK_N)
+        # Even, because the software pipeline consumes two tiles per iteration
+        # and `split_t_end` is already even; an odd base would make the segment
+        # odd and leave the epilogue a tile short.
+        t0 = (t0 // fx.Index(2)) * fx.Index(2)
+        # The pipeline's prologue plus epilogue need four tiles to exist. The
+        # base class guarantees `max_num_tiles >= 4`, so this cannot underflow.
+        cap = self.split_t_end - fx.Index(4)
+        self.split_t0 = fx.Index((t0 < cap).select(t0, cap))
 
     def init_runtime_indices(self, **kwargs):
         super().init_runtime_indices(**kwargs)
@@ -795,6 +877,99 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
 
     def reduce_max(self, v_s):
         return dualwave._score_pair_max(v_s, self.c_neg_floor, self.fm_fast)
+
+    # -- P3: generalized sliding window --------------------------------------
+    #
+    # The right bound needs no code here at all: it rides on `delta_i32`, which
+    # `ParityKernelContext.init_runtime_indices` re-points at the resolved
+    # `window_right`. Only the left bound is new.
+
+    def _causal_mask_inplace(self, v_s, tile_idx, q_row_i32=None):
+        """The causal right bound, then the window's left one.
+
+        `super()` masks `col <= row + delta`. A window adds `col >= row - left`,
+        and the two are independent comparisons against the same per-element
+        column, so this composes rather than replacing anything.
+
+        Plain `select`s rather than the paired inline asm the right bound uses.
+        The asm packs two compares and two cndmasks per pair and exists because
+        the causal mask is on the innermost path of every build; this one runs
+        only in window builds, and `seq_pad_mask_inplace` next door already
+        establishes the `select` form as the idiom here. Reach for the asm if a
+        measurement asks for it, not before.
+        """
+        super()._causal_mask_inplace(v_s, tile_idx, q_row_i32=q_row_i32)
+        if const_expr(not self.traits.WINDOW):
+            return
+        if q_row_i32 is None:
+            q_row_i32 = self.ctx_ref.q_row_i32
+        traits = self.traits
+        s_lo, s_hi = v_s
+        kv_start_i32 = fx.Int32(tile_idx * traits.BLOCK_N)
+        # Same lane->column mapping the right bound uses; `s_hi` is the same
+        # rows 32 columns further on, which is why its `rel` is 32 smaller.
+        lane_n_off = 8 if traits.KV_VECTORIZED else 4
+        lane_off_i32 = fx.Int32(self.lane_div_32) * fx.Int32(lane_n_off)
+        rel_lo = fx.Int32(q_row_i32 - self.ctx_ref.window_left_i32 - kv_start_i32 - lane_off_i32)
+        rel_hi = fx.Int32(rel_lo - fx.Int32(32))
+        for p in range_constexpr(len(dualwave._causal_pair_thresholds(traits.KV_VECTORIZED))):
+            thr_x, thr_y = dualwave._causal_pair_thresholds(traits.KV_VECTORIZED)[p]
+            ix, iy = 2 * p, 2 * p + 1
+            # Keep where the column has not fallen behind the left edge.
+            s_lo[ix] = (rel_lo <= fx.Int32(thr_x)).select(s_lo[ix], self.c_neg_inf)
+            s_lo[iy] = (rel_lo <= fx.Int32(thr_y)).select(s_lo[iy], self.c_neg_inf)
+            s_hi[ix] = (rel_hi <= fx.Int32(thr_x)).select(s_hi[ix], self.c_neg_inf)
+            s_hi[iy] = (rel_hi <= fx.Int32(thr_y)).select(s_hi[iy], self.c_neg_inf)
+
+    def causal_mask_prologue_if_needed(self, v_s, tile_idx=None, kv_end_pos=None, **kwargs):
+        """Two-sided version of "does this tile need masking at all?".
+
+        The inherited test is one-sided -- `q_start + right < kv_end`, i.e. does
+        the *first* row's right bound fall inside this tile. That is sufficient
+        for causal, where the only partial tiles are the ones straddling the
+        diagonal, and wrong for a window, whose left bound clips a second set
+        of tiles somewhere else entirely.
+
+        So the test gains a second term rather than being dropped. Masking
+        unconditionally is also correct -- a mask on a fully live tile is a
+        no-op -- but measured 197 us against causal's 126 at an unbounded left
+        bound, because it forces the mask onto every interior tile in the walk.
+
+        Each term is the worst case over the tile:
+
+        - a column can overrun the right bound only if the *lowest* row's
+          bound, `q_start + right`, lands inside the tile;
+        - a column can fall behind the left bound only if the *highest* row's
+          edge, `q_start + BLOCK_M - 1 - left`, is still above `kv_start`.
+        """
+        if const_expr(not self.traits.WINDOW):
+            return super().causal_mask_prologue_if_needed(v_s, tile_idx=tile_idx, kv_end_pos=kv_end_pos, **kwargs)
+        traits = self.traits
+        if tile_idx is None:
+            tile_idx = fx.Index(0)
+        kv_end_tile = kwargs.get("kv_end_tile")
+        if kv_end_pos is None:
+            kv_end_pos = self.tile_start(tile_idx + fx.Index(1) if kv_end_tile is None else kv_end_tile)
+        kv_start_pos = self.tile_start(tile_idx)
+        q_start_pos_i32 = kwargs.get("q_start_pos_i32") or self.ctx_ref.q_start_pos_i32
+        q_row_i32 = kwargs.get("q_row_i32") or self.ctx_ref.q_row_i32
+        window_left_i32 = self.ctx_ref.window_left_i32
+        delta_i32 = self.delta_i32
+        mask_inplace = self._causal_mask_inplace
+        to_lists = self.v_s_vec_to_lists
+
+        @flyc.jit
+        def _window_mask_if_needed(v_s, tile_idx, kv_end_pos, kv_start_pos, q_start_pos_i32, q_row_i32):
+            s_lo, s_hi = v_s
+            clipped_right = q_start_pos_i32 + delta_i32 < fx.Int32(kv_end_pos)
+            clipped_left = fx.Int32(kv_start_pos) < q_start_pos_i32 + fx.Int32(traits.BLOCK_M - 1) - window_left_i32
+            if clipped_right | clipped_left:
+                lo_list, hi_list = to_lists(v_s)
+                mask_inplace((lo_list, hi_list), tile_idx, q_row_i32=q_row_i32)
+                s_lo, s_hi = dualwave._score_lists_to_vecs((lo_list, hi_list))
+            return s_lo, s_hi
+
+        return _window_mask_if_needed(v_s, tile_idx, kv_end_pos, kv_start_pos, q_start_pos_i32, q_row_i32)
 
     def rescale_o_serial(self, v_o, m_row, l_row, m_tile_max):
         """`rescale_o` without the `v_p` term, for the staged (unpipelined) loop.

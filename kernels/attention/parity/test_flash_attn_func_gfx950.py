@@ -25,12 +25,14 @@ Three kinds of test, and the distinction is what makes the suite worth having:
 """
 
 import math
+import time
 from dataclasses import replace
 
 import pytest
 import torch
 import torch.nn.functional as F
 from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module as build
+import fmha_common_gfx1201 as fmha
 from fmha_tuning_gfx950 import LADDER, LADDER_PLANNED, FmhaInputMetadata, fmha_knobs, tile_width_for
 from gfx950_standalone import dualwave  # noqa: F401  (puts the repo root on sys.path)
 
@@ -440,6 +442,173 @@ def test_padded_head_is_derived_not_guessed():
         assert fmha_knobs("gfx950").resolve(FmhaInputMetadata(num_heads=8, head_dim=hdim)).padded_head is False
     assert fmha_knobs("gfx950").resolve(FmhaInputMetadata(num_heads=8, head_dim=40)).padded_head is True
     assert fmha_knobs("gfx950").resolve(FmhaInputMetadata(num_heads=8, head_dim=64, head_dim_v=32)).padded_head is True
+
+
+# ---------------------------------------------------------------------------
+# P3: generalized sliding window (gSWA)
+# ---------------------------------------------------------------------------
+
+
+def _run_window(q, k, v, window, *, causal=True):
+    """Dispatch a window build. `window` is the raw (left, right) wire pair."""
+    b, hq, s, d = q.shape
+    o = torch.empty(b, hq, s, v.shape[3], device="cuda", dtype=q.dtype)
+    fn = build(
+        num_heads=hq,
+        head_dim=d,
+        head_dim_v=v.shape[3],
+        causal=causal,
+        window=True,
+        dtype_str="bf16",
+        num_kv_heads=k.shape[1],
+    )
+    fn(q, k, v, o, b, s, seqlen_k=k.shape[2], scale=None, lse=None, window=window)
+    return o
+
+
+def _window_ref(q, k, v, left, right):
+    """SDPA with the band `i - left <= c <= i + right` as an additive mask."""
+    s, sk = q.shape[2], k.shape[2]
+    i = torch.arange(s, device="cuda").view(-1, 1)
+    c = torch.arange(sk, device="cuda").view(1, -1)
+    live = (c >= i - left) & (c <= i + right)
+    assert bool(live.any(dim=1).all()), "every row must keep a key, or the reference is NaN"
+    bias = torch.zeros(s, sk, device="cuda", dtype=torch.float32)
+    bias.masked_fill_(~live, float("-inf"))
+    return F.scaled_dot_product_attention(q.float(), k.float(), v.float(), attn_mask=bias)
+
+
+@pytest.mark.parametrize("hdim", [64, 128])
+def test_window_sentinel_is_bitwise_causal(hdim):
+    """A window build fed the causal sentinels must reproduce causal exactly.
+
+    The sharpest oracle available for this phase, and the reason the sentinels
+    are resolved on the device rather than the host: `WINDOW_BOTRIGHT` means
+    `window_right = seqlen_k - seqlen_q`, which is precisely the `delta` the
+    causal path already uses, and `window_left = seqlen_q`, which is wide
+    enough that no row loses a key. So the left bound is exercised -- the
+    compares are emitted and executed -- while masking nothing, and any
+    disagreement is the window machinery rather than a tolerance.
+    """
+    b, h, s = 2, 8, 512
+    q, k, v = (_rand(b, h, s, hdim) for _ in range(3))
+    want = _run(q, k, v, causal=True)
+    got = _run_window(q, k, v, (fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT))
+    assert torch.equal(got, want), (got.float() - want.float()).abs().max().item()
+
+
+@pytest.mark.parametrize("causal_shape", [(2, 8, 512), (1, 4, 1024)], ids=["s512", "s1024"])
+@pytest.mark.parametrize("left,right", [(31, 0), (127, 0), (511, 0), (63, 63), (0, 0), (255, 32)])
+def test_window_matches_masked_sdpa(causal_shape, left, right):
+    """Real bands against SDPA with the same band as an additive mask.
+
+    `(0, 0)` is the degenerate diagonal -- one key per row -- which is the case
+    a left bound gets wrong most loudly, and `(63, 63)` is a symmetric band
+    that is not causal at all, reachable only because `window_right` is a free
+    bound rather than a fixed alignment.
+    """
+    b, h, s = causal_shape
+    q, k, v = (_rand(b, h, s, 64) for _ in range(3))
+    got = _run_window(q, k, v, (left, right))
+    assert _err(got, _window_ref(q, k, v, left, right)) < TOL
+
+
+def _window_ref_with_dead_rows(q, k, v, left, right):
+    """`_window_ref`, but tolerating rows the window leaves with no key.
+
+    Those rows are what a negative bound produces, and the reference cannot
+    express them directly: an all-`-inf` row makes SDPA's softmax `0/0`. The
+    convention -- FlashAttention's, and what this kernel produces -- is that a
+    row with nothing to attend to contributes nothing, so its output is zero.
+    """
+    s, sk = q.shape[2], k.shape[2]
+    i = torch.arange(s, device="cuda").view(-1, 1)
+    c = torch.arange(sk, device="cuda").view(1, -1)
+    live = (c >= i - left) & (c <= i + right)
+    dead = ~live.any(dim=1)
+    bias = torch.zeros(s, sk, device="cuda", dtype=torch.float32)
+    bias.masked_fill_(~live, float("-inf"))
+    bias[dead] = 0.0  # keep SDPA finite; the rows are zeroed below anyway
+    out = F.scaled_dot_product_attention(q.float(), k.float(), v.float(), attn_mask=bias)
+    out[:, :, dead, :] = 0.0
+    return out, int(dead.sum())
+
+
+@pytest.mark.parametrize(
+    "left,right",
+    [(-32, 128), (-1, 64), (512, -32), (512, -1), (256, -128), (-32, 0), (-64, 32), (-32, -16)],
+)
+def test_window_negative_bounds(left, right):
+    """Either bound may be negative, and then some rows keep no key at all.
+
+    A negative `window_left` pushes the band *ahead* of the diagonal and a
+    negative `window_right` pushes it behind; both are ordinary AOTriton
+    inputs. The last three cases admit no key for any row, which is the one
+    that would most easily produce `NaN`: the row max is never written, the
+    denominator stays zero, and a division would be `0/0`.
+
+    That it does not is `ParitySoftmaxHelper`'s floor-seeded `reduce_max`
+    earning its keep -- no lane ever holds `-inf` as a max, so `exp2` gives a
+    clean zero rather than `NaN`. The assertion on `isnan` is the point of the
+    test; the tolerance check alone would not distinguish the two.
+    """
+    b, h, s = 1, 4, 512
+    q, k, v = (_rand(b, h, s, 64) for _ in range(3))
+    got = _run_window(q, k, v, (left, right))
+    assert not torch.isnan(got.float()).any(), "a fully masked row produced NaN"
+    want, n_dead = _window_ref_with_dead_rows(q, k, v, left, right)
+    assert n_dead > 0, "this case is meant to exercise rows with no live key"
+    assert _err(got, want) < TOL
+
+
+def test_window_skips_leading_dead_tiles():
+    """A narrow window must be *faster*, not merely correct.
+
+    A dead tile masks to `-inf`, contributes zero and changes no output bit, so
+    every correctness test here passes whether or not the walk skips it. Only a
+    measurement can tell, which is why this one is a timing assertion.
+
+    The margin is deliberately loose. At `left=127` over 8192 tokens the walk
+    covers a handful of tiles instead of the full lower triangle and measures
+    around 7x; anything under 3x means the tile range is not being cut.
+    """
+    b, h, s, d = 1, 8, 8192, 64
+    q, k, v = (_rand(b, h, s, d) for _ in range(3))
+    o = torch.empty(b, h, s, d, device="cuda", dtype=DT)
+    fn = build(num_heads=h, head_dim=d, causal=True, window=True, dtype_str="bf16", num_kv_heads=h)
+
+    def timed(window):
+        call = lambda: fn(q, k, v, o, b, s, seqlen_k=s, scale=None, lse=None, window=window)  # noqa: E731
+        for _ in range(10):
+            call()
+        torch.cuda.synchronize()
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            for _ in range(20):
+                call()
+            torch.cuda.synchronize()
+            best = min(best, time.perf_counter() - t0)
+        return best
+
+    narrow = timed((127, 0))
+    unbounded = timed((s, 0))
+    assert unbounded / narrow > 3.0, f"narrow window only {unbounded / narrow:.1f}x faster; tiles not skipped"
+
+
+def test_window_requires_a_window_build():
+    """Passing a window to a build that ignores it must raise, not be dropped."""
+    b, h, s = 1, 4, 256
+    q, k, v = (_rand(b, h, s, 64) for _ in range(3))
+    o = torch.empty(b, h, s, 64, device="cuda", dtype=DT)
+    fn = build(num_heads=h, head_dim=64, causal=True, dtype_str="bf16", num_kv_heads=h)
+    with pytest.raises(ValueError, match="not compiled for windows"):
+        fn(q, k, v, o, b, s, seqlen_k=s, scale=None, lse=None, window=(31, 0))
+
+
+def test_window_build_requires_causal():
+    with pytest.raises(ValueError, match="window=True requires causal=True"):
+        build(num_heads=8, head_dim=64, causal=False, window=True, dtype_str="bf16")
 
 
 # ---------------------------------------------------------------------------

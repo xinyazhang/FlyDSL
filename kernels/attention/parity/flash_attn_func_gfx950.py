@@ -61,14 +61,16 @@ rather than corrupting the neighbouring row.
 
 --- Phase status -----------------------------------------------------------
 
-P0 (this ABI, runtime scale/head counts/strides, LSE) and P1 (runtime
-`hdim_qk`/`hdim_vo` with `PADDED_HEAD`) are in. Windows/gSWA, the five varlen
-modes, bias and dropout are not; see `sdpa-close-gap-gfx950.md`.
+P0 (this ABI, runtime scale/head counts/strides, LSE), P1 (runtime
+`hdim_qk`/`hdim_vo` with `PADDED_HEAD`) and P3 (generalized sliding windows --
+`window=True` plus the runtime `window_left`/`window_right` pair) are in. The
+five varlen modes, bias and dropout are not; see `sdpa-close-gap-gfx950.md`.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import fmha_abi_gfx1201 as abi
+import fmha_common_gfx1201 as fmha
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr
 from fmha_dualwave_gfx950 import (
@@ -150,6 +152,14 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
     # express, so anything staged is on the wide path by construction.
     WIDE = traits.D_STAGES > 1 or traits.VO_SHARDS > 1
 
+    # Whether *every* tile needs the mask applied, or only the ones near the
+    # causal diagonal. Plain causal is the latter: `max_num_tiles` already
+    # stops the walk just past the diagonal, so the interior tiles below it are
+    # fully live and the pipeline masks only `v_s_0`. A window is the former --
+    # its left bound clips tiles anywhere in the range -- and so is
+    # `CROSS_SEQLEN`, which is why that flag already gates the `v_s_1` site.
+    MASK_ALL_TILES = traits.CROSS_SEQLEN or traits.WINDOW
+
     # A scale baked into the build configuration. `None` means "derive it",
     # which `abi.resolve_scale` then does from the *real* head dim rather than
     # the compiled tile -- the distinction that matters under a padded head.
@@ -196,6 +206,8 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         BlockTable: fx.Tensor,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
+        window_left: fx.Int32,
+        window_right: fx.Int32,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
@@ -238,6 +250,8 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             hdim_vo=hdim_vo,
             padded_head=PADDED_HEAD,
             hdim_qk_floor=HDIM_QK_FLOOR,
+            window_left=window_left,
+            window_right=window_right,
             Q=Q,
             K=K,
             V=V,
@@ -332,16 +346,20 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             v_s_0 = gemm_helper.qk(v_k, q_all_scaled_bf16)
             _sched_barrier(0)
 
+            # `split_tile(0)`, not tile 0. The prologue loaded `load_k_split(0)`,
+            # so the tile it must mask is the *base* of this workgroup's range,
+            # and split-K was long the only thing that moved that base -- which
+            # is why the non-split arms used to spell it `0`. A window moves it
+            # too, and masking tile 0's diagonal against another tile's scores
+            # is wrong in a way only a left bound exposes: the right bound is
+            # so slack at tile 0 that it keeps everything either way.
+            #
+            # Identical to the old code wherever the base is zero, so builds
+            # without split-K or a window are unchanged bit for bit.
             if const_expr(traits.CAUSAL):
-                if const_expr(traits.SPLITK):
-                    v_s_0 = softmax_helper.causal_mask_split_prologue_if_needed(v_s_0)
-                else:
-                    v_s_0 = softmax_helper.causal_mask_prologue_if_needed(v_s_0)
+                v_s_0 = softmax_helper.causal_mask_split_prologue_if_needed(v_s_0)
             else:
-                if const_expr(traits.SPLITK):
-                    v_s_0 = softmax_helper.seq_pad_mask_if_needed(v_s_0, softmax_helper.split_tile(0))
-                else:
-                    v_s_0 = softmax_helper.seq_pad_mask_if_needed(v_s_0, fx.Index(0))
+                v_s_0 = softmax_helper.seq_pad_mask_if_needed(v_s_0, softmax_helper.split_tile(0))
             m_row_pro = softmax_helper.reduce_max(v_s_0)
             if const_expr(traits.CAUSAL):
                 m_row_pro = softmax_helper.floor_masked_max(m_row_pro)
@@ -351,10 +369,12 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             _dualwave_sync_barrier()
 
             # Software-pipelined inner loop
-            if const_expr(traits.SPLITK):
-                loop_lb = ctx.split_tile(3)
-            else:
-                loop_lb = fx.Index(3)
+            # `split_tile(3)`, for the same reason the prologue's mask uses
+            # `split_tile(0)`: the loop resumes three tiles past this
+            # workgroup's *base*, and split-K used to be the only thing that
+            # moved it. An absolute 3 makes a window build re-walk the tiles it
+            # deliberately skipped. Identical wherever the base is zero.
+            loop_lb = ctx.split_tile(3)
 
             if const_expr(traits.PAGED):
                 _init_v_pid_lds = page_ids.load_page_id_lds(loop_lb - fx.Index(2))
@@ -428,7 +448,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
                 v_o = gemm_helper.pv_step_k(0, v_p_0, v_v, v_o)
-                if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
+                if const_expr(traits.CAUSAL and MASK_ALL_TILES):
                     v_s_1 = softmax_helper.causal_mask_prologue_if_needed(
                         v_s_1,
                         j_idx - 2,
@@ -812,6 +832,44 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         o_pack = combine.pack_output(acc, den)
         combine.store_output(o_pack)
 
+    def _resolve_window_args(window):
+        """`(window_left, window_right)` for the wire, as signed i32.
+
+        Always a pair, even for a build that ignores it -- the non-windowed
+        arms forward sentinels so every build shares one ABI and stays directly
+        comparable, which is the same reason the strides are passed even under
+        `strides_constexpr`. gfx1201's `abi.resolve_window` makes the same call.
+
+        A *sentinel* rather than a bound is what goes on the wire for the fixed
+        alignments: the kernel resolves it against each sequence's own lengths,
+        which is the only correct thing to do once varlen means there is more
+        than one pair of lengths to resolve against.
+        """
+        if not traits.CAUSAL:
+            if window is not None:
+                # Dropping it silently would return dense attention: right
+                # shape, finite, wrong. A window is only ever passed by a
+                # caller who believes it is being applied.
+                raise ValueError("window= requires a causal build; this one has causal=False")
+            return 0, 0
+        if not traits.WINDOW:
+            if window is not None:
+                raise ValueError(
+                    "this build is not compiled for windows; pass window=True in FmhaInputMetadata "
+                    "to get generalized sliding-window attention"
+                )
+            # Bottom-right causal, which is what `delta = seqlen_kv - seqlen_q`
+            # already means on this kernel.
+            return fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT
+        if window is None:
+            raise ValueError(
+                "a window build requires window=(left, right); pass "
+                "(fmha.WINDOW_TOPLEFT, fmha.WINDOW_TOPLEFT) for top-left causal or "
+                "(fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT) for bottom-right"
+            )
+        wl, wr = window
+        return int(wl), int(wr)
+
     @flyc.jit
     def launch_flash_attn_func_gfx950(
         Q: fx.Tensor,
@@ -824,6 +882,8 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         batch_size: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
+        window_left: fx.Int32,
+        window_right: fx.Int32,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
@@ -878,6 +938,8 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             BlockTable,
             max_seqlen_q,
             max_seqlen_k,
+            window_left,
+            window_right,
             num_head_q,
             num_head_k,
             hdim_qk,
@@ -927,6 +989,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         workspace=None,
         block_table=None,
         block_table_stride=None,
+        window=None,
         stream=None,
     ):
         """Every kernel argument but the stream, in launch order.
@@ -1022,6 +1085,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             batch_size,
             seqlen_q,
             seqlen_k,
+            *_resolve_window_args(window),
             num_head_q,
             num_head_k,
             hdim_qk,

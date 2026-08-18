@@ -214,6 +214,13 @@ class FmhaInputMetadata:
     head_dim_v: int | None = None
     sm_scale: float | None = None
 
+    # P3. Whether this build reads the runtime `window_left`/`window_right`
+    # pair and applies a left bound as well as the causal right one --
+    # AOTriton's `CAUSAL_TYPE == 3`. The bounds are runtime arguments, so they
+    # are not here; only the decision to compile for them is. Requires
+    # `causal`, since a window is a left bound *on top of* the causal one.
+    window: bool = False
+
 
 # ---------------------------------------------------------------------------
 # How to compute it
@@ -670,6 +677,7 @@ class Gfx950Knobs(FmhaKnobs):
             v_k_substep=self.v_k_substep,
             v_dc_in_pair=self.v_dc_in_pair,
             causal=meta.causal,
+            window=meta.window,
             dtype_str=meta.dtype_str,
             waves_per_eu=self.waves_per_eu,
             daz=self.daz,

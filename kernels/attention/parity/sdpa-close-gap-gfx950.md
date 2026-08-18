@@ -2014,3 +2014,94 @@ after a 16-wide-N PV lands (tier 2 of "16xD") a *uniform* granule cannot serve
 it. Decomposition is the general mechanism for any head dim that is a sum of
 supported blocks, and it composes with both families rather than replacing
 either.
+
+---
+
+# Outcome: P3 — generalized sliding window — DONE
+
+`window=True` in `FmhaInputMetadata` compiles a build that reads a runtime
+`(window_left, window_right)` pair; every other build forwards the causal
+sentinels, so all arms share one ABI. 25 tests, `284 passed` overall.
+
+## The plan's central claim held, and the schedule was not restructured
+
+"A second threshold comparison rather than a replacement", and the reason is
+sharper than the plan states: **`delta_i32` already *was* the right bound.**
+The base class sets it to `seqlen_kv - seqlen_q`, which is bottom-right causal
+written as a diagonal offset, and every causal site reads it from there -- the
+mask's `rel`, `causal_end_raw_i32`, `max_num_tiles`. Re-pointing it at the
+resolved `window_right` generalizes all of them at once. Only the left bound is
+new code, and it is eight `select`s per pair in a subclass.
+
+`[t_begin, t_end)` needed no new machinery either. `[split_t0, split_t_end)` is
+already the tile range the whole pipeline is written against; split-K was
+simply the only thing that had ever moved the base.
+
+## Three places assumed the tile base was zero
+
+That last point is also where the bugs were. Non-split-K arms spelled the base
+as a literal, which is correct exactly while nothing moves it:
+
+- the prologue masked `tile_idx=0` rather than `split_tile(0)`;
+- `loop_lb` was `fx.Index(3)` rather than `split_tile(3)`;
+- the `v_s_1` mask site was gated on `CROSS_SEQLEN`, which under plain causal
+  is right -- interior tiles are fully live -- and wrong for a window.
+
+All three are one-line fixes to *use the existing relative form*, and each is
+bit-identical wherever the base is zero.
+
+**What found them is worth recording.** The failures were localised to the
+first row of the second Q block, and only for some windows. `left=31` passed
+with the same tile base as `left=127`, which fails -- because at `left=31` the
+mis-masked tile happens to be fully dead either way, so the wrong mask and the
+right one agree. A single passing case proved nothing; the discriminator was
+that the *first bad row was exactly `q_start`*.
+
+## Masking every tile is correct and costs 57%
+
+The first version dropped the "does this tile need the mask?" test, since the
+inherited one is one-sided and a window clips tiles the causal bound does not.
+That is correct -- masking a live tile is a no-op -- and measured 197 us
+against plain causal's 126 at an unbounded left bound.
+
+Restoring the test with a second term costs 2%. Each term is the worst case
+over the tile: a column overruns the right bound only if the lowest row's
+`q_start + right` lands inside it, and falls behind the left bound only if the
+highest row's `q_start + BLOCK_M - 1 - left` is still above `kv_start`.
+
+## Measured, B=1 H=8 S=8192 D=64 bf16
+
+| window | us | vs unbounded |
+|---|---|---|
+| `left=127` | 18.0 | 7.1x |
+| `left=255` | 21.3 | 6.0x |
+| `left=1023` | 34.8 | 3.7x |
+| `left=8192` (unbounded) | 128.1 | 1.0x |
+| plain causal build | 126.1 | -- |
+
+The plan asked for this separately from correctness, and it was right to: a
+dead tile masks to `-inf` and changes no output bit, so every correctness test
+passes whether the walk skips it or not. `test_window_skips_leading_dead_tiles`
+is a timing assertion for that reason.
+
+## Negative bounds work, including rows with no key at all
+
+Not in the plan, and the case worth naming. Either bound may be negative --
+that is how AOTriton expresses a band ahead of or behind the diagonal -- and
+`(-32, 0)` leaves *every* row with nothing to attend to. The denominator is
+then zero and the natural failure is `0/0`.
+
+It returns exact zeros with no `NaN`, and the reason is already in the tree:
+`ParitySoftmaxHelper` seeds `reduce_max` at `-3.0e38` instead of `-inf`, so no
+lane ever holds `-inf` as a max and `exp2` gives a clean zero. Its docstring
+predicted this ("removes the case for every masking mode at once, including
+the windows and bias still to come") one phase early.
+
+## Not done
+
+- **Split-K + window.** `_skip_dead_leading_tiles` is gated off under
+  `SPLITK`, which already owns `split_t0`. Composing them means intersecting
+  two tile ranges rather than assigning one, and split-K is an optimization
+  rather than a parity feature (see the split-K note above).
+- `CAUSAL_TYPE` is not surfaced as an integer. The two values AOTriton ships,
+  0 and 3, are `causal=False` and `window=True` here.
