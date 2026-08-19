@@ -537,6 +537,101 @@ def test_padded_head_is_derived_not_guessed():
 
 
 # ---------------------------------------------------------------------------
+# P5: bias
+# ---------------------------------------------------------------------------
+
+
+def _run_bias(q, k, v, bias):
+    b, h, s, d = q.shape
+    o = torch.empty_like(q)
+    fn = build(num_heads=h, head_dim=d, causal=False, bias=True, dtype_str="bf16", num_kv_heads=k.shape[1])
+    fn(q, k, v, o, b, s, seqlen_k=k.shape[2], scale=None, lse=None, bias=bias)
+    return o
+
+
+@pytest.mark.parametrize("hdim", [64, 128, 256, 384, 512], ids=["d64", "d128", "d256", "wide384", "wide512"])
+def test_bias_matches_sdpa(hdim):
+    """A `(B, H, Sq, Sk)` bias added to the scores, on both kernel bodies.
+
+    Parametrized across the break at 256 because the two bodies reach the bias
+    through different code: the dual-wave loop masks only its edge tiles, so
+    its interior tiles take the bias through `bias_to_lists`, while the wide
+    body masks every tile and takes it through the `seq_pad_mask_if_needed`
+    override. A build that wired only one would pass half of this.
+    """
+    b, h, s = 1, 2, 512
+    q, k, v = (_rand(b, h, s, hdim) for _ in range(3))
+    bias = _rand(b, h, s, s)
+    got = _run_bias(q, k, v, bias)
+    want = F.scaled_dot_product_attention(q.float(), k.float(), v.float(), attn_mask=bias.float())
+    assert _err(got, want) < TOL
+
+
+@pytest.mark.parametrize("hdim", [64, 384], ids=["dualwave", "wide"])
+def test_bias_minus_inf_never_produces_nan(hdim):
+    """`-inf` in the bias is how a caller says "never attend here".
+
+    **This is the first configuration in which the `-inf - -inf -> NaN` bug is
+    reachable at all**, which is why the test belongs to this phase and not an
+    earlier one. A whole row of `-inf` drives that row's max to `-inf`, the
+    denominator to zero, and a normalisation to `0/0`.
+
+    It does not, because `ParitySoftmaxHelper` seeds `reduce_max` at `-3.0e38`
+    rather than `-inf`, so no lane ever holds `-inf` as a max. The assertion on
+    `isnan` is the point; a tolerance check alone would not tell the two apart.
+
+    The one-tile case is the milder half: the row keeps a finite max from other
+    tiles and the dead tile must simply contribute nothing.
+    """
+    b, h, s = 1, 4, 512
+    q, k, v = (_rand(b, h, s, hdim) for _ in range(3))
+
+    tile = torch.zeros(b, h, s, s, device="cuda", dtype=DT)
+    tile[:, :, :, 64:128] = float("-inf")
+    got = _run_bias(q, k, v, tile)
+    assert not torch.isnan(got.float()).any()
+    want = F.scaled_dot_product_attention(q.float(), k.float(), v.float(), attn_mask=tile.float())
+    assert _err(got, want) < TOL
+
+    rows = torch.zeros(b, h, s, s, device="cuda", dtype=DT)
+    dead = [7, 300]
+    rows[:, :, dead, :] = float("-inf")
+    got = _run_bias(q, k, v, rows)
+    assert not torch.isnan(got.float()).any(), "a fully -inf bias row produced NaN"
+    assert torch.count_nonzero(got[:, :, dead, :]) == 0, "a row with no live key must be exactly zero"
+    live = torch.ones(s, dtype=torch.bool)
+    live[dead] = False
+    want = F.scaled_dot_product_attention(q.float(), k.float(), v.float(), attn_mask=rows.float())
+    assert _err(got[:, :, live], want[:, :, live]) < TOL
+
+
+def test_bias_and_causal_are_rejected():
+    """Undefined, not unimplemented -- the same call AOTriton and torch make."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        build(num_heads=8, head_dim=64, causal=True, bias=True, dtype_str="bf16")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        build(num_heads=8, head_dim=64, causal=True, window=True, bias=True, dtype_str="bf16")
+
+
+def test_bias_tensor_presence_is_checked_both_ways():
+    """A bias build needs one; a plain build must refuse one.
+
+    Silently ignoring a bias returns dense attention -- right shape, wrong
+    answer -- and a bias is only ever passed by a caller who believes it is
+    being applied.
+    """
+    b, h, s, d = 1, 4, 256, 64
+    q, k, v = (_rand(b, h, s, d) for _ in range(3))
+    o = torch.empty_like(q)
+    biased = build(num_heads=h, head_dim=d, causal=False, bias=True, dtype_str="bf16", num_kv_heads=h)
+    with pytest.raises(ValueError, match="requires a"):
+        biased(q, k, v, o, b, s, seqlen_k=s, scale=None, lse=None)
+    plain = build(num_heads=h, head_dim=d, causal=False, dtype_str="bf16", num_kv_heads=h)
+    with pytest.raises(ValueError, match="not compiled for bias"):
+        plain(q, k, v, o, b, s, seqlen_k=s, scale=None, lse=None, bias=_rand(b, h, s, s))
+
+
+# ---------------------------------------------------------------------------
 # P4: varlen -- the five VarlenBits configurations
 # ---------------------------------------------------------------------------
 

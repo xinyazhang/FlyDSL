@@ -221,6 +221,10 @@ class FmhaInputMetadata:
     # `causal`, since a window is a left bound *on top of* the causal one.
     window: bool = False
 
+    # P5. Whether this build reads a (B, H, Sq, Sk) bias matrix. Mutually
+    # exclusive with `causal`; see `make_traits`.
+    bias: bool = False
+
 
 # ---------------------------------------------------------------------------
 # How to compute it
@@ -700,6 +704,7 @@ class Gfx950Knobs(FmhaKnobs):
             v_dc_in_pair=self.v_dc_in_pair,
             causal=meta.causal,
             window=meta.window,
+            bias=meta.bias,
             dtype_str=meta.dtype_str,
             waves_per_eu=self.waves_per_eu,
             daz=self.daz,

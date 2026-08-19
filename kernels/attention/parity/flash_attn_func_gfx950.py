@@ -79,8 +79,8 @@ P0 (this ABI, runtime scale/head counts/strides, LSE), P1 (runtime
 `hdim_qk`/`hdim_vo` with `PADDED_HEAD`), P3 (generalized sliding windows --
 `window=True` plus the runtime `window_left`/`window_right` pair) and P4 (the
 five `VarlenBits` modes, including the LSE token pitch, row origin and the
-`_HT`/`_TH` layout bits) are in. Bias and dropout are not; see
-`sdpa-close-gap-gfx950.md`.
+`_HT`/`_TH` layout bits) and P5 (a `(B, H, Sq, Sk)` bias, on both kernel
+bodies) are in. Dropout is not; see `sdpa-close-gap-gfx950.md`.
 """
 
 import fmha_abi_gfx1201 as abi
@@ -220,6 +220,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         V: fx.Tensor,
         O: fx.Tensor,  # noqa: E741
         LSE: fx.Tensor,
+        Bias: fx.Tensor,
         Workspace: fx.Tensor,
         BlockTable: fx.Tensor,
         seqinfo_q0: fx.Pointer,
@@ -249,6 +250,9 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         stride_o_batch: fx.Int64,
         stride_o_head: fx.Int64,
         stride_o_seq: fx.Int64,
+        stride_b_batch: fx.Int64,
+        stride_b_head: fx.Int64,
+        stride_b_seq: fx.Int64,
         block_table_stride: fx.Int32,
     ):
         ctx = (WideKernelContext if WIDE else ParityKernelContext)(
@@ -287,6 +291,8 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             CuSeqQ=Q,
             CuSeqKv=Q,
             BlockTable=BlockTable,
+            Bias=Bias,
+            bias_strides=(stride_b_batch, stride_b_head, stride_b_seq),
             seq_len=max_seqlen_q,
             seq_len_kv=max_seqlen_k,
             stride_q_n=stride_q_seq,
@@ -482,7 +488,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
                         kv_end_tile=j_idx - 1,
                     )
                 else:
-                    v_s_1 = softmax_helper.v_s_vec_to_lists(v_s_1)
+                    v_s_1 = softmax_helper.bias_to_lists(v_s_1, j_idx - 2)
                 m_tile_max_a = softmax_helper.reduce_max(v_s_1)
                 _sched_barrier_pairs(traits, 4, 6, 2)
                 if const_expr(traits.DUALWAVE_SWP_LAZY_RESCALE):
@@ -542,7 +548,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
                         kv_end_tile=j_idx,
                     )
                 else:
-                    v_s_0 = softmax_helper.v_s_vec_to_lists(v_s_0)
+                    v_s_0 = softmax_helper.bias_to_lists(v_s_0, j_idx - 1)
                 _s_waitcnt(traits.LGKMCNT_0_ONLY)
                 _waitcnt_vm_n(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
                 _dualwave_sync_barrier()
@@ -910,6 +916,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         V: fx.Tensor,
         O: fx.Tensor,  # noqa: E741
         LSE: fx.Tensor,
+        Bias: fx.Tensor,
         Workspace: fx.Tensor,
         BlockTable: fx.Tensor,
         batch_size: fx.Int32,
@@ -940,6 +947,9 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         stride_o_batch: fx.Int64,
         stride_o_head: fx.Int64,
         stride_o_seq: fx.Int64,
+        stride_b_batch: fx.Int64,
+        stride_b_head: fx.Int64,
+        stride_b_seq: fx.Int64,
         block_table_stride: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -978,6 +988,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             V,
             O,
             LSE,
+            Bias,
             Workspace,
             BlockTable,
             seqinfo_q0,
@@ -1007,6 +1018,9 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             stride_o_batch,
             stride_o_head,
             stride_o_seq,
+            stride_b_batch,
+            stride_b_head,
+            stride_b_seq,
             block_table_stride,
             value_attrs={
                 "rocdl.waves_per_eu": traits.WAVES_PER_EU,
@@ -1042,6 +1056,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         window=None,
         varlen=None,
         num_seqlens=0,
+        bias=None,
         stream=None,
     ):
         """Every kernel argument but the stream, in launch order.
@@ -1161,6 +1176,25 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         # Placeholders for the tensors a given build does not read. Every one
         # is behind a `const_expr` gate in the kernel, so the slot must be a
         # valid tensor but its contents are never touched.
+        # A bias build must be handed one, and a build without bias must not
+        # be: silently ignoring a bias tensor returns dense attention that is
+        # the right shape and the wrong answer, and it is only ever passed by
+        # a caller who believes it is being applied.
+        if traits.BIAS_TYPE and bias is None:
+            raise ValueError("this build has bias=True and requires a (batch, num_heads, seqlen_q, seqlen_k) tensor")
+        if bias is not None and not traits.BIAS_TYPE:
+            raise ValueError("this build was not compiled for bias; pass bias=True in FmhaInputMetadata")
+        if bias is not None:
+            if bias.shape[3] != K.shape[2] or bias.shape[2] != Q.shape[2]:
+                raise ValueError(
+                    f"bias must be (batch, num_heads, seqlen_q, seqlen_k); got {tuple(bias.shape)} "
+                    f"against seqlen_q={Q.shape[2]}, seqlen_k={K.shape[2]}"
+                )
+            if bias.stride(3) != 1:
+                raise ValueError(f"bias needs a contiguous seqlen_k axis; strides are {tuple(bias.stride())}")
+        bias_t = bias if bias is not None else O
+        bias_st = tuple(int(x) for x in bias.stride()[:3]) if bias is not None else (0, 0, 0)
+
         lse_out = lse if lse is not None else O
         ws = workspace if workspace is not None else O
         bt = block_table if block_table is not None else O
@@ -1180,6 +1214,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             V,
             O,
             lse_out,
+            bias_t,
             ws,
             bt,
             batch_size,
@@ -1202,6 +1237,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
                 1.0 / (BLOCK_DMODEL**0.5),
             ),
             *st,
+            *bias_st,
             0 if block_table_stride is None else block_table_stride,
         ), stream
 

@@ -54,7 +54,7 @@ from dataclasses import replace
 
 import fmha_common_gfx1201 as fmha
 from fmha_common_gfx1201 import MaskedAxis
-from gfx950_standalone import dualwave
+from gfx950_standalone import buffer_ops, dualwave
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -133,6 +133,32 @@ def _v_dc_offset(traits, dc):
 def _v_imm_lo(traits, dc, k_substep):
     """`_swizzled_v_imm_lo`, in bytes, over the general dc offset."""
     return (k_substep * traits.V_LDS_TO_REG_K_SUBSTEP_STRIDE + _v_dc_offset(traits, dc)) * traits.BF16_BYTES
+
+
+def _bias_column_runs(kv_vectorized):
+    """`[(element_index, column_offset, width)]` covering one score vector.
+
+    The 16 f32 an MFMA lane holds are 16 *columns* of a single row -- the row
+    is `lane_mod_32`, and `lane_div_32` shifts the column set -- so a bias read
+    is a row-wise gather in principle and a handful of contiguous spans in
+    practice. Which spans is exactly what the causal mask's threshold table
+    already says, since that table maps element to column; this reads the same
+    fact for a different purpose rather than restating it.
+
+    Grouping the thresholds into consecutive runs gives four spans of four at
+    the default granule and two of eight when the KV tile is vectorized. Both
+    are single `buffer_load`s, which is the whole reason bias needs no LDS
+    staging: the accumulator's layout hands back contiguity for free.
+    """
+    thresholds = []
+    for thr_x, thr_y in dualwave._causal_pair_thresholds(kv_vectorized):
+        thresholds.extend((thr_x, thr_y))
+    runs, start = [], 0
+    for i in range(1, len(thresholds) + 1):
+        if i == len(thresholds) or thresholds[i] != thresholds[i - 1] + 1:
+            runs.append((start, thresholds[start], i - start))
+            start = i
+    return runs
 
 
 class ParityGemmHelper(dualwave.DualwaveGemmHelper):
@@ -317,6 +343,8 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         seqinfo=(None, None, None, None),
         varlen_bits=0,
         num_seqlens=0,
+        Bias=None,
+        bias_strides=(0, 0, 0),
         **kwargs,
     ):
         super().__init__(traits, **kwargs)
@@ -362,6 +390,10 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         self.seqinfo_q0, self.seqinfo_q1, self.seqinfo_k0, self.seqinfo_k1 = seqinfo
         self.varlen_bits_arg = varlen_bits
         self.num_seqlens_arg = num_seqlens
+        # P5. The bias matrix and its (batch, head, seqlen_q) strides. Slot 3
+        # is the KV axis and is contractually contiguous, so it is not passed.
+        self.Bias = Bias
+        self.stride_b_batch, self.stride_b_head, self.stride_b_seq = bias_strides
 
     # -- runtime softmax scale -------------------------------------------
     #
@@ -653,6 +685,35 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         # the D-tail chunks without branching.
         self.o_oob_off = self.seqlen_q_v * self.stride_o_seq_v
 
+        if const_expr(traits.BIAS_TYPE):
+            # Same slab shape as Q, which is the point: bias is indexed by
+            # (batch, head, q_row, kv_col), so the varlen row origin and the
+            # head fold into the base exactly as Q's do, and what remains per
+            # access is `q_row * stride_b_seq + col`.
+            #
+            # A raw resource rather than a `_slab_view`: the reads here are
+            # per-lane vectors of 4 or 8 elements at an address the lane
+            # computes, which is `buffer_ops.buffer_load`'s shape, not the
+            # copy-atom one the K/V DMA uses.
+            #
+            # The bound is the slab, so a row past `seqlen_q` reads zero
+            # instead of faulting -- which is also the right bias for a padded
+            # row -- and so does a column that runs off the last row's end.
+            _bias_span = self.seqlen_q_v * fx.Index(self.stride_b_seq)
+            self.bias_rsrc = buffer_ops.create_buffer_resource(
+                self.Bias,
+                max_size=False,
+                num_records_bytes=as_mlir_value(_bias_span * fx.Index(traits.BF16_BYTES)),
+                base_byte_offset=as_mlir_value(
+                    self._slab_byte_base(
+                        self.stride_b_batch,
+                        self.stride_b_head,
+                        self.stride_b_seq,
+                        self.q_row_off,
+                        self.q_head_idx,
+                    )
+                ),
+            )
         self.q_div = self._slab_view(
             self.Q,
             self.stride_q_batch,
@@ -978,6 +1039,91 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
 
     def reduce_max(self, v_s):
         return dualwave._score_pair_max(v_s, self.c_neg_floor, self.fm_fast)
+
+    # -- P5: bias ------------------------------------------------------------
+
+    def _add_bias_inplace(self, v_s, tile_idx):
+        """`S += bias * log2(e)`, in place, for one KV tile.
+
+        **After the scale and before the mask**, and both halves of that matter:
+
+        - after, because `m_i` and the exponent live in the base-2 scaled
+          domain -- Q is pre-scaled by `sm_scale * log2e` on this kernel -- so
+          a bias in natural units has to cross into it. This is AOTriton's
+          `qk += bias * 1.44269504089`.
+        - before, because a column past `seqlen_k` must stay `-inf` rather than
+          becoming `-inf + bias`. Those columns are not keys the caller hid;
+          they do not exist, and neither do their bias entries.
+
+        No runtime "does this tile need it" guard. There is nothing to skip: a
+        bias build reads a bias for every live tile by definition.
+        """
+        traits = self.traits
+        ctx = self.ctx_ref
+        s_lo, s_hi = v_s
+        lane_n_off = 8 if traits.KV_VECTORIZED else 4
+        # The row is this lane's, and the descriptor already holds (batch,
+        # head, row origin), so what is left is `row * pitch + column`.
+        row_base = ctx.q_row * fx.Index(ctx.stride_b_seq)
+        col_base = fx.Index(tile_idx * traits.BLOCK_N) + self.lane_div_32 * fx.Index(lane_n_off)
+        log2e = fx.Float32(1.4426950408889634)
+        # **Not `fm_fast` here.** `fm_fast` is MLIR's `fast`, which carries
+        # `ninf` and `nnan` -- a licence to assume no infinities reach the
+        # operation. A bias entry of `-inf` is how a caller spells "never
+        # attend here", so bias is the first thing in this kernel that puts a
+        # real infinity into *arithmetic* rather than into a select: the causal
+        # mask writes `-inf` through a `cndmask` on raw bits and the KV tail
+        # mask through `select`, neither of which fastmath touches.
+        #
+        # It happens to produce the right answer with `fast` today. That is not
+        # a reason to keep it -- plan1 records `ninf` silently deleting a KV
+        # tail mask on gfx1201, which is the same licence being taken up later
+        # by a different pass. Two operations per element, one of them by a
+        # constant, so the flag costs nothing measurable to get right.
+        fm_bias = arith.FastMathFlags.contract | arith.FastMathFlags.reassoc
+        for half, values in ((0, s_lo), (1, s_hi)):
+            for elem0, col_off, width in _bias_column_runs(traits.KV_VECTORIZED):
+                span = buffer_ops.buffer_load(
+                    ctx.bias_rsrc,
+                    as_mlir_value(fx.Int32(row_base + col_base + fx.Index(col_off + half * 32))),
+                    vec_width=width,
+                    dtype=ctx.elem_dtype,
+                )
+                for j in range_constexpr(width):
+                    b = fx.Float32(Vec(span, (width,), ctx.elem_dtype)[j].to(fx.Float32))
+                    values[elem0 + j] = dualwave._fadd(values[elem0 + j], dualwave._fmul(b, log2e, fm_bias), fm_bias)
+
+    def bias_to_lists(self, v_s, tile_idx):
+        """`v_s_vec_to_lists`, with the bias folded in on the way through.
+
+        The interior tiles of the dual-wave loop only unpack the scores -- they
+        need no KV tail mask, being wholly in bounds -- so this is where their
+        bias goes. The tiles that *do* mask get it from the
+        `seq_pad_mask_if_needed` override, which keeps every tile covered
+        exactly once.
+        """
+        lists = self.v_s_vec_to_lists(v_s)
+        if const_expr(self.traits.BIAS_TYPE):
+            self._add_bias_inplace(lists, tile_idx)
+        return lists
+
+    def seq_pad_mask_if_needed(self, v_s, tile_idx):
+        """The KV tail mask, with the bias applied first.
+
+        Order is the point, and it is the same one gfx1201 records: a column
+        past `seqlen_k` must come out `-inf`, not `-inf + bias`. Those columns
+        are not keys the caller hid -- they do not exist, and neither do their
+        bias entries.
+
+        Overriding here rather than adding a call at each site is what makes
+        the *wide* body work unchanged: it masks every tile it visits, so this
+        single override is its whole bias path.
+        """
+        if const_expr(self.traits.BIAS_TYPE):
+            lists = self.v_s_vec_to_lists(v_s)
+            self._add_bias_inplace(lists, tile_idx)
+            v_s = dualwave._score_lists_to_vecs(lists)
+        return super().seq_pad_mask_if_needed(v_s, tile_idx)
 
     # -- P3: generalized sliding window --------------------------------------
     #

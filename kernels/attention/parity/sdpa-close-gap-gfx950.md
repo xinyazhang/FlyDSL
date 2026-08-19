@@ -2257,3 +2257,63 @@ masking modes.
 ## Not done
 
 - **Split-K + varlen** is rejected upstream of this work already.
+
+
+---
+
+# Outcome: P5 — bias — DONE
+
+A `(B, H, Sq, Sk)` matrix added to the scores before the softmax, on **both**
+kernel bodies. `345 passed`.
+
+## No LDS staging, because the accumulator hands back contiguity
+
+The plan predicted this and it held. A lane's 16 scores are 16 *columns of one
+row* -- the row is `lane_mod_32`, `lane_div_32` shifts the column set -- so a
+bias read looks like a row-wise gather and is in fact a handful of contiguous
+spans. Which spans is already written down: the causal mask's threshold table
+maps element to column, so `_bias_column_runs` groups that table into runs
+rather than restating the mapping.
+
+    default granule   4 runs of 4 columns
+    KV vectorized     2 runs of 8
+
+Both are single `buffer_load`s. `BIAS_TYPE` is a build axis, so a build without
+bias emits nothing: 64/128/256 measure 888/1091/933 TFLOP/s against 889/1092/934
+before the phase.
+
+## One override covered the wide body
+
+The two bodies reach the scores differently -- the dual-wave loop masks only
+its edge tiles and merely unpacks the interior ones, while the wide body masks
+every tile it visits. Overriding `seq_pad_mask_if_needed` to apply the bias
+first therefore covers the whole wide body and the dual-wave *edges*, and only
+the two interior sites needed a call, through `bias_to_lists`. Every tile is
+covered exactly once, and the test is parametrized across the 256 break because
+a build wiring only one path would pass half of it.
+
+## The two things the plan flagged for this phase
+
+**The `-inf` regression is real and now verifiable.** A bias row of `-inf`
+drives that row's max to `-inf`, the denominator to zero and the normalisation
+to `0/0`. It returns exact zeros with no `NaN`, because `ParitySoftmaxHelper`
+seeds `reduce_max` at `-3.0e38`. That seeding was written two phases early
+"for every masking mode at once, including the windows and bias still to come";
+this is the phase where it was finally reachable.
+
+**The fast-math audit found something.** `fm_fast` is MLIR's `fast`, which
+carries `ninf` and `nnan` -- a licence to assume no infinity reaches the
+operation. Bias is the first thing in this kernel to put a real infinity into
+*arithmetic* rather than into a select: the causal mask writes `-inf` through a
+`cndmask` on raw bits, and the KV tail mask through `select`, neither of which
+fastmath touches. It produced the right answer with `fast` anyway, which is not
+a reason to keep it -- plan1 records `ninf` silently deleting a KV tail mask on
+gfx1201, the same licence taken up later by a different pass. The bias mul and
+add now carry `contract | reassoc` only.
+
+## Bias and causal are rejected together
+
+Undefined rather than unimplemented, in the same words gfx1201 uses: causal is
+an attention mask with a fixed pattern and a bias *is* an attention mask
+supplied directly, so asking for both asks which wins where they disagree.
+AOTriton disables the pair; PyTorch's math backend raises on it.

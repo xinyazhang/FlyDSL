@@ -103,6 +103,12 @@ class ParityDualwaveTraits(dualwave.DualwaveSwpTraits):
     # lengths, which under varlen differ per sequence. See `resolve_window`.
     WINDOW: bool = False
 
+    # P5. AOTriton's `BIAS_TYPE`: 0 = none, 1 = a (B, H, Sq, Sk) matrix added to
+    # the scores before the softmax. A *build* axis, so a build without bias
+    # emits nothing at all -- the KV loop is latency-bound and a bias that cost
+    # anything when unused would be paid by every caller who does not want one.
+    BIAS_TYPE: int = 0
+
 
 # Hardware constants. Not parameters: these are the wave, the DMA width and the
 # MFMA shape, and a build that changed one would not be this algorithm.
@@ -135,6 +141,7 @@ def make_traits(
     v_dc_in_pair=None,
     causal=True,
     window=False,
+    bias=False,
     dtype_str="bf16",
     waves_per_eu=2,
     daz=True,
@@ -158,6 +165,20 @@ def make_traits(
         # the right shape, finite, and wrong. An unbounded `window_right`
         # expresses a pure left-band, so nothing is lost by requiring this.
         raise ValueError("window=True requires causal=True; it is a left bound on top of the causal one")
+    if bias and (causal or window):
+        # Undefined, not unimplemented. Causal is an attention mask with a
+        # fixed pattern; a bias *is* an attention mask supplied directly, since
+        # a large negative or -inf entry is how a caller spells "do not attend
+        # here". Asking for both asks which wins where they disagree, and there
+        # is no answer -- the same thing has been said twice in two
+        # vocabularies with no rule for reconciling them. AOTriton disables the
+        # combination and PyTorch's math backend raises on it; gfx1201 rejects
+        # it in the same words.
+        raise ValueError(
+            "bias and causal/window masking are mutually exclusive: a bias already is an attention "
+            "mask, so combining it with a positional one has no defined meaning. Fold the causal "
+            "pattern into the bias tensor, or drop the bias"
+        )
     if num_waves % vo_shards:
         raise ValueError(f"vo_shards {vo_shards} must divide num_waves {num_waves}")
     # With `vo_shards` waves sharing one Q tile, the workgroup covers
@@ -323,6 +344,7 @@ def make_traits(
         GQA_GROUP_SIZE=gqa_group_size,
         CAUSAL=causal,
         WINDOW=window,
+        BIAS_TYPE=1 if bias else 0,
         DTYPE_STR=dtype_str,
         WAVES_PER_EU=waves_per_eu,
         DAZ=bool(daz),
