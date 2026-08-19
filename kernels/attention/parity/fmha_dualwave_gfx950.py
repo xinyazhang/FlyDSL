@@ -59,7 +59,7 @@ from philox import Philox
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
@@ -456,6 +456,24 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         self.group_id = self.h_idx // num_head_k
         self.q_head_idx = self.h_kv_idx * gqa_group + self.group_id
         self.kv_head_idx = self.h_kv_idx
+        if const_expr(self.traits.LPT_TILE_ORDER and self.traits.CAUSAL):
+            # P7. Longest-processing-time-first: under a causal mask q-block
+            # `i` walks about `i` KV tiles and `grid.y` issues in increasing
+            # order, so the cheapest workgroups go first and the most expensive
+            # land in the tail. Reversing the index puts them first.
+            #
+            # A bijection over the same index set, so the output is
+            # bit-identical and only the schedule moves -- which is what makes
+            # it safe as a knob. **Measured at 0.0% on gfx950** across every
+            # width and shape tried, so it ships off; with 8 XCDs and this many
+            # workgroups the tail imbalance it targets is already absorbed.
+            # gfx1201's forward kernel measures 12-16% from the same change.
+            #
+            # Folded into this override rather than added as a second one: an
+            # `init_thread_mapping` of its own silently replaced the head-index
+            # derivation above, which only shows up once the runtime head
+            # counts differ from the build's.
+            self.q_block_idx = fx.Index(gpu.grid_dim.y) - fx.Index(1) - self.q_block_idx
 
     # -- granule-general staging ------------------------------------------
 
@@ -1171,6 +1189,32 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
             self._add_bias_inplace(lists, tile_idx)
             v_s = dualwave._score_lists_to_vecs(lists)
         return super().seq_pad_mask_if_needed(v_s, tile_idx)
+
+    def rescale_o(self, v_o, m_row, l_row, m_tile_max, v_p):
+        """The non-lazy rescale, anchored so one accumulator does not abort LLVM.
+
+        `_anchor_v_o` here is the parity one, which spells out the
+        `D_CHUNKS == 1` case; `rescale_o` in the shared helper reaches the
+        production version, which always asks an inline asm with `D_CHUNKS`
+        outputs for a struct. At one output LLVM does not diagnose that -- it
+        aborts with *"inline asm with one output cannot return struct"* and an
+        `UNREACHABLE`, killing the process rather than raising.
+
+        Found by the P7 sweep, which is exactly what a sweep is for: head_dim
+        32 is the only width with `D_CHUNKS == 1`, `lazy_rescale=True` is the
+        default and takes the other path, so this needed the one combination
+        nothing had built. The body is the shared one with that single
+        substitution; there is no other difference.
+        """
+        if const_expr(self.traits.D_CHUNKS != 1):
+            return super().rescale_o(v_o, m_row, l_row, m_tile_max, v_p)
+        m_new = dualwave._fmax(m_row, m_tile_max, self.fm_fast)
+        corr = rocdl.exp2(T.f32, as_mlir_value(dualwave._fsub(m_row, m_new, self.fm_fast)))
+        self.scale_o(v_o, corr)
+        v_o = _anchor_v_o(self.traits, v_o)
+        v_p = dualwave._scale_v_p(self.traits, v_p, corr, elem_dtype=self.elem_dtype, fm_fast=self.fm_fast)
+        l_row = dualwave._fmul(l_row, corr, self.fm_fast)
+        return v_o, m_new, l_row, v_p
 
     def safe_l_inv(self, l_row):
         """`1/l`, with the dropout survivor scale folded in.

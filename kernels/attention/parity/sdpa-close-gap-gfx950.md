@@ -2396,3 +2396,105 @@ From here on this is a constraint on the tuner, not an observation.
   constant scale.
 - Dropout composes with causal, unlike bias: a positional mask says which keys
   exist and dropout thins the ones that do, so there is nothing to reconcile.
+
+
+---
+
+# Outcome: P7 — knob re-sweep — DONE, and it changed no defaults
+
+600 legal points enumerated, 228 measured across GPUs 4-7 before the wide arms
+wedged, 216 of them correct. `383 passed, 3 skipped`.
+
+## The headline is a negative result, and it is the right one
+
+The plan's instruction was that "every entry rejected on spills or LDS earlier
+must be retried once the budget moves". It was retried. **Nothing moved.**
+
+The concurrent sweep suggested 2-5% wins at five rungs -- `waves_per_eu` 4 at
+96/224/256/384, `waves_per_eu` 1 at 64, granule 32 over 64 at 256. Re-measured
+as an interleaved A/B on one idle GPU, every one of them collapsed:
+
+    hd   candidate         delta      spread
+    64   wpe1              +0.8%       1.5%
+    96   wpe1 / wpe4       +0.2%       1.1%
+    128  wpe1              +0.0%       3.4%
+    160  wpe4              +0.1%      10.4%
+    192  granule 32        +0.2%       9.5%
+    224  wpe4              +0.1%       4.3%
+    256  granule 32, wpe4  +0.1%       2.1%
+    384  wpe4              +0.0%       9.2%
+    512  wpe4              -0.0%       5.5%
+
+Every delta is inside its own run-to-run spread. **The table stands as
+measured.**
+
+**Four GPUs at once is not a measurement.** The sweep's margins were an
+artifact of it -- neighbours on the same node move a 2-5% needle, which is
+exactly the range every candidate sat in. A sweep is for *ranking* and for
+finding things that are broken; a 2-5% claim needs interleaved arms in one
+process on an idle device, where a slow patch of wall-clock hits both arms.
+This is the second time in this work a perf number nearly became a wrong
+conclusion.
+
+One large effect is real and reproduces in both methods: `waves_per_eu = 4` at
+head_dim 64 costs **-75%** (207 against 833 TFLOP/s). The occupancy target is
+unmet and the allocator spills. The default is 2 and stays there.
+
+## What the sweep was actually worth: two bugs
+
+**A compiler abort.** head_dim 32 is the only width with `D_CHUNKS == 1`, and
+`lazy_rescale=False` is the only path that reaches the production
+`_anchor_v_o`, which asks an inline asm with one output for a struct. LLVM does
+not diagnose that -- it aborts with an `UNREACHABLE` and kills the process, so
+two sweep shards died outright rather than recording a failure.
+`ParitySoftmaxHelper.rescale_o` now uses the one-accumulator-safe anchor.
+
+**A wrong-answer geometry, and the invariant that was only a comment.**
+`rows_per_wave = block_m // q_tiles` had to equal the MFMA's M extent, and
+`make_traits` said so in prose while checking nothing. `vo_shards` divides
+`q_tiles` without touching a pinned `block_m`, so a geometry consistent
+unsharded silently stops being so:
+
+    rows/wave    status    best TFLOP/s
+       8           ok          281
+      16           ok          563
+      32           ok         1111
+      64          WRONG         --
+     128          WRONG         --
+
+All twelve wrong points are head_dim 512 at 8 waves with `vo_shards > 1`,
+returning finite garbage at 0.15-0.28 relative error. The bound is a *ceiling*,
+not an equality: fewer rows per wave is legal and merely wastes the MFMA in
+exact proportion (the 281/563/1111 column is 1:2:4 to within 2%), so it stays
+available to the tuner. The guard separates the 216 correct points from the 12
+wrong ones exactly, and every shipped default still resolves.
+
+## `lpt_tile_order`: ported, measured, off
+
+Reversing the causal Q-block order is a bijection over the same index set, so
+the output is **bit-identical** and only the schedule moves. Measured at
+head_dim 64/128/256/512 over two shapes each: **0.0%**, worst case -0.3%.
+
+gfx1201's forward kernel gets 12-16% from the same change. It does nothing here
+because gfx950 has 8 XCDs and 256 CUs, so `B*H*num_q_blocks` workgroups leave a
+tail that is a small fraction of the launch and the hardware absorbs it. Kept
+as a knob, defaulted off, with the measurement recorded so nobody re-derives it
+from gfx1201's number.
+
+## The grid axis order was already settled
+
+The plan lists it as open, but it had been measured by the time the sweep ran:
+`XCD_SWIZZLE` re-derives `(head, q_block)` with head as the slow axis so one
+head's blocks stay on one XCD, and making q_block the fast axis costs 7%. It is
+gated off under causal, where unequal work per block makes the clustering
+counterproductive -- which is exactly the gap `lpt_tile_order` was ported to
+fill, and did not.
+
+## Coverage this sweep did not reach
+
+The wide arms (384/512 across `d_stages` x `vo_shards`) wedged the shards: the
+runner had no per-build timeout and some of those configurations run the
+register allocator for many minutes, which is what the project's 8-minute build
+rule exists for. 512 has 18 points and none of them is the shipped default, so
+**512 was re-measured only by the targeted A/B above**, not by the sweep. A
+future pass wanting that space needs a subprocess per build with a timeout.

@@ -380,6 +380,7 @@ class Gfx950Knobs(FmhaKnobs):
     lazy_rescale: bool | None = None
     setprio: bool | None = None
     stagger: bool | None = None
+    lpt_tile_order: bool | None = None
 
     # Problem modes. Ordinary fields; see the class docstring.
     varlen: bool | None = None
@@ -711,6 +712,7 @@ class Gfx950Knobs(FmhaKnobs):
             window=meta.window,
             bias=meta.bias,
             dropout=meta.dropout,
+            lpt_tile_order=self.lpt_tile_order,
             dtype_str=meta.dtype_str,
             waves_per_eu=self.waves_per_eu,
             daz=self.daz,
@@ -746,6 +748,7 @@ _GFX950_FALLBACK = Gfx950Knobs(
     lazy_rescale=True,
     setprio=True,
     stagger=True,
+    lpt_tile_order=False,
     varlen=False,
     cross_seqlen=None,  # derived from varlen+causal; see `_with_mode_defaults`
     paged=False,

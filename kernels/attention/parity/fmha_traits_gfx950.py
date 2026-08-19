@@ -113,6 +113,11 @@ class ParityDualwaveTraits(dualwave.DualwaveSwpTraits):
     # `BIAS_TYPE`: a build without dropout emits no PRNG at all.
     ENABLE_DROPOUT: bool = False
 
+    # P7. Dispatch the causal Q blocks longest-first. A bijection over the same
+    # index set, so the output is bit-identical and this is purely a
+    # load-balance choice; see `ParityKernelContext.init_thread_mapping`.
+    LPT_TILE_ORDER: bool = False
+
 
 # Hardware constants. Not parameters: these are the wave, the DMA width and the
 # MFMA shape, and a build that changed one would not be this algorithm.
@@ -122,6 +127,7 @@ BF16_BYTES = 2
 VEC_KV = 8  # bf16 elements one lane moves per DMA issue (16 B)
 MFMA_LANE_K = 8
 K_STEP_QK = 16  # MFMA K extent
+MFMA_M = 32  # MFMA M extent -- what pins ROWS_PER_WAVE, whatever BLOCK_M says
 D_CHUNK = 32  # PV MFMA N extent -- the O accumulator's width
 PV_K_STEP = 16
 K_SUB_N = 32
@@ -147,6 +153,7 @@ def make_traits(
     window=False,
     bias=False,
     dropout=False,
+    lpt_tile_order=False,
     dtype_str="bf16",
     waves_per_eu=2,
     daz=True,
@@ -200,6 +207,29 @@ def make_traits(
 
     block_size = num_waves * WARP_SIZE
     rows_per_wave = block_m // q_tiles
+    if rows_per_wave > MFMA_M:
+        # **The comment above is an invariant, and this enforces it.** A wave
+        # holds at most the MFMA's M extent in rows, so `BLOCK_M` is really
+        # `q_tiles * MFMA_M`; a larger one builds a kernel whose helpers
+        # address rows its accumulator does not have. It does not fail. The P7
+        # sweep found twelve such points -- all `head_dim 512` at 8 waves with
+        # `vo_shards > 1`, giving 64 or 128 rows per wave -- each returning
+        # finite garbage at 0.15 to 0.28 relative error.
+        #
+        # Sharding is where this bites, because `vo_shards` divides `q_tiles`
+        # while `block_m` stays whatever was pinned: a geometry that was
+        # consistent unsharded silently stops being so.
+        #
+        # Fewer rows per wave is legal and merely wasteful -- the wave runs a
+        # full 32-row MFMA and discards the rows it does not own, which the
+        # same sweep measured as almost exactly proportional (8/16/32 rows ->
+        # 281/563/1111 TFLOP/s at head_dim 128). So this is a ceiling, not an
+        # equality, and the loss below it is left to the tuner.
+        raise ValueError(
+            f"BLOCK_M {block_m} over {q_tiles} Q tiles gives {rows_per_wave} rows per wave, but the "
+            f"MFMA's M extent caps it at {MFMA_M}. BLOCK_M is derived: pass "
+            f"{q_tiles * MFMA_M} for num_waves={num_waves}, vo_shards={vo_shards}"
+        )
 
     k_steps_qk = head_dim // K_STEP_QK
     d_chunks = head_dim // D_CHUNK
@@ -351,6 +381,7 @@ def make_traits(
         WINDOW=window,
         BIAS_TYPE=1 if bias else 0,
         ENABLE_DROPOUT=bool(dropout),
+        LPT_TILE_ORDER=bool(lpt_tile_order),
         DTYPE_STR=dtype_str,
         WAVES_PER_EU=waves_per_eu,
         DAZ=bool(daz),

@@ -537,6 +537,86 @@ def test_padded_head_is_derived_not_guessed():
 
 
 # ---------------------------------------------------------------------------
+# P7: what the knob re-sweep found
+# ---------------------------------------------------------------------------
+
+
+def test_rows_per_wave_cannot_exceed_the_mfma_m_extent():
+    """`BLOCK_M` is derived, and pinning a larger one is a wrong answer.
+
+    A wave holds at most the MFMA's 32 rows, so `BLOCK_M` is really
+    `q_tiles * 32`; a bigger one builds a kernel whose helpers address rows its
+    accumulator does not have, and it **does not fail**. The sweep found twelve
+    such points -- all head_dim 512 at 8 waves with `vo_shards > 1`, so 64 or
+    128 rows per wave -- each returning finite garbage at 0.15-0.28 relative
+    error.
+
+    Sharding is where it bites: `vo_shards` divides `q_tiles` while `block_m`
+    stays whatever was pinned, so a geometry that was consistent unsharded
+    silently stops being so. That is why the check is on the derived value and
+    not on the pinned tuple, which `_check_helpers_support_geometry` already
+    covers and which looked entirely legal here.
+    """
+    meta = FmhaInputMetadata(num_heads=8, head_dim=512, causal=False)
+    bad = fmha_knobs("gfx950", num_waves=8, block_m=256, block_n=64, head_dim_granule=64, d_stages=2, vo_shards=2)
+    with pytest.raises(ValueError, match="rows per wave"):
+        bad.resolve(meta)
+    # Fewer rows per wave stays legal: the wave runs a full 32-row MFMA and
+    # discards what it does not own, which is wasteful and not wrong.
+    fmha_knobs("gfx950", num_waves=8, block_m=128, block_n=64, head_dim_granule=64).resolve(
+        FmhaInputMetadata(num_heads=8, head_dim=128, causal=False)
+    )
+
+
+@pytest.mark.parametrize("lazy_rescale", [True, False])
+def test_one_accumulator_builds_on_both_rescale_paths(lazy_rescale):
+    """head_dim 32 is the only width with `D_CHUNKS == 1`, and it has two paths.
+
+    `_anchor_v_o` asks an inline asm for a struct of `D_CHUNKS` outputs, and at
+    one output LLVM does not diagnose it -- it aborts with an `UNREACHABLE`,
+    killing the process rather than raising. The lazy path was fixed when
+    head_dim 32 was built; `rescale_o`, which only `lazy_rescale=False` takes,
+    reaches the production anchor and still aborted. The sweep found it by
+    being the first thing to build that combination.
+    """
+    b, h, s = 1, 4, 512
+    q, k, v = (_rand(b, h, s, 32) for _ in range(3))
+    o = torch.empty_like(q)
+    meta = FmhaInputMetadata(num_heads=h, head_dim=32, causal=False)
+    from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module_primary as build_primary
+
+    fn = build_primary(meta, fmha_knobs("gfx950", lazy_rescale=lazy_rescale).resolve(meta))
+    fn(q, k, v, o, b, s, seqlen_k=s, scale=None, lse=None)
+    assert _err(o, _ref(q, k, v)) < TOL
+
+
+@pytest.mark.parametrize("hdim", [64, 256])
+def test_lpt_tile_order_is_bit_identical(hdim):
+    """Reversing the causal Q-block order must change nothing but the schedule.
+
+    It is a bijection over the same index set, which is what makes it safe to
+    leave as a tuning knob. It is also worth **0.0% on gfx950** across every
+    width and shape measured, so it ships off -- the same answer the gfx1201
+    dK/dV port reached, and for a related reason: with 8 XCDs and this many
+    workgroups the tail imbalance the reordering targets is already absorbed.
+    """
+    b, h, s = 1, 4, 1024
+    q, k, v = (_rand(b, h, s, hdim) for _ in range(3))
+    meta = FmhaInputMetadata(num_heads=h, head_dim=hdim, causal=True)
+    from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module_primary as build_primary
+
+    outs = []
+    for lpt in (False, True):
+        o = torch.empty_like(q)
+        build_primary(meta, fmha_knobs("gfx950", lpt_tile_order=lpt).resolve(meta))(
+            q, k, v, o, b, s, seqlen_k=s, scale=None, lse=None
+        )
+        outs.append(o)
+    assert torch.equal(outs[0], outs[1])
+    assert fmha_knobs("gfx950").resolve(meta).traits.LPT_TILE_ORDER is False
+
+
+# ---------------------------------------------------------------------------
 # P6: dropout (philox)
 # ---------------------------------------------------------------------------
 
