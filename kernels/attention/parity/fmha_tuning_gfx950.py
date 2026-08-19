@@ -416,7 +416,14 @@ class Gfx950Knobs(FmhaKnobs):
         answer, since every derived field is recomputed from `meta` and the
         pinned fields rather than read back.
         """
-        return _GFX950_FALLBACK.merge(self)._checked_modes()._with_widths(meta)._with_wave_geometry()._with_traits(meta)
+        return (
+            _GFX950_FALLBACK.merge(self)
+            ._checked_modes()
+            ._with_mode_defaults(meta)
+            ._with_widths(meta)
+            ._with_wave_geometry()
+            ._with_traits(meta)
+        )
 
     def _checked_modes(self):
         """Reject mode combinations the kernel does not implement.
@@ -430,6 +437,29 @@ class Gfx950Knobs(FmhaKnobs):
             raise ValueError("varlen is not supported together with num_kv_splits > 1")
         if self.kv_cache_layout not in ("linear", "vectorized"):
             raise ValueError(f"kv_cache_layout must be 'linear' or 'vectorized', got {self.kv_cache_layout!r}")
+        return self
+
+    def _with_mode_defaults(self, meta):
+        """Decide the mode flags that depend on what is being computed.
+
+        Only `cross_seqlen` so far, and it needs `meta` -- which is why it is a
+        step rather than part of `_checked_modes`.
+
+        **A causal varlen build wants `cross_seqlen` on.** Q and K lengths come
+        from independent arrays read at runtime, so nothing at build time knows
+        whether they match; and where `seqlen_k < seqlen_q`, bottom-right
+        causal leaves the leading Q blocks with no live key at all, which the
+        kernel must detect and zero. That is exactly what `cross_seqlen` adds.
+        Defaulting it off would make the common varlen shape silently wrong,
+        and it was: all five modes passed non-causal and two failed causal
+        until this was turned on by hand.
+
+        Still pinnable to `False`, because it is not free -- it costs an extra
+        `active` term and an O-zeroing pass -- and a caller who knows every
+        sequence has `seqlen_q == seqlen_k` is entitled to skip it.
+        """
+        if self.cross_seqlen is None:
+            return replace(self, cross_seqlen=bool(self.varlen and meta.causal))
         return self
 
     def _with_wave_geometry(self):
@@ -706,7 +736,7 @@ _GFX950_FALLBACK = Gfx950Knobs(
     setprio=True,
     stagger=True,
     varlen=False,
-    cross_seqlen=False,
+    cross_seqlen=None,  # derived from varlen+causal; see `_with_mode_defaults`
     paged=False,
     kv_cache_layout="linear",
     num_kv_splits=1,

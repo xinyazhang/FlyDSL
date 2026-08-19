@@ -76,9 +76,10 @@ rather than corrupting the neighbouring row.
 --- Phase status -----------------------------------------------------------
 
 P0 (this ABI, runtime scale/head counts/strides, LSE), P1 (runtime
-`hdim_qk`/`hdim_vo` with `PADDED_HEAD`) and P3 (generalized sliding windows --
-`window=True` plus the runtime `window_left`/`window_right` pair) are in. The
-five varlen modes, bias and dropout are not; see `sdpa-close-gap-gfx950.md`.
+`hdim_qk`/`hdim_vo` with `PADDED_HEAD`), P3 (generalized sliding windows --
+`window=True` plus the runtime `window_left`/`window_right` pair) and P4 (the
+five `VarlenBits` modes) are in. Bias and dropout are not; see
+`sdpa-close-gap-gfx950.md`.
 """
 
 import fmha_abi_gfx1201 as abi
@@ -220,6 +221,12 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         LSE: fx.Tensor,
         Workspace: fx.Tensor,
         BlockTable: fx.Tensor,
+        seqinfo_q0: fx.Pointer,
+        seqinfo_q1: fx.Pointer,
+        seqinfo_k0: fx.Pointer,
+        seqinfo_k1: fx.Pointer,
+        varlen_bits: fx.Int32,
+        num_seqlens: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
@@ -268,6 +275,9 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             hdim_qk_floor=HDIM_QK_FLOOR,
             window_left=window_left,
             window_right=window_right,
+            seqinfo=(seqinfo_q0, seqinfo_q1, seqinfo_k0, seqinfo_k1),
+            varlen_bits=varlen_bits,
+            num_seqlens=num_seqlens,
             Q=Q,
             K=K,
             V=V,
@@ -902,6 +912,12 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         Workspace: fx.Tensor,
         BlockTable: fx.Tensor,
         batch_size: fx.Int32,
+        seqinfo_q0: fx.Pointer,
+        seqinfo_q1: fx.Pointer,
+        seqinfo_k0: fx.Pointer,
+        seqinfo_k1: fx.Pointer,
+        varlen_bits: fx.Int32,
+        num_seqlens: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
@@ -928,7 +944,12 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
     ):
         # Make the build configuration visible to the JIT cache key.
         _ = _cache_tag
-        bs_idx = fx.Index(batch_size)
+        # The grid's z extent counts *sequences*, which is `num_seqlens` when a
+        # packed tensor holds several in one batch slot and `batch_size`
+        # otherwise. The two are genuinely different numbers -- a packed
+        # (1, H, T, D) call is `batch_size=1, num_seqlens=N` -- and using the
+        # batch extent there would launch one program for N sequences.
+        bs_idx = fx.Index(num_seqlens if num_seqlens != fx.Int32(0) else batch_size)
         sl_idx = fx.Index(max_seqlen_q)
         num_q_blocks = (sl_idx + traits.BLOCK_M - 1) // traits.BLOCK_M
         if const_expr(traits.SPLITK):
@@ -958,6 +979,12 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             LSE,
             Workspace,
             BlockTable,
+            seqinfo_q0,
+            seqinfo_q1,
+            seqinfo_k0,
+            seqinfo_k1,
+            varlen_bits,
+            num_seqlens,
             max_seqlen_q,
             max_seqlen_k,
             window_left,
@@ -1012,6 +1039,8 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         block_table=None,
         block_table_stride=None,
         window=None,
+        varlen=None,
+        num_seqlens=0,
         stream=None,
     ):
         """Every kernel argument but the stream, in launch order.
@@ -1135,6 +1164,15 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         ws = workspace if workspace is not None else O
         bt = block_table if block_table is not None else O
 
+        # `abi.varlen_args` is gfx1201's, reused unedited: it encodes the same
+        # wire format, and it is where the two host-side checks live that no
+        # kernel can make -- `batch_size` must be the tensor's batch extent
+        # whatever the layout, and a packed `num_seqlens` must agree with the
+        # length array. Passing the sequence count where the batch extent
+        # belongs launches N programs over a 1-batch tensor and every one of
+        # them addresses a plausible row.
+        _vl = abi.varlen_args(STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens)
+
         return (
             Q,
             K,
@@ -1144,8 +1182,13 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             ws,
             bt,
             batch_size,
-            seqlen_q,
-            seqlen_k,
+            _vl[1],
+            _vl[2],
+            _vl[3],
+            _vl[4],
+            _vl[0],
+            int(num_seqlens),
+            *_vl[5:],  # max_seqlen_q, max_seqlen_k -- the decode's MAX fallback
             *_resolve_window_args(window),
             num_head_q,
             num_head_k,

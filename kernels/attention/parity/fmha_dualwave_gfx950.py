@@ -314,6 +314,9 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         hdim_qk_floor=0,
         window_left=None,
         window_right=None,
+        seqinfo=(None, None, None, None),
+        varlen_bits=0,
+        num_seqlens=0,
         **kwargs,
     ):
         super().__init__(traits, **kwargs)
@@ -352,6 +355,13 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         # this build will use are known.
         self.window_left_arg = window_left
         self.window_right_arg = window_right
+        # P4. `VarlenBits` plus the four sequence-info arrays, named by role:
+        # `?0` supplies lengths, `?1` supplies positions. Unread slots are
+        # **null pointers**, which is safe only because the decoder branches
+        # rather than selects -- see `fmha.cond_load`.
+        self.seqinfo_q0, self.seqinfo_q1, self.seqinfo_k0, self.seqinfo_k1 = seqinfo
+        self.varlen_bits_arg = varlen_bits
+        self.num_seqlens_arg = num_seqlens
 
     # -- runtime softmax scale -------------------------------------------
     #
@@ -420,6 +430,72 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         self.k_lds_read_base_per_lane = _k_read_base(self.traits, self.lane_mod_32, self.lane_div_32)
 
     # -- per-tensor strides ----------------------------------------------
+
+    def init_sequence_lengths(self, **kwargs):
+        """Decode `VarlenBits` into the six scalars the rest of the kernel uses.
+
+        The base class knows exactly one varlen shape -- cumulative
+        `cu_seqlens` on both sides -- and reads it directly. `VarlenBits`
+        generalizes that to three orthogonal axes per side (STACKED, LENGTH,
+        POSITION), which is five useful configurations rather than one, so the
+        decode replaces that branch rather than extending it.
+
+        `fmha.decode_addressing` is gfx1201's, reused unedited: the bits mean
+        the same thing on both architectures, and a second copy of a wire
+        format is a second thing to keep in step.
+
+        Three things about the shape of this:
+
+        - **`z` is not `batch_idx`.** The workgroup's `z` selects a *sequence*;
+          the decode says which *batch slice* that sequence lives in, which is
+          `z` for a batched layout and 0 for a packed one. Overwriting
+          `batch_idx` here is what keeps `_slab_byte_base` correct without a
+          varlen branch inside it.
+        - **The reads are scalar.** `z` is workgroup-uniform, so these land in
+          SGPRs and cost nothing against the VGPR budget.
+        - **Row offsets stay separate from the batch index.** A packed tensor
+          has `batch = 0` and a large `row_off`; a padded one has a real batch
+          and `row_off = 0`. Both go through the same
+          `batch * s_batch + row_off * s_seq`, which is why the descriptors
+          need no varlen case at all.
+        """
+        traits = self.traits
+        if const_expr(not traits.VARLEN):
+            super().init_sequence_lengths(**kwargs)
+            self.lse_tokens_i32 = fx.Int32(self.seq_len_v)
+            self.kv_batch_idx = self.batch_idx
+            return
+        z = fx.Int32(self.batch_idx)
+        q_len, q_row, q_batch = fmha.decode_addressing(
+            self.varlen_bits_arg, 0, self.seq_len_v, self.seqinfo_q0, self.seqinfo_q1, z
+        )
+        k_len, k_row, k_batch = fmha.decode_addressing(
+            self.varlen_bits_arg, 8, self.seq_len_kv_v, self.seqinfo_k0, self.seqinfo_k1, z
+        )
+        self.lse_tokens_i32 = fmha.lse_token_pitch(
+            self.varlen_bits_arg, 0, self.seq_len_v, self.seqinfo_q0, self.seqinfo_q1, self.num_seqlens_arg
+        )
+        # **Each side owns its own batch index**, and this is not pedantry:
+        # `0x040B` -- packed Q against `seqused_k` on a BHSD cache -- has Q
+        # stacked (batch 0, large row offset) and K batched (batch z, no row
+        # offset) in the *same call*. Reusing Q's index for K reads batch 0 of
+        # the cache for every sequence, which is plan section 1.4 arriving as a
+        # wrong answer. Measured before the split: correct for the four
+        # configurations where both sides agree, wrong for the one that does
+        # not.
+        self.batch_idx = fx.Index(q_batch)
+        self.kv_batch_idx = fx.Index(k_batch)
+        self.varlen_q_row_off = fx.Index(q_row)
+        self.varlen_kv_row_off = fx.Index(k_row)
+        self.seqlen_q_v = fx.Index(q_len)
+        self.seqlen_kv_v = fx.Index(k_len)
+        self.seqlen_kv_i32 = fx.Int32(k_len)
+        # `q_tok_base` / `q_tok_end` are the base class's names for the same
+        # interval; the paged and split-K helpers read them.
+        self.q_tok_base = fx.Index(0)
+        self.q_tok_end = self.seqlen_q_v
+        self.kv_tok_base = fx.Index(0)
+        self.kv_tok_end = self.seqlen_kv_v
 
     def init_tile_bounds(self, **kwargs):
         """Resolve the window, then let the causal bound derive from it.
@@ -505,7 +581,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         self.stride_q_n_v = self.stride_q_seq_v
         self.stride_kv_n_v = self.stride_k_seq_v
 
-    def _slab_byte_base(self, s0, s1, s2, row_off, head_idx):
+    def _slab_byte_base(self, s0, s1, s2, row_off, head_idx, batch_idx=None):
         """Byte offset of this workgroup's (batch, head) slab.
 
         Both axes are workgroup-uniform, so folding them into the descriptor
@@ -519,10 +595,12 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         offset with `stride_0` set to 0, which is the same decomposition
         `fmha.decode_addressing` produces on gfx1201.
         """
-        elems = self.batch_idx * fx.Index(s0) + head_idx * fx.Index(s1) + row_off * fx.Index(s2)
+        if batch_idx is None:
+            batch_idx = self.batch_idx
+        elems = batch_idx * fx.Index(s0) + head_idx * fx.Index(s1) + row_off * fx.Index(s2)
         return elems * fx.Index(self.traits.BF16_BYTES)
 
-    def _slab_view(self, tensor, s0, s1, s2, row_off, head_idx, rows):
+    def _slab_view(self, tensor, s0, s1, s2, row_off, head_idx, rows, batch_idx=None):
         """A buffer view over one (batch, head) slab, bounded at `rows` rows.
 
         The bound is `rows * stride_seq`, so a row past the sequence is out of
@@ -533,7 +611,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         span_elems = rows * fx.Index(s2)
         return dualwave._make_rebased_view(
             fx.get_iter(tensor),
-            self._slab_byte_base(s0, s1, s2, row_off, head_idx),
+            self._slab_byte_base(s0, s1, s2, row_off, head_idx, batch_idx=batch_idx),
             span_elems * fx.Index(self.traits.BF16_BYTES),
             fx.make_layout(fx.Int32(span_elems), fx.Int32(1)),
             _buf_flags_i32=self.buf_flags_i32,
@@ -555,8 +633,16 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
 
         # Varlen token origins. Dense is 0 on both sides: the batch axis has a
         # real stride here, so it must not also be spent as a token offset.
-        self.q_row_off = fx.Index(0)
-        self.kv_row_off = fx.Index(0)
+        # Under varlen these come from the decode, and the pairing is what
+        # makes one expression serve every mode -- a packed tensor gets
+        # `batch = 0` with a large `row_off`, a padded one a real batch with
+        # `row_off = 0`.
+        if const_expr(traits.VARLEN):
+            self.q_row_off = self.varlen_q_row_off
+            self.kv_row_off = self.varlen_kv_row_off
+        else:
+            self.q_row_off = fx.Index(0)
+            self.kv_row_off = fx.Index(0)
 
         # Head folded into the base, so what remains per access is `s * stride`.
         self.q_gmem_elem_offset = self.q_start * self.stride_q_seq_v
@@ -594,6 +680,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
                 self.kv_row_off,
                 self.kv_head_idx,
                 self.seqlen_kv_v,
+                batch_idx=self.kv_batch_idx,
             )
             self.v_div = self._slab_view(
                 self.V,
@@ -603,6 +690,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
                 self.kv_row_off,
                 self.kv_head_idx,
                 self.seqlen_kv_v,
+                batch_idx=self.kv_batch_idx,
             )
 
 

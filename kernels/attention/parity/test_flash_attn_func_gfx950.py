@@ -537,6 +537,222 @@ def test_padded_head_is_derived_not_guessed():
 
 
 # ---------------------------------------------------------------------------
+# P4: varlen -- the five VarlenBits configurations
+# ---------------------------------------------------------------------------
+
+_VL_H, _VL_D = 4, 64
+_VL_Q = [128, 377, 64, 500]
+_VL_K = [100, 300, 64, 400]
+_VL_N = len(_VL_Q)
+_VL_MAX = max(_VL_Q)
+
+
+def _i32(x):
+    return torch.tensor(list(x), device="cuda", dtype=torch.int32)
+
+
+def _cumsum(lens):
+    out, run = [0], 0
+    for value in lens:
+        run += value
+        out.append(run)
+    return out
+
+
+def _sdpa_bottom_right(q, k, v, causal):
+    """SDPA with the kernel's causal convention: `col <= row + (Sk - Sq)`.
+
+    `torch`'s `is_causal` is **top-left** aligned, and the two agree only when
+    `Sq == Sk` -- which every dense test here happens to satisfy and no varlen
+    test does. Using `is_causal` made two of the five modes look broken.
+    """
+    if not causal:
+        return F.scaled_dot_product_attention(q.float(), k.float(), v.float())
+    sq, sk = q.shape[2], k.shape[2]
+    rows = torch.arange(sq, device="cuda").view(-1, 1)
+    cols = torch.arange(sk, device="cuda").view(1, -1)
+    bias = torch.zeros(sq, sk, device="cuda", dtype=torch.float32)
+    bias.masked_fill_(cols > rows + (sk - sq), float("-inf"))
+    return F.scaled_dot_product_attention(q.float(), k.float(), v.float(), attn_mask=bias)
+
+
+def _run_varlen(q, k, v, o, bits, causal, batch_size, num_seqlens, **seqinfo):
+    fn = build(
+        num_heads=_VL_H,
+        head_dim=_VL_D,
+        causal=causal,
+        dtype_str="bf16",
+        num_kv_heads=_VL_H,
+        varlen=True,
+    )
+    varlen = dict(bits=bits, max_seqlen_q=_VL_MAX, max_seqlen_k=_VL_MAX)
+    varlen.update({name: t for name, t in seqinfo.items() if t is not None})
+    fn(q, k, v, o, batch_size, _VL_MAX, seqlen_k=_VL_MAX, scale=None, lse=None, varlen=varlen, num_seqlens=num_seqlens)
+    return o
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_varlen_compact(causal):
+    """`0x0B0B` -- both sides packed, positions reused from the length array."""
+    import fmha_abi_gfx1201 as _abi
+
+    cu = _cumsum(_VL_Q)
+    total = cu[-1]
+    q, k, v = (_rand(1, _VL_H, total, _VL_D) for _ in range(3))
+    o = torch.empty_like(q)
+    side = _abi.VARLEN_COMPACT_SIDE
+    _run_varlen(q, k, v, o, _abi.varlen_bits(side, side), causal, 1, _VL_N, seqinfo_q0=_i32(cu), seqinfo_k0=_i32(cu))
+    for i in range(_VL_N):
+        a, b = cu[i], cu[i + 1]
+        want = _sdpa_bottom_right(q[:, :, a:b], k[:, :, a:b], v[:, :, a:b], causal)
+        assert _err(o[:, :, a:b], want) < TOL, f"sequence {i}"
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_varlen_padded(causal):
+    """`0x0202` -- a real batch axis with short sequences, lengths from cu."""
+    import fmha_abi_gfx1201 as _abi
+
+    cu = _cumsum(_VL_Q)
+    q, k, v = (_rand(_VL_N, _VL_H, _VL_MAX, _VL_D) for _ in range(3))
+    o = torch.zeros_like(q)
+    side = _abi.VARLEN_PADDED_SIDE
+    _run_varlen(q, k, v, o, _abi.varlen_bits(side, side), causal, _VL_N, 0, seqinfo_q0=_i32(cu), seqinfo_k0=_i32(cu))
+    for i, length in enumerate(_VL_Q):
+        want = _sdpa_bottom_right(q[i : i + 1, :, :length], k[i : i + 1, :, :length], v[i : i + 1, :, :length], causal)
+        assert _err(o[i : i + 1, :, :length], want) < TOL, f"sequence {i}"
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_varlen_strided(causal):
+    """`0x1313` -- packed, but positions from their own array, with gaps.
+
+    The only configuration that reads a position array on both sides, and the
+    one that separates POSITION from LENGTH: the starts here are deliberately
+    not the prefix sums, so a decoder that reused the length array would land
+    in the wrong rows.
+    """
+    import fmha_abi_gfx1201 as _abi
+
+    cu = _cumsum(_VL_Q)
+    starts = [0, 200, 700, 900]
+    assert starts != cu[:-1], "the gaps are the point of this case"
+    total = starts[-1] + _VL_Q[-1] + 64
+    q, k, v = (_rand(1, _VL_H, total, _VL_D) for _ in range(3))
+    o = torch.empty_like(q)
+    pos = _i32(starts + [starts[-1] + _VL_Q[-1]])
+    side = _abi.VARLEN_STRIDED_SIDE
+    _run_varlen(
+        q,
+        k,
+        v,
+        o,
+        _abi.varlen_bits(side, side),
+        causal,
+        1,
+        _VL_N,
+        seqinfo_q0=_i32(cu),
+        seqinfo_q1=pos,
+        seqinfo_k0=_i32(cu),
+        seqinfo_k1=pos,
+    )
+    for i, length in enumerate(_VL_Q):
+        a = starts[i]
+        want = _sdpa_bottom_right(q[:, :, a : a + length], k[:, :, a : a + length], v[:, :, a : a + length], causal)
+        assert _err(o[:, :, a : a + length], want) < TOL, f"sequence {i}"
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_varlen_seqused_k_on_packed_kv(causal):
+    """`0x150B` -- packed Q, and a K side whose lengths are individual.
+
+    `seqused_k` on packed KV must use ARRAY rather than REUSE: its length array
+    holds individual lengths, so it is not a position array and there is
+    nothing to reuse. That is plan section 1.4 showing up in the encoding.
+    """
+    import fmha_abi_gfx1201 as _abi
+
+    cu, kcu = _cumsum(_VL_Q), _cumsum(_VL_K)
+    q = _rand(1, _VL_H, cu[-1], _VL_D)
+    k, v = (_rand(1, _VL_H, kcu[-1], _VL_D) for _ in range(2))
+    o = torch.empty_like(q)
+    _run_varlen(
+        q,
+        k,
+        v,
+        o,
+        _abi.varlen_bits(_abi.VARLEN_COMPACT_SIDE, _abi.VARLEN_SEQUSED_PACKED_SIDE),
+        causal,
+        1,
+        _VL_N,
+        seqinfo_q0=_i32(cu),
+        seqinfo_k0=_i32(_VL_K),
+        seqinfo_k1=_i32(kcu),
+    )
+    for i in range(_VL_N):
+        a, b = cu[i], cu[i + 1]
+        c, d = kcu[i], kcu[i + 1]
+        want = _sdpa_bottom_right(q[:, :, a:b], k[:, :, c:d], v[:, :, c:d], causal)
+        assert _err(o[:, :, a:b], want) < TOL, f"sequence {i}"
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_varlen_seqused_k_on_bhsd_cache(causal):
+    """`0x040B` -- packed Q against a *batched* K cache, in one call.
+
+    The case the two sides genuinely disagree: Q is stacked, so its batch index
+    is 0 and its row offset large; K is not, so its batch index is `z` and its
+    row offset zero. A kernel that let one side's batch index serve both reads
+    batch 0 of the cache for every sequence -- which is what this did until
+    `kv_batch_idx` was split out, and it was the only one of the five modes
+    that noticed.
+    """
+    import fmha_abi_gfx1201 as _abi
+
+    cu = _cumsum(_VL_Q)
+    kmax = max(_VL_K)
+    q = _rand(1, _VL_H, cu[-1], _VL_D)
+    k, v = (_rand(_VL_N, _VL_H, kmax, _VL_D) for _ in range(2))
+    o = torch.empty_like(q)
+    _run_varlen(
+        q,
+        k,
+        v,
+        o,
+        _abi.varlen_bits(_abi.VARLEN_COMPACT_SIDE, _abi.VARLEN_SEQUSED_CACHE_SIDE),
+        causal,
+        1,
+        _VL_N,
+        seqinfo_q0=_i32(cu),
+        seqinfo_k0=_i32(_VL_K),
+    )
+    for i in range(_VL_N):
+        a, b = cu[i], cu[i + 1]
+        length = _VL_K[i]
+        want = _sdpa_bottom_right(q[:, :, a:b], k[i : i + 1, :, :length], v[i : i + 1, :, :length], causal)
+        assert _err(o[:, :, a:b], want) < TOL, f"sequence {i}"
+
+
+def test_varlen_causal_defaults_to_cross_seqlen():
+    """A causal varlen build must turn `cross_seqlen` on by itself.
+
+    Q and K lengths come from independent arrays read at runtime, so nothing at
+    build time knows whether they match; where `seqlen_k < seqlen_q`,
+    bottom-right causal leaves the leading Q blocks with no live key and the
+    kernel has to zero them. Two of the five modes returned wrong answers until
+    this defaulted on. Still pinnable off, since it is not free.
+    """
+    causal_vl = fmha_knobs("gfx950", varlen=True).resolve(FmhaInputMetadata(num_heads=8, head_dim=64, causal=True))
+    assert causal_vl.cross_seqlen is True
+    full_vl = fmha_knobs("gfx950", varlen=True).resolve(FmhaInputMetadata(num_heads=8, head_dim=64, causal=False))
+    assert full_vl.cross_seqlen is False
+    dense = fmha_knobs("gfx950").resolve(FmhaInputMetadata(num_heads=8, head_dim=64, causal=True))
+    assert dense.cross_seqlen is False
+    pinned = fmha_knobs("gfx950", varlen=True, cross_seqlen=False)
+    assert pinned.resolve(FmhaInputMetadata(num_heads=8, head_dim=64, causal=True)).cross_seqlen is False
+
+
+# ---------------------------------------------------------------------------
 # Split-K: correct only in the production output layout
 # ---------------------------------------------------------------------------
 

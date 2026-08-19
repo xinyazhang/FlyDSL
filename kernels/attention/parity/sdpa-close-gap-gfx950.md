@@ -2172,3 +2172,56 @@ exactly this reason.
   silent wrong answer into a message naming the layout that works.
 - `CAUSAL_TYPE` is not surfaced as an integer. The two values AOTriton ships,
   0 and 3, are `causal=False` and `window=True` here.
+
+
+---
+
+# Outcome: P4 — varlen (`VarlenBits`) — DONE
+
+All five configurations of the plan's section 2 table, both masking modes, ten
+device tests. `332 passed` overall.
+
+## The port was mostly plumbing, because the shapes were already right
+
+`fmha.decode_addressing` and `fmha.lse_token_pitch` came across unedited -- the
+bits mean the same thing on both architectures -- and `abi.varlen_args` with
+them, including the two host checks no kernel can make. On the gfx950 side
+`_slab_byte_base` already took a `row_off` it always passed 0, put there by P0
+with a comment saying varlen would use it. It did.
+
+So the decode replaces the base class's one varlen shape (cumulative
+`cu_seqlens`, both sides) rather than extending it: five configurations for one
+decoder called twice, six scalar loads into SGPRs, no VGPR cost.
+
+## Two bugs, and only one configuration could see either
+
+**Each side needs its own batch index.** The first version let Q's decoded
+batch serve both, on the reasoning that Q and O are indexed by it and K/V by
+their own row offset. That is true for four of the five configurations, because
+in those the two sides agree. `0x040B` -- packed Q against `seqused_k` on a
+*batched* KV cache -- is section 1.4 of the varlen plan arriving as a wrong
+answer: Q is stacked (batch 0, large row offset), K is not (batch `z`, no row
+offset), in the same call. Every sequence read batch 0 of the cache.
+
+**A causal varlen build must default `cross_seqlen` on.** Q and K lengths come
+from independent arrays read at runtime, so nothing at build time knows whether
+they match; where `seqlen_k < seqlen_q`, bottom-right causal leaves the leading
+Q blocks with no live key and they must be zeroed. All five modes passed
+non-causal with it off, and two failed causal. It is now derived in
+`_with_mode_defaults`, and still pinnable off for callers whose lengths match.
+
+## The reference was wrong before the kernel was
+
+Worth recording because it cost a wrong diagnosis first: `torch`'s `is_causal`
+is **top-left** aligned and this kernel is **bottom-right**
+(`delta = seqlen_kv - seqlen_q`). The two agree exactly when `Sq == Sk`, which
+every dense test here satisfies and no varlen test does. Two modes looked
+broken until the reference grew an explicit `col <= row + (Sk - Sq)` mask;
+`_sdpa_bottom_right` now spells it out.
+
+## Not done
+
+- **LSE under varlen.** `lse_token_pitch` is decoded and stored as
+  `lse_tokens_i32`, but the store still uses the dense row formula, so
+  `return_lse` with a packed layout is untested and unclaimed.
+- **Split-K + varlen** is rejected upstream of this work already.
