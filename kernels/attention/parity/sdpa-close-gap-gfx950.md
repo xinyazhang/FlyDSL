@@ -2150,9 +2150,25 @@ exactly this reason.
   now cover it, and the dispatcher refuses a head stride the combine cannot
   address rather than returning plausible numbers.
 
-  Fixing it means a parity subclass of the combine helper that reads the real
-  `stride_o0/1/2`, the same change of variables the rest of the port already
-  made. Not done here: split-K is an optimization rather than a parity feature
-  (see the split-K note above), and the guard removes the hazard.
+  **Split-K is not used.** `num_kv_splits` defaults to 1, the parity kernel has
+  no interface layer or benchmark caller, and its only caller in the tree is
+  its own test file -- so nothing reaches the broken path except the tests that
+  pin it. That is what makes deferring the fix reasonable rather than
+  negligent.
+
+  The guard asserts the two conditions the combine's addressing implies, and
+  they are independent. It is handed only `(batch_size, seq_len,
+  stride_o_seq)`, so it can do nothing but assume heads adjacent
+  (`stride_o_head == HEAD_DIM`) *and* batches packed
+  (`stride_o_batch == seqlen * stride_o_seq`). The first version checked only
+  the head stride; a BSHD tensor with an over-allocated sequence axis sliced
+  back passes that and still lands in the wrong batch, error 4.0. Both arms
+  have tests.
+
+  Fixing it means a parity subclass of the combine helper reading the real
+  `stride_o_batch/_head/_seq`, the same change of variables the rest of the
+  port already made. Deferred: split-K is an optimization rather than a parity
+  feature (see the split-K note above), it is unused, and the guard turns a
+  silent wrong answer into a message naming the layout that works.
 - `CAUSAL_TYPE` is not surfaced as an integer. The two values AOTriton ships,
   0 and 3, are `causal=False` and `window=True` here.

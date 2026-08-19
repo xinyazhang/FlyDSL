@@ -566,6 +566,25 @@ def test_splitk_matches_sdpa_in_production_layout(splits):
     assert _err(o, _ref(q, k, v, causal=True)) < TOL
 
 
+def test_splitk_refuses_a_gapped_batch_stride():
+    """Heads adjacent is necessary but not sufficient; batches must be packed.
+
+    The combine kernel is handed only `(batch_size, seq_len, stride_o_seq)`, so
+    it can do nothing but assume a batch origin of `seq_len * stride_o_seq`.
+    This O is BSHD -- the layout that works -- with an over-allocated sequence
+    axis sliced back, so its head stride is right and its batch stride is not.
+    It passed the first version of this guard and returned error 4.0.
+    """
+    b, h, s, d = 3, 4, 2048, 64
+    q, k, v = (_rand(b, s + 37, h, d)[:, :s, :, :].transpose(1, 2) for _ in range(3))
+    o = _rand(b, s + 37, h, d)[:, :s, :, :].transpose(1, 2)
+    assert o.stride(1) == d, "heads are adjacent, so only the batch stride is wrong"
+    assert o.stride(0) != s * o.stride(2)
+    fn = build(num_heads=h, head_dim=d, causal=True, dtype_str="bf16", num_kv_heads=h, num_kv_splits=2)
+    with pytest.raises(ValueError, match="batch stride"):
+        fn(q, k, v, o, b, s, seqlen_k=s, scale=None, lse=None, workspace=_splitk_workspace(b, h, s, 2, d))
+
+
 def test_splitk_refuses_a_bhsd_output():
     """A BHSD-contiguous O must raise, because the combine would alias heads.
 

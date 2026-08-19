@@ -1085,33 +1085,44 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
                 f"this build serves hdim_qk in ({HDIM_QK_FLOOR}, {BLOCK_DMODEL}], got {hdim_qk}; "
                 f"build for the narrower head_dim, or pin hdim_qk_floor=0 to mask every column"
             )
-        # **Split-K's combine kernel is not stride-general, and this is the
-        # only place that can say so.** `DualwaveSplitKCombineHelper` is shared
-        # production code, and its store is the BSHD-flattened form the
-        # dual-wave kernel was written for:
+        # **Split-K's combine kernel is not stride-general.** It is shared
+        # production code and it addresses O the way the dual-wave kernel's
+        # BSHD-flattened world does, from just `(batch_size, seq_len,
+        # stride_o_seq)`:
         #
-        #     o_global = seq * stride_q_n + head * HEAD_DIM + col
+        #     o_global = seq * stride_o_seq + head * HEAD_DIM + col
         #
-        # The whole point of this port is that (batch, head, seq) are free
-        # strides, and the combine path never got that change of variables. On
-        # a BHSD-contiguous O the head term is `head * HEAD_DIM` while the
-        # sequence term is `seq * HEAD_DIM` too, so the heads alias the tokens
-        # and the answer is silently wrong -- measured 3.5 against a 2e-2
-        # tolerance, with no NaN and no fault.
+        # and a batch origin of `seq_len * stride_o_seq`. Two things follow,
+        # and neither is implied by the other:
         #
-        # It is *correct* whenever the heads really are packed adjacently, i.e.
-        # `stride_o_head == HEAD_DIM`, which is exactly the layout PyTorch's SDPA
-        # shim hands down. Verified at 2 and 4 splits and batch 3. So this
-        # refuses the broken case rather than the feature.
-        if traits.SPLITK and O.stride(1) != BLOCK_DMODEL:
-            raise ValueError(
-                f"num_kv_splits > 1 needs O's head stride to be {BLOCK_DMODEL} (heads adjacent, the "
-                f"BSHD-flattened layout), got {O.stride(1)} from strides {tuple(O.stride())}. The "
-                f"split-K combine kernel is shared with the production dual-wave kernel and is not "
-                f"stride-general; a BHSD-contiguous O would alias heads onto tokens and return "
-                f"plausible wrong numbers. Pass a (B, S, H, D) allocation transposed to (B, H, S, D), "
-                f"or build with num_kv_splits=1."
-            )
+        # - heads must be adjacent, `stride_o_head == HEAD_DIM`. On a
+        #   BHSD-contiguous O the head term is `head * HEAD_DIM` while the
+        #   sequence term is `seq * HEAD_DIM` too, so heads alias tokens.
+        # - batches must be packed, `stride_o_batch == seqlen * stride_o_seq`.
+        #   A gapped batch stride -- an over-allocated allocation sliced back --
+        #   satisfies the first condition and still lands in the wrong batch.
+        #
+        # Both were measured: error 3.5 and 4.0 against a 2e-2 tolerance,
+        # finite, deterministic, no fault. The whole point of this port is that
+        # these three strides are free, and the combine path never received
+        # that change of variables -- see `fmha_dualwave_gfx950`'s docstring
+        # for the change every other helper did get.
+        #
+        # Strict on purpose. Split-K is off by default and has no caller here,
+        # so a rejected layout costs nothing while a silent wrong answer is the
+        # failure mode this whole guard exists to prevent.
+        if traits.SPLITK:
+            _packed_batch = seqlen_q * O.stride(2)
+            if O.stride(1) != BLOCK_DMODEL or O.stride(0) != _packed_batch:
+                raise ValueError(
+                    f"num_kv_splits > 1 needs an O the split-K combine kernel can address: head "
+                    f"stride {BLOCK_DMODEL} (heads adjacent) and batch stride {_packed_batch} "
+                    f"(batches packed), got strides {tuple(O.stride())} for shape "
+                    f"{tuple(O.shape)}. The combine is shared with the production dual-wave kernel "
+                    f"and is not stride-general; it would return plausible wrong numbers. Pass a "
+                    f"tightly-allocated (B, S, H, D) tensor transposed to (B, H, S, D), or build "
+                    f"with num_kv_splits=1."
+                )
 
         if traits.RETURN_LSE and lse is None:
             raise ValueError("this build has return_lse=True and requires an fp32 `lse` tensor")
