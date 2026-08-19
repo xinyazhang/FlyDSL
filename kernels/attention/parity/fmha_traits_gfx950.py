@@ -109,6 +109,10 @@ class ParityDualwaveTraits(dualwave.DualwaveSwpTraits):
     # anything when unused would be paid by every caller who does not want one.
     BIAS_TYPE: int = 0
 
+    # P6. AOTriton's `ENABLE_DROPOUT`. A build axis for the same reason as
+    # `BIAS_TYPE`: a build without dropout emits no PRNG at all.
+    ENABLE_DROPOUT: bool = False
+
 
 # Hardware constants. Not parameters: these are the wave, the DMA width and the
 # MFMA shape, and a build that changed one would not be this algorithm.
@@ -142,6 +146,7 @@ def make_traits(
     causal=True,
     window=False,
     bias=False,
+    dropout=False,
     dtype_str="bf16",
     waves_per_eu=2,
     daz=True,
@@ -345,6 +350,7 @@ def make_traits(
         CAUSAL=causal,
         WINDOW=window,
         BIAS_TYPE=1 if bias else 0,
+        ENABLE_DROPOUT=bool(dropout),
         DTYPE_STR=dtype_str,
         WAVES_PER_EU=waves_per_eu,
         DAZ=bool(daz),

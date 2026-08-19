@@ -123,8 +123,25 @@ DEFAULT_ROUNDS = 10
 # eight-column accumulator group exactly -- does not come close to paying for
 # itself here. It is kept because that trade will look different on a target
 # with a native 64-bit multiplier.
+# gfx950 (CDNA4), same benchmark:
+#
+#   width  u32/call   G randoms/s   VGPRs (one call)
+#   32     4          1884.5        9
+#   64     8           840.6        22
+#
+# 32-bit again, by **2.24x** per random and 13 registers -- the same answer as
+# gfx1201 for the same reason, but by a visibly smaller margin. CDNA4's 64-bit
+# expansion is the better of the two, which is what the narrowing from 4.3x to
+# 2.24x is measuring; it is still not competitive with a single
+# `v_mul_hi_u32`.
+#
+# Recorded rather than left to `_FALLBACK_WIDTH`, even though the value agrees
+# with it. The fallback is a guess that happens to be right, and an entry here
+# is a measurement -- and this table is the one place a wrong entry silently
+# changes every dropout mask the arch produces.
 _WIDTH_BY_ARCH = {
     "gfx1201": 32,
+    "gfx950": 32,
 }
 _FALLBACK_WIDTH = 32
 

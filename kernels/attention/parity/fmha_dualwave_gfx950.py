@@ -55,6 +55,7 @@ from dataclasses import replace
 import fmha_common_gfx1201 as fmha
 from fmha_common_gfx1201 import MaskedAxis
 from gfx950_standalone import buffer_ops, dualwave
+from philox import Philox
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -135,7 +136,7 @@ def _v_imm_lo(traits, dc, k_substep):
     return (k_substep * traits.V_LDS_TO_REG_K_SUBSTEP_STRIDE + _v_dc_offset(traits, dc)) * traits.BF16_BYTES
 
 
-def _bias_column_runs(kv_vectorized):
+def _score_column_runs(kv_vectorized):
     """`[(element_index, column_offset, width)]` covering one score vector.
 
     The 16 f32 an MFMA lane holds are 16 *columns* of a single row -- the row
@@ -345,6 +346,9 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         num_seqlens=0,
         Bias=None,
         bias_strides=(0, 0, 0),
+        philox=(None, None, 0, None, None),
+        idropout_p=0,
+        dropout_scale=1.0,
         **kwargs,
     ):
         super().__init__(traits, **kwargs)
@@ -394,6 +398,19 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         # is the KV axis and is contractually contiguous, so it is not passed.
         self.Bias = Bias
         self.stride_b_batch, self.stride_b_head, self.stride_b_seq = bias_strides
+        # P6. The counter is the (pointer, immediate) pair torch splits it
+        # into, not one pre-summed scalar: a captured graph re-reads the
+        # pointer half. The two `*_output` slots report back what was actually
+        # used, so a backward pass can regenerate the identical mask.
+        (
+            self.philox_seed_ptr,
+            self.philox_offset1,
+            self.philox_offset2,
+            self.philox_seed_output,
+            self.philox_offset_output,
+        ) = philox
+        self.idropout_p = idropout_p
+        self.dropout_scale_arg = dropout_scale
 
     # -- runtime softmax scale -------------------------------------------
     #
@@ -528,6 +545,36 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         self.q_tok_end = self.seqlen_q_v
         self.kv_tok_base = fx.Index(0)
         self.kv_tok_end = self.seqlen_kv_v
+
+    def init_philox(self):
+        """Seed, counter and this workgroup's plane origin. Prologue-only.
+
+        **The offset scheme is `Philox.grid_plane`/`grid_offset`, and using
+        them is the reproducibility contract** rather than a convenience. A
+        dropout mask is generated here and *regenerated* by the backward pass
+        and by the debug mask kernel; all three must agree bit for bit or the
+        gradients are quietly wrong. They agree because they call the same two
+        functions, not because three transcriptions of one formula happened to
+        match.
+
+        The consequence to write down, since it is invisible in any test run at
+        a single tile size: **the mask is a function of element coordinates
+        only.** `grid_plane` is given `max_seqlen_q`/`max_seqlen_k`, never
+        `BLOCK_M`/`BLOCK_N`, so re-tuning the tile geometry cannot move a single
+        random. From this phase onward that is a constraint on the tuner, not
+        just a property of today's code.
+        """
+        if const_expr(not self.traits.ENABLE_DROPOUT):
+            return
+        self.philox_rng = Philox.for_arch("gfx950")
+        plane = fx.Int32(self.batch_idx) * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
+        seed = fmha.philox_seed_value(self.philox_seed_ptr)
+        offset = fmha.philox_offset_base(self.philox_offset1, self.philox_offset2)
+        fmha.philox_report(self.philox_seed_output, self.philox_offset_output, seed, offset)
+        self.philox_seed = seed
+        self.philox_plane_base, self.philox_row_stride = self.philox_rng.grid_plane(
+            offset, plane, self.seq_len_v, self.seq_len_kv_v
+        )
 
     def init_tile_bounds(self, **kwargs):
         """Resolve the window, then let the causal bound derive from it.
@@ -1082,7 +1129,7 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
         # constant, so the flag costs nothing measurable to get right.
         fm_bias = arith.FastMathFlags.contract | arith.FastMathFlags.reassoc
         for half, values in ((0, s_lo), (1, s_hi)):
-            for elem0, col_off, width in _bias_column_runs(traits.KV_VECTORIZED):
+            for elem0, col_off, width in _score_column_runs(traits.KV_VECTORIZED):
                 span = buffer_ops.buffer_load(
                     ctx.bias_rsrc,
                     as_mlir_value(fx.Int32(row_base + col_base + fx.Index(col_off + half * 32))),
@@ -1124,6 +1171,64 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
             self._add_bias_inplace(lists, tile_idx)
             v_s = dualwave._score_lists_to_vecs(lists)
         return super().seq_pad_mask_if_needed(v_s, tile_idx)
+
+    def safe_l_inv(self, l_row):
+        """`1/l`, with the dropout survivor scale folded in.
+
+        `1/(1-p)` is a per-row constant, so it belongs here and not on the
+        3200-odd scores it would otherwise multiply: one extra multiply per
+        output row against one per element. `dropout_args` computes the value
+        host side, and both kernel bodies reach their normalisation through
+        this method, so this is the whole fold.
+        """
+        inv = super().safe_l_inv(l_row)
+        if const_expr(self.traits.ENABLE_DROPOUT):
+            inv = dualwave._fmul(inv, fx.Float32(self.ctx_ref.dropout_scale_arg), self.fm_fast)
+        return inv
+
+    def cast_p(self, v_p, tile_idx=None):
+        """`cast_p`, with the dropout mask applied first.
+
+        **After `l_row`, before the O accumulation**, which is why this hangs
+        off `cast_p` and not off `exp2`. The softmax denominator must be the
+        *undropped* sum, or the result stops being an expectation of the
+        undropped attention and the logsumexp the backward pass reads is wrong.
+        Moving this one call earlier produces plausible output that is wrong by
+        a per-row factor, and no shape check notices.
+
+        The survivors are **not** scaled here. `1/(1-p)` is a per-row constant,
+        so it folds into the reciprocal of `l` at the store -- one multiply per
+        output row instead of one per score. `dropout_args` computes it host
+        side; gfx1201 folds it the same way.
+
+        The column runs are the bias ones. A lane's 16 scores are 16 columns of
+        one row in a few contiguous spans, and the spans start at multiples of
+        `randoms_per_offset`, so each is a whole number of Philox calls with no
+        partial draw.
+        """
+        if const_expr(self.traits.ENABLE_DROPOUT):
+            traits = self.traits
+            ctx = self.ctx_ref
+            # `v_p` is already a pair of 16-element lists here -- `exp2` hands
+            # those back, where `v_s` arrives as a vector pair. No unpacking.
+            lo, hi = list(v_p[0]), list(v_p[1])
+            rng = ctx.philox_rng
+            lane_n_off = 8 if traits.KV_VECTORIZED else 4
+            col_base = fx.Int64(tile_idx * traits.BLOCK_N) + fx.Int64(self.lane_div_32 * fx.Index(lane_n_off))
+            zero = fx.Float32(0.0)
+            for half, values in ((0, lo), (1, hi)):
+                for elem0, col_off, width in _score_column_runs(traits.KV_VECTORIZED):
+                    first = rng.grid_offset(
+                        ctx.philox_plane_base,
+                        ctx.philox_row_stride,
+                        fx.Int64(ctx.q_row),
+                        col_base + fx.Int64(col_off + half * 32),
+                    )
+                    keep = rng.keep_span(ctx.philox_seed, first, width, ctx.idropout_p)
+                    for j in range_constexpr(width):
+                        values[elem0 + j] = keep[j].select(fx.Float32(values[elem0 + j]), zero)
+            v_p = (lo, hi)
+        return super().cast_p(v_p)
 
     # -- P3: generalized sliding window --------------------------------------
     #

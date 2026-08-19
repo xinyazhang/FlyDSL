@@ -80,7 +80,16 @@ P0 (this ABI, runtime scale/head counts/strides, LSE), P1 (runtime
 `window=True` plus the runtime `window_left`/`window_right` pair) and P4 (the
 five `VarlenBits` modes, including the LSE token pitch, row origin and the
 `_HT`/`_TH` layout bits) and P5 (a `(B, H, Sq, Sk)` bias, on both kernel
-bodies) are in. Dropout is not; see `sdpa-close-gap-gfx950.md`.
+bodies) and P6 (philox dropout, both bodies) are in -- the AOTriton feature
+surface is complete. See `sdpa-close-gap-gfx950.md`.
+
+**The dropout mask is a function of element coordinates only**, never of
+`BLOCK_M`/`BLOCK_N`. That is the reproducibility contract of
+`sdpa-dropout-plan.md` section 3, and from P6 onward it is a constraint on the
+tuner rather than a property of today's code: a mask made here is regenerated
+by the backward pass and by the debug mask kernel, and all three must agree bit
+for bit. `test_dropout_mask_does_not_depend_on_the_tiling` builds one problem
+with two supported wave geometries and requires identical output.
 """
 
 import fmha_abi_gfx1201 as abi
@@ -233,6 +242,13 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
+        philox_seed_ptr: fx.Pointer,
+        philox_offset1: fx.Pointer,
+        philox_offset2: fx.Int64,
+        philox_seed_output: fx.Pointer,
+        philox_offset_output: fx.Pointer,
+        idropout_p: fx.Int32,
+        dropout_scale: fx.Float32,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
@@ -293,6 +309,9 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             BlockTable=BlockTable,
             Bias=Bias,
             bias_strides=(stride_b_batch, stride_b_head, stride_b_seq),
+            philox=(philox_seed_ptr, philox_offset1, philox_offset2, philox_seed_output, philox_offset_output),
+            idropout_p=idropout_p,
+            dropout_scale=dropout_scale,
             seq_len=max_seqlen_q,
             seq_len_kv=max_seqlen_k,
             stride_q_n=stride_q_seq,
@@ -308,6 +327,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         ctx.init_sequence_lengths()
         ctx.init_descriptors()
         ctx.init_workspace()
+        ctx.init_philox()
         ctx.init_atoms_and_lds_ptrs()
         ctx.init_dma_thread_offsets()
         ctx.init_tile_bounds()
@@ -456,7 +476,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
                 v_s_1 = gemm_helper.qk(v_k, q_all_scaled_bf16)
                 v_p_0 = softmax_helper.exp2(v_p_0, 16, 16)
                 l_row = softmax_helper.reduce_sum(l_row, v_p_0)
-                v_p_0 = softmax_helper.cast_p(v_p_0)
+                v_p_0 = softmax_helper.cast_p(v_p_0, j_idx - fx.Index(3))
                 v_p_0 = _anchor_v_p(traits, v_p_0, elem_dtype=elem_dtype)
                 _sched_barrier_exp_pairs(traits, 6, 3, 1)
                 _sched_barrier_pairs(traits, 10, 5, 1)
@@ -526,7 +546,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
                 v_s_0 = gemm_helper.qk(v_k, q_all_scaled_bf16)
                 v_p_1 = softmax_helper.exp2(v_p_1, 16, 16)
                 l_row = softmax_helper.reduce_sum(l_row, v_p_1)
-                v_p_1 = softmax_helper.cast_p(v_p_1)
+                v_p_1 = softmax_helper.cast_p(v_p_1, j_idx - fx.Index(2))
                 v_p_1 = _anchor_v_p(traits, v_p_1, elem_dtype=elem_dtype)
                 _sched_barrier_exp_pairs(traits, 6, 3, 3)
                 _sched_barrier_pairs(traits, 10, 5, 3)
@@ -613,7 +633,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             v_s_1 = gemm_helper.qk(v_k, q_all_scaled_bf16)
             v_p_0 = softmax_helper.exp2(v_p_0, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p_0)
-            v_p_0 = softmax_helper.cast_p(v_p_0)
+            v_p_0 = softmax_helper.cast_p(v_p_0, max_m3 - fx.Index(1))
             v_p_0 = _anchor_v_p(traits, v_p_0, elem_dtype=elem_dtype)
             _sched_barrier_exp_pairs(traits, 6, 3, 5)
             _sched_barrier_pairs(traits, 10, 5, 5)
@@ -679,7 +699,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             l_row = softmax_helper.apply_l_rescale(l_row, rescale_e3)
             v_p_1 = softmax_helper.exp2(v_p_1, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p_1)
-            v_p_1 = softmax_helper.cast_p(v_p_1)
+            v_p_1 = softmax_helper.cast_p(v_p_1, max_m3)
             v_p_1 = _anchor_v_p(traits, v_p_1, elem_dtype=elem_dtype)
             _sched_barrier_exp_pairs(traits, 6, 3, 7)
             _sched_barrier_pairs(traits, 10, 5, 7)
@@ -737,7 +757,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             l_row = softmax_helper.apply_l_rescale(l_row, rescale_e7)
             v_p_0 = softmax_helper.exp2(v_p_0, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p_0)
-            v_p_0 = softmax_helper.cast_p(v_p_0)
+            v_p_0 = softmax_helper.cast_p(v_p_0, max_m2)
             v_p_0 = _anchor_v_p(traits, v_p_0, elem_dtype=elem_dtype)
             _sched_barrier_exp_pairs(traits, 6, 3, 9)
             _sched_barrier_pairs(traits, 10, 5, 9)
@@ -770,7 +790,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             v_p_1 = softmax_helper.exp2(v_p_1, 16, 16)
             l_row = softmax_helper.apply_l_rescale(l_row, rescale_e11)
             l_row = softmax_helper.reduce_sum(l_row, v_p_1)
-            v_p_1 = softmax_helper.cast_p(v_p_1)
+            v_p_1 = softmax_helper.cast_p(v_p_1, max_m1)
             v_p_1 = _anchor_v_p(traits, v_p_1, elem_dtype=elem_dtype)
             _sched_barrier(0)
             softmax_helper.scale_o(v_o, rescale_e11)
@@ -930,6 +950,13 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         max_seqlen_k: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
+        philox_seed_ptr: fx.Pointer,
+        philox_offset1: fx.Pointer,
+        philox_offset2: fx.Int64,
+        philox_seed_output: fx.Pointer,
+        philox_offset_output: fx.Pointer,
+        idropout_p: fx.Int32,
+        dropout_scale: fx.Float32,
         num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
@@ -1001,6 +1028,13 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             max_seqlen_k,
             window_left,
             window_right,
+            philox_seed_ptr,
+            philox_offset1,
+            philox_offset2,
+            philox_seed_output,
+            philox_offset_output,
+            idropout_p,
+            dropout_scale,
             num_head_q,
             num_head_k,
             hdim_qk,
@@ -1057,6 +1091,12 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         varlen=None,
         num_seqlens=0,
         bias=None,
+        dropout_p=None,
+        philox_seed=None,
+        philox_offset1=None,
+        philox_offset2=0,
+        philox_seed_out=None,
+        philox_offset_out=None,
         stream=None,
     ):
         """Every kernel argument but the stream, in launch order.
@@ -1195,6 +1235,27 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         bias_t = bias if bias is not None else O
         bias_st = tuple(int(x) for x in bias.stride()[:3]) if bias is not None else (0, 0, 0)
 
+        # `abi.dropout_args` is gfx1201's: it turns the probability into the
+        # i32 threshold the raw random is compared against and the `1/(1-p)`
+        # survivor scale, both once per call rather than per element, and
+        # keeps the counter as the (pointer, immediate) pair torch splits it
+        # into so a captured graph can re-read the pointer half.
+        *_dp, _dp_keepalive = abi.dropout_args(
+            bool(traits.ENABLE_DROPOUT),
+            dropout_p,
+            philox_seed,
+            philox_offset1,
+            philox_offset2,
+            device=Q.device,
+            stream=stream,
+        )
+        if dropout_p is not None and not traits.ENABLE_DROPOUT:
+            raise ValueError("this build was not compiled for dropout; pass dropout=True in FmhaInputMetadata")
+        _dp_out = (
+            abi.ptr_arg(philox_seed_out) if philox_seed_out is not None else abi.NULL_PTR,
+            abi.ptr_arg(philox_offset_out) if philox_offset_out is not None else abi.NULL_PTR,
+        )
+
         lse_out = lse if lse is not None else O
         ws = workspace if workspace is not None else O
         bt = block_table if block_table is not None else O
@@ -1226,6 +1287,13 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             int(num_seqlens),
             *_vl[5:],  # max_seqlen_q, max_seqlen_k -- the decode's MAX fallback
             *_resolve_window_args(window),
+            _dp[0],
+            _dp[1],
+            _dp[2],
+            _dp_out[0],
+            _dp_out[1],
+            _dp[3],
+            _dp[4],
             num_head_q,
             num_head_k,
             hdim_qk,

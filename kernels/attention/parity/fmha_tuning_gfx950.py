@@ -225,6 +225,11 @@ class FmhaInputMetadata:
     # exclusive with `causal`; see `make_traits`.
     bias: bool = False
 
+    # P6. Whether this build applies a philox dropout mask to P. The rate and
+    # the seed are runtime arguments; only the decision to compile for them is
+    # here.
+    dropout: bool = False
+
 
 # ---------------------------------------------------------------------------
 # How to compute it
@@ -705,6 +710,7 @@ class Gfx950Knobs(FmhaKnobs):
             causal=meta.causal,
             window=meta.window,
             bias=meta.bias,
+            dropout=meta.dropout,
             dtype_str=meta.dtype_str,
             waves_per_eu=self.waves_per_eu,
             daz=self.daz,

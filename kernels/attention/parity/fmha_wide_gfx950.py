@@ -388,7 +388,7 @@ def make_wide_body(
             v_p = softmax_helper.exp2(v_s, 0, 16)
             v_p = softmax_helper.exp2(v_p, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p)
-            v_p = softmax_helper.cast_p(v_p)
+            v_p = softmax_helper.cast_p(v_p, j)
 
             # -- GEMM2. D is an output axis here: each (stage, shard) owns a
             #    disjoint run of O, so nothing is combined afterwards.

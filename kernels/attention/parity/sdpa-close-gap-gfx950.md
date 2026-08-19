@@ -2317,3 +2317,82 @@ Undefined rather than unimplemented, in the same words gfx1201 uses: causal is
 an attention mask with a fixed pattern and a bias *is* an attention mask
 supplied directly, so asking for both asks which wins where they disagree.
 AOTriton disables the pair; PyTorch's math backend raises on it.
+
+
+---
+
+# Outcome: P6 — dropout (philox) — DONE
+
+Philox dropout on both kernel bodies. `378 passed, 3 skipped`.
+
+## `philox.py` works on both architectures, and now says so
+
+The module was already written arch-neutral -- "no wave-size assumptions, no
+target intrinsics, no attention-specific code" -- and `test_philox.py` passes
+unmodified on gfx950. The only arch-specific thing in it is `_WIDTH_BY_ARCH`,
+where gfx950 was falling through to `_FALLBACK_WIDTH`.
+
+Measured rather than left to the fallback, with the module's own microbench:
+
+    arch     width  u32/call  G randoms/s  VGPRs
+    gfx950     32      4        1884.5       9
+    gfx950     64      8         840.6      22
+
+32-bit again, by **2.24x** per random and 13 registers -- the same answer as
+gfx1201 for the same reason, but by a visibly smaller margin (4.3x there).
+CDNA4's 64-bit expansion is the better of the two; still not competitive with a
+single `v_mul_hi_u32`. The entry is recorded even though it equals the
+fallback, because the fallback is a guess that happens to be right and this
+table is the one place a wrong value silently changes every mask the arch
+produces.
+
+## Two override points covered both bodies
+
+`cast_p` for the mask and `safe_l_inv` for the scale -- both bodies reach both.
+The column runs are **the bias ones**, unchanged: a lane's 16 scores are 16
+columns of one row in a few contiguous spans, and those spans start at
+multiples of `randoms_per_offset`, so each is a whole number of Philox calls
+with no partial draw. `_bias_column_runs` became `_score_column_runs`.
+
+**Order is the whole correctness argument.** The mask goes after `l_row` and
+before the O accumulation, which is why it hangs off `cast_p` and not `exp2`:
+the softmax denominator must be the *undropped* sum, or the result stops being
+an expectation of the undropped attention and the logsumexp the backward pass
+reads is wrong. One call earlier gives plausible output that is wrong by a
+per-row factor and no shape check notices.
+
+The survivor scale is **not** per element. `1/(1-p)` is a per-row constant, so
+it folds into the reciprocal of `l`: one multiply per output row against one
+per score.
+
+`ENABLE_DROPOUT` is a build axis, so a build without it emits no PRNG --
+64/128/256 measure 886/1091/933 TFLOP/s against 889/1092/934 before P5.
+
+## The reproducibility contract, and the test that can see it
+
+The mask must be a function of element coordinates alone, so re-tuning the tile
+geometry cannot move a single random. `grid_plane` is handed
+`max_seqlen_q`/`max_seqlen_k` and never `BLOCK_M`/`BLOCK_N`, which is what makes
+that true -- and it is invisible in any test run at one tile size.
+
+`test_dropout_mask_does_not_depend_on_the_tiling` builds the same problem with
+family A (8 waves, BLOCK_M 256) and family B (4 waves, 128), both supported,
+and requires **bit-identical** output. The no-dropout control is part of it: it
+shows the two geometries agree anyway, so a difference under dropout could only
+come from the mask.
+
+From here on this is a constraint on the tuner, not an observation.
+
+## What the other tests are for
+
+- `p = 0` is **bitwise** identical to a build without dropout.
+- The keep rate is read straight out of O rather than from a reference: with
+  `Q = K = 0` every score is equal, so the softmax is uniform and the
+  denominator is 1; with `V[..., 0] = 1` the first output column is
+  `(kept / S) / (1 - p)`. Measured within 0.02 of `1 - p` at 0.1, 0.5 and 0.9.
+- Averaging 32 seeds converges to the undropped answer within the analytic
+  standard error. This is the **only** test that would catch the `1/(1-p)`
+  scale being dropped or applied twice -- every other one passes with any
+  constant scale.
+- Dropout composes with causal, unlike bias: a positional mask says which keys
+  exist and dropout thins the ones that do, so there is nothing to reconcile.
