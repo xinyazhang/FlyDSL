@@ -1104,6 +1104,69 @@ class ParityStoreHelper(dualwave.DualwaveStoreHelper):
     def _final_o_base(self, q_row):
         return q_row * self.stride_o_seq_v + self.lane_div_32 * 8
 
+    def _store_lse_row(self, m_row, l_row, q_row):
+        """LSE addressed through `VarlenBits`, which decides three things here.
+
+        LSE is always **compact** -- it is the one tensor whose strides are not
+        a free variable but a function of the bits, the head count and the
+        token count, which is why no `lse_stride` is passed (plan section 4.2).
+        Compact is not the same as fixed, though, and the production formula
+        `q_head_idx * seq_len_v + q_row` pins all three of the things that
+        vary:
+
+        - **the token pitch.** `seq_len_v` is `max_seqlen_q`, which is right
+          for a batched layout that pads every row-group to the longest
+          sequence. A stacked Q side runs to the *batch total* instead, which
+          is what `lse_token_pitch` decoded into `lse_tokens_i32`.
+        - **the row origin.** A packed sequence starts at `q_row_off`, not 0.
+        - **the layout.** Bits 17:16 choose `_HT` -- `(H, T)`, T contiguous,
+          AOTriton's -- or `_TH`, which is Transformer Engine's. The production
+          formula is `_HT` written out, so `_TH` was silently ignored.
+
+        `fmha.lse_row_addressing` is gfx1201's and returns `(base, pitch)` so
+        the per-row part stays a multiply-add. It is called with **batch 0**
+        because the descriptor below already folds the batch in, and the two
+        must not both count it; that works for either layout because a batch's
+        rows are contiguous in both, `H * tokens` of them.
+
+        Non-varlen builds keep the production expression exactly. It is what
+        this generalizes to at `varlen_bits == 0`, `row_off == 0` and
+        `tokens == seq_len_v` -- but only as a *runtime* equality, and emitting
+        a select per store to rediscover a constant is not worth it on the path
+        every dense build takes.
+        """
+        traits = self.traits
+        if const_expr(not traits.VARLEN):
+            super()._store_lse_row(m_row, l_row, q_row)
+            return
+        tokens = fx.Index(self.lse_tokens_i32)
+        per_batch = fx.Index(traits.NUM_HEADS_Q) * tokens
+        per_batch_bytes = per_batch * fx.Index(4)
+        rsrc = dualwave._make_ws_rsrc(
+            fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))),
+            self.batch_idx * per_batch_bytes,
+            per_batch_bytes,
+        )
+        lse_val = dualwave._fadd(
+            dualwave._fmul(m_row, self.c_ln2_f, self.fm_fast),
+            dualwave.fmath.log(as_mlir_value(l_row), fastmath=self.fm_fast),
+            self.fm_fast,
+        )
+        base, pitch = fmha.lse_row_addressing(
+            self.varlen_bits_arg,
+            fx.Index(0),
+            self.q_head_idx,
+            traits.NUM_HEADS_Q,
+            tokens,
+            self.q_row_off,
+        )
+        # One writer per row: low half-wave, in-bounds row; everything else is
+        # redirected to the sentinel the buffer bound drops.
+        lse_local = base + q_row * pitch
+        off_row = (q_row < self.seqlen_q_v).select(lse_local, per_batch)
+        off = fx.Index((self.lane < fx.Index(32)).select(off_row, per_batch))
+        dualwave._ws_store_f32(lse_val, off, rsrc)
+
     def _final_o_global(self, o_base, dc, g):
         """The store's element offset, redirected out of the buffer if past `hdim_vo`.
 

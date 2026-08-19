@@ -733,6 +733,79 @@ def test_varlen_seqused_k_on_bhsd_cache(causal):
         assert _err(o[:, :, a:b], want) < TOL, f"sequence {i}"
 
 
+def _ref_lse_bottom_right(q, k, v, causal):
+    """`logsumexp` of the scaled scores, with the kernel's causal convention."""
+    sq, sk = q.shape[2], k.shape[2]
+    scores = (q.float() @ k.float().transpose(-1, -2)) * (q.shape[3] ** -0.5)
+    if causal:
+        rows = torch.arange(sq, device="cuda").view(-1, 1)
+        cols = torch.arange(sk, device="cuda").view(1, -1)
+        scores = scores.masked_fill(cols > rows + (sk - sq), float("-inf"))
+    return torch.logsumexp(scores, dim=-1)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("layout", ["HT", "TH"])
+def test_varlen_logsumexp_layouts(layout, causal):
+    """LSE under varlen: token pitch, row origin and `VarlenBits` bits 17:16.
+
+    LSE is always *compact* -- it is the one tensor whose strides are a
+    function of the bits rather than a free variable, which is why no
+    `lse_stride` is passed. Compact is not fixed, though, and the production
+    formula `q_head_idx * seq_len_v + q_row` hardcodes all three things that
+    move: the pitch is `max_seqlen_q` where a stacked side runs to the batch
+    total, the row origin is 0 where a packed sequence starts at `q_row_off`,
+    and the layout is `_HT` written out, so `_TH` was silently ignored.
+
+    `_TH` is the case that fails loudest if the bits are dropped, since it is
+    a transpose rather than an offset -- reading it back with `_HT` indexing
+    would give a different value for every element but the first.
+    """
+    import fmha_abi_gfx1201 as _abi
+
+    bits_layout = _abi.VARLEN_LSE_LAYOUT_HT if layout == "HT" else _abi.VARLEN_LSE_LAYOUT_TH
+    cu = _cumsum(_VL_Q)
+    total = cu[-1]
+    q, k, v = (_rand(1, _VL_H, total, _VL_D) for _ in range(3))
+    o = torch.empty_like(q)
+    lse = torch.zeros(_VL_H * total, device="cuda", dtype=torch.float32)
+    fn = build(
+        num_heads=_VL_H,
+        head_dim=_VL_D,
+        causal=causal,
+        dtype_str="bf16",
+        num_kv_heads=_VL_H,
+        varlen=True,
+        return_lse=True,
+    )
+    side = _abi.VARLEN_COMPACT_SIDE
+    fn(
+        q,
+        k,
+        v,
+        o,
+        1,
+        _VL_MAX,
+        seqlen_k=_VL_MAX,
+        scale=None,
+        lse=lse,
+        varlen=dict(
+            bits=_abi.varlen_bits(side, side, bits_layout),
+            max_seqlen_q=_VL_MAX,
+            max_seqlen_k=_VL_MAX,
+            seqinfo_q0=_i32(cu),
+            seqinfo_k0=_i32(cu),
+        ),
+        num_seqlens=_VL_N,
+    )
+    for i in range(_VL_N):
+        a, b = cu[i], cu[i + 1]
+        want = _ref_lse_bottom_right(q[:, :, a:b], k[:, :, a:b], v[:, :, a:b], causal)[0]
+        for h in range(_VL_H):
+            got = lse[h * total + a : h * total + b] if layout == "HT" else lse[a * _VL_H + h : b * _VL_H + h : _VL_H]
+            assert (got - want[h]).abs().max().item() < 5e-2, f"sequence {i} head {h}"
+
+
 def test_varlen_causal_defaults_to_cross_seqlen():
     """A causal varlen build must turn `cross_seqlen` on by itself.
 

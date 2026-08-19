@@ -78,7 +78,8 @@ rather than corrupting the neighbouring row.
 P0 (this ABI, runtime scale/head counts/strides, LSE), P1 (runtime
 `hdim_qk`/`hdim_vo` with `PADDED_HEAD`), P3 (generalized sliding windows --
 `window=True` plus the runtime `window_left`/`window_right` pair) and P4 (the
-five `VarlenBits` modes) are in. Bias and dropout are not; see
+five `VarlenBits` modes, including the LSE token pitch, row origin and the
+`_HT`/`_TH` layout bits) are in. Bias and dropout are not; see
 `sdpa-close-gap-gfx950.md`.
 """
 

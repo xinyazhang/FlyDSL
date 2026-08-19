@@ -2219,9 +2219,41 @@ every dense test here satisfies and no varlen test does. Two modes looked
 broken until the reference grew an explicit `col <= row + (Sk - Sq)` mask;
 `_sdpa_bottom_right` now spells it out.
 
+## LSE: compact, but not fixed
+
+Worth stating carefully, because "compact" invites the wrong conclusion. LSE is
+the one tensor whose strides are *not* a free variable -- they are a function
+of `VarlenBits`, the head count and the token count, which is why no
+`lse_stride` is passed (plan section 4.2). That does not make the address
+constant, and the production formula
+
+    lse_local = q_head_idx * seq_len_v + q_row
+
+pins all three things that move under varlen:
+
+- **the token pitch.** `seq_len_v` is `max_seqlen_q`, right for a batched
+  layout that pads each row-group to the longest sequence. A stacked Q side
+  runs to the *batch total*, which is what `lse_token_pitch` computes.
+- **the row origin.** A packed sequence starts at `q_row_off`, not 0.
+- **the layout.** Bits 17:16 select `_HT` -- `(H, T)`, AOTriton's -- or `_TH`,
+  Transformer Engine's. The formula above *is* `_HT`, so `_TH` was silently
+  ignored rather than rejected.
+
+`fmha.lse_row_addressing` returns `(base, pitch)` and covers all three. It is
+called with **batch 0** because the descriptor already folds the batch in, and
+both counting it would double it; that works for either layout because a
+batch's rows are contiguous in both, `H * tokens` of them.
+
+Non-varlen builds keep the production expression exactly. The general form
+reduces to it at `varlen_bits == 0`, but only as a *runtime* equality, and
+emitting a select per store to rediscover a constant is not worth it on the
+path every dense build takes.
+
+`_TH` is the arm that fails loudest if the bits are dropped -- it is a
+transpose rather than an offset, so reading it back with `_HT` indexing
+disagrees on every element but the first. Both layouts are tested in both
+masking modes.
+
 ## Not done
 
-- **LSE under varlen.** `lse_token_pitch` is decoded and stored as
-  `lse_tokens_i32`, but the store still uses the dense row formula, so
-  `return_lse` with a packed layout is untested and unclaimed.
 - **Split-K + varlen** is rejected upstream of this work already.
