@@ -407,6 +407,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         K: fx.Pointer,
         V: fx.Pointer,
         DO: fx.Pointer,
+        Bias: fx.Pointer,
         DK: fx.Pointer,
         DV: fx.Pointer,
         L: fx.Pointer,
@@ -449,11 +450,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         stride_dv_batch: fx.Int64,
         stride_dv_head: fx.Int64,
         stride_dv_seq: fx.Int64,
-        sm_scale_arg: fx.Float32,
-        Bias: fx.Pointer,
         stride_b0: fx.Int64,
         stride_b1: fx.Int64,
         stride_b2: fx.Int64,
+        sm_scale_arg: fx.Float32,
     ):
         elem_type = elem_numeric_cls.ir_type
         elem_dtype = elem_numeric_cls
@@ -1158,6 +1158,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         K: fx.Pointer,
         V: fx.Pointer,
         DO: fx.Pointer,
+        Bias: fx.Pointer,
         DK: fx.Pointer,
         DV: fx.Pointer,
         L: fx.Pointer,
@@ -1200,11 +1201,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         stride_dv_batch: fx.Int64,
         stride_dv_head: fx.Int64,
         stride_dv_seq: fx.Int64,
-        sm_scale_arg: fx.Float32,
-        Bias: fx.Pointer,
         stride_b0: fx.Int64,
         stride_b1: fx.Int64,
         stride_b2: fx.Int64,
+        sm_scale_arg: fx.Float32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -1220,6 +1220,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             K,
             V,
             DO,
+            Bias,
             DK,
             DV,
             L,
@@ -1262,11 +1263,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             stride_dv_batch,
             stride_dv_head,
             stride_dv_seq,
-            sm_scale_arg,
-            Bias,
             stride_b0,
             stride_b1,
             stride_b2,
+            sm_scale_arg,
         )
 
         if const_expr(WAVES_PER_EU is not None):
@@ -1355,7 +1355,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         abi.run_compiled(
             _COMPILED,
             launch_bwd_dkdv,
-            *ptrs,
+            # `ptrs` is (Q, K, V, DO, DK, DV); Bias joins the inputs.
+            *ptrs[:4],
+            _bp,
+            *ptrs[4:],
             _lp,
             _dp,
             _sq0,
@@ -1376,11 +1379,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             _dsc,
             *meta_t,
             *st,
-            abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
-            _bp,
             _sb0,
             _sb1,
             _sb2,
+            abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
             stream if stream is not None else fx.Stream(None),
         )
 

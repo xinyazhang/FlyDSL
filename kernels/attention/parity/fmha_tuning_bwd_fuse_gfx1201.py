@@ -111,6 +111,20 @@ class BwdInputMetadata:
     dropout: bool = False
     philox_width: int | None = None
 
+    # Attention bias. **Rejected rather than ignored**, and not yet supported
+    # here even though the two standalone kernels now take one.
+    #
+    # The forward folds the bias into the score *and* into the logsumexp it
+    # stores, and this kernel recomputes P from that logsumexp -- so without
+    # the bias term every gradient it produces is wrong by `exp(-bias)`,
+    # silently. Carrying the flag is what lets `plan` say so.
+    #
+    # Supporting it means the add at *both* P sites, and they want different
+    # loads: the dQ half walks KV tiles for a fixed Q block, so eight adjacent
+    # columns are one v8, while the dK/dV half holds one kv column and eight q
+    # rows and needs eight strided scalars. See the two standalone kernels.
+    bias: bool = False
+
 
 @dataclass(frozen=True)
 class BwdKnobs:
@@ -262,6 +276,14 @@ def plan(request: BwdInputMetadata, overrides: BwdKnobs | None = None) -> BwdPla
     rather than assertions inside the traced kernel where the message would
     arrive without the knobs that caused it.
     """
+    if request.bias:
+        raise ValueError(
+            "attention bias is not supported by the fused backward kernel. The forward "
+            "folds the bias into both the score and the logsumexp it stores, and this "
+            "kernel recomputes P from that logsumexp without it, so every gradient "
+            "would be wrong by exp(-bias). Use the standalone dQ and dK/dV kernels, "
+            "which do take a bias -- and which is also where dB comes from."
+        )
     if request.head_dim < 1:
         raise ValueError(f"head_dim must be positive, got {request.head_dim}")
     if request.num_head_k < 1 or request.num_head_q % request.num_head_k:

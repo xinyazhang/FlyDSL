@@ -405,7 +405,9 @@ def build_bwd_dq_module_primary(meta, knobs):
         K: fx.Pointer,
         V: fx.Pointer,
         DO: fx.Pointer,
+        Bias: fx.Pointer,
         DQ: fx.Pointer,
+        DB: fx.Pointer,
         L: fx.Pointer,
         Delta: fx.Pointer,
         seqinfo_q0: fx.Pointer,
@@ -443,12 +445,10 @@ def build_bwd_dq_module_primary(meta, knobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
-        sm_scale_arg: fx.Float32,
-        Bias: fx.Pointer,
-        DB: fx.Pointer,
         stride_b0: fx.Int64,
         stride_b1: fx.Int64,
         stride_b2: fx.Int64,
+        sm_scale_arg: fx.Float32,
     ):
         elem_type = elem_numeric_cls.ir_type
         elem_dtype = elem_numeric_cls
@@ -1193,7 +1193,9 @@ def build_bwd_dq_module_primary(meta, knobs):
         K: fx.Pointer,
         V: fx.Pointer,
         DO: fx.Pointer,
+        Bias: fx.Pointer,
         DQ: fx.Pointer,
+        DB: fx.Pointer,
         L: fx.Pointer,
         Delta: fx.Pointer,
         seqinfo_q0: fx.Pointer,
@@ -1231,12 +1233,10 @@ def build_bwd_dq_module_primary(meta, knobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
-        sm_scale_arg: fx.Float32,
-        Bias: fx.Pointer,
-        DB: fx.Pointer,
         stride_b0: fx.Int64,
         stride_b1: fx.Int64,
         stride_b2: fx.Int64,
+        sm_scale_arg: fx.Float32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -1252,7 +1252,9 @@ def build_bwd_dq_module_primary(meta, knobs):
             K,
             V,
             DO,
+            Bias,
             DQ,
+            DB,
             L,
             Delta,
             seqinfo_q0,
@@ -1290,12 +1292,10 @@ def build_bwd_dq_module_primary(meta, knobs):
             stride_dq_batch,
             stride_dq_head,
             stride_dq_seq,
-            sm_scale_arg,
-            Bias,
-            DB,
             stride_b0,
             stride_b1,
             stride_b2,
+            sm_scale_arg,
         )
 
         if const_expr(WAVES_PER_EU is not None):
@@ -1397,8 +1397,14 @@ def build_bwd_dq_module_primary(meta, knobs):
             False, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
         )
         _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(ENABLE_DROPOUT, dropout_p, seed, off1, off2, Q.device)
+        _bp, _dbp, _sb0, _sb1, _sb2 = abi.bias_args(BIAS_TYPE, WITH_DB, bias, dbias, Q)
         return (
-            *ptrs,
+            # `ptrs` is (Q, K, V, DO, DQ); Bias goes in front of DQ and DB
+            # behind it, so the pointer block stays inputs-then-outputs.
+            *ptrs[:4],
+            _bp,
+            ptrs[4],
+            _dbp,
             _lp,
             _dp,
             _sq0,
@@ -1419,8 +1425,10 @@ def build_bwd_dq_module_primary(meta, knobs):
             _dsc,
             *meta_t,
             *st,
+            _sb0,
+            _sb1,
+            _sb2,
             abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
-            *abi.bias_args(BIAS_TYPE, WITH_DB, bias, dbias, Q),
         )
 
     def _launch(
