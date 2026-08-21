@@ -319,6 +319,16 @@ head_dim 96 is a normal rung again.
   every line under it and fails 168 tests in 72 seconds with no coherent error.
   It looks exactly like a catastrophic regression. Two clean reruns said 259
   passed. Let the run finish, or edit a copy.
+- **Do not hand-roll an LDS scaffold for a probe.** A minimal `@flyc.kernel`
+  that does `fx.SharedAllocator().allocate(struct).peek()`, writes a bf16
+  tensor into the array, barriers and reads back **segfaults the compiler** --
+  exit 139, no diagnostic, before reaching any interesting instruction. It is
+  not the transpose read, not `fx.Int16` (bf16 does it too) and not the `gpu`
+  accessor; all three were bisected out and it still crashes. The working
+  pattern is the one `tooling/probe_kv_staging.py` uses: build a real
+  `ParityKernelContext` and let `init_lds` do the allocation. Copy that harness
+  rather than starting from `SharedAllocator`, and a probe costs an hour
+  instead of an afternoon.
 - **Check `agpr_count` alongside spills.** On this kernel the allocator either
   uses the AGPR file for the O accumulator or abandons it entirely and spills
   to scratch, and the difference is 1.4-1.6x. Four waves keeps it; eight loses
