@@ -309,6 +309,11 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
     ENABLE_DROPOUT = bool(dropout)
     PHILOX = Philox.for_arch() if philox_width is None else Philox(width=philox_width)
 
+    # Attention bias. An input only -- dB is the dQ kernel's, for the layout
+    # reason `BwdDkDvMetadata.bias` records.
+    BIAS_TYPE = 1 if meta.bias else 0
+    assert not (BIAS_TYPE and CAUSAL), "bias and causal are mutually exclusive, as in the forward"
+
     NUM_HEADS = num_heads  # noqa: F841  (kept for parity with the forward's metadata)
 
     fastmath = fmha.FastMath(FP_MODE)
@@ -445,6 +450,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         stride_dv_head: fx.Int64,
         stride_dv_seq: fx.Int64,
         sm_scale_arg: fx.Float32,
+        Bias: fx.Pointer,
+        stride_b0: fx.Int64,
+        stride_b1: fx.Int64,
+        stride_b2: fx.Int64,
     ):
         elem_type = elem_numeric_cls.ir_type
         elem_dtype = elem_numeric_cls
@@ -459,6 +468,8 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         v_ptr = fmha.pointer_to_llvm_ptr(V)
         do_ptr = fmha.pointer_to_llvm_ptr(DO)
         do_ptr_i64 = _to_global_ptr_i64(DO)
+        if const_expr(BIAS_TYPE):
+            bias_ptr = fmha.pointer_to_llvm_ptr(Bias)
         dk_ptr = fmha.pointer_to_llvm_ptr(DK)
         dv_ptr = fmha.pointer_to_llvm_ptr(DV)
         l_ptr = fmha.pointer_to_llvm_ptr(L)
@@ -560,6 +571,18 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
 
         def store_global_v8f16(base_ptr, base64, off32, val):
             _pointer_store(val, fmha.split_ptr(base_ptr, base64, off32, elem_type))
+
+        def load_global_f16(base_ptr, off64):
+            """One bias element.
+
+            Scalar, and unavoidably so: this kernel runs the loop transposed,
+            so a lane holds one kv column and eight q *rows*, and those eight
+            bias entries are `stride_b2` apart rather than adjacent. The dQ
+            kernel, walking the other axis, gets all eight in one v8. It is the
+            same layout cost the dropout path here already pays, and the reason
+            dB is emitted from dQ rather than from this kernel.
+            """
+            return _pointer_load(elem_type, buffer_ops.get_element_ptr(base_ptr, fx.Int64(off64), elem_type=elem_type))
 
         def load_global_f32(base_ptr, off64):
             """One f32 from a compact rank-2 tensor (logsumexp or delta).
@@ -819,6 +842,11 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             _addr_kw_q = dict(seqlen_k=seqlen_q_v, seq_last=q_seq_last, hoist=ADDR_HOIST, clamp=True)
             _, _, q_addr = fmha.make_addr_pair(q_st, head_q, _q_batch_v, _q_row_off_v, **_addr_kw_q)
             _, _, do_addr = fmha.make_addr_pair(do_st, head_q, _q_batch_v, _q_row_off_v, **_addr_kw_q)
+            if const_expr(BIAS_TYPE):
+                # Rebuilt per iteration because `head_q` moves with the GQA
+                # fold, exactly as the Q/dO addressing above is. Uniform
+                # scalars, so this is SGPR arithmetic.
+                _b_head = _q_batch_v * fx.Index(stride_b0) + head_q * fx.Index(stride_b1)
 
             _fetch_q = fmha.reader(q_addr, lambda b, o: load_global_f16xN(q_ptr, b, o))(_q_row_start)
             _fetch_do = fmha.reader(do_addr, lambda b, o: load_global_f16xN(do_ptr, b, o))(_q_row_start)
@@ -981,6 +1009,18 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                     else:
                         _sv = fx.Float32(Vec(s_acc)[si])
                     _s = fastmath.mul(_sv, sm_log2e)
+                    if const_expr(BIAS_TYPE):
+                        # After the scale and before the mask, as in the
+                        # forward, so the log2(e) factor applies here too.
+                        # Both indices are clamped: a dead row or column still
+                        # issues the load, and `_dead` below is what removes
+                        # its contribution -- the same contract the Q/dO
+                        # staging has with its clamped rows.
+                        _bq = fx.Index(_q_row_i32) if _q_ok else fx.Index(0)
+                        _bk = kv_row_abs if (kv_row_abs_i32 < seqlen_k_i32) else fx.Index(0)
+                        _boff = _b_head + (_q_row_off_v + _bq) * fx.Index(stride_b2) + _bk
+                        _bv = fx.Float32(fx.as_dsl_value(load_global_f16(bias_ptr, _boff)).to(fx.Float32))
+                        _s = fastmath.add(_s, fastmath.mul(_bv, fx.Float32(_LOG2E)))
                     _e = fastmath.sub(_s, fastmath.mul(fx.Float32(_lse), fx.Float32(_LOG2E)))
                     _p = rocdl.exp2(f32_ty, fx.as_ir_value(_e))
 
@@ -1161,6 +1201,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         stride_dv_head: fx.Int64,
         stride_dv_seq: fx.Int64,
         sm_scale_arg: fx.Float32,
+        Bias: fx.Pointer,
+        stride_b0: fx.Int64,
+        stride_b1: fx.Int64,
+        stride_b2: fx.Int64,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -1219,6 +1263,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             stride_dv_head,
             stride_dv_seq,
             sm_scale_arg,
+            Bias,
+            stride_b0,
+            stride_b1,
+            stride_b2,
         )
 
         if const_expr(WAVES_PER_EU is not None):
@@ -1284,6 +1332,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         philox_seed=0,
         philox_offset1=None,
         philox_offset2=0,
+        bias=None,
     ):
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta_t, st = abi.prep_tensors(
@@ -1300,6 +1349,9 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(
             ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset1, philox_offset2, Q.device, stream
         )
+        # `with_db=False`: dB is the dQ kernel's, so the DB slot is discarded
+        # rather than being a kernarg this kernel does not have.
+        _bp, _, _sb0, _sb1, _sb2 = abi.bias_args(BIAS_TYPE, False, bias, None, Q)
         abi.run_compiled(
             _COMPILED,
             launch_bwd_dkdv,
@@ -1325,6 +1377,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             *meta_t,
             *st,
             abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
+            _bp,
+            _sb0,
+            _sb1,
+            _sb2,
             stream if stream is not None else fx.Stream(None),
         )
 

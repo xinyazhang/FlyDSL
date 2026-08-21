@@ -408,15 +408,17 @@ class BwdDkDvMetadata:
     causal_type: int | None = None
     dropout: bool = False
     philox_width: int | None = None
-    # Attention bias, matching the forward's `BIAS_TYPE`. **Not yet supported
-    # here, and rejected rather than ignored.**
+    # Attention bias, matching the forward's `BIAS_TYPE`: a (B, H, Sq, Sk)
+    # matrix added to the scores after the scale and before the mask.
     #
-    # The forward folds the bias into the score *and* into the logsumexp it
-    # stores, while this kernel recomputes `P = exp(sm_scale*QK^T - lse)` from
-    # that logsumexp. Without the bias term the recomputed P is off by
-    # `exp(-bias)`, so dQ, dK and dV are all wrong -- silently, since nothing
-    # about the inputs looks unusual. Carrying the flag is what lets `plan`
-    # say so instead.
+    # An input only. The forward folds the bias into the score *and* into the
+    # logsumexp it stores, and this kernel recomputes `P` from that logsumexp,
+    # so without the bias term dK and dV are wrong by `exp(-bias)`.
+    #
+    # **dB is not emitted here.** It is `dS`, which this kernel also has, but
+    # it walks Q tiles for a fixed KV block -- so its eight elements are eight
+    # q *rows* at one kv column and the store would go down a dB column. The
+    # dQ kernel writes it along a row instead; see `return_dbias` there.
     bias: bool = False
 
 
@@ -543,13 +545,11 @@ def plan(request: BwdDkDvMetadata, overrides: BwdDkDvKnobs | None = None) -> Bwd
     records whether the two differ -- exactly as `fmha_tuning_gfx1201.plan`
     does, so the two passes round a given head_dim the same way.
     """
-    if request.bias:
+    if request.bias and (request.causal or request.causal_type):
         raise ValueError(
-            "attention bias is not supported by the backward kernels yet. The forward "
-            "folds the bias into both the score and the logsumexp it stores, and this "
-            "kernel recomputes P from that logsumexp without it -- so dQ, dK and dV "
-            "would all be wrong by a factor exp(-bias), silently. Rejected rather than "
-            "computed. dB is not emitted either."
+            "bias and causal masking are mutually exclusive, as in the forward: a bias "
+            "already is an additive mask, so the pair has no defined meaning. Fold the "
+            "causal pattern into the bias tensor, or drop the bias"
         )
     head_dim = request.head_dim
     if head_dim < 1 or head_dim > MAX_HEAD_DIM:

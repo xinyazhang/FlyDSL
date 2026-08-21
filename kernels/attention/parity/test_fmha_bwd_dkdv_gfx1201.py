@@ -714,3 +714,105 @@ def test_lds_budget_is_enforced():
 
     with pytest.raises(ValueError, match="LDS"):
         resolve_knobs(BwdDkDvMetadata(num_heads=2, head_dim=256), BwdDkDvKnobs(block_m=256))
+
+
+# --------------------------------------------------------------------------
+# Attention bias
+#
+# An input only: dB is emitted by the dQ kernel, because that one walks KV
+# tiles for a fixed Q block and so writes along a dB row, where this kernel
+# would write down a column. What matters here is that dK and dV are *correct*
+# under a bias -- the forward folds the bias into the logsumexp this kernel
+# recomputes P from, so a build without the bias term is wrong by exp(-bias).
+# --------------------------------------------------------------------------
+
+
+def _bias_ref(q, k, v, do, bias):
+    qf, kf, vf = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    bf = bias.detach().float().requires_grad_(True)
+    sm = 1.0 / (q.shape[3] ** 0.5)
+    s = (qf @ kf.transpose(-1, -2)) * sm + bf
+    o = torch.softmax(s, -1) @ vf
+    o.backward(do.float())
+    return (
+        o.detach(),
+        torch.logsumexp(s, -1).detach(),
+        (do.float() * o.detach()).sum(-1),
+        kf.grad.detach(),
+        vf.grad.detach(),
+    )
+
+
+def _bias_dkdv(q, k, v, do, bias):
+    batch, heads, seq, head_dim = q.shape
+    _, lse, delta, _, _ = _bias_ref(q, k, v, do, bias)
+    _plan = bwd_plan(
+        BwdDkDvMetadata(
+            num_heads=heads,
+            head_dim=head_dim,
+            causal=False,
+            dtype_str="bf16" if q.dtype == torch.bfloat16 else "f16",
+            bias=True,
+        )
+    )
+    exe = build_bwd_dkdv_module(_plan.meta, _plan.knobs)
+    pitch = (head_dim + 7) // 8 * 8
+    dk = torch.zeros(batch, heads, seq, pitch, dtype=q.dtype, device=q.device)[..., :head_dim]
+    dv = torch.zeros_like(dk)
+    exe(
+        q,
+        k,
+        v,
+        do,
+        dk,
+        dv,
+        lse.reshape(batch * heads, seq).contiguous(),
+        delta.reshape(batch * heads, seq).contiguous(),
+        batch,
+        seq,
+        seqlen_k=seq,
+        bias=bias,
+    )
+    return dk, dv
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_bias_dkdv_matches_autograd(head_dim):
+    _require_env()
+    q, k, v, do = _case(1, 2, 2, 128, 128, head_dim)
+    gen = torch.Generator(device=q.device).manual_seed(5)
+    bias = torch.randn(1, 2, 128, 128, dtype=q.dtype, device=q.device, generator=gen)
+    _, _, _, dk_ref, dv_ref = _bias_ref(q, k, v, do, bias)
+    dk, dv = _bias_dkdv(q, k, v, do, bias)
+    assert _rel(dk, dk_ref) < _tol(q.dtype), f"dK rel={_rel(dk, dk_ref):.3e}"
+    assert _rel(dv, dv_ref) < _tol(q.dtype), f"dV rel={_rel(dv, dv_ref):.3e}"
+
+
+def test_zero_bias_matches_no_bias_dkdv():
+    """The check whose absence let the missing-bias bug live here too."""
+    _require_env()
+    q, k, v, do = _case(1, 2, 2, 128, 128, 64)
+    zeros = torch.zeros(1, 2, 128, 128, dtype=q.dtype, device=q.device)
+    o, lse, delta, _, _ = _bias_ref(q, k, v, do, zeros)
+    dk_p, dv_p = _bwd_via_kernel(q, k, v, do, o.half(), lse, delta, 0, None)
+    dk_b, dv_b = _bias_dkdv(q, k, v, do, zeros)
+    assert _rel(dk_b, dk_p.float()) < 1e-3, f"a zero bias moved dK by {_rel(dk_b, dk_p.float()):.3e}"
+    assert _rel(dv_b, dv_p.float()) < 1e-3, f"a zero bias moved dV by {_rel(dv_b, dv_p.float()):.3e}"
+
+
+def test_nonzero_bias_actually_changes_dkdv():
+    _require_env()
+    q, k, v, do = _case(1, 2, 2, 128, 128, 64)
+    gen = torch.Generator(device=q.device).manual_seed(13)
+    bias = torch.randn(1, 2, 128, 128, dtype=q.dtype, device=q.device, generator=gen)
+    dk_b, _ = _bias_dkdv(q, k, v, do, bias)
+    dk_z, _ = _bias_dkdv(q, k, v, do, torch.zeros_like(bias))
+    assert _rel(dk_b, dk_z.float()) > 1e-2
+
+
+def test_bias_and_causal_are_rejected_together_dkdv():
+    from fmha_tuning_bwd_dkdv_gfx1201 import BwdDkDvMetadata
+    from fmha_tuning_bwd_dkdv_gfx1201 import plan as _plan
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _plan(BwdDkDvMetadata(num_heads=2, head_dim=64, causal=True, bias=True))
