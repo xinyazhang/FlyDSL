@@ -680,7 +680,7 @@ Vectorising is available in principle (a lane's 16 scores are four runs of four
 contiguous columns) and is not correct in general: a run straddling `seqlen_k`
 would have to be partially written and a multi-dword store is all-or-nothing,
 so a vectorised version needs a second runtime arm for the tail tile *and* a
-`stride_db_seq` divisible by 4 (an 8-byte store off a row pitch of 201 elements
+`stride_db_seq_q` divisible by 4 (an 8-byte store off a row pitch of 201 elements
 is 2-byte aligned).
 
 It costs **4-5x** when enabled, at `B=2 H=8 S=2048`: 55 → 271 us at head_dim 64,
@@ -1192,7 +1192,7 @@ the next thing to measure if dB's cost at 384/512 matters.
   with dB on. The two levers are streaming the A operands (384) and
   `QK_SHARDS` (512), in that order.
 - **`dB`'s store is still per element** -- 32 per lane per KV tile. Vectorising
-  needs a runtime tail arm and a 4-divisible `stride_db_seq`; it would help the
+  needs a runtime tail arm and a 4-divisible `stride_db_seq_q`; it would help the
   narrow rungs most, where the cost ratio is worst.
 - **No pipelining, one tile in flight.** At 128 the body reaches 732 TF against
   the forward's ~1018 on the same board for two GEMMs; whether a dual-wave

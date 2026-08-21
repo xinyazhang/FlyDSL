@@ -397,7 +397,16 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         # P5. The bias matrix and its (batch, head, seqlen_q) strides. Slot 3
         # is the KV axis and is contractually contiguous, so it is not passed.
         self.Bias = Bias
-        self.stride_b_batch, self.stride_b_head, self.stride_b_seq = bias_strides
+        # `_seq_q`, not `_seq`. Bias is the one rank-4 tensor here with **two**
+        # sequence axes, `(batch, head, seqlen_q, seqlen_k)`, so a bare `_seq`
+        # does not say which -- and the k axis is contiguous by contract and
+        # therefore never passed, which makes the ambiguity easy to miss rather
+        # than obviously wrong. Not `_seqq`: the doubled letter reads as a typo
+        # and is skipped. Not `_seq0`: a numeric slot is exactly what the P7
+        # stride rename removed, on the grounds that nothing at runtime
+        # distinguishes one stride from another and spelling the axis out is
+        # the only check there is.
+        self.stride_b_batch, self.stride_b_head, self.stride_b_seq_q = bias_strides
         # P6. The counter is the (pointer, immediate) pair torch splits it
         # into, not one pre-summed scalar: a captured graph re-reads the
         # pointer half. The two `*_output` slots report back what was actually
@@ -754,7 +763,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
             # Same slab shape as Q, which is the point: bias is indexed by
             # (batch, head, q_row, kv_col), so the varlen row origin and the
             # head fold into the base exactly as Q's do, and what remains per
-            # access is `q_row * stride_b_seq + col`.
+            # access is `q_row * stride_b_seq_q + col`.
             #
             # A raw resource rather than a `_slab_view`: the reads here are
             # per-lane vectors of 4 or 8 elements at an address the lane
@@ -764,7 +773,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
             # The bound is the slab, so a row past `seqlen_q` reads zero
             # instead of faulting -- which is also the right bias for a padded
             # row -- and so does a column that runs off the last row's end.
-            _bias_span = self.seqlen_q_v * fx.Index(self.stride_b_seq)
+            _bias_span = self.seqlen_q_v * fx.Index(self.stride_b_seq_q)
             self.bias_rsrc = buffer_ops.create_buffer_resource(
                 self.Bias,
                 max_size=False,
@@ -773,7 +782,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
                     self._slab_byte_base(
                         self.stride_b_batch,
                         self.stride_b_head,
-                        self.stride_b_seq,
+                        self.stride_b_seq_q,
                         self.q_row_off,
                         self.q_head_idx,
                     )
@@ -1129,7 +1138,7 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
         lane_n_off = 8 if traits.KV_VECTORIZED else 4
         # The row is this lane's, and the descriptor already holds (batch,
         # head, row origin), so what is left is `row * pitch + column`.
-        row_base = ctx.q_row * fx.Index(ctx.stride_b_seq)
+        row_base = ctx.q_row * fx.Index(ctx.stride_b_seq_q)
         col_base = fx.Index(tile_idx * traits.BLOCK_N) + self.lane_div_32 * fx.Index(lane_n_off)
         log2e = fx.Float32(1.4426950408889634)
         # **Not `fm_fast` here.** `fm_fast` is MLIR's `fast`, which carries

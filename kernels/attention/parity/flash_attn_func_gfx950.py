@@ -268,7 +268,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         stride_o_seq: fx.Int64,
         stride_b_batch: fx.Int64,
         stride_b_head: fx.Int64,
-        stride_b_seq: fx.Int64,
+        stride_b_seq_q: fx.Int64,
         block_table_stride: fx.Int32,
     ):
         ctx = (WideKernelContext if WIDE else ParityKernelContext)(
@@ -308,7 +308,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             CuSeqKv=Q,
             BlockTable=BlockTable,
             Bias=Bias,
-            bias_strides=(stride_b_batch, stride_b_head, stride_b_seq),
+            bias_strides=(stride_b_batch, stride_b_head, stride_b_seq_q),
             philox=(philox_seed_ptr, philox_offset1, philox_offset2, philox_seed_output, philox_offset_output),
             idropout_p=idropout_p,
             dropout_scale=dropout_scale,
@@ -976,7 +976,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         stride_o_seq: fx.Int64,
         stride_b_batch: fx.Int64,
         stride_b_head: fx.Int64,
-        stride_b_seq: fx.Int64,
+        stride_b_seq_q: fx.Int64,
         block_table_stride: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -1054,7 +1054,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             stride_o_seq,
             stride_b_batch,
             stride_b_head,
-            stride_b_seq,
+            stride_b_seq_q,
             block_table_stride,
             value_attrs={
                 "rocdl.waves_per_eu": traits.WAVES_PER_EU,

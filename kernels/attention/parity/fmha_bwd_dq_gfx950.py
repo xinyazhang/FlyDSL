@@ -213,7 +213,10 @@ class BwdDqKernelContext(ParityKernelContext):
     def __init__(self, traits, *, do_strides, db_strides=(0, 0, 0), DO=None, DB=None, Delta=None, **kwargs):
         super().__init__(traits, **kwargs)
         self.stride_do_batch, self.stride_do_head, self.stride_do_seq = do_strides
-        self.stride_db_batch, self.stride_db_head, self.stride_db_seq = db_strides
+        # `_seq_q` for the reason `ParityKernelContext` gives for the bias
+        # input's: dB is `(batch, head, seqlen_q, seqlen_k)` and a bare `_seq`
+        # does not say which of the two it is.
+        self.stride_db_batch, self.stride_db_head, self.stride_db_seq_q = db_strides
         self.DO = DO
         self.DB = DB
         self.Delta = Delta
@@ -249,7 +252,7 @@ class BwdDqKernelContext(ParityKernelContext):
             # contiguous -- and a raw resource for the same reason: the stores
             # are per-lane at an address the lane computes, which is
             # `buffer_ops.buffer_store`'s shape and not the copy atom's.
-            db_span = self.seqlen_q_v * fx.Index(self.stride_db_seq)
+            db_span = self.seqlen_q_v * fx.Index(self.stride_db_seq_q)
             # First element past the descriptor. A store redirected here is
             # dropped by the hardware bound; see `BwdDbStoreHelper`.
             self.db_oob_off = db_span
@@ -261,7 +264,7 @@ class BwdDqKernelContext(ParityKernelContext):
                     self._slab_byte_base(
                         self.stride_db_batch,
                         self.stride_db_head,
-                        self.stride_db_seq,
+                        self.stride_db_seq_q,
                         self.q_row_off,
                         self.q_head_idx,
                     )
@@ -557,7 +560,7 @@ class BwdDbStoreHelper(ParityStoreHelper):
     numbers and the register accounting are in the B3 outcome section of
     `sdpa-bwd-plan-gfx950.md`. A vectorised version needs *two* things and not
     one: a runtime second arm for the tile containing `seqlen_k`, and a
-    `stride_db_seq` divisible by 4, since an 8-byte store off a row pitch of,
+    `stride_db_seq_q` divisible by 4, since an 8-byte store off a row pitch of,
     say, 201 elements is 2-byte aligned.
 
     --- The source is the packed bf16, not the f32 -----------------------------
@@ -580,7 +583,7 @@ class BwdDbStoreHelper(ParityStoreHelper):
         traits = self.traits
         ctx = self.ctx_ref
         lo_packs, hi_packs = ds_packs
-        row_base = q_row * fx.Index(ctx.stride_db_seq)
+        row_base = q_row * fx.Index(ctx.stride_db_seq_q)
         col_base = dualwave._seq_pad_col_base(traits, tile_idx, lane_div_32=self.lane_div_32)
         in_row = q_row < self.seqlen_q_v
         for half, packs in ((0, lo_packs), (1, hi_packs)):
@@ -684,7 +687,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         stride_dq_seq: fx.Int64,
         stride_db_batch: fx.Int64,
         stride_db_head: fx.Int64,
-        stride_db_seq: fx.Int64,
+        stride_db_seq_q: fx.Int64,
     ):
         ctx = BwdDqKernelContext(
             traits,
@@ -705,7 +708,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
                 stride_dq_seq,
             ),
             do_strides=(stride_do_batch, stride_do_head, stride_do_seq),
-            db_strides=(stride_db_batch, stride_db_head, stride_db_seq),
+            db_strides=(stride_db_batch, stride_db_head, stride_db_seq_q),
             sm_scale=sm_scale,
             num_head_q=num_head_q,
             num_head_k=num_head_k,
@@ -935,7 +938,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         stride_dq_seq: fx.Int64,
         stride_db_batch: fx.Int64,
         stride_db_head: fx.Int64,
-        stride_db_seq: fx.Int64,
+        stride_db_seq_q: fx.Int64,
         stream: fx.Stream = fx.Stream(None),
     ):
         # Make the build configuration visible to the JIT cache key.
@@ -1002,7 +1005,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             stride_dq_seq,
             stride_db_batch,
             stride_db_head,
-            stride_db_seq,
+            stride_db_seq_q,
             value_attrs={
                 "rocdl.waves_per_eu": traits.WAVES_PER_EU,
                 "rocdl.flat_work_group_size": f"{traits.BLOCK_SIZE},{traits.BLOCK_SIZE}",
