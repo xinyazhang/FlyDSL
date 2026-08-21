@@ -9,9 +9,12 @@ surface the forward now has.
 The gfx1201 backward already exists and is thoroughly documented
 (`fmha_bwd_dkdv_gfx1201_kernel.py`, `fmha_bwd_dq_gfx1201_kernel.py`,
 `fmha_bwd_fuse_gfx1201_kernel.py`, ~4000 lines with three tuning modules and
-2100 lines of tests). **It is the specification, not the implementation.** The
-forward work established that features port across architectures and schedules
-do not; the same split applies here, and the sections below say which is which.
+2100 lines of tests). **It is the specification, not the implementation** —
+and only the first two are being ported; §4 says why the fused one is not.
+
+The forward work established that features port across architectures and
+schedules do not; the same split applies here, and the sections below say which
+is which.
 
 ---
 
@@ -159,22 +162,36 @@ That reasoning is arch-independent and should be reused.
 
 ---
 
-## 4. Do not fuse, at least not first
+## 4. No fused kernel, and this is a scope decision rather than a deferral
 
-gfx1201 has a fused kernel and measured what it costs. Two program roles are
-selected by `block_idx.x`; the dK/dV role needs 52480 B of LDS and the dQ role
-13568 B, and **a workgroup's LDS allocation is static, so the binary reserves
-the larger for both** — the dQ programs run at a quarter of the occupancy a
-split kernel gives them. The fusion buys one dispatch.
+**Two kernels: dK/dV and dQ. There is no gfx950 fused variant in this plan,
+and none is planned after it.** `fmha_bwd_fuse_gfx1201_kernel.py` is not being
+ported.
 
-On gfx950 the same trade is worse, because LDS is 160 KB and the dual-wave body
-already spends most of it on two KV tiles in flight. Ship **two kernels**.
-Revisit fusion only if dispatch overhead shows up in a profile, and then with
-the occupancy cost measured rather than assumed.
+The reason is what fusion is *for*. Its whole return is saving one dispatch,
+which only registers when the dispatch is a visible fraction of the work —
+small batches, short sequences, decode-shaped problems. That regime is already
+served: **AOTriton's Triton `bwd_kernel_fuse` covers it acceptably**, and at
+those sizes the gap to hand-tuned assembly is not what decides anything. Where
+this stack earns its keep is the large workloads, and there the dispatch is
+noise and the split kernels win on their own terms.
+
+The cost side supports it. gfx1201 measured the fused kernel: two program roles
+selected by `block_idx.x`, the dK/dV role needing 52480 B of LDS and the dQ
+role 13568 B, and **a workgroup's LDS allocation is static, so the binary
+reserves the larger for both** — the dQ programs run at a quarter of the
+occupancy a split kernel gives them. On gfx950 that trade is worse, because the
+dual-wave body already spends most of its 160 KB on two KV tiles in flight.
+
+So this is not "fuse later once dispatch overhead shows up in a profile". The
+profile would have to show it on a workload that has a better answer already.
+If that changes, the thing to build is a *persistent* backward, not a
+two-role one — the occupancy cliff above is a property of the role split, not
+of doing more work per launch.
 
 ---
 
-## 5. `delta` — take the tensor first, fuse later
+## 5. `delta` — take it as a tensor first, kernel it later
 
 `delta = rowsum(dO * O)` is a preprocess. AOTriton has a `bwd_preprocess`
 kernel and AITER ships it as 12 separate `odo` binaries, so both tuned
@@ -184,7 +201,9 @@ host-computed tensor and says so.
 Do the same: one argument, `(dO.float() * O.float()).sum(-1)` on the host, then
 a gfx950 preprocess kernel as a later, separately-measured step. It changes one
 argument and nothing else, and the two references agreeing on the split is
-reason enough not to fuse it early.
+reason enough to keep it out of the main kernel. (This is the `delta`
+preprocess, not §4's dK/dV+dQ fusion -- unrelated decisions that happen to
+share a word.)
 
 ---
 
@@ -320,7 +339,8 @@ halves.
 `../aotriton/modules/flash/kernel/` is the specification for *what to compute*:
 `bwd_kernel_dk_dv` + `bwd_inner_dk_dv`, `bwd_kernel_dq` + `bwd_inner_dq`,
 `bwd_kernel_fuse`, `bwd_preprocess`, `bwd_postprocess`. Read it directly, not
-only through the gfx1201 port — where the two disagree, Triton says what the
+only through the gfx1201 port — `bwd_kernel_fuse` included, since it is the
+fallback for the small-workload regime §4 declines to build for — where the two disagree, Triton says what the
 algorithm requires and gfx1201 says what one previous port chose.
 
 **It is not a differential oracle for everything**, and the boundary is sharp:
@@ -402,7 +422,9 @@ none; varlen against *N* dense calls. Every one of these transfers.
 
 ## 9. Out of scope
 
-- **Fusion** of dK/dV and dQ into one launch (§4) — revisit with measurements.
+- **A fused dK/dV + dQ kernel** (§4). Not deferred — not wanted. Fusion buys
+  one dispatch, which only matters on small workloads, and AOTriton's Triton
+  fused kernel already serves those adequately.
 - **Split-K** on any backward kernel.
 - **fp8** backward.
 - Fixing the forward's split-K combine addressing, which remains guarded.
