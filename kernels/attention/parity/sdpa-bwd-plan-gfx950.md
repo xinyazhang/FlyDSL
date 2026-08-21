@@ -47,7 +47,7 @@ tile instead of two.
 
 ---
 
-## 1. The one architectural bet, and it is worth a spike before anything else
+## 1. The architectural bet — **spiked, and it pays**
 
 gfx1201's dK/dV stages **four LDS tiles** — Q, Qᵀ, dO, dOᵀ — because its four
 GEMMs contract Q and dO over two different axes:
@@ -59,29 +59,78 @@ GEMMs contract Q and dO over two different axes:
 | `dVᵀ = dOᵀ·P` | q | dO **transposed** |
 | `dKᵀ = Qᵀ·dS` | q | Q **transposed** |
 
-Those four tiles are what bound `block_m` there, and they forced a
-`transposed_source` knob ("tile" vs "derived") whose "derived" arm pays eight
-strided scalar reads per operand — measured 2.7% for one tensor in the forward
-and paid twice here.
+Those four tiles bound `block_m` there and forced a `transposed_source` knob
+whose "derived" arm pays eight strided scalar reads per operand.
 
-**gfx950 has `ds_read_b64_tr_b16`: a hardware-transposing LDS read.** The
-forward already uses it for V (`_ds_read_tr16_b64_imm`). If it serves the
-transposed A operands here, dK/dV stages **two** LDS tiles instead of four, the
-`transposed_source` knob never needs porting, and `block_m` roughly doubles at
-every width.
+**gfx950 needs two tiles, not four.** Answered from two independent sources
+before writing any code.
 
-That is a large enough difference that it changes the tiling, the LDS budget
-and the tuning space. **Spike it first (B0 below).** Two outcomes:
+### 1.1 The ISA says the instruction is for exactly this
 
-- *It works.* dK/dV is materially cheaper than gfx1201's and the plan proceeds
-  as written.
-- *It does not* — the transpose granularity or the operand lane map does not
-  line up with what MFMA wants for the `q`-contracted GEMMs. Then port
-  gfx1201's four-tile scheme and its `transposed_source` knob, and expect
-  `block_m` to be the binding constraint from head_dim 128 upward.
+CDNA4 ISA §11.4, *MFMA Transpose Load from LDS*:
 
-Do not build anything else until this is answered. Everything downstream is
-sized by it.
+> **DS_READ_B64_TR_B16** — Used for either **column major matrix A** or row
+> major matrix B data load to 2 VGPRs. Element size is 16b. **Two instructions
+> load a complete matrix.** The first loads K=0..3 and K=8..11 into two VGPRs,
+> and the next loads K=4..7 and 12..15. Each lane (one VGPR) holds 4
+> consecutive M or N values.
+
+"Column major matrix A" *is* the transposed A operand the two q-contracted
+GEMMs want. The instruction was designed for this case; the forward already
+uses it for V, which is the same shape of problem one tensor at a time.
+
+Two instructions per operand also matches the arithmetic: a `32x32x16` bf16 A
+operand is 8 bf16 per lane = 4 VGPRs, and each read returns 2.
+
+### 1.2 AITER's tuned kernel confirms it in practice
+
+`bwd_hd128_bf16_a32_psskddv.co` disassembled: **512 `ds_read_b64_tr_b16`**, the
+single most frequent instruction in the kernel, against 512 MFMAs — 1:1. They
+issue in pairs at +32-byte offsets and land directly in MFMA operand registers,
+sometimes straight into AGPRs:
+
+```
+ds_read_b64_tr_b16 v[36:37], v11 offset:36224
+ds_read_b64_tr_b16 v[38:39], v11 offset:36256      <- +32B, completes the pair
+...
+ds_read_b64_tr_b16 a[36:37], v16 offset:32768      <- directly into an AGPR
+v_mfma_f32_32x32x16_bf16 a[192:207], a[112:115], v[60:63], a[192:207]
+```
+
+**And AITER has two code generations, which is the sharper evidence.** Its
+hd64 and hd192 kernels use `v_mfma_f32_16x16x16_bf16` with **zero** transpose
+reads — the gfx1201-shaped approach of staging both orientations. Its hd128 and
+hd192_128 kernels use the wider MFMA shapes *with* heavy transpose use:
+
+| kernel | `tr_b16` | `ds_read_b128` | MFMA shapes |
+|---|---|---|---|
+| hd64 | 0 | 120 | `16x16x16` ×480 |
+| hd192 | 0 | 128 | `16x16x16` ×240 |
+| hd128 | **512** | 220 | `16x16x32` ×384, `32x32x16` ×128 |
+| hd192_128 | **408** | 198 | `16x16x32` ×288, `16x16x16` ×120, `32x32x16` ×60 |
+
+So the transpose path is the newer, tuned one, adopted where it mattered and
+not retrofitted elsewhere. That is a recommendation *and* a warning: it is
+worth doing and it was not free enough to backport.
+
+### 1.3 Two constraints the ISA attaches, and one is a hazard
+
+- **"Prior to executing these instructions the EXEC mask must be set to all
+  1's."** A transpose read inside a divergent region is undefined, not merely
+  slow. The forward's masking is `select`-shaped rather than branch-shaped so
+  it never hit this, but the backward has genuine `scf.if` regions around
+  edge tiles. **Treat this as a hazard class of its own**: it belongs in
+  `sdpa_lore_gfx950.md` next to the two inline-asm hazards, because the failure
+  mode is the same — a wrong-but-finite answer with no diagnostic.
+- LDS addresses must be aligned to the data size, and 64-bit DS ops need an
+  even-aligned VGPR pair.
+
+### 1.4 What is left of B0
+
+Not "does it work" but "what is the exact map". One probe: stage a Q tile,
+read it back through the transpose path, and check the lane→(m, k) mapping
+against a host reference for the specific MFMA shapes chosen in §2. Half a day,
+and it produces the table every LDS layout below is written against.
 
 ---
 
@@ -119,22 +168,28 @@ dK/dV.
 WMMA 16x16x16 on wave32 with no global→LDS path; gfx950 is MFMA 32x32x16 on
 wave64 with DMA and MFMA/VALU co-execution. Concretely:
 
-- **A wave owns 32 KV rows, not 16**, so `BLOCK_N = 32 * NUM_WAVES` for dK/dV.
+- **The MFMA shape is a tuning axis here, which it was not in the forward.**
+  The forward uses `32x32x16` throughout. AITER's backward uses all three of
+  `16x16x16`, `16x16x32` and `32x32x16`, mixing two shapes within one kernel
+  (§1.2), and exposes `ts_qo ∈ {16, 32}` as a knob. So "a wave owns 32 KV rows"
+  is a *choice* — 16 is equally available and halves the accumulator (§3) at
+  the cost of halving `BLOCK_N` for a given wave count. Pick it per width by
+  measurement, and do not bake 32 into the helpers.
 - The lane→(m, k) maps differ, so every LDS layout is re-derived. The forward's
   `_score_column_runs` / threshold-table technique is the right tool: derive
-  the map once, use it everywhere, never transcribe it twice.
+  the map once, use it everywhere, never transcribe it twice. With two MFMA
+  shapes in play that discipline stops being tidiness.
 - The dual-wave 8-cluster pipeline applies directly, because dK/dV streams
   **two** tensors (Q, dO) exactly as the forward streams two (K, V).
 
 ---
 
-## 3. Register pressure moves the wide path two rungs earlier
+## 3. Register pressure, and why the tiling choice decides the wide threshold
 
 This is the number that decides how much of the plan is "wide".
 
-A dK/dV wave holds **two** accumulators, `dKᵀ` and `dVᵀ`, each `[d][32]` f32.
-An MFMA 32x32 tile is 16 f32 per lane, and `[d][32]` is `d/32` tiles, so each
-accumulator costs `d/2` VGPRs per lane:
+A dK/dV wave holds **two** accumulators, `dKᵀ` and `dVᵀ`. **At 32 KV rows per
+wave** they are `[d][32]` f32, which over 64 lanes is `d/2` VGPRs each:
 
 | head_dim | dKᵀ | dVᵀ | total | against 256 AGPRs |
 |---|---|---|---|---|
@@ -146,7 +201,15 @@ accumulator costs `d/2` VGPRs per lane:
 
 The forward carries **one** O accumulator of the same `d/2`, which is why its
 wide path starts at 384. **dK/dV needs sharding from 256**, and 192 will be
-marginal. Expect the family split to be roughly:
+marginal.
+
+**This table is a function of the tiling choice, not a constant.** At 16 KV
+rows per wave the accumulators are `[d][16]` and cost `d/4` each, halving every
+number above and pushing the wide threshold *later* than the forward's rather
+than earlier — paid for by halving `BLOCK_N` at a given wave count, so the same
+work needs more workgroups or more waves. That trade is precisely what AITER's
+`ts_qo` knob selects, and it is the first thing B4 should sweep. Read the split
+below as the 32-row case:
 
 ```
 head_dim <= 128     dual-wave, unsharded
@@ -213,14 +276,23 @@ Each phase is a shippable increment with its own gate. The forward's phase
 structure earned its keep — every one of P1–P7 found at least one bug that the
 previous phase's tests could not see — so this mirrors it.
 
-### B0 — the transpose spike *(blocking, ~1–2 days)*
+### B0 — the transpose spike *(mostly done; ~half a day left)*
 
-Answer §1. A standalone probe that stages a Q tile in LDS and reads it both
-row-major and through `ds_read_b64_tr_b16`, checking both against a host
-reference for the exact operand layouts MFMA 32x32x16 wants.
+§1 answers the question this phase existed to ask: **two LDS tiles, not four**,
+on the ISA's own description of the instruction and on AITER's tuned kernel
+using 512 of them 1:1 with its MFMAs.
 
-*Gate:* a written answer, two LDS tiles or four, with the lane map recorded.
-Nothing else starts first.
+What remains is the lane map, not the decision. One probe: stage a Q tile, read
+it back through `ds_read_b64_tr_b16`, and check lane→(m, k) against a host
+reference for the MFMA shapes §2 selects. It produces the table every LDS
+layout downstream is written against.
+
+Fold in two ISA constraints while writing it (§1.3): the **EXEC mask must be
+all 1's** across these reads, and 64-bit DS ops need an even-aligned VGPR pair.
+The first is a hazard, so give it a test that runs the read under a divergent
+region and shows the guard holds.
+
+*Gate:* the lane-map table, written down, plus that hazard test.
 
 ### B1 — dK/dV, dense, non-causal, head_dim 64/128
 
@@ -409,7 +481,9 @@ none; varlen against *N* dense calls. Every one of these transfers.
 
 | risk | why it is real here | mitigation |
 |---|---|---|
-| the transpose spike fails | it is the whole tiling premise | B0 is blocking and cheap; the fallback is gfx1201's scheme, already written |
+| ~~the transpose spike fails~~ | **resolved in §1** -- ISA and AITER both say two tiles | residual risk is the lane map only |
+| a transpose read reaches a divergent region | the ISA requires EXEC all-1s and the failure is a wrong-but-finite answer | §1.3; a dedicated test in B0, and an entry in the lore beside the inline-asm hazards |
+| baking one MFMA shape into the helpers | AITER mixes two shapes in one kernel and exposes the tile size as a knob | keep the shape a parameter from B1; the threshold-table technique makes that cheap |
 | dK/dV register pressure at 192–256 | two accumulators, not one (§3) | shard from 256; measure at 192 rather than inferring from spills (P7) |
 | inline-asm hazards resurface | the forward hit two, one still unexplained | `sdpa_lore_gfx950.md` §"Recognising one" first, before theorising; never emit a memory op as inline asm |
 | the dropout mask disagrees across fwd/bwd | silent wrong gradients, no shape check notices | cross-kernel tiling-independence test in B6 |
@@ -437,13 +511,16 @@ none; varlen against *N* dense calls. Every one of these transfers.
 
 ## 10. Sequencing and what "done" means
 
-B0 gates everything. B1 and B2 are independent once B0 lands and can proceed in
-parallel if there are two people; B3–B6 are ordered, because each phase's tests
-are what make the next one's failures legible. B7 is last, after the register
+B0 no longer gates the *design* — §1 settled that — only the lane map B1 and B2
+are written against, which is half a day. B1 and B2 are independent after it
+and can proceed in parallel if there are two people; B3–B6 are ordered,
+because each phase's tests are what make the next one's failures legible. B7 is last, after the register
 budget has settled — which is the same reason the forward's sweep was P7.
 
 **Done** is: dK/dV and dQ on the full `LADDER`, with causal, windows, varlen,
-dropout and padded heads, matching autograd through our own forward within the
-forward's own tolerance, at a throughput recorded honestly against the WMMA/MFMA
-ceiling — plus `dB`, which takes this past the gfx1201 surface rather than
-merely level with it.
+dropout, bias and padded heads, passing the §7.1 error-ratio gate against the
+math backend, at a throughput recorded honestly against the MFMA ceiling.
+
+Two of those go past our gfx1201 backward rather than merely matching it:
+**`dB`**, which AOTriton has and that port dropped, and **`VarlenBits`**, which
+AOTriton does not have at all.
