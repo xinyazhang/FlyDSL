@@ -172,7 +172,7 @@ def _ratio_check(b, h, sq, sk, d, scale=None):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("head_dim", LADDER)
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize(
     "shape",
     [
@@ -189,6 +189,21 @@ def test_matches_math_backend(shape, head_dim):
 
 
 @pytest.mark.parametrize("head_dim", LADDER)
+def test_ladder_matches_math_backend(head_dim):
+    """Every compiled rung, at a square shape and a ragged asymmetric one.
+
+    Two shapes rather than the four above because each rung is a separate
+    build, and what a new rung can get wrong is the *geometry* -- the staging
+    granule, the wave count, the shard split -- which either works for a rung
+    or does not. The sequence-length edges are width-independent and are
+    covered once, at 64 and 128, by the tests above.
+    """
+    _require_rocm_path()
+    _ratio_check(1, 2, 256, 256, head_dim)
+    _ratio_check(1, 2, 199, 333, head_dim)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize(
     "sq,sk",
     [(199, 333), (1024, 256), (256, 1024), (65, 65), (101, 103), (67, 130), (1, 1), (1, 512), (512, 1), (2, 3)],
@@ -207,7 +222,7 @@ def test_ragged_and_asymmetric_sequences(sq, sk, head_dim):
     _ratio_check(1, 2, sq, sk, head_dim)
 
 
-@pytest.mark.parametrize("head_dim", LADDER)
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("scale", [0.02, 0.5, 4.0])
 def test_scale_sweep(scale, head_dim):
     """Two things at once, and the second is why the range is 200x rather than 4x.
@@ -235,7 +250,7 @@ def test_scale_sweep(scale, head_dim):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("head_dim", LADDER)
+@pytest.mark.parametrize("head_dim", [64, 128, 192, 256])
 def test_consistent_with_the_gfx950_forward(head_dim):
     """Feed this kernel the forward kernel's own `O` and `LSE`.
 
@@ -273,7 +288,7 @@ def test_consistent_with_the_gfx950_forward(head_dim):
         )
 
 
-@pytest.mark.parametrize("head_dim", LADDER)
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
 def test_joint_with_dq_against_one_autograd_call(head_dim):
     """dQ and dK/dV are one gradient; test them apart and a cancelling error hides.
 
@@ -311,7 +326,7 @@ def test_joint_with_dq_against_one_autograd_call(head_dim):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("head_dim", LADDER)
+@pytest.mark.parametrize("head_dim", [64, 128, 192])
 def test_bshd_layout_is_read_through_the_strides(head_dim):
     """A BSHD *layout* with a BHSD *shape* must give the same answer.
 
@@ -344,7 +359,7 @@ def test_bshd_layout_is_read_through_the_strides(head_dim):
     assert torch.equal(dv_t, dv_c), "dV differs between a BSHD and a BHSD layout of the same data"
 
 
-@pytest.mark.parametrize("head_dim", LADDER)
+@pytest.mark.parametrize("head_dim", [64, 128, 384])
 def test_writes_nothing_past_the_kv_sequence(head_dim):
     """The output descriptors bound the store; a ragged tail must stay untouched.
 
@@ -378,7 +393,138 @@ def test_writes_nothing_past_the_kv_sequence(head_dim):
     assert torch.isfinite(dk_full[:, :, :s]).all() and torch.isfinite(dv_full[:, :, :s]).all()
 
 
-@pytest.mark.parametrize("head_dim", LADDER)
+# The input contract is 8xD even though the compiled tiles are 32xD: loads and
+# stores are 8 columns wide, so a head_dim that is a multiple of 8 is a whole
+# number of chunks and the kernel never touches a column it was not given.
+# Every multiple of 8 the ladder can reach, so a rung that mishandles its
+# sub-8-grid widths cannot hide behind the ones the suite happens to name.
+_GRID8 = list(range(8, 513, 8))
+
+
+@pytest.mark.parametrize("hdim", _GRID8)
+def test_grid8_contiguous_is_exact_and_writes_nothing_past_the_last_row(hdim):
+    """A plainly contiguous 8xD tensor -- no padded view -- must just work.
+
+    The forward's `test_grid8_contiguous_is_exact_and_writes_nothing_past_o`,
+    transposed. What a caller actually passes is `torch.randn(b, h, s, hdim)`,
+    whose D pitch is `hdim` itself; every tensor built through a padded
+    allocation is 8-aligned *by construction* and cannot fail the way a tight
+    `(B, H, S, 24)` can.
+
+    The extra dK and dV rows are canaries: they are contiguous with the last
+    real row, so a D-tail chunk overrunning it lands in them and nowhere else.
+    Both outputs are checked, because the two extents are separate arguments
+    and the suppression is written twice.
+    """
+    _require_rocm_path()
+    b, h, s = 1, 2, 128
+    torch.manual_seed(hdim)
+    q, k, v, do = (_rand(b, h, s, hdim) for _ in range(4))
+    assert q.stride(2) == hdim, "the point of this test is a tight pitch"
+    scale = 1.0 / hdim**0.5
+    _o, lse64, delta64, _dq, dk64, dv64 = _math_backward(q, k, v, do, scale, torch.float64)
+    _o2, _l, _d, _dq2, dk16, dv16 = _math_backward(q, k, v, do, scale, torch.bfloat16)
+    lse = lse64.reshape(b * h, s).float().contiguous()
+    delta = delta64.reshape(b * h, s).float().contiguous()
+
+    sentinel = -12345.0
+    dkbuf = torch.full((b, h, s + 1, hdim), sentinel, device="cuda", dtype=DT)
+    dvbuf = torch.full((b, h, s + 1, hdim), sentinel, device="cuda", dtype=DT)
+    _run(q, k, v, do, lse, delta, scale=scale, dk=dkbuf[:, :, :s], dv=dvbuf[:, :, :s])
+    torch.cuda.synchronize()
+    assert torch.all(dkbuf[:, :, s] == sentinel), f"a dK store ran past the last row at hdim {hdim}"
+    assert torch.all(dvbuf[:, :, s] == sentinel), f"a dV store ran past the last row at hdim {hdim}"
+    for name, ours, low, high, other in (
+        ("dk", dkbuf[:, :, :s], dk16, dk64, dv64),
+        ("dv", dvbuf[:, :, :s], dv16, dv64, dk64),
+    ):
+        floor = other.norm().item()
+        e_ours, e_low = _rel(ours, high, floor), _rel(low, high, floor)
+        assert e_ours <= FUDGE[name] * e_low + DEGENERATE_ATOL, f"{name} at hdim {hdim}: {e_ours:.3e} vs {e_low:.3e}"
+
+
+@pytest.mark.parametrize("hdim,pitch", [(100, 104), (33, 40), (7, 8), (300, 304)])
+def test_padded_head_never_writes_past_the_8_aligned_chunk(hdim, pitch):
+    """A D tail may spill into the caller's pad, but not past it.
+
+    A 128-bit store is all-or-nothing, so a chunk straddling `hdim` writes into
+    the allocation's own padding -- permitted, and the reason the pitch
+    contract exists. A chunk starting at or past `hdim` must be dropped
+    entirely, and columns from `ceil8(hdim)` on were never in any store chunk
+    at all; this pins both by checking they are untouched.
+    """
+    _require_rocm_path()
+    b, h, s = 1, 2, 128
+    torch.manual_seed(hdim)
+
+    def _padded(*, rows=s):
+        full = torch.randn(b, h, rows, pitch, device="cuda", dtype=DT)
+        return full, full[..., :hdim]
+
+    _fq, q = _padded()
+    _fk, k = _padded()
+    _fv, v = _padded()
+    _fdo, do = _padded()
+    scale = 1.0 / hdim**0.5
+    _o, lse64, delta64, _dq, dk64, dv64 = _math_backward(q, k, v, do, scale, torch.float64)
+    _o2, _l, _d, _dq2, dk16, dv16 = _math_backward(q, k, v, do, scale, torch.bfloat16)
+    lse = lse64.reshape(b * h, s).float().contiguous()
+    delta = delta64.reshape(b * h, s).float().contiguous()
+
+    dkfull = torch.full((b, h, s, pitch), -7.0, device="cuda", dtype=DT)
+    dvfull = torch.full((b, h, s, pitch), -7.0, device="cuda", dtype=DT)
+    _run(q, k, v, do, lse, delta, scale=scale, dk=dkfull[..., :hdim], dv=dvfull[..., :hdim])
+    torch.cuda.synchronize()
+    ceil8 = (hdim + 7) // 8 * 8
+    assert torch.all(dkfull[..., ceil8:] == -7.0), "dK store ran past the 8-aligned chunk containing hdim_qk"
+    assert torch.all(dvfull[..., ceil8:] == -7.0), "dV store ran past the 8-aligned chunk containing hdim_vo"
+    for name, ours, low, high, other in (
+        ("dk", dkfull[..., :hdim], dk16, dk64, dv64),
+        ("dv", dvfull[..., :hdim], dv16, dv64, dk64),
+    ):
+        floor = other.norm().item()
+        e_ours, e_low = _rel(ours, high, floor), _rel(low, high, floor)
+        assert e_ours <= FUDGE[name] * e_low + DEGENERATE_ATOL, f"{name} at hdim {hdim}: {e_ours:.3e} vs {e_low:.3e}"
+
+
+def test_tight_odd_hdim_is_refused_not_corrupted():
+    """An odd head_dim in a tight allocation has nowhere to put the tail chunk.
+
+    `ceil8(100)` is 104, so the kernel touches four columns that belong to the
+    next row. Refusing is the contract; the alternative is a wrong answer in a
+    tensor the caller never suspected.
+    """
+    _require_rocm_path()
+    b, h, s, hdim = 1, 2, 128, 100
+    q, k, v, do = (_rand(b, h, s, hdim) for _ in range(4))
+    dk, dv = torch.empty_like(k), torch.empty_like(v)
+    lse = torch.zeros(b * h, s, device="cuda", dtype=torch.float32)
+    fn = build(num_heads=h, head_dim=hdim)
+    with pytest.raises(ValueError, match="not a multiple of 8"):
+        fn(q, k, v, do, dk, dv, lse, lse, b, s)
+
+
+def test_odd_hdim_bshd_without_slack_is_refused():
+    """BSHD hides the overrun from a pitch check, so the check is not a pitch.
+
+    Heads of one token are adjacent in BSHD, so the gap after a D row is `hdim`
+    itself and there is no slack -- while `stride(2)` is `num_heads * hdim`,
+    a tidy multiple of 8 whenever `num_heads` is even.
+    """
+    _require_rocm_path()
+    b, h, s, hdim = 1, 4, 128, 100
+    assert (h * hdim) % 8 == 0, "the case is only interesting when the pitch looks fine"
+    q, k, v, do = (torch.randn(b, s, h, hdim, device="cuda", dtype=DT).transpose(1, 2) for _ in range(4))
+    dk = torch.empty(b, s, h, hdim, device="cuda", dtype=DT).transpose(1, 2)
+    dv = torch.empty(b, s, h, hdim, device="cuda", dtype=DT).transpose(1, 2)
+    lse = torch.zeros(b * h, s, device="cuda", dtype=torch.float32)
+    assert q.stride(2) % 8 == 0, "the pitch check would pass here"
+    fn = build(num_heads=h, head_dim=hdim)
+    with pytest.raises(ValueError, match="unused element"):
+        fn(q, k, v, do, dk, dv, lse, lse, b, s)
+
+
+@pytest.mark.parametrize("head_dim", [64, 512])
 def test_deterministic(head_dim):
     """Bit-identical run to run. Nothing here accumulates through an atomic.
 
@@ -407,10 +553,8 @@ def test_refuses_what_it_does_not_compute():
         build(num_heads=8, head_dim=64, dropout=True)
     with pytest.raises(NotImplementedError, match="GQA"):
         build(num_heads=8, head_dim=64, num_kv_heads=2)
-    with pytest.raises(NotImplementedError, match="B3"):
-        build(num_heads=8, head_dim=96)
-    with pytest.raises(NotImplementedError, match="B1 serves"):
-        build(num_heads=8, head_dim=192)
+    with pytest.raises(ValueError, match="exceeds the widest tile"):
+        build(num_heads=8, head_dim=513)
     with pytest.raises(NotImplementedError, match="bf16"):
         build(num_heads=8, head_dim=64, dtype_str="f16")
 

@@ -943,3 +943,445 @@ expecting a third.
 - **`BLOCK_Q` is pinned at 64** by the transpose read covering four 16-row
   k-substeps. A 128-row streamed tile would need eight, which is describable
   but is a second geometry to validate; not attempted.
+
+---
+
+## Outcome: B3/dQ — the ladder to 512 *(dense, non-causal, bf16)*
+
+**Every rung of `LADDER` (32 … 512) is built, correct and tested**, with the
+8xD input contract, padded heads and asymmetric `hdim_qk`/`hdim_vo`. 169 tests
+pass with no skips, which means the joint dQ + dK/dV autograd check ran at all
+ten rungs. Nothing outside the three dQ files was edited.
+
+### The LDS blocker: one region for K, not two
+
+B2 staged K twice — K pitch for GEMM1, V pitch for GEMM3 — because the two
+readers disagree only about `SMEM_K_PAD` (8 elements) vs `SMEM_V_PAD` (32).
+Three regions is 199 KB at head_dim 512 against a 163840 B cap, so this was a
+blocker rather than the B7 optimisation B2 called it.
+
+The fix is to stage K **once, in the V layout**, and re-point the *K path* at
+the V pitch:
+
+    (V region) <- K   -> load_v(0)      GEMM3, the stock transpose read
+                      -> the K path on V-pitch lines   GEMM1
+    (K region) <- V   -> the K path, stock             GEMM2
+
+`BwdDqKvLdsToVgprLoader._read_k_packs` does that by `replace`-ing two trait
+fields (`SMEM_K_LINE_STRIDE` and the k-step outer stride) around the shared
+formula, so nothing is transcribed. **Which reader moves is deliberate**: the K
+path is a plain `llvm.LoadOp` with two address expressions, while the transpose
+path is `ds_read_b64_tr_b16` with alias scopes, an even-VGPR-pair constraint
+and two open hazards against it. Leave the fragile one stock.
+
+`LDS_KV_TOTAL_SIZE` then drops to one buffer — one trait field in
+`make_bwd_dq_traits` — and the fourth region is no longer allocated:
+
+| head_dim | 256 | 384 | 512 |
+|---|---|---|---|
+| B2, three regions | 99 KB | 149 KB | **199 KB, over cap** |
+| B3, two regions | 66.5 KB | 99.8 KB | **133.0 KB** |
+
+No `D_STAGES` anywhere on the ladder, which is the substantive divergence from
+the forward's family W.
+
+### Measured, per rung
+
+`B=2 H=8 S=2048` bf16 non-causal, GPU 6 idle, `6·B·H·S²·d` FLOPs:
+
+| head_dim | waves | BLOCK_M | granule | LDS | TFLOP/s | build |
+|---|---|---|---|---|---|---|
+| 32 | 4 | 128 | 32 | 8.3 KB | 420 | 1.2 s |
+| 64 | 4 | 128 | 64 | 16.6 KB | 580 | 1.2 s |
+| 96 | 4 | 128 | 32 | 24.9 KB | 667 | 1.3 s |
+| 128 | 2 | 64 | 64 | 33.2 KB | **732** | 1.4 s |
+| 160 | 2 | 64 | 32 | 41.6 KB | 678 | 1.5 s |
+| 192 | 2 | 64 | 64 | 49.9 KB | 663 | 1.5 s |
+| 224 | 2 | 64 | 32 | 58.2 KB | 676 | 1.6 s |
+| 256 | 2 | 64 | 64 | 66.5 KB | 698 | 1.7 s |
+| 384 | 4 | 128 | 64 | 99.8 KB | **340** | 1.9 s |
+| 512 | 4 | 128 | 64 | 133.0 KB | **113** | 2.3 s |
+
+Every build is under 2.5 s, so the 8-minute cap never bound. head_dim 128 at
+732 TF is up from B2's 496 at the same shape, entirely from the geometry.
+
+### `waves_per_eu = 1`, and the discriminator that says why
+
+The full `(num_waves, waves_per_eu)` grid is in
+`BwdDqKnobs._with_wave_geometry`'s docstring. The headline reproduces B1's:
+**`waves_per_eu = 1` is never worse and is worth up to 4x.** head_dim 256 at
+four waves is 675 TF at 1 and 169 at 2, and the ISA dumps separate the two
+exactly as the addendum predicts:
+
+| build | VGPR | AGPR | spills | scratch | TF |
+|---|---|---|---|---|---|
+| 256, w4, wpe 2 | 256 | **0** | **191** | 768 B | 169 |
+| 256, w2, wpe 1 | 460 | 204 | 0 | 0 | 712 |
+
+Zero AGPRs with a nonzero spill count is not a register shortage, it is a
+prohibition. The forward's default of 2 is wrong for this kernel at every rung
+measured, so `_BWD_DQ_FALLBACK` deliberately does not carry it.
+
+Wave count: 4 below head_dim 128, 2 from 128 to 256, 4 above. Several
+neighbouring points differ by under 10%, which the lore says a sweep cannot
+settle; those are left where they fall rather than tuned.
+
+### 384 and 512 are register-bound, and 512 is *structurally* so
+
+**Flat across the entire (waves, wpe) grid** — 335–339 TF at 384 and 113–117
+at 512, at every one of six points. Not occupancy. The ISA says why:
+
+| head_dim | VGPR (total) | AGPR | spills | scratch |
+|---|---|---|---|---|
+| 384 | 512 | 256 | 112 | 452 B |
+| 512 | 512 | 256 | **546** | 1804 B |
+
+Both saturate the 512-register unified file and still spill. The accounting is
+arithmetic, at 32 rows per wave:
+
+    Q packs     head_dim / 4      128 at d=512, loop-invariant
+    dO packs    head_dim / 4      128
+    dQ acc      head_dim / 2      256
+    ------------------------------------------------------
+                                  512 = the entire file, before a single operand
+
+So **head_dim 512 cannot be made to fit by scheduling**: the loop-invariant
+operands plus the accumulator are the whole register file on their own, and the
+three streams of K/V/Kᵀ packs (256 each if fully materialised) have nowhere to
+go. At 384 the same three terms are 384, leaving 128 — enough for a *streamed*
+operand (one pack pair at a time) plus the score accumulators, which is why 384
+plausibly is fixable and 512 is not.
+
+Two levers, in the order they should be tried:
+
+1. **Stream the A operands** — fuse the LDS read into the MFMA loop so one pack
+   is live instead of `K_STEPS_QK` of them. Local, and it should recover 384.
+   Not attempted here: it has to work under the padded-head mask, which is
+   per-k-step, and B3's remaining budget went to the correctness gates.
+2. **`QK_SHARDS`** for 512, which is what plan §3 already predicts fits dQ
+   neatly — GEMM1's reduction axis and GEMM3's output axis are the same axis,
+   so one shard offset serves Q, dO *and* dQ and halves all three terms above
+   (64 + 64 + 128 = 256, leaving 256 for operands). It needs the cross-shard S
+   reduction through LDS that the forward declined to build. This is the real
+   answer at 512 and it is a phase of its own.
+
+Neither is a *correctness* gap: both rungs pass the error-ratio gate.
+
+### The near miss, and the guard it produced
+
+`Gfx950Knobs._with_d_axis_splits` turns `d_stages = 2` on at block_dmodel > 256
+— exactly the rungs B3 added — and under `D_STAGES > 1` the inherited
+`ParityGemmHelper.qk` silently becomes `qk_stage(..., stage=0)` while `pv`
+writes only the first stage's chunks. This loop never advances the stage, so
+384 and 512 would have reduced over **half the head dim**, written half the
+accumulator, and returned a finite wrong answer.
+
+It was caught by an LDS figure that was half what it should have been, and by
+nothing else — the error-ratio sweep that produced the table above ran against
+an earlier override that happened to pin `d_stages = 1`. `BwdDqKnobs` now
+overrides `_with_d_axis_splits` *and* refuses a pinned `d_stages`/`qk_shards`/
+`vo_shards` by name, because relying on a default to hold is what nearly went
+wrong. `test_d_axis_splits_are_refused`.
+
+### Padded heads: the two crossed extents, fixed and tested
+
+B2's outcome named them; B3 spends them.
+
+- **GEMM2 reads V through the K register path**, whose padded-head mask reads
+  `self.hdim_qk`. There are now two `BwdDqKvLdsToVgprLoader` instances, one per
+  tile, differing in the LDS pitch *and* the extent — plus `HDIM_VO_FLOOR`, the
+  vo counterpart of `HDIM_QK_FLOOR`, which drops to 0 when `head_dim_v` sits
+  below the rung's floor (`head_dim 128, head_dim_v 40`).
+- **dQ is stored through the O path**, whose suppression reads `hdim_vo` while
+  dQ is `hdim_qk` wide. `BwdDqStoreHelper` rebinds the attribute.
+
+Both coincide in every symmetric build, so nothing before `test_asymmetric_hdim`
+could tell the fix from its absence.
+
+**And a third one, which was a genuine silent wrong answer.** A build resolved
+without `head_dim_v` gets `padded_head=False` and emits *no* D-axis mask, so a
+V narrower than the tile is reduced over the caller's slack — finite, right
+shape, 0.70 relative error. This file's own test helper made exactly that
+mistake. The guard is now in `_args`: a non-padded build requires
+`hdim_qk == hdim_vo == BLOCK_DMODEL`. A real caller can make the same mistake,
+so it belongs in the kernel and not in the test that found it.
+
+### Also fixed: head_dim 32 crashed
+
+`D_CHUNKS == 1` is the one rung where the loop carries a single value, and an
+`scf.for` with one result hands it back **unwrapped**. `loop_results[0]` then
+indexes a `vector<16xf32>` and returns an f32, which surfaces two frames away
+inside `_scale_o_accs` as "Cannot cast type to VectorType". `_carried()`
+normalises it. The forward never sees this because it always carries `m_row`
+and `l_row` alongside.
+
+### Gates
+
+- Full `LADDER`, square and ragged, error-ratio gate per rung
+  (`test_ladder_error_ratio`). Observed ratios 1.0–1.9 against a 4.0 gate.
+- **8xD contract**: every multiple of 8 from 8 to 512, plainly contiguous, with
+  an overrun canary row (`test_grid8_contiguous_is_exact_and_writes_nothing_past_dq`).
+- Padded heads with a **poisoned** pad, asymmetric hdim including the
+  floor-fallback case, and a store-suppression canary.
+- Rows-per-wave ceiling asserted at both layers — `make_bwd_dq_traits` raises,
+  and the knob-level geometry list rejects the same configuration earlier.
+- Wave geometries: every entry `BwdDqKnobs._SUPPORTED_GEOMETRIES` adds over the
+  forward's is *run*, not asserted.
+- Joint dQ + dK/dV against one fp64 autograd call, at all ten rungs.
+- The forward's suite unchanged; no file outside the three dQ files was edited.
+
+### dB does not move the ceiling, but it costs at every rung
+
+The rung table above is the `store_db=False` arm. Measured as a matrix, same
+shape, with the store enabled at every rung:
+
+| head_dim | dB off, VGPR/AGPR/spill | dB on, VGPR/AGPR/spill | cost |
+|---|---|---|---|
+| 32 | 400 TF, 140/0/0 | 73 TF, 174/0/0 | 5.5x |
+| 64 | 555, 190/0/0 | 136, 224/0/0 | 4.1x |
+| 96 | 659, 236/16/0 | 193, 272/16/0 | 3.4x |
+| 128 | 713, 260/4/0 | 256, 330/74/0 | 2.8x |
+| 160 | 666, 312/56/0 | 291, 383/127/0 | 2.3x |
+| 192 | 695, 360/104/0 | 339, 435/179/0 | 2.0x |
+| 224 | 694, 412/156/0 | 358, 483/227/0 | 1.9x |
+| 256 | 698, 460/204/**0** | 319, 512/256/**14** | 2.2x |
+| 384 | 334, 512/256/112 | 137, 512/256/288 | 2.4x |
+| 512 | 113, 512/256/546 | 83, 512/256/802 | 1.4x |
+
+**Every rung builds and is correct with dB on, 512 included**, and the dQ error
+is bit-for-bit the same on both arms. So dB is a cost, not a ceiling, and no
+rung has to be withdrawn for it. Three things the matrix says that the single
+line did not:
+
+- **dB adds a flat ~70 registers at every rung**, not a proportional amount: it
+  is the `dS` tile plus the store's address arithmetic, and neither scales with
+  `d`. That is enough to tip head_dim **256 from zero spills into 14**, which
+  is the rung where the ladder's register headroom actually runs out.
+- **The relative cost is worst at the narrow end** (5.5x at 32, 1.4x at 512),
+  because the store count is `32 per lane per KV tile` regardless of `d` while
+  the GEMM work is linear in it. A vectorised store would help the small rungs
+  most, which is the opposite of where the register pressure is.
+- The earlier "4-5x" figure came from head_dim 64/128 only and was not
+  representative of the ladder.
+
+**The lever that helped was the live range, not the accumulator.** `dS` exists
+twice -- 32 f32 scores, and after `cast_p` 16 packed bf16 -- and the store now
+reads the packs, so the f32 form dies at `cast_p` instead of living across the
+32-store sequence. Three placements measured on the rungs that spill:
+
+| variant | 256 | 384 | 512 |
+|---|---|---|---|
+| f32 lists, before `cast_p` | 280 | **149** | 56 |
+| packs, after `cast_p` *(kept)* | **319** | 137 | **83** |
+| packs, after `pv` | 305 | 146 | 73 |
+
+Below head_dim 256 the three are register-identical, so the allocator was
+already sinking the f32 form and there was nothing to win. At 512 the pack
+source is **1.49x**. 384 prefers the f32 form by 9%, which the lore says a
+sweep cannot settle and which is an allocator outcome rather than a mechanism
+-- the spill counts are not monotone with the rate in any column. Kept the
+variant whose one decisive measurement agrees with the mechanism.
+
+Not tried: interleaving the store into GEMM3's `pv` loop so each pack dies
+right after its MFMAs. That is the sharper version of the same lever and it is
+the next thing to measure if dB's cost at 384/512 matters.
+
+### Still not done
+
+- **384 at half rate and 512 at a sixth** with dB off, above; both worse again
+  with dB on. The two levers are streaming the A operands (384) and
+  `QK_SHARDS` (512), in that order.
+- **`dB`'s store is still per element** -- 32 per lane per KV tile. Vectorising
+  needs a runtime tail arm and a 4-divisible `stride_db_seq`; it would help the
+  narrow rungs most, where the cost ratio is worst.
+- **No pipelining, one tile in flight.** At 128 the body reaches 732 TF against
+  the forward's ~1018 on the same board for two GEMMs; whether a dual-wave
+  schedule closes that is a B7 measurement.
+- Causal, windows, varlen, dropout and bias input remain refused by name.
+
+---
+
+## Outcome: B3 — dK/dV on the full ladder *(dense, non-causal, MHA, bf16)*
+
+`LADDER` is the forward's entire `(32 … 512)`, with the 8xD input contract and
+padded heads. 134 tests, all passing, no skips -- so the joint dQ + dK/dV
+autograd check ran. The forward's own suite still passes untouched (329/329 in
+12m31s on this checkout).
+
+**Every rung was correct on its first run**, including 384 and 512. Three
+phases in a row have now said that about "subclass, do not port"; at some point
+it stops being luck.
+
+### Measured, per rung
+
+`B=4 H=8 S=4096` bf16 non-causal, GPU 5 idle. TFLOP/s counts **nominal**
+`8·B·H·Sq·Sk·d` -- the duplicated S and dP a shard recomputes are *not*
+credited, so the sharded rungs' MFMA-issue rate is higher by the factor in the
+last column.
+
+| head_dim | gran | waves | wpe | shards | buf | BLOCK_KV | tight | VGPR | AGPR | spills | build | TFLOP/s | ×dup |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 32 | 32 | 4 | 2 | 1 | 2 | 128 | yes | 150 | 0 | 0 | 0.7 s | **508** | 1.0 |
+| 64 | 64 | 4 | 1 | 1 | 2 | 128 | no | 232 | 0 | 0 | 0.8 s | **713** | 1.0 |
+| 96 | 32 | 4 | 2 | 1 | 2 | 128 | no | 256 | 0 | 4 | 1.0 s | **805** | 1.0 |
+| 128 | 64 | 2 | 2 | 1 | 2 | 64 | no | 330 | 74 | 0 | 1.2 s | **744** | 1.0 |
+| 160 | 32 | 4 | 2 | 1 | 2 | 128 | no | 356 | 100 | 0 | 1.3 s | **751** | 1.0 |
+| 192 | 64 | 4 | 1 | 1 | 2 | 128 | no | 488 | 232 | 0 | 1.4 s | **636** | 1.0 |
+| 224 | 32 | 4 | 1 | 1 | 2 | 128 | no | 486 | 230 | 0 | 1.6 s | **737** | 1.0 |
+| 256 | 64 | 4 | 1 | 2 | 2 | 64 | no | 424 | 168 | 0 | 1.4 s | **451** | 1.5 |
+| 384 | 64 | 4 | 1 | 2 | 1 | 64 | yes | 512 | 256 | 31 | 1.7 s | **283** | 1.5 |
+| 512 | 64 | 4 | 1 | 4 | 1 | 32 | yes | 512 | 256 | 38 | 1.8 s | **260** | 2.5 |
+
+The error ratio against the math backend is **1.41–1.48 at every rung**, flat in
+width exactly as it was flat in shape at B1. Build times peak at 1.8 s; nothing
+in the whole sweep came near the eight-minute cap, so that gate never fired.
+
+### LDS never binds, and single-buffering is what buys 384 and 512
+
+The addendum's arithmetic held: a staged slot is `68 · head_dim` elements, so
+two tensors single-buffered are `272 · head_dim` bytes and head_dim 512 fits in
+139264 of the 163840 cap **with a whole tile of Q and of dO resident**. The
+second stream buffer is the only thing LDS ever costs, and dropping it at 384
+and 512 is the entire LDS story. **`D_STAGES` was never needed and is not
+implemented here.**
+
+Dropping the buffer costs the prefetch distance, not a code path:
+`NUM_STREAM_BUFFERS` is a number the tile loop reads, and at 1 the DMA for the
+next tile is issued at the end of this one and waited on immediately.
+
+### The lever the addendum did not name, and it dominates above 128
+
+`(num_waves, waves_per_eu)` was first and it worked as B1 said. The **second**
+lever turned out not to be sharding but `BLOCK_KV`, and it is bigger:
+
+| head_dim | waves | BLOCK_KV | TFLOP/s |
+|---|---|---|---|
+| 160 | 2 | 64 | 408 |
+| 160 | **4** | **128** | **690** |
+| 224 | 2 | 64 | 486 |
+| 224 | **4** | **128** | **723** |
+
+Same registers per wave -- 4 waves is still one per SIMD -- and 1.7x. The
+reason is that **every workgroup streams the whole of Q and dO for its head**,
+so the total read traffic is `seqlen / BLOCK_KV` copies of that slab. Raising
+the wave count at fixed shards raises `BLOCK_KV` and halves the traffic for
+free. That is why every rung but 128 lands on 4 waves, and why 8 is worse
+everywhere it was tried (256: 198 TF against 451; 384: 91 against 283; 512: 81
+against 260) -- 8 waves crosses back over the AGPR cliff.
+
+It also reframes `DKV_SHARDS`: sharding *divides* `BLOCK_KV` at a fixed wave
+count, so it pays the traffic lever back at the same time as it buys
+accumulator space. That is most of why 256 (451 TF at 2 shards) sits below its
+unsharded neighbours 224 (737) and 192 (636) rather than between them.
+
+### `DKV_SHARDS` is `VO_SHARDS`, and that was the cheap part
+
+D is an *output* axis for both accumulators, so shards write disjoint columns
+and never have to agree on anything -- no cross-wave reduction, no extra
+barrier, no summation order. Exactly the forward's `VO_SHARDS` bargain, and the
+implementation reuses the field itself rather than adding one, so
+`make_traits`' shard derivation and its even-chunk validation came for free.
+Two sites know about it: the transposed read folds the shard's first chunk into
+`stream_col_read_base` (the forward's `load_v_shard` trick, and it needs the
+even-chunk rule to be legal), and the store adds the shard's column origin.
+
+### `TIGHT_REGISTERS`: one knob for a real crossover
+
+Two choices in the tile body hold the same thing live and cost the same thing:
+whether a staged half is read pack-by-pack into its MFMA or all at once, and
+whether the tile's two 32-row halves go through the softmax together. They are
+one knob because they trade the same currency -- live f32 against the
+scheduler's freedom to overlap an MFMA burst.
+
+| head_dim | loose | tight |
+|---|---|---|
+| 32 | 472 TF, 0 spills | **511**, 0 |
+| 128 | **744**, 0 | 606, 0 |
+| 224 | **723**, 0 | 645, 0 |
+| 256 | 148, 246 spills | **375**, 166 |
+| 384 | 197, 368 spills | **283**, 31 |
+| 512 | 213, 294 spills | **261**, 38 |
+
+The crossover is at 384, where the accumulators stop leaving room. head_dim 32
+is the odd one at the narrow end and is not a register story: with
+`D_CHUNKS == 1` there is barely any independent work for the loose arm to
+overlap, so all it does is lengthen live ranges.
+
+### A negative result worth recording: KV-block-fast grid order
+
+Since every workgroup streams the whole of Q and dO, putting the **KV block**
+on the fast grid axis so that concurrently-issued workgroups share that slab is
+the obvious move. It is **12–15% slower at every rung tried** -- 512: 230 TF
+against 260; 384: 260 against 283; 256: 390 against 433. The eight XCDs have
+separate L2s, so sharing one slab duplicates it across all of them instead of
+spreading distinct work over them. Same conclusion as the forward's head-fastest
+choice, for the opposite reason. The knob was measured and then **deleted**; the
+grid order is a literal again, with the measurement in the comment.
+
+### Padded heads: the cheap mask is the other one
+
+The forward masks Q once in its prologue and K on the hot path, and measured
+27–54% for the second. Here the roles are swapped, so the cheap side is **K and
+V** -- resident, masked once, every k-step -- and Q and dO are the hot ones,
+masked only on the steps `HDIM_QK_FLOOR` cannot rule out (two of thirty-two at
+head_dim 512).
+
+Only the two *d-contracted* GEMMs need masked operands at all. In `dV` and `dK`
+the head dim is the **output** axis, so a pad column of dO can only reach a pad
+column of dV and the store suppresses it by address. Asymmetric
+`hdim_qk`/`hdim_vo` is supported and the two extents are used the way round
+they read: K and dK against `hdim_qk`, V, dO and dV against `hdim_vo`.
+
+All 64 multiples of 8 from 8 to 512 pass with plainly contiguous tensors, each
+with a sentinel row contiguous with the last real one on **both** outputs --
+the suppression is written twice and a canary on one would not see the other.
+A tight odd head_dim is refused rather than corrupted, including the BSHD case
+where the pitch check alone would wave it through.
+
+### head_dim 96 does not need the forward's Hazard 2 workaround
+
+`ParityGemmHelper.qk` carries an `s_nop 1` because head_dim 96 computes a wrong
+answer without it, mechanism still unknown. This kernel has no such nop and
+head_dim 96 is correct at ratio 1.437 across three shapes. That is a data
+point, not an explanation: the hazard is a register-allocation coincidence, and
+a different body places registers differently. It does say the defect is not
+inherent to granule-32 staging or to `ds_read_b64_tr_b16` counts, both of which
+this kernel has at 96.
+
+### The rows-per-wave ceiling is enforced, and the lever behind it is *not* built
+
+`_with_traits` raises unless `ROWS_PER_WAVE == 32`, and `BLOCK_KV` is *derived*
+from `32 · waves / shards` rather than pinned beside the wave count, so the two
+cannot disagree. That is P7's twelve silently-wrong configurations answered.
+
+**But the addendum's lever 2 -- rows per wave 32 → 16 -- is not implemented**,
+and this is the honest gap in B3. It needs `v_mfma_f32_16x16x16`, whose v4f32
+accumulator is a different register layout through every helper: the score
+accumulator, the `8·(r//4) + 4·(lane//32) + (r%4)` row map the LSE and delta
+reads are grouped by, `_pack_p_v8_slices`, the `permlane32_swap` store, and a
+**re-derived transpose-read lane map** -- the existing one delivers `m = lane %
+32` and 16-row A wants `m = lane % 16` with the second 16 lanes carrying
+different *tokens* rather than different columns. That is B0's probe, for real
+this time. It is a second family, not a parameter, and `DKV_SHARDS` reached the
+same accumulator relief without new operand algebra.
+
+It is also the *better* answer and should be built before anyone tunes 512
+further. At 16 rows per wave the per-wave loop invariant is `0.75·d` -- resident
+`d/4`, accumulators `d/2` -- which is 384 at head_dim 512, the same as four-way
+sharding gives. But it gets there with **no duplicated S/dP** (against 2.5x) and
+with `BLOCK_KV = 16 · waves = 64` (against 32), i.e. half the Q/dO traffic. Both
+of the two things that make 512 slow.
+
+### Not done
+
+- **Causal, windows, varlen, dropout, bias input, GQA.** Refused by name; the
+  ABI carries every argument slot.
+- **16 rows per wave**, above.
+- **No software pipeline**, one tile in flight, two barriers per tile.
+- **The wide rungs are duplicated-work- and traffic-bound, not spill-bound.**
+  384 and 512 still spill 31 and 38, which is small and did not respond to any
+  remaining knob; the 2.5x MFMA duplication and the 32-row `BLOCK_KV` are the
+  cost, and both have the same fix (previous section).
+- **`BLOCK_Q` is pinned at 64** by the transpose read covering four 16-row
+  k-substeps. 128 would need eight -- describable, a second geometry to
+  validate, not attempted.

@@ -132,9 +132,15 @@ def _run_dq(q, k, v, do, lse, delta, *, scale=None, db=None, dq=None):
     b, hq, sq, d = q.shape
     if dq is None:
         dq = torch.full((b, hq, sq, d), float("nan"), device="cuda", dtype=q.dtype)
+    # `head_dim_v` comes from V's own last dimension rather than being passed,
+    # so an asymmetric-hdim test cannot accidentally disagree with the tensor
+    # it hands in. Dropping it here builds `padded_head=False` for a genuinely
+    # padded call, and the kernel then reduces over the caller's slack -- which
+    # is exactly the failure the guard in `_args` now refuses.
     fn = build_dq(
         num_heads=hq,
         head_dim=d,
+        head_dim_v=v.shape[3],
         causal=False,
         dtype_str="bf16" if q.dtype is torch.bfloat16 else "f16",
         num_kv_heads=k.shape[1],
@@ -180,8 +186,14 @@ SHAPES = [
     (1, 4, 128, 777),
 ]
 
+# The two rungs that get the full shape cross-product. Every rung is covered by
+# `test_ladder_error_ratio`; these two also get the ragged and multi-workgroup
+# cases, because they are the widths every other test in this file uses and a
+# regression there should be visible from more than one direction.
+WORKHORSE = (64, 128)
 
-@pytest.mark.parametrize("head_dim", BWD_DQ_LADDER)
+
+@pytest.mark.parametrize("head_dim", WORKHORSE)
 @pytest.mark.parametrize("b,h,sq,sk", SHAPES, ids=lambda x: str(x))
 def test_error_ratio_vs_math_backend(b, h, sq, sk, head_dim):
     """`err(ours, fp64) <= fudge * err(math-in-bf16, fp64)`, on dQ.
@@ -212,6 +224,36 @@ def test_error_ratio_vs_math_backend(b, h, sq, sk, head_dim):
 
 
 @pytest.mark.parametrize("head_dim", BWD_DQ_LADDER)
+@pytest.mark.parametrize("sq,sk", [(512, 512), (300, 411)], ids=["square", "ragged"])
+def test_ladder_error_ratio(head_dim, sq, sk):
+    """Every rung of the ladder, square and ragged.
+
+    The ladder is where the *geometry* changes -- wave count, staging granule,
+    LDS size -- so a rung that addresses its tile wrongly fails here and
+    nowhere else. Two shapes because a rung whose only failure is the KV tail
+    passes a square one: `sk = 411` is not a multiple of `BLOCK_N`, and
+    `sq = 300` is not a multiple of any `BLOCK_M` on the table.
+    """
+    torch.manual_seed(13)
+    b, h = 1, 4
+    q, do = (_rand(b, h, sq, head_dim) for _ in range(2))
+    k, v = (_rand(b, h, sk, head_dim) for _ in range(2))
+    scale = _sm_scale(head_dim)
+
+    lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
+    got = _run_dq(q, k, v, do, lse, delta, scale=scale)
+
+    hi = _math_grads(q, k, v, do, torch.float64, scale=scale, gqa=False)[0]
+    lo = _math_grads(q, k, v, do, DT, scale=scale, gqa=False)[0]
+    ours, honest = _max_err(got, hi), _max_err(lo, hi)
+    assert torch.isfinite(got.float()).all()
+    assert ours <= DQ_FUDGE * honest, (
+        f"head_dim {head_dim}: dQ error {ours:.3e} exceeds {DQ_FUDGE}x the bf16 math backend's "
+        f"{honest:.3e} (ratio {ours / max(honest, 1e-30):.2f})"
+    )
+
+
+@pytest.mark.parametrize("head_dim", WORKHORSE)
 def test_error_ratio_under_gqa(head_dim):
     """Same gate with four Q heads per KV head.
 
@@ -405,6 +447,149 @@ def test_db_covers_a_ragged_kv_axis():
 
 
 # ---------------------------------------------------------------------------
+# The 8xD input contract, and padded heads
+# ---------------------------------------------------------------------------
+
+
+# Loads and stores are 8 columns wide, so a head_dim that is a multiple of 8 is
+# a whole number of chunks and the kernel never touches a column it was not
+# given. Every multiple of 8 the ladder can reach, so a rung that mishandles
+# its sub-8-grid widths cannot hide behind the ones the suite happens to name.
+_GRID8 = list(range(8, 513, 8))
+
+
+@pytest.mark.parametrize("hdim", _GRID8)
+def test_grid8_contiguous_is_exact_and_writes_nothing_past_dq(hdim):
+    """A plainly contiguous 8xD tensor -- no padded view -- must just work.
+
+    The forward's counterpart of this test found a real class of bug, and the
+    reason is that every *other* padded test allocates through a wider buffer
+    and slices, so its D pitch is 8-aligned by construction. What a caller
+    actually passes is `torch.randn(b, h, s, 24)`, whose pitch is 24.
+
+    The extra dQ row is a canary: it is contiguous with the last real row, so a
+    tail chunk overrunning the final row lands in it and nowhere else. That is
+    the check that `BwdDqStoreHelper`'s `hdim_vo` rebinding actually took --
+    without it the suppression compares against the wrong extent and the
+    overrun is by whole chunks.
+    """
+    torch.manual_seed(14)
+    b, h, s = 1, 2, 128
+    q, do = (_rand(b, h, s, hdim) for _ in range(2))
+    k, v = (_rand(b, h, s, hdim) for _ in range(2))
+    assert q.stride(2) == hdim, "the point of this test is a tight pitch"
+    scale = _sm_scale(hdim)
+    lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
+
+    sentinel = -12345.0
+    buf = torch.full((b, h, s + 1, hdim), sentinel, device="cuda", dtype=DT)
+    got = _run_dq(q, k, v, do, lse, delta, scale=scale, dq=buf[:, :, :s, :])
+
+    assert torch.all(buf[:, :, s, :] == sentinel), "a store ran past the last dQ row"
+    hi = _math_grads(q, k, v, do, torch.float64, scale=scale, gqa=False)[0]
+    lo = _math_grads(q, k, v, do, DT, scale=scale, gqa=False)[0]
+    assert _max_err(got, hi) <= DQ_FUDGE * _max_err(lo, hi)
+
+
+def _padded(b, h, s, hdim, pitch, poison=None):
+    """A `(b, h, s, hdim)` view into an 8-aligned allocation of `pitch`.
+
+    What the pad *contains* is deliberately not part of the contract, which is
+    what `poison` exists to hold the kernel to: masking Q alone is enough for a
+    finite pad because `0 * x == 0`, and not enough for a NaN.
+    """
+    t = _rand(b, h, s, pitch)
+    if poison is not None:
+        t[..., hdim:] = poison
+    return t[..., :hdim]
+
+
+@pytest.mark.parametrize("hdim", [40, 100, 129, 200, 260, 400])
+@pytest.mark.parametrize("poison", [None, float("nan")], ids=["clean", "nan-pad"])
+def test_padded_head(hdim, poison):
+    """A head_dim between two rungs, with the surplus columns masked.
+
+    The pad is poisoned in half the cases because the D-axis slack belongs to
+    the caller and nothing constrains its contents. Masking Q alone would
+    survive a finite pad and not a NaN, which is why K is masked too -- and in
+    this kernel *both* tiles that reach the K register path are, each against
+    its own extent.
+    """
+    torch.manual_seed(15)
+    b, h, s = 1, 2, 256
+    pitch = (hdim + 7) // 8 * 8
+    q, k, v, do = (_padded(b, h, s, hdim, pitch, poison) for _ in range(4))
+    scale = _sm_scale(hdim)
+    lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
+
+    dq = torch.empty(b, h, s, pitch, device="cuda", dtype=DT)[..., :hdim]
+    dq.fill_(float("nan"))
+    got = _run_dq(q, k, v, do, lse, delta, scale=scale, dq=dq)
+
+    hi = _math_grads(q, k, v, do, torch.float64, scale=scale, gqa=False)[0]
+    lo = _math_grads(q, k, v, do, DT, scale=scale, gqa=False)[0]
+    assert torch.isfinite(got.float()).all(), "the poisoned pad reached the arithmetic"
+    assert _max_err(got, hi) <= DQ_FUDGE * _max_err(lo, hi)
+
+
+@pytest.mark.parametrize("hdim,hdim_v", [(128, 64), (64, 32), (128, 96), (192, 128), (256, 128), (100, 40)])
+def test_asymmetric_hdim(hdim, hdim_v):
+    """`hdim_qk != hdim_vo`, which is where the two extents cross.
+
+    **This is the test the B2 outcome asked for.** GEMM2 reads V through the
+    *K* register path, whose padded-head mask is written against `hdim_qk`;
+    dQ is written through the O store, whose suppression is written against
+    `hdim_vo`. Both are the other extent here, and they coincide in every
+    symmetric build -- so nothing before this could tell the fix from its
+    absence.
+
+    `(100, 40)` is the case that also exercises the `HDIM_VO_FLOOR` fallback:
+    the 128 tile's floor is 96, `hdim_vo` is below it, so the V mask has to
+    cover every K-step rather than the two the floor would leave.
+    """
+    torch.manual_seed(16)
+    b, h, s = 1, 2, 256
+    pitch = (max(hdim, hdim_v) + 7) // 8 * 8
+    q, k = (_padded(b, h, s, hdim, pitch) for _ in range(2))
+    v, do = (_padded(b, h, s, hdim_v, pitch) for _ in range(2))
+    scale = _sm_scale(hdim)
+    lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
+
+    dq = torch.empty(b, h, s, pitch, device="cuda", dtype=DT)[..., :hdim]
+    dq.fill_(float("nan"))
+    got = _run_dq(q, k, v, do, lse, delta, scale=scale, dq=dq)
+
+    hi = _math_grads(q, k, v, do, torch.float64, scale=scale, gqa=False)[0]
+    lo = _math_grads(q, k, v, do, DT, scale=scale, gqa=False)[0]
+    assert _max_err(got, hi) <= DQ_FUDGE * _max_err(lo, hi)
+
+
+def test_padded_head_never_writes_past_hdim_qk():
+    """dQ's D-tail may spill into the caller's pad, but not past it.
+
+    The store is 128 bits and cannot be split, so a chunk straddling the real
+    extent writes into the allocation's own padding -- permitted, and the
+    reason the 8-element pitch contract exists. A chunk starting at or past it
+    must be suppressed, and **dQ's extent is `hdim_qk`**: a build that
+    suppressed against `hdim_vo` here would write four whole chunks of garbage
+    into the next row.
+    """
+    torch.manual_seed(17)
+    b, h, s, hdim, hdim_v = 1, 2, 256, 72, 40
+    pitch = 128  # far wider than either extent, so the surplus is visible
+    q, k = (_padded(b, h, s, hdim, pitch) for _ in range(2))
+    v, do = (_padded(b, h, s, hdim_v, pitch) for _ in range(2))
+    scale = _sm_scale(hdim)
+    lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
+
+    sentinel = -12345.0
+    buf = torch.full((b, h, s, pitch), sentinel, device="cuda", dtype=DT)
+    _run_dq(q, k, v, do, lse, delta, scale=scale, dq=buf[..., :hdim])
+    # `ceil8(72)` is 72, so nothing may be written at or past column 72.
+    assert torch.all(buf[..., hdim:] == sentinel), "a chunk past hdim_qk was not suppressed"
+
+
+# ---------------------------------------------------------------------------
 # Structural
 # ---------------------------------------------------------------------------
 
@@ -514,24 +699,146 @@ def test_unimplemented_modes_are_refused(field, value):
         build_dq(num_heads=4, head_dim=64, **{field: value})
 
 
-@pytest.mark.parametrize("head_dim", [32, 192, 256, 512])
-def test_unbuilt_rungs_are_refused(head_dim):
-    """B2 is head_dim 64 and 128. The rest is B3, and says so."""
-    with pytest.raises(NotImplementedError, match="head_dim"):
-        build_dq(num_heads=4, head_dim=head_dim, causal=False)
+def test_head_dim_past_the_widest_rung_is_refused():
+    """B3 reaches 512, which is the widest tile the ladder describes."""
+    with pytest.raises(ValueError, match="exceeds the widest tile"):
+        build_dq(num_heads=4, head_dim=520, causal=False)
 
 
-@pytest.mark.parametrize("head_dim,head_dim_v", [(100, None), (48, None), (64, 32)])
-def test_padded_and_asymmetric_heads_are_refused(head_dim, head_dim_v):
-    """The two extents are used the other way round here, so refuse until B3.
+@pytest.mark.parametrize("field", ["d_stages", "qk_shards", "vo_shards"])
+def test_d_axis_splits_are_refused(field):
+    """The traits can describe them; this body cannot execute them.
 
-    GEMM2 reads V through the *K* register path, whose padded-head mask is
-    written against `hdim_qk`; the dQ store suppresses against `hdim_vo`. Both
-    are the wrong extent for this kernel, and a build that ignored that would
-    return a finite gradient with the pad folded in.
+    **A near miss worth a test.** The forward's `_with_d_axis_splits` turns
+    `d_stages` on at block_dmodel > 256 -- exactly the rungs B3 added -- and
+    under `D_STAGES > 1` the inherited `ParityGemmHelper.qk` becomes
+    `qk_stage(..., stage=0)` and `pv` writes only the first stage's chunks. The
+    loop here never advances the stage, so the kernel would reduce over part of
+    the head dim, write part of the accumulator, and return a finite wrong
+    answer at 384 and 512. It was caught by an LDS figure that was half what it
+    should have been.
     """
-    with pytest.raises(NotImplementedError):
-        build_dq(num_heads=4, head_dim=head_dim, head_dim_v=head_dim_v, causal=False)
+    with pytest.raises(NotImplementedError, match=field):
+        build_dq(num_heads=4, head_dim=384, causal=False, **{field: 2})
+
+
+def test_rows_per_wave_ceiling_is_enforced():
+    """A geometry over the MFMA's M extent must raise, not compute.
+
+    P7's finding, and the addendum requires it enforced rather than commented:
+    the forward shipped twelve silently-wrong configurations at 0.15-0.28
+    relative error because `BLOCK_M` over `Q_TILES` exceeded `MFMA_M` and the
+    invariant lived in prose.
+
+    Two layers, and they are checked separately because either alone could be
+    removed without the other noticing. `make_bwd_dq_traits` is where the
+    invariant is *enforced*; the knob-level geometry list happens to reject the
+    same configuration earlier, and only because every entry on it satisfies
+    `block_m == num_waves * 32`.
+    """
+    from fmha_tuning_bwd_dq_gfx950 import make_bwd_dq_traits
+
+    with pytest.raises(ValueError, match="caps it at 32"):
+        make_bwd_dq_traits(
+            num_heads=4,
+            num_kv_heads=4,
+            head_dim=128,
+            num_waves=2,
+            block_m=128,  # 64 rows per wave, twice the MFMA's M extent
+            block_n=64,
+            granule=64,
+            causal=False,
+        )
+    with pytest.raises(NotImplementedError, match="addressable"):
+        build_dq(
+            num_heads=4,
+            head_dim=128,
+            causal=False,
+            num_waves=2,
+            block_m=128,
+            block_n=64,
+            head_dim_granule=64,
+        )
+
+
+def test_a_non_padded_build_refuses_a_padded_call():
+    """`padded_head=False` promises the tile is the extent, on *both* axes.
+
+    The kernel emits no D-axis mask at all in that build, so a V narrower than
+    the tile is reduced over the caller's slack: finite, right-shaped, 0.70
+    relative error. Found by this file getting it wrong -- `_run_dq` used to
+    omit `head_dim_v` -- which is why the guard is in `_args` and not here.
+    """
+    torch.manual_seed(19)
+    b, h, s, d, dv = 1, 2, 128, 128, 64
+    q, do = (_rand(b, h, s, d) for _ in range(2))
+    k = _rand(b, h, s, d)
+    v = _rand(b, h, s, dv)
+    lse = torch.zeros(b * h, s, device="cuda", dtype=torch.float32)
+    dq = torch.empty(b, h, s, d, device="cuda", dtype=DT)
+    fn = build_dq(num_heads=h, head_dim=d, causal=False)  # no head_dim_v: not padded
+    with pytest.raises(ValueError, match="not compiled for a padded head"):
+        fn(q, k, v, do[..., :dv], dq, lse, lse.clone(), b, s, seqlen_k=s)
+
+
+@pytest.mark.parametrize("waves", [2, 4])
+@pytest.mark.parametrize("wpe", [1, 2])
+def test_wave_geometries_agree(waves, wpe):
+    """Every geometry the knobs will accept must give the same answer.
+
+    `BwdDqKnobs._SUPPORTED_GEOMETRIES` adds the two-wave points to the
+    forward's list, and the list exists precisely because a geometry that is
+    *describable* can still address the wrong LDS -- P2 measured that at
+    head_dim 192. So the entries have to be run, not asserted: a wave count
+    that gets `ISSUES_PER_WAVE` wrong leaves LDS lines unwritten and reads back
+    whatever was there.
+
+    Against the error-ratio gate rather than bitwise, because the wave count
+    changes `BLOCK_M` and therefore which rows a workgroup owns; the
+    accumulation order within a row is unchanged, but nothing here needs to
+    depend on that.
+    """
+    torch.manual_seed(18)
+    b, h, s, d = 1, 4, 512, 128
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    scale = _sm_scale(d)
+    lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
+
+    dq = torch.full((b, h, s, d), float("nan"), device="cuda", dtype=DT)
+    fn = build_dq(
+        num_heads=h,
+        head_dim=d,
+        causal=False,
+        num_waves=waves,
+        block_m=waves * 32,
+        block_n=64,
+        head_dim_granule=64,
+        waves_per_eu=wpe,
+    )
+    fn(q, k, v, do, dq, lse, delta, b, s, seqlen_k=s, scale=scale)
+
+    hi = _math_grads(q, k, v, do, torch.float64, scale=scale, gqa=False)[0]
+    lo = _math_grads(q, k, v, do, DT, scale=scale, gqa=False)[0]
+    assert _max_err(dq, hi) <= DQ_FUDGE * _max_err(lo, hi)
+
+
+def test_the_wide_rungs_fit_lds_unstaged():
+    """head_dim 384 and 512 inside the cap, on two staging regions rather than three.
+
+    The B3 blocker, as an assertion. B2 staged K twice -- 199 KB at head_dim
+    512 against a 163840 B cap -- so the ladder did not merely run slowly
+    there, it could not be built. A regression that reintroduced the third
+    region would fail to compile with "local memory exceeds limit", which names
+    the symptom and not the cause.
+    """
+    from fmha_tuning_gfx950 import FmhaInputMetadata
+
+    for head_dim, want_kb in ((256, 66.5), (384, 99.8), (512, 133.0)):
+        traits = bwd_dq_knobs().resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False)).traits
+        kb = traits.LDS_KV_TOTAL_SIZE * traits.BF16_BYTES / 1024
+        assert abs(kb - want_kb) < 0.5, f"head_dim {head_dim}: {kb:.1f} KB, expected {want_kb}"
+        assert kb < 160.0
+        assert traits.D_STAGES == 1 and traits.VO_SHARDS == 1
 
 
 def test_lse_and_delta_layout_is_checked_on_the_host():

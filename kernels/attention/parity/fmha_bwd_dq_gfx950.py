@@ -3,9 +3,10 @@
 
 """Flash-attention **backward dQ (and dB)** for gfx950 -- AOTriton's `bwd_kernel_dq`.
 
-B2 of `sdpa-bwd-plan-gfx950.md`. Dense, non-causal, head_dim 64 and 128, bf16.
-The dK/dV half is B1 and lives in its own file; there is deliberately no fused
-kernel (plan section 4).
+B2 and B3 of `sdpa-bwd-plan-gfx950.md`. Dense, non-causal, bf16, the full
+`LADDER` from head_dim 32 to 512, with the 8xD input contract, padded heads and
+asymmetric `hdim_qk`/`hdim_vo`. The dK/dV half is B1 and lives in its own file;
+there is deliberately no fused kernel (plan section 4).
 
     P  = exp2(qk_scale * S - lse2)        S  = Q.K^T,  qk_scale = sm_scale*log2e
     dP = dO . V^T
@@ -33,29 +34,38 @@ through `cast_p`, so it carries the *same* K permutation `P` does, which is why
 `load_v`'s transpose read lands K in the operand registers the MFMA wants with
 no further shuffle.
 
---- Three LDS tiles in four slots ---------------------------------------------
+--- Two LDS tiles, and the read that makes it two ------------------------------
 
 GEMM1 wants K with the KV token on the MFMA's M axis and `d` contracted; GEMM3
-wants K with `d` on M and the KV token contracted. Those are two different LDS
-read patterns -- the forward's K path and its V path -- and the two stagings
-differ in their line padding (`SMEM_K_PAD` 8 elements against `SMEM_V_PAD` 32),
-so **K is staged twice**. V is staged once, in the K layout.
+wants K with `d` on M and the KV token contracted. Those are the forward's K
+path and its V path, and the two stagings differ **only in the line padding**
+(`SMEM_K_PAD` 8 elements against `SMEM_V_PAD` 32). B2 answered that by staging
+K twice. B3 cannot: three slots is 199 KB at head_dim 512 against a 163840 B
+cap, so the double staging is what stops the ladder rather than merely costing
+DMA.
 
-The forward's allocation already has four slots: `(K,buf0) (V,buf0) (K,buf1)
-(V,buf1)`, sized for two KV tiles in flight. This kernel keeps one tile in
-flight and spends three of them:
+So the K tile is staged **once, in the V layout**, and read two ways:
 
-    (K, buf 0) <- K, K layout   -> load_k(0)  GEMM1
-    (V, buf 0) <- K, V layout   -> load_v(0)  GEMM3   (the transpose read)
-    (K, buf 1) <- V, K layout   -> load_k(1)  GEMM2
-    (V, buf 1) <- unused
+    (V, buf 0) <- K   -> load_v(0)          GEMM3, the stock transpose read
+                      -> load_k_packs()     GEMM1, the K path on V-pitch lines
+    (K, buf 0) <- V   -> load_k_packs()     GEMM2, the stock K path
+    buf 1                unused, and not allocated
 
-Repurposing the slots rather than adding a layout costs one unused tile of LDS
-(17 KB at head_dim 128, inside the cap) and buys **zero new addressing code**:
-the DMA `m0` tables, the buffer bases and the LDS alias scopes are all the
-forward's, already validated by `tooling/probe_kv_staging.py`. The double
-staging of K is the honest cost of the design and is the first thing to attack
-if a profile asks; see the outcome section of the plan.
+`LDS_KV_TOTAL_SIZE` drops to one buffer -- `SMEM_K_TILE_ELEMS +
+SMEM_V_TILE_ELEMS`, 133 KB at head_dim 512 -- which is a single trait field
+(`BwdDqTraits`, `make_bwd_dq_traits`).
+
+**The K tile is the one in the V region, not the other way round, and that is
+deliberate.** One of the two readers has to be re-pointed at the other pitch,
+and the K path is a plain `llvm.LoadOp` whose whole addressing is two
+expressions; the transpose path is `ds_read_b64_tr_b16` with alias scopes, an
+even-VGPR-pair constraint and two open hazards against it (`sdpa_lore_gfx950`).
+Leave the fragile one stock. `BwdDqKvLdsToVgprLoader` re-points the other by
+scoping two trait fields, so the *formula* is still the shared one.
+
+The alias scopes stay truthful: the K tile is read under `lds_v0` by both of
+its readers and the V tile under `lds_k0`, so no scope claims two regions are
+disjoint when they are the same memory.
 
 --- Conventions this kernel must not get wrong --------------------------------
 
@@ -75,16 +85,32 @@ check them against our own forward rather than only against torch:
   `m_row*ln2 + ln(l)`, so `lse2 = lse * log2e` (AOTriton's `l_i = ... *
   RCP_LN2`). `fmha.lse_row_addressing` owns the layout for both LSE and delta.
 
+--- The two head extents are crossed, and that is not a detail ----------------
+
+In the forward, the tensor read through the K register path has the *qk*
+extent and the tensor written through the O store has the *vo* one. **Both are
+the other way round here**, because GEMM2 reads V through the K path and the
+store writes dQ, which is Q-shaped:
+
+- two `BwdDqKvLdsToVgprLoader` instances, one per tile, differing in the LDS
+  pitch *and* in which extent their padded-head mask is written against
+  (plus `HDIM_VO_FLOOR`, the vo counterpart of `HDIM_QK_FLOOR`);
+- `BwdDqStoreHelper`, which rebinds `hdim_vo` to the qk extent.
+
+They coincide in every symmetric build, so only `test_asymmetric_hdim` can tell
+the fix from its absence.
+
 --- Not implemented, deliberately ---------------------------------------------
 
-Causal, windows, varlen, dropout, bias *input*, split-K, paged, head_dim off
-{64, 128}, padded heads and asymmetric `hdim_qk`/`hdim_vo`.
-`BwdDqKnobs._with_traits` refuses each by name rather than ignoring it -- every
-one of them would otherwise build, run and return a correctly-shaped wrong
-answer. The last two are refused for a specific reason worth reading there: the
-two head extents are used the *other way round* in this kernel than in the
-forward, because GEMM2 reads V through the K register path.
+Causal, windows, varlen, dropout, bias *input*, split-K, paged, `D_STAGES`,
+d-axis sharding. `BwdDqKnobs._with_traits` refuses each by name rather than
+ignoring it -- every one of them would otherwise build, run and return a
+correctly-shaped wrong answer, and `D_STAGES` nearly did: the forward's knob
+policy turns it on above head_dim 256 and the inherited GEMM helpers then
+reduce over one stage of the head dim while this loop never advances the stage.
 """
+
+from dataclasses import replace
 
 import fmha_abi_gfx1201 as abi
 import fmha_common_gfx1201 as fmha
@@ -97,15 +123,25 @@ from fmha_dualwave_gfx950 import (
     ParitySoftmaxHelper,
     ParityStoreHelper,
 )
+
+# Private to `fmha_dualwave_gfx950`, and imported anyway: they are the
+# granule-general spellings of the K read's per-lane base and k-step offset,
+# and the alternative is a second copy of two formulas the read and write sides
+# of an LDS layout both depend on. Reaching across within one kernel family
+# beats transcribing.
+from fmha_dualwave_gfx950 import _k_read_base as _parity_k_read_base
+from fmha_dualwave_gfx950 import _ks_offset as _parity_ks_offset
 from fmha_tuning_bwd_dq_gfx950 import BwdDqKnobs, bwd_dq_knobs
 from fmha_tuning_gfx950 import FmhaInputMetadata
 from gfx950_standalone import buffer_ops, dualwave
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
+from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
@@ -116,7 +152,9 @@ __all__ = [
     "BwdDbStoreHelper",
     "BwdDqKernelContext",
     "BwdDqKvGmemToLdsLoader",
+    "BwdDqKvLdsToVgprLoader",
     "BwdDqSoftmaxHelper",
+    "BwdDqStoreHelper",
     "BwdRowInputLoader",
     "BwdSecondaryQLoader",
     "build_fmha_bwd_dq_gfx950_module",
@@ -126,6 +164,26 @@ __all__ = [
 _s_barrier = dualwave._s_barrier
 _s_waitcnt = dualwave._s_waitcnt
 _sched_barrier = dualwave._sched_barrier
+
+
+def _carried(values, count):
+    """An `scf.for`'s carried values as a list of `count`, however many it hands back.
+
+    **A loop with exactly one carried value hands it back unwrapped**, because
+    an `scf.for` with one result is a value rather than a tuple. This kernel
+    carries `D_CHUNKS` accumulators and nothing else, so head_dim 32 -- the one
+    rung where `D_CHUNKS == 1` -- is the only place that bites, and it bites
+    two frames away: `loop_results[0]` on a `vector<16xf32>` returns the *first
+    f32 element*, and the failure surfaces inside `_scale_o_accs` as "Cannot
+    cast type to VectorType". The forward never sees this because it always
+    carries `m_row` and `l_row` alongside.
+    """
+    if const_expr(isinstance(values, (list, tuple))):
+        return list(values)
+    if const_expr(count != 1):
+        raise AssertionError(f"expected {count} carried values, got one unwrapped value")
+    return [values]
+
 
 _COMPILED = {}
 
@@ -340,19 +398,17 @@ class BwdSecondaryQLoader(ParityQLoader):
 
 
 class BwdDqKvGmemToLdsLoader(ParityKvGmemToLdsLoader):
-    """One staging routine, three (tensor, layout, slot) triples.
+    """One staging routine, two (tensor, region) pairs.
 
     The inherited `load_k` / `load_v` pair hardcodes which tensor goes to which
-    slot, which is exactly the assumption this kernel breaks: K is staged
-    twice, into slots of two different layouts. `_stage` is the inherited body
-    with the tensor, the stride and the `m0` table all handed in, so the three
-    calls below differ only in their arguments.
+    region, and this kernel puts **K in the V region**. `_stage` is the
+    inherited body with the tensor, the stride and the `m0` table all handed
+    in, so the two calls below differ only in their arguments.
 
-    The `m0` table *is* the layout choice: `k_dma_m0` addresses lines at
-    `SMEM_K_LINE_STRIDE` and `v_dma_m0` at `SMEM_V_LINE_STRIDE`, and each
-    matches the reader that later walks that slot. Pairing them wrongly would
-    read a tile that was written with a different pitch -- plausible numbers,
-    no fault.
+    The `m0` table *is* the pitch: `k_dma_m0` addresses lines at
+    `SMEM_K_LINE_STRIDE` and `v_dma_m0` at `SMEM_V_LINE_STRIDE`, and each has to
+    match the reader that later walks the region. Pairing them wrongly reads a
+    tile written with a different pitch -- plausible numbers, no fault.
 
     Setting `stride_kv_n_v` before delegating is the inherited trick and is
     safe for the inherited reason: tracing is eager, so the attribute is read
@@ -371,17 +427,111 @@ class BwdDqKvGmemToLdsLoader(ParityKvGmemToLdsLoader):
             self.NUM_DMA_K,
         )
 
-    def stage_k_for_qk(self, tile_start):
-        """K in the K layout: GEMM1's A operand, read by `load_k(0)`."""
-        self._stage(tile_start, self.k_div, self.stride_k_seq_v, self.ctx_ref.k_dma_m0, 0)
-
-    def stage_k_for_dq(self, tile_start):
-        """K in the V layout: GEMM3's A operand, read by `load_v(0)` transposed."""
+    def stage_k(self, tile_start):
+        """K into the V region: GEMM1's and GEMM3's A operand, one copy."""
         self._stage(tile_start, self.k_div, self.stride_k_seq_v, self.ctx_ref.v_dma_m0, 0)
 
-    def stage_v_for_dp(self, tile_start):
-        """V in the K layout: GEMM2's A operand, read by `load_k(1)`."""
-        self._stage(tile_start, self.v_div, self.stride_v_seq_v, self.ctx_ref.k_dma_m0, 1)
+    def stage_v(self, tile_start):
+        """V into the K region: GEMM2's A operand."""
+        self._stage(tile_start, self.v_div, self.stride_v_seq_v, self.ctx_ref.k_dma_m0, 0)
+
+
+class BwdDqKvLdsToVgprLoader(ParityKvLdsToVgprLoader):
+    """The forward's two readers, with the K path re-pointable at the V pitch.
+
+    One instance per tile, because the *padded-head extent* differs between
+    them as much as the pitch does: the K tile's D axis is `hdim_qk` and the V
+    tile's is `hdim_vo`. B2 had one instance and would have masked V's columns
+    against Q's extent the moment a padded head arrived -- one of the two
+    crossed sites the plan's B2 outcome names.
+
+    `v_layout` is a Python bool fixed at construction, so every `const_expr`
+    below folds and neither instance emits the other's code.
+    """
+
+    def __init__(self, ctx, *, v_layout, hdim, hdim_floor):
+        super().__init__(ctx)
+        self.v_layout = bool(v_layout)
+        # `load_k`'s mask reads these two by these names. Rebinding them is
+        # what makes one class serve both extents.
+        self.hdim_qk = hdim
+        self.HDIM_QK_FLOOR = int(hdim_floor)
+
+    def _lds_pack(self, elem_idx, scope_name):
+        """One 8xbf16 MFMA operand pack out of LDS, under a chosen alias scope.
+
+        `dualwave._load_k_pack_aligned` is the same four lines, except that it
+        derives the scope as `lds_k{buf_id}` -- and this kernel's K tile lives
+        in the `v0` region. A scope that names the wrong region is not a
+        cosmetic problem: `ROCDL_LDS_Read_Tr_IntrOp` and this load are told
+        they cannot alias, and here they read the same bytes.
+        """
+        traits = self.traits
+        ptr = buffer_ops.get_element_ptr(self.lds_kv_base_ptr, byte_offset=elem_idx * traits.BF16_BYTES, elem_type=T.i8)
+        return llvm.LoadOp(
+            self.kv_mfma_pack_type,
+            ptr,
+            alignment=16,
+            alias_scopes=dualwave._dualwave_lds_alias_scopes(scope_name),
+            noalias_scopes=dualwave._dualwave_lds_noalias_scopes(scope_name, traits.LDS_SCOPE_NAMES),
+        ).result
+
+    def _read_k_packs(self, buf_id, urk_base):
+        """The K path, over whichever region this instance owns.
+
+        The `v_layout` arm re-points three things and no more: the line pitch,
+        the k-step outer stride (which is `SMEM_N_RPT` lines) and the region
+        base. Everything else -- `_parity_k_read_base`, `_parity_ks_offset`,
+        the `N_STRIP` lo/hi split -- is the shared formula, evaluated against a
+        `replace`d traits object rather than transcribed. The two pitches are
+        the *only* difference between the layouts, which is what makes the
+        substitution total.
+
+        `urk_base` is ignored on this arm: `load_k` computes it from
+        `k_lds_read_base_per_lane`, which the context derived at the K pitch.
+        """
+        if const_expr(not self.v_layout):
+            return super()._read_k_packs(buf_id, urk_base)
+        full = self.traits
+        self.traits = replace(
+            full,
+            SMEM_K_LINE_STRIDE=full.SMEM_V_LINE_STRIDE,
+            K_LDS_TO_REG_KSTEP_OUTER_STRIDE=full.SMEM_N_RPT * full.SMEM_V_LINE_STRIDE,
+        )
+        try:
+            traits = self.traits
+            scope = dualwave._dualwave_lds_scope("v", buf_id)
+            base = dualwave._v_buf_base(traits, buf_id) + _parity_k_read_base(
+                traits, self.lane_mod_32, self.lane_div_32
+            )
+            k_lo = [None] * traits.K_STEPS_QK
+            k_hi = [None] * traits.K_STEPS_QK
+            for ks in range_constexpr(traits.K_STEPS_QK):
+                idx = base + _parity_ks_offset(traits, ks)
+                k_lo[ks] = self._lds_pack(idx, scope)
+                k_hi[ks] = self._lds_pack(idx + traits.K_LDS_TO_REG_N_STRIP_STRIDE, scope)
+            return k_lo, k_hi
+        finally:
+            self.traits = full
+
+
+class BwdDqStoreHelper(ParityStoreHelper):
+    """The O store, told that its output is `hdim_qk` wide.
+
+    `_final_o_global` suppresses chunks starting at or past `self.hdim_vo`,
+    because in the forward the tensor it writes *is* O. Here it writes dQ,
+    which is Q-shaped and `hdim_qk` wide. The two coincide in every symmetric
+    build and cross the moment they do not -- the second of the two sites the
+    plan's B2 outcome names.
+
+    Rebinding the attribute rather than overriding the method: the suppression
+    is one comparison inside a method that also computes the address, and a
+    copy of it would be a copy of both.
+    """
+
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self.hdim_vo = ctx.hdim_qk
 
 
 class BwdDbStoreHelper(ParityStoreHelper):
@@ -402,33 +552,51 @@ class BwdDbStoreHelper(ParityStoreHelper):
     the same device `ParityStoreHelper._final_o_global` and `_store_lse_row`
     use.
 
-    **It costs 4-5x, measured**, at `B=2 H=8 S=2048`: 55 -> 271 us at head_dim
-    64 and 89 -> 373 us at 128. That is not bandwidth -- the tensor is 134 MB,
-    about 27 us at this board's rate -- it is 32 scalar stores per lane per KV
-    tile. A vectorised version needs *two* things and not one: a runtime
-    second arm for the tile containing `seqlen_k`, and a `stride_db_seq`
-    divisible by 4, since an 8-byte store off a row pitch of, say, 201
-    elements is 2-byte aligned. Both are straightforward and neither is B2.
+    It costs 2-5.5x, measured across the ladder, and it is a *cost* rather than
+    a ceiling: every rung including 512 builds and is correct with it on. The
+    numbers and the register accounting are in the B3 outcome section of
+    `sdpa-bwd-plan-gfx950.md`. A vectorised version needs *two* things and not
+    one: a runtime second arm for the tile containing `seqlen_k`, and a
+    `stride_db_seq` divisible by 4, since an 8-byte store off a row pitch of,
+    say, 201 elements is 2-byte aligned.
+
+    --- The source is the packed bf16, not the f32 -----------------------------
+
+    **This shortens a live range rather than shrinking a value**, and at the
+    top of the ladder that is the difference that matters. `dS` exists twice:
+    as 32 f32 scores, and -- after `cast_p` -- as 4 packed `v8` bf16 vectors,
+    16 VGPRs against 32. Storing from the f32 list keeps *both* alive across
+    the 32-store sequence and its address arithmetic, at exactly the point
+    where head_dim 384 and 512 have no registers left. Reading from the packs
+    lets the f32 form die at `cast_p`.
+
+    The values are identical: `dB` is a bf16 tensor either way, so the f32 ->
+    bf16 rounding happens once regardless -- this only moves *where*. The
+    element map is unchanged, because `_pack_p_v8_slices` packs list element
+    `pks*8 + j` into lane slot `j` of pack `pks`, in order.
     """
 
-    def store_tile(self, ds_lists, tile_idx, q_row):
+    def store_tile(self, ds_packs, tile_idx, q_row):
         traits = self.traits
         ctx = self.ctx_ref
-        lo, hi = ds_lists
+        lo_packs, hi_packs = ds_packs
         row_base = q_row * fx.Index(ctx.stride_db_seq)
         col_base = dualwave._seq_pad_col_base(traits, tile_idx, lane_div_32=self.lane_div_32)
         in_row = q_row < self.seqlen_q_v
-        for half, values in ((0, lo), (1, hi)):
-            for r in range_constexpr(16):
-                # The same element -> column map the KV tail mask uses. Derived
-                # once, in `flash_attn_utils`, and read here rather than
-                # transcribed: the mask and this store must agree about which
-                # column an element is, or dB is a permutation of itself.
-                col_i32 = col_base + fx.Int32(dualwave._seq_pad_score_threshold(traits, r) + half * 32)
-                live = in_row & (col_i32 < self.seqlen_kv_i32)
-                off = fx.Index(live.select(row_base + fx.Index(col_i32), ctx.db_oob_off))
-                val = fx.Float32(values[r]).to(self.elem_dtype)
-                buffer_ops.buffer_store(as_mlir_value(val), ctx.db_rsrc, as_mlir_value(fx.Int32(off)))
+        for half, packs in ((0, lo_packs), (1, hi_packs)):
+            for pks in range_constexpr(len(packs)):
+                vec = Vec(packs[pks], (8,), self.elem_dtype)
+                for j in range_constexpr(8):
+                    # The same element -> column map the KV tail mask uses.
+                    # Derived once, in `flash_attn_utils`, and read here rather
+                    # than transcribed: the mask and this store must agree
+                    # about which column an element is, or dB is a permutation
+                    # of itself.
+                    r = pks * 8 + j
+                    col_i32 = col_base + fx.Int32(dualwave._seq_pad_score_threshold(traits, r) + half * 32)
+                    live = in_row & (col_i32 < self.seqlen_kv_i32)
+                    off = fx.Index(live.select(row_base + fx.Index(col_i32), ctx.db_oob_off))
+                    buffer_ops.buffer_store(as_mlir_value(vec[j]), ctx.db_rsrc, as_mlir_value(fx.Int32(off)))
 
 
 def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
@@ -444,6 +612,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
 
     BLOCK_DMODEL = knobs.block_dmodel
     PADDED_HEAD = knobs.padded_head
+    HDIM_QK_FLOOR = knobs.hdim_qk_floor
     STORE_DB = traits.STORE_DB
     BUILD_SM_SCALE = meta.sm_scale
 
@@ -454,6 +623,8 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         traits.cache_tag,
         BLOCK_DMODEL,
         PADDED_HEAD,
+        HDIM_QK_FLOOR,
+        traits.HDIM_VO_FLOOR,
         STORE_DB,
         BUILD_SM_SCALE,
         (knobs.num_waves, knobs.block_m, knobs.block_n, knobs.head_dim_granule),
@@ -588,12 +759,16 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         ctx.init_row_inputs()
 
         kv_gmem_to_lds = BwdDqKvGmemToLdsLoader(ctx)
-        kv_lds_to_regs = ParityKvLdsToVgprLoader(ctx)
+        # Two reader instances, and they differ in *both* the LDS pitch and the
+        # padded-head extent. `k_reader` also serves GEMM3 through the stock
+        # `load_v(0)`, since that reads the same region it does.
+        k_reader = BwdDqKvLdsToVgprLoader(ctx, v_layout=True, hdim=hdim_qk, hdim_floor=HDIM_QK_FLOOR)
+        v_reader = BwdDqKvLdsToVgprLoader(ctx, v_layout=False, hdim=hdim_vo, hdim_floor=traits.HDIM_VO_FLOOR)
         q_loader = ParityQLoader(ctx)
         do_loader = BwdSecondaryQLoader(ctx, ctx.do_div, ctx.stride_do_seq_v, ctx.do_gmem_elem_offset, hdim_vo)
         gemm_helper = ParityGemmHelper(ctx)
         softmax_helper = BwdDqSoftmaxHelper(ctx)
-        output_store = ParityStoreHelper(ctx)
+        output_store = BwdDqStoreHelper(ctx)
         row_inputs = BwdRowInputLoader(ctx)
         db_store = BwdDbStoreHelper(ctx)
 
@@ -610,22 +785,21 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             init_args = [ctx.c_zero_v16f32 for _ in range_constexpr(traits.D_CHUNKS)]
             loop_results = init_args
             for j, loop_args in range(ctx.split_tile(0), ctx.split_t_end, fx.Index(1), init=init_args):
-                v_dq = [loop_args[i] for i in range_constexpr(traits.D_CHUNKS)]
+                v_dq = _carried(loop_args, traits.D_CHUNKS)
                 tile_start = ctx.tile_start(j)
 
                 # Closes the previous iteration's readers before the DMA
                 # overwrites what they were reading. One tile in flight, so
                 # there is no second buffer to hide behind.
                 _s_barrier()
-                kv_gmem_to_lds.stage_k_for_qk(tile_start)
-                kv_gmem_to_lds.stage_k_for_dq(tile_start)
-                kv_gmem_to_lds.stage_v_for_dp(tile_start)
+                kv_gmem_to_lds.stage_k(tile_start)
+                kv_gmem_to_lds.stage_v(tile_start)
                 _s_waitcnt(0)
                 _sched_barrier(0)
                 _s_barrier()  # every wave's DMA has landed, not just mine
 
                 # -- GEMM1. S, raw. The scale and the LSE subtract follow.
-                v_s = gemm_helper.qk(kv_lds_to_regs.load_k(0), q_all_bf16)
+                v_s = gemm_helper.qk(k_reader.load_k(0), q_all_bf16)
                 v_s = softmax_helper.scale_and_sub_lse(v_s, ctx.c_sm_scale_log2e, lse2)
                 # Columns past `seqlen_kv` read zero from the buffer bound,
                 # which is a *score of zero*, not an absent key: without the
@@ -634,8 +808,10 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
                 v_s = softmax_helper.seq_pad_mask_if_needed(v_s, j)
 
                 # -- GEMM2. dP. V is read through the K path, so this is
-                #    GEMM1's code with the two operands substituted.
-                v_dp = gemm_helper.qk(kv_lds_to_regs.load_k(1), do_all_bf16)
+                #    GEMM1's code with the two operands substituted -- and with
+                #    the *other* reader instance, which owns the K-pitch region
+                #    and masks against `hdim_vo`.
+                v_dp = gemm_helper.qk(v_reader.load_k(0), do_all_bf16)
 
                 # P = exp2(qk_scale*S - lse2). `exp2` is the forward's, split
                 # into two halves there for the pipeline and simply adjacent
@@ -652,22 +828,45 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
                     ds_lo[r] = dualwave._fmul(v_p[0][r], dualwave._fsub(dp_lo[r], delta, ctx.fm_fast), ctx.fm_fast)
                     ds_hi[r] = dualwave._fmul(v_p[1][r], dualwave._fsub(dp_hi[r], delta, ctx.fm_fast), ctx.fm_fast)
 
-                if const_expr(STORE_DB):
-                    # Before the bf16 cast below consumes the lists, and
-                    # before `sm_scale`: `dB = dS`, and AOTriton scales only
-                    # `dq` at the end.
-                    db_store.store_tile((ds_lo, ds_hi), j, ctx.q_row)
-
                 # -- GEMM3. dQ += dS . K, with K read transposed out of the V
                 #    slot. `cast_p` gives dS the same K permutation P has, and
                 #    the transpose read is built against that permutation, so
                 #    the two line up with no further shuffle.
                 v_ds = softmax_helper.cast_p((ds_lo, ds_hi))
-                v_dq = gemm_helper.pv(v_ds, kv_lds_to_regs.load_v(0), v_dq)
+
+                if const_expr(STORE_DB):
+                    # **After `cast_p`, before `pv`, and reading the packs.**
+                    # `dB = dS`, so nothing here is ordered by *arithmetic* --
+                    # the store need only precede `sm_scale`, which is after
+                    # the loop. It is ordered entirely by register pressure,
+                    # and three placements were measured at `B=2 H=8 S=2048`
+                    # (TFLOP/s, on the rungs that spill):
+                    #
+                    #     variant                        256    384    512
+                    #     f32 lists, before cast_p       280    149     56
+                    #     packs, after cast_p (this)     315    136     83
+                    #     packs, after pv                305    146     73
+                    #
+                    # Reading the packs is the lever: `dS` exists as 32 f32
+                    # *and*, after `cast_p`, as 16 packed bf16, and storing
+                    # from the f32 form keeps both alive across the 32-store
+                    # sequence. Below head_dim 256 it changes nothing -- the
+                    # counts are register-identical, so the allocator was
+                    # already sinking the f32 form -- and at 512 it is 1.49x.
+                    #
+                    # 384 prefers the f32 form by 9%, which the lore says a
+                    # sweep cannot settle (it wants interleaved A/B), and it is
+                    # an allocator outcome rather than a mechanism: the spill
+                    # counts are not monotone with the rate in any of the three
+                    # columns. This variant is kept because its one *decisive*
+                    # measurement -- 1.49x at 512 -- agrees with the mechanism.
+                    db_store.store_tile(v_ds, j, ctx.q_row)
+
+                v_dq = gemm_helper.pv(v_ds, k_reader.load_v(0), v_dq)
 
                 loop_results = yield v_dq
 
-            v_dq = [loop_results[i] for i in range_constexpr(traits.D_CHUNKS)]
+            v_dq = _carried(loop_results, traits.D_CHUNKS)
             # `sm_scale` once on the accumulator rather than on every dS: the
             # softmax input is `sm_scale * Q.K^T`, so the factor is linear in
             # the whole sum. AOTriton's `composed_mul_lhs(dq, sm_scale)`.
@@ -843,6 +1042,20 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         )
         del _ptrs  # gfx950 addresses through buffer descriptors, so it wants the tensors
         num_head_q, num_head_k, hdim_qk, hdim_vo = shape_meta
+
+        # **A build without `padded_head` promises the tile *is* the extent**,
+        # on both axes, and this is the only place that can be checked. Found
+        # by a test of this file's own making: `build(head_dim=128)` handed a V
+        # of width 64 resolves to `padded_head=False`, emits no mask at all,
+        # and reduces `dP` over the caller's D-axis slack. The answer is finite
+        # and 0.70 relative error. A real caller can make the same mistake, so
+        # the guard belongs here rather than in the test that found it.
+        if not PADDED_HEAD and not (hdim_qk == hdim_vo == BLOCK_DMODEL):
+            raise ValueError(
+                f"this build is not compiled for a padded head, so it requires hdim_qk == hdim_vo == "
+                f"{BLOCK_DMODEL}; got hdim_qk {hdim_qk}, hdim_vo {hdim_vo}. Pass head_dim_v to the "
+                "builder so the D-axis masks are emitted."
+            )
 
         # **`(batch * heads, tokens)`, and the shape is shared with dK/dV.**
         # Both backward kernels take the same two row tensors and read them

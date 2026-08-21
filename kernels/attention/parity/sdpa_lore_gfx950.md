@@ -359,3 +359,50 @@ head_dim 96 is a normal rung again.
   pair, not the wave count, and read `agpr_count` as the discriminator: a build
   at 0 AGPRs with a nonzero spill count is not short of registers, it is
   forbidden from using half of them.
+- **A policy default you did not choose can turn an inherited helper into a
+  half-implementation.** The forward's `_with_d_axis_splits` switches
+  `d_stages` on above head_dim 256. A backward kernel that subclasses those
+  knobs and reaches those rungs inherits it -- and under `D_STAGES > 1` the
+  shared `ParityGemmHelper.qk` becomes `qk_stage(..., stage=0)` while `pv`
+  writes only the first stage's accumulator chunks. A body that never advances
+  the stage then reduces over **half the head dim** and returns a finite,
+  correctly-shaped wrong answer at exactly the widths that are hardest to
+  eyeball. Caught on dQ by an LDS figure that was half what it should have
+  been, and by nothing else -- the error sweep had run against an earlier
+  override that happened to pin it to 1. Two rules follow: when you subclass a
+  knob pipeline, **enumerate what its defaults do at the shapes you newly
+  reach**, and refuse a feature the body does not implement *by name* rather
+  than trusting a default to stay put.
+- **`padded_head` is resolved, not passed, and resolving it wrong emits no mask
+  at all.** `build(head_dim=128)` handed a V of width 64 resolves
+  `padded_head=False` -- because it only ever saw one extent -- and the build
+  then reduces `dP` over the caller's D-axis slack: finite, right shape, 0.70
+  relative error. The host is the only place this is visible, so a non-padded
+  build should *require* `hdim_qk == hdim_vo == BLOCK_DMODEL` at dispatch. This
+  was found by a test helper making the mistake, which is the good case; a
+  caller making it gets silently wrong gradients.
+- **An `scf.for` with exactly one carried value hands it back unwrapped.**
+  Indexing it then returns the first *element* of the vector rather than the
+  vector, and the failure surfaces frames away ("Cannot cast type to
+  VectorType" inside `_scale_o_accs`). It only appears where the loop carries a
+  single value, so head_dim 32 (`D_CHUNKS == 1`) is the one rung that hits it
+  and the forward never does -- it always carries `m_row` and `l_row` too.
+  Normalise the loop results through a helper rather than indexing them
+  directly.
+- **Ask what a workgroup *re-reads*, not just what it computes.** The gfx950
+  backward's dK/dV kernel keeps K/V resident and streams Q/dO, so every
+  workgroup reads the *whole* of Q and dO for its head and the total traffic is
+  `seqlen / BLOCK_KV` copies of that slab. `BLOCK_KV` is `32 * waves / shards`,
+  which makes the wave count a **bandwidth** knob as well as a register one --
+  worth 1.7x at head_dim 160 and 224 (408 -> 690, 486 -> 723) with the register
+  allocation byte-identical, because 4 waves is still one per SIMD. Anything
+  that divides `BLOCK_KV` (sharding, in that kernel) pays this back at the same
+  time as it buys registers, and the two effects have to be priced together.
+- **Sharing a slab across the fast grid axis is not a locality win here.** The
+  obvious follow-on to the above -- put the KV block on the fast axis so the
+  concurrently-issued workgroups all read the same Q -- is **12-15% slower at
+  every width tried** (512: 230 TF against 260, 384: 260 against 283, 256: 390
+  against 433). The eight XCDs have separate L2s, so a shared slab is
+  duplicated across all of them instead of distinct work being spread over
+  them. Head-fastest wins on both the forward and the backward, for opposite
+  reasons; do not port the *reason*.

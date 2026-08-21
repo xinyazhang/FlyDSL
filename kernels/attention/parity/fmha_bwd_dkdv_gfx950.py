@@ -3,8 +3,10 @@
 
 """dK / dV for gfx950 -- AOTriton's `bwd_kernel_dk_dv` on the dualwave helpers.
 
-B1 of `sdpa-bwd-plan-gfx950.md`: dense, non-causal, head_dim 64 and 128, bf16,
-MHA. The contract is `sdpa-bwd-contract-gfx950.md`; read that first.
+B1 + B3 of `sdpa-bwd-plan-gfx950.md`: dense, non-causal, MHA, bf16, over the
+forward's whole head_dim ladder with the 8xD input contract and padded heads.
+The contract is `sdpa-bwd-contract-gfx950.md` and its B3 addendum; read those
+first.
 
 --- The whole design in one paragraph --------------------------------------
 
@@ -14,8 +16,9 @@ resident Q and streaming K/V. Every helper in `fmha_dualwave_gfx950.py` was
 written against "a tensor, its bounds and where it lands" rather than against
 K or V by name, so the roles swap by re-pointing four descriptors and nothing
 else. The two tensor slots the staging machinery calls *K* and *V* carry **Q**
-and **dO** here, and `BLOCK_M` / `BLOCK_N` in the traits mean the KV block and
-the Q tile -- see `fmha_tuning_bwd_dkdv_gfx950`'s docstring for the full map.
+and **dO** here, and `BLOCK_M` / `BLOCK_N` / `VO_SHARDS` in the traits mean the
+KV block, the Q tile and the dK/dV D-axis split -- see
+`fmha_tuning_bwd_dkdv_gfx950`'s docstring for the full map.
 
 --- Four GEMMs, and where each operand comes from ---------------------------
 
@@ -39,7 +42,33 @@ staged in the *V* LDS shape and read two ways: `ds_read_b128` for the
 row-major operand and the transpose path for the column-major one. Deriving a
 second lane map was the alternative, and contract section 3 says not to.
 
---- Why nothing is masked ---------------------------------------------------
+--- What binds at the wide rungs, and what does not -------------------------
+
+**LDS never forces `D_STAGES` here.** A staged slot is `68 * head_dim`
+elements, so two tensors single-buffered are `272 * head_dim` bytes -- 139264
+at head_dim 512, inside the 163840 cap. The second buffer is the only thing
+LDS ever costs, and `_with_buffers` spends it while it can afford to.
+
+**Registers do bind**, because a wave holds two accumulators of `d/2` VGPRs
+each on top of `d/4` of resident K and `d/4` of V. Two levers answer it, in
+the addendum's order: `(num_waves, waves_per_eu)` as a pair, which is free and
+decided head_dim 128; and then `DKV_SHARDS`, which divides the accumulator
+pair across waves that write disjoint D columns -- no cross-wave reduction, no
+extra barrier, at the price of every shard recomputing S and dP.
+
+--- Padded heads: which operand is masked, and why it is the cheap one ------
+
+The forward masks Q once in its prologue and K on the hot path, and pays for
+the second one. Here the roles are swapped, so **the cheap masks are K and V**
+-- resident, masked once, every step. Q and dO are the hot ones and are masked
+only on the k-steps that can contain pad, which `HDIM_QK_FLOOR` bounds to two
+on the 32-spaced ladder.
+
+Only the two *d-contracted* GEMMs need masked operands at all. In `dV` and
+`dK` the head dim is the **output** axis, so a pad column of dO can only reach
+a pad column of dV, and the store suppresses it by address.
+
+--- Why nothing else is masked ----------------------------------------------
 
 Dense and non-causal, so the only edge is the ragged tail, and the buffer
 descriptors already answer it. Q and dO are bounded at `seqlen_q` rows, so a
@@ -52,16 +81,16 @@ undefined under a divergent EXEC.
 
 --- Phase status -----------------------------------------------------------
 
-Causal and windows (B4), varlen (B5), dropout and bias (B6), the head_dim
-ladder and the wide body (B3), and GQA are **not implemented**. The ABI
-carries their argument slots so the wire format does not move when they
-arrive, and `BwdDkDvKnobs.resolve` refuses a build that would need one; there
-is no half-implemented arm anywhere below.
+Causal and windows (B4), varlen (B5), dropout and bias (B6) and GQA are **not
+implemented**. The ABI carries their argument slots so the wire format does not
+move when they arrive, and `BwdDkDvKnobs.resolve` refuses a build that would
+need one; there is no half-implemented arm anywhere below.
 """
 
 import weakref
 
 import fmha_abi_gfx1201 as abi
+from fmha_common_gfx1201 import MaskedAxis
 from fmha_dualwave_gfx950 import (
     ParityGemmHelper,
     ParityKernelContext,
@@ -135,6 +164,23 @@ def _stream_ks_offset(traits, ks):
     return (ks // per_band) * (traits.SMEM_N_RPT * traits.STREAM_LINE_STRIDE) + (ks % per_band) * traits.K_STEP_QK
 
 
+def _masked_ks_steps(traits, hdim_floor):
+    """The k-steps whose D columns can reach past the real head dim.
+
+    A build serves `(HDIM_QK_FLOOR, BLOCK_DMODEL]` and the dispatcher enforces
+    it, so a step whose columns all lie at or below the floor is reading real
+    data whatever the runtime extent. On the 32-spaced ladder consecutive rungs
+    are 32 apart and `K_STEP_QK` is 16, so exactly two steps survive at every
+    width -- 2 of 32 at head_dim 512 rather than 32.
+
+    The forward found this to be the whole cost of a padded head: masking every
+    step ran 27-54% below the rung's native rate, near-independently of how
+    much pad there was, which is what identified the masking rather than the
+    wasted MFMA columns.
+    """
+    return [ks for ks in range(traits.K_STEPS_QK) if (ks + 1) * traits.K_STEP_QK > hdim_floor]
+
+
 def _lds_pack_read(traits, lds_ptr, elem_idx, scope_name, pack_type):
     """One 128-bit LDS read of 8 bf16, alias-scoped to the buffer it touches.
 
@@ -162,7 +208,7 @@ class BwdDkDvKernelContext(ParityKernelContext):
     (pinned dense until B5) and the philox prologue (inert until B6) by
     subclassing rather than porting, per contract section 2.
 
-    Five things move, and they are all descriptors or bounds:
+    Six things move, and they are all descriptors, bounds or indices:
 
     - `strides` carries **18** slots, not 12: Q, K, V, dO, dK, dV. The first
       twelve go to the base class, which means its `stride_o_*` names hold
@@ -173,6 +219,7 @@ class BwdDkDvKernelContext(ParityKernelContext):
       base are recomputed against `STREAM_LINE_STRIDE`.
     - The tile loop walks **q** tiles, so `init_tile_bounds` counts them from
       `seqlen_q`.
+    - `wave_id` splits into a KV row block and a D-axis shard.
     - LSE and delta get f32 row resources, which the forward has no reader for.
     """
 
@@ -225,14 +272,38 @@ class BwdDkDvKernelContext(ParityKernelContext):
         """m0 for the dO staging DMA. The forward's V slot."""
         return self._dma_m0(self.do_buf_base(buf_id), self.traits.STREAM_LINE_STRIDE, d)
 
+    def dma_m0_table(self, base_fn, count):
+        """One row per *stream buffer*, not the base class's fixed two.
+
+        At `NUM_STREAM_BUFFERS == 1` the second row would address LDS past the
+        allocation. It is never issued, so it folds away -- but a table that
+        contains an illegal address is a thing a later reader has to reason
+        about, and building the right number is free.
+        """
+        return tuple(tuple(base_fn(buf, d) for d in range(count)) for buf in range(self.traits.NUM_STREAM_BUFFERS))
+
     def init_lds_read_bases(self):
         super().init_lds_read_bases()
-        self.stream_row_read_base = _stream_row_read_base(self.traits, self.lane_mod_32, self.lane_div_32)
+        traits = self.traits
+        self.stream_row_read_base = _stream_row_read_base(traits, self.lane_mod_32, self.lane_div_32)
         # The column-major base is the forward's V one *unchanged*, which is
         # the whole of contract section 3: the tile is V-shaped and the read is
         # the same instruction sequence, so the validated lane map carries over
         # rather than being re-derived.
-        self.stream_col_read_base = self.v_lds_read_base_per_lane
+        col_base = self.v_lds_read_base_per_lane
+        if const_expr(traits.DKV_SHARDS > 1):
+            # The shard's D offset folds into the base rather than being added
+            # per read, because `_v_imm_lo` needs a *compile-time* chunk index
+            # and `shard_id` is `wave_id % SHARDS`. `_v_dc_offset` splits as
+            # `_v_dc_offset(a + i) = (a // PER_BAND) * PAIR + _v_dc_offset(i)`
+            # whenever `a` is a multiple of `D_CHUNKS_PER_BAND`, which
+            # `make_traits` enforces for a shard's first chunk. The forward's
+            # `WideKvLdsToVgprLoader.load_v_shard` folds it the same way.
+            per_band = traits.D_CHUNKS_PER_BAND
+            col_base = col_base + self.dkv_shard_id * (
+                (traits.D_CHUNKS_PER_SHARD // per_band) * traits.V_LDS_TO_REG_DCHUNK_PAIR_STRIDE
+            )
+        self.stream_col_read_base = col_base
 
     # -- indices -----------------------------------------------------------
 
@@ -246,11 +317,25 @@ class BwdDkDvKernelContext(ParityKernelContext):
 
     def init_thread_mapping(self):
         super().init_thread_mapping()
+        traits = self.traits
         # Aliases, not new values: `grid.y` selects a KV block here and the
         # base class's `q_*` names already hold exactly that arithmetic.
         self.kv_block_idx = self.q_block_idx
         self.kv_start = self.q_start
+        if const_expr(traits.DKV_SHARDS > 1):
+            # With `SHARDS` waves per KV row block, `wave_id` no longer names a
+            # row block -- `wave_id // SHARDS` does, and the remainder picks
+            # which D columns of dK/dV the wave owns. The base class set
+            # `wave_q_offset` from the raw wave id; this is the same correction
+            # `WideKernelContext` makes for `VO_SHARDS`.
+            self.dkv_shard_id = self.wave_id % traits.DKV_SHARDS
+            self.wave_q_offset = (self.wave_id // traits.DKV_SHARDS) * traits.ROWS_PER_WAVE
+        else:
+            self.dkv_shard_id = fx.Index(0)
         self.wave_kv_offset = self.wave_q_offset
+        # Global first D column of this wave's accumulators. Runtime, because
+        # the shard comes from `wave_id`; zero and folded away when unsharded.
+        self.dkv_col_base = self.dkv_shard_id * fx.Index(traits.D_CHUNKS_PER_SHARD * traits.D_CHUNK)
 
     def init_kv_row(self):
         """The 32 KV rows this wave owns. `init_q_row`'s arithmetic, renamed."""
@@ -270,7 +355,6 @@ class BwdDkDvKernelContext(ParityKernelContext):
         same trade for the same reason.
         """
         super().init_descriptors(**kwargs)
-        traits = self.traits
         self.q_row_off = fx.Index(0)
         self.kv_row_off = fx.Index(0)
         # The staged tiles address from token 0 of the slab; the tile offset
@@ -342,6 +426,11 @@ class BwdDkDvKernelContext(ParityKernelContext):
 
         self.k_res_elem_base = self.kv_start * self.stride_k_seq_v
         self.v_res_elem_base = self.kv_start * self.stride_v_seq_v
+        # First element past each output's descriptor. A store redirected here
+        # is dropped by the hardware bound, which is how the padded-head D tail
+        # is suppressed without a branch.
+        self.dk_oob_off = self.seqlen_kv_v * self.stride_dk_seq_v
+        self.dv_oob_off = self.seqlen_kv_v * self.stride_dv_seq_v
 
         # LSE and delta. Compact `(batch * heads, tokens)` f32, the layout the
         # forward writes LSE in -- `q_head_idx * seq_len_v + q_row` inside a
@@ -353,18 +442,17 @@ class BwdDkDvKernelContext(ParityKernelContext):
         head_bytes = self.batch_idx * per_batch_bytes + self.q_head_idx * row_bytes
         self.lse_rsrc = dualwave._make_ws_rsrc(fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))), head_bytes, row_bytes)
         self.delta_rsrc = dualwave._make_ws_rsrc(fx.Int64(fx.ptrtoint(fx.get_iter(self.Delta))), head_bytes, row_bytes)
-        del traits
 
     # -- bounds ------------------------------------------------------------
 
     def init_tile_bounds(self, **kwargs):
         """Count **q** tiles, rounded up to an even number.
 
-        The body consumes two tiles per iteration, one per LDS buffer, so an
-        odd count would leave the second half of the last iteration reading a
-        tile that does not exist. Rounding up costs one dead tile rather than
-        an epilogue: its rows are past `seqlen_q`, so Q and dO stage as zeros
-        and it contributes exactly nothing (module docstring).
+        The body consumes two tiles per iteration, so an odd count would leave
+        the second half of the last iteration reading a tile that does not
+        exist. Rounding up costs one dead tile rather than an epilogue: its
+        rows are past `seqlen_q`, so Q and dO stage as zeros and it contributes
+        exactly nothing (module docstring).
         """
         traits = self.traits
         self.kv_tile_size = traits.BLOCK_Q
@@ -407,28 +495,37 @@ class BwdDkDvResidentLoader(dualwave.DualwaveKernelContext):
     at `row * stride + ks * K_STEP_QK + (lane // 32) * MFMA_LANE_K` -- because
     the MFMA's A and B operands take identical per-lane layouts, so what the
     forward builds for Q is what this needs for K and V. Kept as a list of
-    per-`ks` packs rather than one concatenated vector: the forward concatenates
-    so that `_get_q_pack` can slice a loop-invariant register, and here the
-    packs feed two different GEMMs and never need to be adjacent.
+    per-`ks` packs rather than one concatenated vector: the forward
+    concatenates so `_get_q_pack` can slice a loop-invariant register, and here
+    the packs feed two different GEMMs and never need to be adjacent.
+
+    **This is where a padded head is masked**, and it is the cheap side of the
+    trade. K and V are read once per kernel, so masking every k-step here costs
+    nothing measurable -- against the forward, which has to mask its streamed
+    K on the hot path and measured 27-54% for it.
     """
 
-    def load_rows(self, div, elem_base, stride_seq, row_in_block):
+    def load_rows(self, div, elem_base, stride_seq, row_in_block, hdim):
         traits = self.traits
+        cols = None
+        if const_expr(self.PADDED_HEAD):
+            # Loop-invariant and dead immediately after the prologue, so the
+            # bitmask form is pure win here for the same reason it is in the
+            # forward's Q loader.
+            cols = MaskedAxis(fx.Index(hdim), elem_dtype=self.elem_dtype, bitmask=True)
         packs = []
         for ks in range_constexpr(traits.K_STEPS_QK):
-            elem = (
-                elem_base
-                + row_in_block * stride_seq
-                + fx.Index(ks * traits.K_STEP_QK)
-                + self.lane_div_32 * fx.Index(traits.MFMA_LANE_K)
-            )
+            col = fx.Index(ks * traits.K_STEP_QK) + self.lane_div_32 * fx.Index(traits.MFMA_LANE_K)
             raw = dualwave._buffer_load_128(
-                elem,
+                elem_base + row_in_block * stride_seq + col,
                 _load_atom_128=self.load_atom_128,
                 q_div=div,
                 q_load_i32x4_type=self.q_load_i32x4_type,
             )
-            packs.append(Vec(raw, (4,), fx.Int32).bitcast(self.elem_dtype).ir_value())
+            pack = Vec(raw, (4,), fx.Int32).bitcast(self.elem_dtype).ir_value()
+            if const_expr(self.PADDED_HEAD):
+                pack = cols.discard(pack, col, traits.MFMA_LANE_K)
+            packs.append(pack)
         return packs
 
 
@@ -441,34 +538,56 @@ class BwdDkDvStreamReader(dualwave.DualwaveKernelContext):
     `ds_read_b64_tr_b16` was designed for exactly this operand.
     """
 
-    def read_row_half(self, tile_base, scope_name, half):
-        """`A[row][d]` packs for rows `half * 32 .. + 32` of the tile.
+    # Set by the kernel once the floor is known; see `_masked_ks_steps`.
+    masked_steps = ()
+
+    def read_row_pack(self, tile_base, scope_name, half, ks, hdim):
+        """One `A[row][d]` pack for k-step `ks` of rows `half * 32 .. + 32`.
 
         `K_LDS_TO_REG_N_STRIP_STRIDE` is 32 tokens along the intra-line token
         axis, so the two halves are the same columns of consecutive row blocks
         -- the relationship the forward's `_load_k_pair` has between the halves
         of a KV tile, hoisted into a parameter.
 
-        One half at a time, rather than both, because the caller consumes each
-        into its own accumulator and a whole half is `K_STEPS_QK * 4` VGPRs:
-        64 at head_dim 128, against a register budget the two dK/dV
-        accumulators have already spent 128 of.
+        **One pack, not a whole half.** The caller feeds each straight into its
+        MFMA, so nothing outlives its use; reading the half up front would put
+        `K_STEPS_QK * 4` VGPRs live at once, which is 128 at head_dim 512
+        beside accumulators that have already spent most of the file. Splitting
+        the pair into halves was worth 2.2x at head_dim 128 before the wave
+        count was touched at all, and this is the same move one step further.
         """
         traits = self.traits
-        base = tile_base + self.stream_row_read_base + half * traits.K_LDS_TO_REG_N_STRIP_STRIDE
-        return [
-            _lds_pack_read(
-                traits,
-                self.lds_kv_base_ptr,
-                base + _stream_ks_offset(traits, ks),
-                scope_name,
-                self.kv_mfma_pack_type,
+        idx = (
+            tile_base
+            + self.stream_row_read_base
+            + half * traits.K_LDS_TO_REG_N_STRIP_STRIDE
+            + _stream_ks_offset(traits, ks)
+        )
+        pack = _lds_pack_read(traits, self.lds_kv_base_ptr, idx, scope_name, self.kv_mfma_pack_type)
+        if const_expr(self.PADDED_HEAD) and ks in self.masked_steps:
+            # The bitmask form ANDs one precomputed dword per pair instead of
+            # selecting per element, but each mask stays live for the whole q
+            # loop. Gated on how many steps actually survive the floor rather
+            # than on `K_STEPS_QK`: the forward measured +21% in its 64-wide
+            # tile and -43% in the 128-wide one, where 32 extra live registers
+            # turned a spill-free build into 61 spills.
+            width = traits.MFMA_LANE_K
+            col = fx.Index(ks * traits.K_STEP_QK) + self.lane_div_32 * fx.Index(width)
+            cols = MaskedAxis(
+                fx.Index(hdim),
+                elem_dtype=self.elem_dtype,
+                bitmask=len(self.masked_steps) * (width // 2) <= 16,
             )
-            for ks in range_constexpr(traits.K_STEPS_QK)
-        ]
+            pack = cols.discard(pack, col, width)
+        return pack
 
     def read_column_chunk(self, tile_base, scope_name, dc):
-        """The four `A[d][row]` packs for output columns `dc * 32 .. + 32`.
+        """The four `A[d][row]` packs for this shard's output chunk `dc`.
+
+        `dc` is **shard-local**: the shard's first chunk is folded into
+        `stream_col_read_base` (see `init_lds_read_bases`), because the
+        immediate offset `_v_imm_lo` builds has to be a compile-time constant
+        and the shard index is not.
 
         One chunk at a time, not the forward's whole `[4][D_CHUNKS]` table: the
         transposed operand feeds an accumulator that is already 64 VGPRs at
@@ -511,11 +630,16 @@ class BwdDkDvGemmHelper(ParityGemmHelper):
     asks for and which is what stops a transcription drifting.
     """
 
-    def contract_d(self, a_packs, b_packs):
-        """`S` or `dP`: reduce over the head dim into a fresh accumulator."""
+    def contract_d(self, read_a, b_packs):
+        """`S` or `dP`: reduce over the head dim into a fresh accumulator.
+
+        `read_a` is a *callable*, not a list, so each A pack is read into the
+        MFMA that consumes it rather than the whole set being gathered first.
+        See `BwdDkDvStreamReader.read_row_pack`.
+        """
         acc = self.c_zero_v16f32
         for ks in range_constexpr(self.traits.K_STEPS_QK):
-            acc = dualwave._mfma_acc(a_packs[ks], b_packs[ks], acc, self.mma_atom, self.mfma_acc_vec_type)
+            acc = dualwave._mfma_acc(read_a(ks), b_packs[ks], acc, self.mma_atom, self.mfma_acc_vec_type)
         return acc
 
     def contract_q(self, a_packs, b_packs, acc):
@@ -544,59 +668,52 @@ class BwdDkDvSoftmaxHelper(ParitySoftmaxHelper):
     `lse` and `delta` arrive as 16 registers rather than one.
     """
 
-    def load_row_values(self, rsrc, tile_base, scale):
-        """`(lo, hi)` lists of 16 f32, one per accumulator element, times `scale`.
+    def load_row_values(self, rsrc, tile_base, half, scale):
+        """16 f32, one per accumulator element of `half`, times `scale`.
 
-        Four `buffer_load_dwordx4` per half. The row an element holds is
+        Four `buffer_load_dwordx4`. The row an element holds is
         `8 * (r // 4) + 4 * (lane // 32) + (r % 4)`, so the four `r % 4` values
-        of a group are four *contiguous* rows -- which is why this is 8 loads
-        and not 32. `_ROW_RUNS` is where that grouping is stated.
+        of a group are four *contiguous* rows -- which is why this is 4 loads
+        and not 16. `_ROW_RUNS` is where that grouping is stated.
         """
-        out = []
-        for half in range_constexpr(2):
-            values = [None] * 16
-            row_base = fx.Int32(tile_base + fx.Index(half * 32)) + fx.Int32(self.lane_div_32) * fx.Int32(4)
-            for elem0, col_off, width in _ROW_RUNS:
-                span = buffer_ops.buffer_load(
-                    rsrc,
-                    as_mlir_value(row_base + fx.Int32(col_off)),
-                    vec_width=width,
-                    dtype=fx.Float32,
-                )
-                vec = Vec(span, (width,), fx.Float32)
-                for j in range_constexpr(width):
-                    values[elem0 + j] = dualwave._fmul(vec[j], scale, self.fm_fast)
-            out.append(values)
-        return out
+        values = [None] * 16
+        row_base = fx.Int32(tile_base + fx.Index(half * 32)) + fx.Int32(self.lane_div_32) * fx.Int32(4)
+        for elem0, col_off, width in _ROW_RUNS:
+            span = buffer_ops.buffer_load(
+                rsrc,
+                as_mlir_value(row_base + fx.Int32(col_off)),
+                vec_width=width,
+                dtype=fx.Float32,
+            )
+            vec = Vec(span, (width,), fx.Float32)
+            for j in range_constexpr(width):
+                values[elem0 + j] = dualwave._fmul(vec[j], scale, self.fm_fast)
+        return values
 
     def probabilities(self, v_s, neg_lse2):
         """`P = exp2(qk_scale * S - log2(e) * LSE)`, element by element.
 
         Q is **not** pre-scaled, which is the one place this departs from the
-        forward. There it is free -- Q is loaded once in the prologue -- while
-        here Q streams, so pre-scaling would cost a multiply and a bf16
-        rounding per element per tile. Folding the scale into the subtraction
-        that has to happen anyway costs one FMA and rounds once less.
+        forward, and B2 measured what it costs to get wrong: folding
+        `sm_scale * log2e` into Q and rounding to bf16 puts the error in the
+        exponent, taking the error ratio from 1.29 at `sm_scale = 0.05` to 10.9
+        at 1.0. `O` is a normalised average and absorbs it; `dS` is not and does
+        not. Here the scale rides the subtraction that had to happen anyway, so
+        it is also free.
         """
-        lo, hi = dualwave._score_pair_to_lists(v_s)
+        values = [Vec(v_s)[r] for r in range_constexpr(16)]
         scale = self.ctx_ref.c_sm_scale_log2e
-        out = []
-        for half, values in ((0, lo), (1, hi)):
-            row = neg_lse2[half]
-            out.append(
-                [
-                    dualwave.rocdl.exp2(
-                        T.f32,
-                        as_mlir_value(
-                            dualwave._fadd(dualwave._fmul(values[r], scale, self.fm_fast), row[r], self.fm_fast)
-                        ),
-                    )
-                    for r in range_constexpr(16)
-                ]
+        return [
+            dualwave.rocdl.exp2(
+                T.f32,
+                as_mlir_value(
+                    dualwave._fadd(dualwave._fmul(values[r], scale, self.fm_fast), neg_lse2[r], self.fm_fast)
+                ),
             )
-        return out
+            for r in range_constexpr(16)
+        ]
 
-    def dscores(self, p_lists, v_dp, delta):
+    def dscores(self, p_list, v_dp, delta):
         """`dS = P * (dP - delta)`.
 
         `dP` is deliberately unscaled: it is `dO . V^T` exactly, and `sm_scale`
@@ -605,35 +722,26 @@ class BwdDkDvSoftmaxHelper(ParitySoftmaxHelper):
         here instead would be a plausible, finite, wrong answer of the kind the
         joint autograd check in contract section 6 exists to catch.
         """
-        lo, hi = dualwave._score_pair_to_lists(v_dp)
-        out = []
-        for half, values in ((0, lo), (1, hi)):
-            row = delta[half]
-            out.append(
-                [
-                    dualwave._fmul(
-                        p_lists[half][r],
-                        dualwave._fsub(values[r], row[r], self.fm_fast),
-                        self.fm_fast,
-                    )
-                    for r in range_constexpr(16)
-                ]
-            )
-        return out
+        values = [Vec(v_dp)[r] for r in range_constexpr(16)]
+        return [
+            dualwave._fmul(p_list[r], dualwave._fsub(values[r], delta[r], self.fm_fast), self.fm_fast)
+            for r in range_constexpr(16)
+        ]
 
-    def pack_operand(self, lists):
-        """The four bf16 B-operand packs for one q tile, in k-substep order.
+    def pack_half(self, values):
+        """The two bf16 B-operand packs for one 32-row half of a q tile.
 
-        `_pack_p_v8_slices` is the forward's, and the flattening below is its
-        `pv_step_k` dispatch (`lo[step]` under 2, else `hi[step - 2]`) written
-        out once instead of at every use.
+        `_pack_p_v8_slices`' inner slicing, done a half at a time. The forward
+        packs both halves together because its two accumulators are live
+        together anyway; here they deliberately are not (see
+        `BwdDkDvTileBody.run`), and a whole-tile packer would force them to be.
         """
-        lo_packs, hi_packs = dualwave._pack_p_v8_slices(
-            self.traits,
-            (lists[0], lists[1]),
-            lambda vals: dualwave._bf16_trunc_pack_v8(self.traits, vals, elem_dtype=self.elem_dtype),
-        )
-        return [lo_packs[0], lo_packs[1], hi_packs[0], hi_packs[1]]
+        return [
+            dualwave._bf16_trunc_pack_v8(
+                self.traits, [values[p * 8 + s] for s in range_constexpr(8)], elem_dtype=self.elem_dtype
+            )
+            for p in range_constexpr(self.traits.PV_K_STEPS)
+        ]
 
 
 class BwdDkDvStoreHelper(dualwave.DualwaveStoreHelper):
@@ -642,18 +750,39 @@ class BwdDkDvStoreHelper(dualwave.DualwaveStoreHelper):
     A dK/dV accumulator is `[d][kv_row]` -- the same shape as the forward's
     `O` accumulator, one axis renamed -- so the 128-bit packing, the
     `permlane32_swap` half-wave exchange and the store are reused verbatim.
-    Only the descriptor and the row stride are parameters, because two output
-    tensors go through one helper.
+    The descriptor, the row stride, the shard's column origin and the head
+    extent are parameters, because two output tensors go through one helper.
     """
 
-    def store_accs(self, accs, div, row, stride_seq):
+    def store_accs(self, accs, div, row, stride_seq, hdim, oob_off):
+        """Store this wave's `D_CHUNKS_PER_SHARD` chunks of one output.
+
+        **Address the chunk from its global column, not its local one.** Under
+        sharding `dc` restarts at 0 while the columns it addresses do not, and
+        the forward's wide body records what happens if the padded-head
+        suppression is derived from the local index: the descriptor spans the
+        whole tensor rather than one row, so a store past the row pitch lands
+        in the *next row* and corrupts it -- head_dim 300 came out at 0.58
+        absolute error, finite and with no fault.
+        """
         traits = self.traits
-        base = row * stride_seq + self.lane_div_32 * fx.Index(8)
-        for dc in range_constexpr(traits.D_CHUNKS):
+        base = row * stride_seq + self.dkv_col_base + self.lane_div_32 * fx.Index(8)
+        cols = MaskedAxis(fx.Index(hdim)) if const_expr(self.PADDED_HEAD) else None
+        for dc in range_constexpr(traits.D_CHUNKS_PER_SHARD):
             for g in range_constexpr(2):
+                off = base + fx.Index(dc * traits.D_CHUNK + 2 * g * 8)
+                if const_expr(self.PADDED_HEAD):
+                    # A 128-bit store is all-or-nothing, so a chunk straddling
+                    # `hdim` writes into the caller's own 8-element pad, which
+                    # the input contract permits. Only a chunk *starting* at or
+                    # past `hdim` must be dropped, and pushing its offset past
+                    # `num_records` is what drops it -- one select on a
+                    # lane-varying value instead of an `scf.if` around a store.
+                    col = self.dkv_col_base + fx.Index(dc * traits.D_CHUNK + 2 * g * 8) + self.lane_div_32 * fx.Index(8)
+                    off = fx.Index(cols.valid(col).select(fx.Index(off), oob_off))
                 dualwave._buffer_store_128(
                     dualwave._packed_o_128_vec(traits, accs, dc, g, self.lane_div_32, self.elem_dtype),
-                    base + fx.Index(dc * traits.D_CHUNK + 2 * g * 8),
+                    off,
                     _o_store_reg_128=self.o_store_reg_128,
                     _store_atom_128=self.store_atom_128,
                     o_div=div,
@@ -670,12 +799,33 @@ class BwdDkDvTileBody(dualwave.DualwaveKernelContext):
     the code it calls stays out of it.
     """
 
-    def __init__(self, ctx, *, stream, reader, gemm, softmax):
+    def __init__(self, ctx, *, stream, reader, gemm, softmax, hdim_qk, hdim_vo, tight_registers):
         super().__init__(ctx)
         self.stream = stream
         self.reader = reader
         self.gemm = gemm
         self.softmax = softmax
+        self.hdim_qk = hdim_qk
+        self.hdim_vo = hdim_vo
+        self.tight_registers = tight_registers
+        self.half_groups = ((0,), (1,)) if tight_registers else ((0, 1),)
+
+    def _row_reader(self, base, scope, half, hdim):
+        """A `ks -> pack` closure over one 32-row half of a staged tile.
+
+        **The one line where `TIGHT_REGISTERS` changes what is emitted.** The
+        tight arm reads each pack inside the MFMA that consumes it, so one is
+        live at a time; the loose arm reads the whole half up front, which is
+        `K_STEPS_QK * 4` VGPRs but lets every `ds_read_b128` issue before the
+        first MFMA waits on it. Same `contract_d` either way -- it takes a
+        callable precisely so this can be the only difference.
+        """
+        if const_expr(self.tight_registers):
+            return lambda ks: self.reader.read_row_pack(base, scope, half, ks, hdim)
+        packs = [
+            self.reader.read_row_pack(base, scope, half, ks, hdim) for ks in range_constexpr(self.traits.K_STEPS_QK)
+        ]
+        return lambda ks: packs[ks]
 
     def run(self, tile_idx, buf_id, prefetch_idx, v_k, v_v, dv, dk):
         """Accumulate this tile into `(dv, dk)` and prefetch `prefetch_idx`.
@@ -687,9 +837,10 @@ class BwdDkDvTileBody(dualwave.DualwaveKernelContext):
         - the **bottom** one says every wave has finished reading it, which is
           what makes the prefetch below safe to overwrite it with.
 
-        The prefetch therefore lands one tile ahead and overlaps the *next*
-        tile's compute, not this one's. Two buffers cannot do better: the other
-        buffer already holds the tile after this one.
+        At two buffers the prefetch lands one tile ahead and overlaps the
+        *next* tile's compute; at one it is issued immediately before the wait
+        for it, which is the price head_dim 384 and 512 pay for their LDS. The
+        body is the same either way.
         """
         traits = self.traits
         ctx = self.ctx_ref
@@ -699,32 +850,45 @@ class BwdDkDvTileBody(dualwave.DualwaveKernelContext):
         do_scope = dualwave._dualwave_lds_scope("v", buf_id)
         tile_base = tile_idx * fx.Index(traits.BLOCK_Q)
 
-        # `vmcnt` retires in issue order, so leaving exactly the next tile's
+        # `vmcnt` retires in issue order, so leaving exactly the newer tiles'
         # groups outstanding retires this one and nothing else. The forward's
-        # `NUM_DMA_K + NUM_DMA_V` idiom, with the two tensors being Q and dO.
-        _waitcnt_vm_n(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
+        # `NUM_DMA_K + NUM_DMA_V` idiom, over however many buffers are in play.
+        _waitcnt_vm_n((traits.NUM_STREAM_BUFFERS - 1) * (ctx.NUM_DMA_K + ctx.NUM_DMA_V))
         _sched_barrier(0)
         _s_barrier()
 
-        # -- GEMM 1 and 2. D is the reduction axis for both, and the resident
-        #    operands are loop-invariant, so each is one burst.
-        s_lo = self.gemm.contract_d(self.reader.read_row_half(q_base, q_scope, 0), v_k)
-        s_hi = self.gemm.contract_d(self.reader.read_row_half(q_base, q_scope, 1), v_k)
-        dp_lo = self.gemm.contract_d(self.reader.read_row_half(do_base, do_scope, 0), v_v)
-        dp_hi = self.gemm.contract_d(self.reader.read_row_half(do_base, do_scope, 1), v_v)
-
-        neg_lse2 = self.softmax.load_row_values(ctx.lse_rsrc, tile_base, ctx.c_neg_log2e)
-        delta = self.softmax.load_row_values(ctx.delta_rsrc, tile_base, ctx.c_one_f)
-        p_lists = self.softmax.probabilities((s_lo, s_hi), neg_lse2)
-        ds_lists = self.softmax.dscores(p_lists, (dp_lo, dp_hi), delta)
-        p_packs = self.softmax.pack_operand(p_lists)
-        ds_packs = self.softmax.pack_operand(ds_lists)
+        # -- GEMMs 1 and 2, then the softmax. `TIGHT_REGISTERS` decides
+        #    whether the tile's two 32-row halves go through together or one
+        #    at a time, the other half of the trade `_row_reader` makes.
+        #
+        # The halves are independent all the way to the packs. Together, the
+        # peak holds two score accumulators, two dP, two LSE vectors, two
+        # delta, two P and two dS -- about 96 f32 that a half-at-a-time order
+        # never has live at once, since only the bf16 packs (8 VGPRs each)
+        # survive a half. Apart, the scheduler has half as much independent
+        # work to overlap the MFMA bursts with.
+        #
+        # `delta` is loaded *after* `probabilities` in both arms -- it is not
+        # needed until `dscores`, and loading it earlier would hold its 16
+        # registers across the LSE vector's.
+        p_packs = [None] * 4
+        ds_packs = [None] * 4
+        for group in self.half_groups:
+            s = {h: self.gemm.contract_d(self._row_reader(q_base, q_scope, h, self.hdim_qk), v_k) for h in group}
+            dp = {h: self.gemm.contract_d(self._row_reader(do_base, do_scope, h, self.hdim_vo), v_v) for h in group}
+            neg_lse2 = {h: self.softmax.load_row_values(ctx.lse_rsrc, tile_base, h, ctx.c_neg_log2e) for h in group}
+            p_list = {h: self.softmax.probabilities(s[h], neg_lse2[h]) for h in group}
+            delta = {h: self.softmax.load_row_values(ctx.delta_rsrc, tile_base, h, ctx.c_one_f) for h in group}
+            ds_list = {h: self.softmax.dscores(p_list[h], dp[h], delta[h]) for h in group}
+            for h in group:
+                p_packs[2 * h : 2 * h + 2] = self.softmax.pack_half(p_list[h])
+                ds_packs[2 * h : 2 * h + 2] = self.softmax.pack_half(ds_list[h])
 
         # -- GEMM 3 and 4. Q is the reduction axis, so the transposed operand
         #    is read one output chunk at a time and dies with its MFMAs.
-        for dc in range_constexpr(traits.D_CHUNKS):
+        for dc in range_constexpr(traits.D_CHUNKS_PER_SHARD):
             dv[dc] = self.gemm.contract_q(self.reader.read_column_chunk(do_base, do_scope, dc), p_packs, dv[dc])
-        for dc in range_constexpr(traits.D_CHUNKS):
+        for dc in range_constexpr(traits.D_CHUNKS_PER_SHARD):
             dk[dc] = self.gemm.contract_q(self.reader.read_column_chunk(q_base, q_scope, dc), ds_packs, dk[dc])
 
         _s_waitcnt(traits.LGKMCNT_0_ONLY)
@@ -744,16 +908,27 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         raise ValueError("knobs must be resolved: call `bwd_dkdv_knobs(arch, ...).resolve(meta)` first")
     traits = knobs.traits
     BLOCK_DMODEL = knobs.block_dmodel
+    PADDED_HEAD = knobs.padded_head
+    # D columns at or below this are guaranteed real, so the streamed masks can
+    # skip them. See `_masked_ks_steps`.
+    HDIM_QK_FLOOR = knobs.hdim_qk_floor
     STRIDES_CONSTEXPR = knobs.strides_constexpr
     BUILD_SM_SCALE = meta.sm_scale
+    NBUF = traits.NUM_STREAM_BUFFERS
+    # One knob for the whole register-against-ILP trade; see
+    # `BwdDkDvTileBody._row_reader` and `_with_register_pressure`.
+    TIGHT_REGISTERS = knobs.tight_registers
+    MASKED_STEPS = tuple(_masked_ks_steps(traits, HDIM_QK_FLOOR)) if PADDED_HEAD else ()
 
     _cache_tag = (
         traits.cache_tag,
         BLOCK_DMODEL,
+        PADDED_HEAD,
+        HDIM_QK_FLOOR,
         STRIDES_CONSTEXPR,
         BUILD_SM_SCALE,
         (knobs.num_waves, knobs.block_kv, knobs.block_q, knobs.head_dim_granule),
-        knobs.num_stream_buffers,
+        (knobs.dkv_shards, NBUF, knobs.waves_per_eu, TIGHT_REGISTERS),
     )
 
     _lds_elem_dtype = dualwave.dtype_to_elem_type(traits.DTYPE_STR)
@@ -843,6 +1018,8 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             num_head_k=num_head_k,
             hdim_qk=hdim_qk,
             hdim_vo=hdim_vo,
+            padded_head=PADDED_HEAD,
+            hdim_qk_floor=HDIM_QK_FLOOR,
             window_left=window_left,
             window_right=window_right,
             seqinfo=(seqinfo_q0, seqinfo_q1, seqinfo_k0, seqinfo_k1),
@@ -894,50 +1071,77 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
 
         stream = BwdDkDvStreamLoader(ctx)
         reader = BwdDkDvStreamReader(ctx)
+        reader.masked_steps = MASKED_STEPS
         resident = BwdDkDvResidentLoader(ctx)
         gemm = BwdDkDvGemmHelper(ctx)
         softmax = BwdDkDvSoftmaxHelper(ctx)
         store = BwdDkDvStoreHelper(ctx)
-        tile = BwdDkDvTileBody(ctx, stream=stream, reader=reader, gemm=gemm, softmax=softmax)
+        tile = BwdDkDvTileBody(
+            ctx,
+            stream=stream,
+            reader=reader,
+            gemm=gemm,
+            softmax=softmax,
+            hdim_qk=hdim_qk,
+            hdim_vo=hdim_vo,
+            tight_registers=TIGHT_REGISTERS,
+        )
 
         zero_acc = ctx.c_zero_v16f32
         t_end = ctx.split_t_end
+        n_acc = traits.D_CHUNKS_PER_SHARD
+        scale_vec = Vec.from_elements([ctx.c_sm_scale], fx.Float32).broadcast_to(16)
 
         @flyc.jit
         def _dkdv_body():
             """K/V resident, Q/dO streaming, two tiles per iteration."""
-            v_k = resident.load_rows(ctx.k_res_div, ctx.k_res_elem_base, ctx.stride_k_seq_v, ctx.kv_row_in_block)
-            v_v = resident.load_rows(ctx.v_res_div, ctx.v_res_elem_base, ctx.stride_v_seq_v, ctx.kv_row_in_block)
+            v_k = resident.load_rows(
+                ctx.k_res_div, ctx.k_res_elem_base, ctx.stride_k_seq_v, ctx.kv_row_in_block, hdim_qk
+            )
+            v_v = resident.load_rows(
+                ctx.v_res_div, ctx.v_res_elem_base, ctx.stride_v_seq_v, ctx.kv_row_in_block, hdim_vo
+            )
 
-            # Prime both buffers. From here every tile's DMA is issued by the
-            # body two tiles earlier, so this is the only staging whose latency
-            # is not covered by compute.
-            stream.stage_q_tile(fx.Index(0), 0)
-            stream.stage_do_tile(fx.Index(0), 0)
-            stream.stage_q_tile(fx.Index(1), 1)
-            stream.stage_do_tile(fx.Index(1), 1)
+            # Prime every buffer. From here each tile's DMA is issued by the
+            # body `NUM_STREAM_BUFFERS` tiles earlier, so this is the only
+            # staging whose latency is not covered by compute.
+            for b in range_constexpr(NBUF):
+                stream.stage_q_tile(fx.Index(b), b)
+                stream.stage_do_tile(fx.Index(b), b)
 
             init_args = []
-            for _ in range_constexpr(2 * traits.D_CHUNKS):
+            for _ in range_constexpr(2 * n_acc):
                 init_args.append(zero_acc)
             loop_results = init_args
 
             for j, loop_args in range(fx.Index(0), t_end, fx.Index(2), init=init_args):
-                dv = [loop_args[i] for i in range_constexpr(traits.D_CHUNKS)]
-                dk = [loop_args[traits.D_CHUNKS + i] for i in range_constexpr(traits.D_CHUNKS)]
-                dv, dk = tile.run(j, 0, j + fx.Index(2), v_k, v_v, dv, dk)
-                dv, dk = tile.run(j + fx.Index(1), 1, j + fx.Index(3), v_k, v_v, dv, dk)
+                dv = [loop_args[i] for i in range_constexpr(n_acc)]
+                dk = [loop_args[n_acc + i] for i in range_constexpr(n_acc)]
+                # Two tiles per iteration, one LDS buffer each when there are
+                # two. At one buffer both slots use it and the prefetch
+                # distance collapses; the arithmetic below is the same.
+                for slot in range_constexpr(2):
+                    dv, dk = tile.run(
+                        j + fx.Index(slot),
+                        slot % NBUF,
+                        j + fx.Index(slot + NBUF),
+                        v_k,
+                        v_v,
+                        dv,
+                        dk,
+                    )
                 loop_results = yield dv + dk
 
-            dv = [loop_results[i] for i in range_constexpr(traits.D_CHUNKS)]
-            dk = [loop_results[traits.D_CHUNKS + i] for i in range_constexpr(traits.D_CHUNKS)]
+            dv = [loop_results[i] for i in range_constexpr(n_acc)]
+            dk = [loop_results[n_acc + i] for i in range_constexpr(n_acc)]
 
             # `dS` is the gradient of the *scaled* logits, so `sm_scale` belongs
             # to `dK` and to nothing else. Once at the end rather than per tile:
             # a linear factor commutes with the accumulation.
-            dualwave._scale_o_accs(dk, ctx.c_sm_scale, traits, ctx.fm_fast)
-            store.store_accs(dv, ctx.dv_div, ctx.kv_row, ctx.stride_dv_seq_v)
-            store.store_accs(dk, ctx.dk_div, ctx.kv_row, ctx.stride_dk_seq_v)
+            for dc in range_constexpr(n_acc):
+                dk[dc] = dualwave._fmul(Vec(dk[dc]), scale_vec, ctx.fm_fast)
+            store.store_accs(dv, ctx.dv_div, ctx.kv_row, ctx.stride_dv_seq_v, hdim_vo, ctx.dv_oob_off)
+            store.store_accs(dk, ctx.dk_div, ctx.kv_row, ctx.stride_dk_seq_v, hdim_qk, ctx.dk_oob_off)
 
         _dkdv_body()
 
@@ -1064,13 +1268,55 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
                 "passthrough": passthrough_entries,
             },
         ).launch(
-            # Head fastest, matching the forward: on MI355X's 8 XCDs the grid
-            # axis order is an L2-locality lever, and the forward measured 7%
-            # for getting it this way round.
-            grid=(num_head_q, num_kv_blocks, fx.Index(batch_size)),
+            # **Head on the fast axis, and measured rather than inherited.**
+            # Every workgroup here streams the whole of Q and dO, so putting
+            # the KV block on the fast axis to make concurrent workgroups share
+            # that slab is the obvious move -- and it is 12-15% *slower* at
+            # every rung tried (512: 230 TF against 260; 384: 260 against 283;
+            # 256: 390 against 433). The eight XCDs have separate L2s, so
+            # sharing a slab duplicates it across all of them instead of
+            # spreading distinct work. Same conclusion as the forward's, for a
+            # different reason.
+            grid=(fx.Index(num_head_q), num_kv_blocks, fx.Index(batch_size)),
             block=(traits.BLOCK_SIZE, 1, 1),
             stream=stream,
         )
+
+    def _check_8x_d_contract(named):
+        """Refuse a layout the kernel's 8-wide accesses would overrun.
+
+        **The input contract is 8xD, not 32xD.** Loads and stores are 8 columns
+        wide, so a head_dim that is a multiple of 8 is a whole number of chunks
+        and a plainly contiguous `(B, H, S, 24)` needs no padding of any kind.
+        An odd head_dim still works, but only in an allocation with slack: the
+        kernel touches `ceil8(hdim)` columns per row, so those extra elements
+        must belong to the caller.
+
+        Two separate requirements, and the pitch is only the first. *Alignment*:
+        a row starts at `sum(index * stride)`, so every non-D stride must be a
+        multiple of 8 for the 16-byte access to land aligned. *Slack*: the gap
+        after a row is the smallest non-D stride, which for a BHSD tensor is
+        the D pitch but for a BSHD one is `D` itself -- consecutive heads of the
+        same token are adjacent, so a pitch check alone waves that through
+        while the store corrupts the next head.
+        """
+        for name, t in named:
+            d = t.shape[3]
+            need = (d + 7) // 8 * 8
+            if need == d:
+                continue
+            outer = [t.stride(i) for i in range(3) if t.shape[i] > 1]
+            aligned = t.stride(3) == 1 and all(s % 8 == 0 for s in outer)
+            slack = min(outer, default=need)
+            if not aligned or slack < need:
+                raise ValueError(
+                    f"{name} has shape {tuple(t.shape)} strides {tuple(t.stride())}, which cannot hold "
+                    f"a head_dim of {d}. {d} is not a multiple of 8, so the kernel reads and writes "
+                    f"{need} columns per row and needs the D axis innermost, every other stride a "
+                    f"multiple of 8, and {need - d} unused element(s) after each row. Allocate the last "
+                    f"dimension as {need} and pass a [..., :{d}] view -- or use a head_dim that is a "
+                    f"multiple of 8, which needs no padding at all."
+                )
 
     def _args(
         Q,
@@ -1107,11 +1353,31 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
                 "over the q heads sharing a kv head, which this kernel does not do. See "
                 "`BwdDkDvKnobs._checked_scope`."
             )
-        if hdim_qk != BLOCK_DMODEL or hdim_vo != BLOCK_DMODEL:
+        # dK follows Q's head dim and dV follows V's, which is what makes an
+        # asymmetric build meaningful at all.
+        if DK.shape[3] != hdim_qk or DO.shape[3] != hdim_vo or DV.shape[3] != hdim_vo:
             raise ValueError(
-                f"this build serves head_dim {BLOCK_DMODEL} exactly, got hdim_qk {hdim_qk} and hdim_vo "
-                f"{hdim_vo}. Padded heads and asymmetric hdim are B3."
+                f"dK must carry hdim_qk ({hdim_qk}) and dO/dV hdim_vo ({hdim_vo}); got "
+                f"dK {DK.shape[3]}, dO {DO.shape[3]}, dV {DV.shape[3]}"
             )
+        if hdim_qk > BLOCK_DMODEL or hdim_vo > BLOCK_DMODEL:
+            raise ValueError(
+                f"this build serves head dims up to {BLOCK_DMODEL}, got hdim_qk {hdim_qk} and " f"hdim_vo {hdim_vo}"
+            )
+        if not PADDED_HEAD and (hdim_qk != BLOCK_DMODEL or hdim_vo != BLOCK_DMODEL):
+            raise ValueError(
+                f"this build is not compiled for a padded head; it serves head_dim {BLOCK_DMODEL} "
+                f"exactly, got hdim_qk {hdim_qk} and hdim_vo {hdim_vo}"
+            )
+        # Both extents share one mask floor, so both must sit above it.
+        if HDIM_QK_FLOOR and min(hdim_qk, hdim_vo) <= HDIM_QK_FLOOR:
+            raise ValueError(
+                f"this build serves head dims in ({HDIM_QK_FLOOR}, {BLOCK_DMODEL}], got hdim_qk "
+                f"{hdim_qk} and hdim_vo {hdim_vo}; build for the narrower rung, or pin "
+                "hdim_qk_floor=0 to mask every column"
+            )
+        if PADDED_HEAD:
+            _check_8x_d_contract((("Q", Q), ("K", K), ("V", V), ("DO", DO), ("DK", DK), ("DV", DV)))
         for name, t in (("DK", DK), ("DV", DV)):
             if t.dtype != Q.dtype:
                 raise ValueError(f"{name} must have Q's dtype ({Q.dtype}), got {t.dtype}")
@@ -1158,7 +1424,9 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             num_head_k,
             hdim_qk,
             hdim_vo,
-            abi.resolve_scale(Q, scale if scale is not None else BUILD_SM_SCALE, False, 1.0 / (BLOCK_DMODEL**0.5)),
+            abi.resolve_scale(
+                Q, scale if scale is not None else BUILD_SM_SCALE, PADDED_HEAD, 1.0 / (BLOCK_DMODEL**0.5)
+            ),
             *st,
             0,
             0,
