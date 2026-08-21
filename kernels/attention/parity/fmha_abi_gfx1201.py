@@ -64,6 +64,7 @@ __all__ = [
     "prep_tensors",
     "lse_args",
     "resolve_window",
+    "bias_args",
     "dropout_args",
     "dropout_outputs",
     "u64_scalar",
@@ -471,6 +472,53 @@ def dropout_outputs(enable_dropout, seed_output, offset_output):
         NULL_PTR if seed_output is None else ptr_arg(seed_output),
         NULL_PTR if offset_output is None else ptr_arg(offset_output),
     )
+
+
+def bias_args(bias_type, with_db, bias, dbias, like):
+    """(Bias, DB, stride_b0, stride_b1, stride_b2) in launch order.
+
+    The bias is `(B, H, Sq, Sk)`, so its three leading strides are batch, head
+    and *query row* -- the last axis is the KV column and is the contiguous one
+    the kernel's inner loop walks. That is the forward's layout, unchanged, so
+    a caller can hand the backward the very tensor it gave the forward.
+
+    Both pointers are always in the kernarg signature and are `NULL_PTR` when
+    their build axis is off, which is how the dropout arguments behave: a
+    kernel argument that exists unconditionally is one fewer ABI variant to
+    keep in step, and `const_expr` means the null is never dereferenced.
+
+    `dbias` is checked against `bias` for shape rather than being inferred,
+    because a dB that is silently the wrong shape writes out of bounds.
+    """
+    if not bias_type:
+        if bias is not None:
+            raise ValueError("bias= was passed but this build has bias=False; rebuild with bias=True")
+        return NULL_PTR, NULL_PTR, 0, 0, 0
+    if bias is None:
+        raise ValueError("this build has bias=True and requires bias=")
+    if bias.dim() != 4:
+        raise ValueError(f"bias must be (B, H, Sq, Sk), got {tuple(bias.shape)}")
+    if bias.dtype != like.dtype:
+        raise ValueError(f"bias dtype {bias.dtype} must match q's {like.dtype}")
+    if bias.stride(3) != 1:
+        # The kernel loads eight adjacent KV columns per accumulator group in
+        # one v8, exactly as the forward does; the same check lives there.
+        raise ValueError(f"bias must have a contiguous last (Sk) dimension, got stride(3)={bias.stride(3)}")
+    db = NULL_PTR
+    if with_db:
+        if dbias is None:
+            raise ValueError("this build has return_dbias=True and requires dbias=")
+        if tuple(dbias.shape) != tuple(bias.shape):
+            raise ValueError(f"dbias shape {tuple(dbias.shape)} must equal bias's {tuple(bias.shape)}")
+        if dbias.dtype != bias.dtype:
+            raise ValueError(f"dbias dtype {dbias.dtype} must equal bias's {bias.dtype}")
+        if dbias.stride(3) != 1:
+            raise ValueError(f"dbias must have a contiguous last (Sk) dimension, got stride(3)={dbias.stride(3)}")
+        db = ptr_arg(dbias)
+    elif dbias is not None:
+        raise ValueError("dbias= was passed but this build has return_dbias=False")
+    sb = bias.stride()
+    return ptr_arg(bias), db, sb[0], sb[1], sb[2]
 
 
 def dropout_args(enable_dropout, dropout_p, seed, offset1, offset2, device=None, stream=None):

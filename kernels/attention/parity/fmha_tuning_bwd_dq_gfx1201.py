@@ -314,16 +314,20 @@ class BwdDqInputMetadata:
     causal_type: int | None = None
     dropout: bool = False
     philox_width: int | None = None
-    # Attention bias, matching the forward's `BIAS_TYPE`. **Not yet supported
-    # here, and rejected rather than ignored.**
+    # Attention bias, matching the forward's `BIAS_TYPE`: a (B, H, Sq, Sk)
+    # matrix added to the scores after the scale and before the mask.
     #
-    # The forward folds the bias into the score *and* into the logsumexp it
-    # stores, while this kernel recomputes `P = exp(sm_scale*QK^T - lse)` from
-    # that logsumexp. Without the bias term the recomputed P is off by
-    # `exp(-bias)`, so dQ, dK and dV are all wrong -- silently, since nothing
-    # about the inputs looks unusual. Carrying the flag is what lets `plan`
-    # say so instead.
+    # It has to be an input, not just an output question. The forward folds the
+    # bias into the score *and* into the logsumexp it stores, and this kernel
+    # recomputes `P` from that logsumexp -- so without the bias term the
+    # recomputed P is off by `exp(-bias)` and dQ, dK and dV are all wrong.
     bias: bool = False
+
+    # Emit dB. Off by default and a *separate* axis from `bias`, because the
+    # gradient of the bias is often not wanted even when a bias is used, and
+    # the store is `BLOCK_M x BLOCK_N` of traffic per tile. `dB = dS`, which
+    # the kernel already forms for GEMM3, so the cost is entirely the writes.
+    return_dbias: bool = False
 
 
 @dataclass(frozen=True)
@@ -441,13 +445,13 @@ def plan(request: BwdDqInputMetadata, overrides: BwdDqKnobs | None = None) -> Bw
     a compiled tile lands in `BwdDqPlan.knobs.block_dmodel`, and
     `knobs.padded_head` records whether the two differ.
     """
-    if request.bias:
+    if request.return_dbias and not request.bias:
+        raise ValueError("return_dbias needs bias=True: dB is the gradient of a bias that is not there")
+    if request.bias and (request.causal or request.causal_type):
         raise ValueError(
-            "attention bias is not supported by the backward kernels yet. The forward "
-            "folds the bias into both the score and the logsumexp it stores, and this "
-            "kernel recomputes P from that logsumexp without it -- so dQ, dK and dV "
-            "would all be wrong by a factor exp(-bias), silently. Rejected rather than "
-            "computed. dB is not emitted either."
+            "bias and causal masking are mutually exclusive, as in the forward: a bias "
+            "already is an additive mask, so the pair has no defined meaning. Fold the "
+            "causal pattern into the bias tensor, or drop the bias"
         )
     head_dim = request.head_dim
     if head_dim < 1 or head_dim > MAX_HEAD_DIM:

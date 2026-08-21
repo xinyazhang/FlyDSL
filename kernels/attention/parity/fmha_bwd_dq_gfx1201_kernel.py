@@ -322,6 +322,14 @@ def build_bwd_dq_module_primary(meta, knobs):
     ENABLE_DROPOUT = bool(dropout)
     PHILOX = Philox.for_arch() if philox_width is None else Philox(width=philox_width)
 
+    # Attention bias, and its gradient. Two independent build axes: BIAS_TYPE 0
+    # emits nothing at all, and WITH_DB is off even for most bias builds since
+    # dB costs a BLOCK_M x BLOCK_N store per tile and is often unwanted.
+    BIAS_TYPE = 1 if meta.bias else 0
+    WITH_DB = bool(meta.return_dbias)
+    assert not (WITH_DB and not BIAS_TYPE), "return_dbias needs bias"
+    assert not (BIAS_TYPE and CAUSAL), "bias and causal are mutually exclusive, as in the forward"
+
     # ---- LDS layout ----
     # K and V are padded rather than XOR-swizzled, following the forward (a
     # swizzle was implemented there and measured a net loss).
@@ -436,6 +444,11 @@ def build_bwd_dq_module_primary(meta, knobs):
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
         sm_scale_arg: fx.Float32,
+        Bias: fx.Pointer,
+        DB: fx.Pointer,
+        stride_b0: fx.Int64,
+        stride_b1: fx.Int64,
+        stride_b2: fx.Int64,
     ):
         elem_type = elem_numeric_cls.ir_type
         elem_dtype = elem_numeric_cls
@@ -649,6 +662,22 @@ def build_bwd_dq_module_primary(meta, knobs):
         q_row_i32 = fx.Int32(q_row)
         # Intra-tile row, bounded by BLOCK_M so the divergent offset stays small.
         q_row_in_tile = wave_q_offset + lane16
+
+        # Bias is (B, H, Sq, Sk): its last axis is the KV column, so its "row"
+        # stride is stride_b2 and the contiguous axis is the one the KV loop
+        # walks. Indexed with the same (batch, q_row_off) the varlen decode
+        # produced, so it inherits every layout for free -- the forward's
+        # `sdpa-bias-plan.md` 3 argument, unchanged. One row per lane, since a
+        # lane owns one Q row for the whole KV loop.
+        if const_expr(BIAS_TYPE):
+            _b_ptr = fmha.pointer_to_llvm_ptr(Bias)
+            _b_row = (
+                _q_batch_v * fx.Index(stride_b0)
+                + head_q * fx.Index(stride_b1)
+                + (_q_row_off_v + q_row) * fx.Index(stride_b2)
+            )
+        if const_expr(WITH_DB):
+            _db_ptr = fmha.pointer_to_llvm_ptr(DB)
 
         q_rows_axis = fmha.MaskedAxis(fx.Index(seqlen_q_i32))
         q_ap = fmha.Aperture(qk_cols, rows=q_rows_axis)
@@ -937,6 +966,26 @@ def build_bwd_dq_module_primary(meta, knobs):
             # away by a fast-math multiply.
             s_raw = [fastmath.mul(v, sm_log2e) for v in s_raw]
 
+            if const_expr(BIAS_TYPE):
+                # After the scale because the exponent lives in the base-2
+                # scaled domain, so a bias in natural units is multiplied by
+                # log2(e) first -- AOTriton's `qk += bias * 1.44269504089`.
+                # Before the mask so a column past seqlen_k stays -inf rather
+                # than becoming -inf + bias.
+                #
+                # Not a gather: element `_st*8 + _r` is KV column
+                # `_st*16 + klane*8 + _r`, so within a group only `_r` varies
+                # and one v8 load covers all eight.
+                for _st in range_constexpr(NUM_S_ACCS):
+                    _bv = load_global_v8f16(
+                        _b_ptr,
+                        _b_row + fx.Index(kv_block_start) + fx.Index(_st * WMMA_N) + klane * fx.Index(8),
+                        fx.Index(0),
+                    )
+                    for _r in range_constexpr(8):
+                        _bs = fx.Float32(Vec(_bv)[_r].to(fx.Float32))
+                        s_raw[_st * 8 + _r] = fastmath.add(s_raw[_st * 8 + _r], fastmath.mul(_bs, fx.Float32(_LOG2E)))
+
             if const_expr(_MASK_STEPS):
                 # Element i of the flattened accumulators is KV column
                 #   (i//16)*32 + ((i//8)%2)*16 + klane*8 + i%8
@@ -998,6 +1047,29 @@ def build_bwd_dq_module_primary(meta, knobs):
                         fastmath.sub(fx.Float32(dp_raw[_i]), delta_i),
                     )
                 )
+
+            if const_expr(WITH_DB):
+                # dB = dS. The bias is added to the score, so d(score)/d(bias)
+                # is 1 and the gradient the kernel already has for GEMM3 *is*
+                # the bias gradient -- this is a store, not a computation.
+                #
+                # Written from the dQ kernel rather than dK/dV because this one
+                # walks KV tiles for a fixed Q block, so the eight elements of
+                # a group are eight contiguous dB columns and the store is one
+                # v8; dK/dV would walk down a column. And because bias excludes
+                # causal, the visited region is the full rectangle, so between
+                # them the Q blocks cover every (q, kv) exactly once.
+                for _st in range_constexpr(NUM_S_ACCS):
+                    _dbv = Vec.from_elements(
+                        [fx.Float32(ds_vals[_st * 8 + _j]).to(elem_dtype) for _j in range_constexpr(8)],
+                        elem_dtype,
+                    ).ir_value()
+                    store_global_v8(
+                        _db_ptr,
+                        _b_row + fx.Index(kv_block_start) + fx.Index(_st * WMMA_N) + klane * fx.Index(8),
+                        fx.Index(0),
+                        _dbv,
+                    )
 
             # ==== Build the dS packs ====
             # Truncated to the input's 16-bit type because RDNA4 WMMA has no
@@ -1160,6 +1232,11 @@ def build_bwd_dq_module_primary(meta, knobs):
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
         sm_scale_arg: fx.Float32,
+        Bias: fx.Pointer,
+        DB: fx.Pointer,
+        stride_b0: fx.Int64,
+        stride_b1: fx.Int64,
+        stride_b2: fx.Int64,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -1214,6 +1291,11 @@ def build_bwd_dq_module_primary(meta, knobs):
             stride_dq_head,
             stride_dq_seq,
             sm_scale_arg,
+            Bias,
+            DB,
+            stride_b0,
+            stride_b1,
+            stride_b2,
         )
 
         if const_expr(WAVES_PER_EU is not None):
@@ -1301,6 +1383,8 @@ def build_bwd_dq_module_primary(meta, knobs):
         seed,
         off1,
         off2,
+        bias,
+        dbias,
     ):
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
         ptrs, meta_t, st = abi.prep_tensors(
@@ -1336,6 +1420,7 @@ def build_bwd_dq_module_primary(meta, knobs):
             *meta_t,
             *st,
             abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
+            *abi.bias_args(BIAS_TYPE, WITH_DB, bias, dbias, Q),
         )
 
     def _launch(
@@ -1358,6 +1443,8 @@ def build_bwd_dq_module_primary(meta, knobs):
         philox_seed=0,
         philox_offset1=None,
         philox_offset2=0,
+        bias=None,
+        dbias=None,
     ):
         args = _args(
             Q,
@@ -1378,6 +1465,8 @@ def build_bwd_dq_module_primary(meta, knobs):
             philox_seed,
             philox_offset1,
             philox_offset2,
+            bias,
+            dbias,
         )
         abi.run_compiled(_COMPILED, launch_bwd_dq, *args, stream if stream is not None else fx.Stream(None))
 
@@ -1401,6 +1490,8 @@ def build_bwd_dq_module_primary(meta, knobs):
         philox_seed=0,
         philox_offset1=None,
         philox_offset2=0,
+        bias=None,
+        dbias=None,
     ):
         args = _args(
             Q,
@@ -1421,6 +1512,8 @@ def build_bwd_dq_module_primary(meta, knobs):
             philox_seed,
             philox_offset1,
             philox_offset2,
+            bias,
+            dbias,
         )
         return flyc.compile(launch_bwd_dq, *args, fx.Stream(stream))
 

@@ -36,7 +36,8 @@ from dropout_mask_gfx1201 import dropout_mask
 from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module
 from fmha_bwd_dq_gfx1201_interface import bwd_dq_delta, flydsl_bwd_dq_gfx1201
 from fmha_bwd_dq_gfx1201_kernel import build_bwd_dq_module
-from fmha_tuning_bwd_dq_gfx1201 import BwdDqKnobs
+from fmha_tuning_bwd_dq_gfx1201 import BwdDqInputMetadata, BwdDqKnobs
+from fmha_tuning_bwd_dq_gfx1201 import plan as bwd_dq_plan
 from philox import dropout_threshold
 
 _NUM_HEADS = 2
@@ -955,3 +956,126 @@ def test_strides_are_read_not_assumed():
     exe(*(t.contiguous() for t in (q, k, v, do)), packed, lse, delta, B, N, N)
     torch.cuda.synchronize()
     assert torch.equal(strided, packed), "the strided and packed layouts disagree"
+
+
+# --------------------------------------------------------------------------
+# Attention bias, and dB
+#
+# The forward supports a bias; for a long time this kernel did not, and the
+# failure mode was silent rather than loud. The forward folds the bias into the
+# score *and* into the logsumexp it stores, and this kernel recomputes P from
+# that logsumexp -- so a build without the bias term produced `P * exp(-bias)`
+# and a plausible, wrong dQ. `test_zero_bias_matches_no_bias` is the cheap
+# check that would have caught it, and it is here for that reason.
+# --------------------------------------------------------------------------
+
+
+def _bias_reference(q, k, v, do, bias):
+    """fp32 forward + autograd with an additive bias, returning what both sides need."""
+    qf, kf, vf = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    bf = bias.detach().float().requires_grad_(True)
+    sm = 1.0 / (q.shape[3] ** 0.5)
+    s = (qf @ kf.transpose(-1, -2)) * sm + bf
+    p = torch.softmax(s, -1)
+    o = p @ vf
+    o.backward(do.float())
+    return (
+        o.detach(),
+        torch.logsumexp(s, -1).detach(),
+        (do.float() * o.detach()).sum(-1),
+        qf.grad.detach(),
+        bf.grad.detach(),
+    )
+
+
+def _bias_dq(q, k, v, do, bias, dbias=None, return_dbias=False):
+    """dQ (and dB) through a bias build, bypassing the interface as `_bwd_via_kernel` does."""
+    batch, heads, seq, head_dim = q.shape
+    _, lse, delta, _, _ = _bias_reference(q, k, v, do, bias)
+    exe = build_bwd_dq_module(
+        num_heads=heads,
+        head_dim=head_dim,
+        causal=False,
+        dtype_str="bf16" if q.dtype == torch.bfloat16 else "f16",
+        bias=True,
+        return_dbias=return_dbias,
+    )
+    pitch = (head_dim + 7) // 8 * 8
+    dq = torch.zeros(batch, heads, seq, pitch, dtype=q.dtype, device=q.device)[..., :head_dim]
+    exe(
+        q,
+        k,
+        v,
+        do,
+        dq,
+        lse.reshape(batch * heads, seq).contiguous(),
+        delta.reshape(batch * heads, seq).contiguous(),
+        batch,
+        seq,
+        seqlen_k=seq,
+        bias=bias,
+        dbias=dbias,
+    )
+    return dq
+
+
+@pytest.mark.parametrize("head_dim", [32, 64, 128])
+def test_bias_dq_matches_autograd(head_dim):
+    """dQ under a bias, against fp32 autograd on the same bias."""
+    _require_env()
+    q, k, v, do = _qkv(1, 2, 2, 128, 128, head_dim, torch.float16)
+    gen = torch.Generator(device=q.device).manual_seed(7)
+    bias = torch.randn(1, 2, 128, 128, dtype=q.dtype, device=q.device, generator=gen)
+    _, _, _, dq_ref, _ = _bias_reference(q, k, v, do, bias)
+    dq = _bias_dq(q, k, v, do, bias)
+    assert _rel(dq, dq_ref) < _RTOL, f"dQ rel={_rel(dq, dq_ref):.3e}"
+
+
+@pytest.mark.parametrize("head_dim", [32, 64, 128])
+def test_dbias_matches_autograd(head_dim):
+    """dB = dS. The kernel already forms it for GEMM3, so this checks the store."""
+    _require_env()
+    q, k, v, do = _qkv(1, 2, 2, 128, 128, head_dim, torch.float16)
+    gen = torch.Generator(device=q.device).manual_seed(7)
+    bias = torch.randn(1, 2, 128, 128, dtype=q.dtype, device=q.device, generator=gen)
+    _, _, _, _, db_ref = _bias_reference(q, k, v, do, bias)
+    dbias = torch.zeros_like(bias)
+    _bias_dq(q, k, v, do, bias, dbias=dbias, return_dbias=True)
+    assert _rel(dbias, db_ref) < _RTOL, f"dB rel={_rel(dbias, db_ref):.3e}"
+
+
+def test_zero_bias_matches_no_bias():
+    """An all-zero bias must reproduce the no-bias build.
+
+    This is the test whose absence let the missing-bias bug live: a bias build
+    that ignored the bias entirely would still pass every *other* test here,
+    because every other test runs without one.
+    """
+    _require_env()
+    q, k, v, do = _qkv(1, 2, 2, 128, 128, 64, torch.float16)
+    zeros = torch.zeros(1, 2, 128, 128, dtype=q.dtype, device=q.device)
+    _, lse, delta, _, _ = _bias_reference(q, k, v, do, zeros)
+    plain = _run(q, k, v, do, lse, delta, causal=False)
+    biased = _bias_dq(q, k, v, do, zeros)
+    assert _rel(biased, plain) < 1e-3, f"a zero bias moved dQ by rel={_rel(biased, plain):.3e}"
+
+
+def test_nonzero_bias_actually_changes_dq():
+    """The converse: a bias that was silently dropped would pass the test above."""
+    _require_env()
+    q, k, v, do = _qkv(1, 2, 2, 128, 128, 64, torch.float16)
+    gen = torch.Generator(device=q.device).manual_seed(11)
+    bias = torch.randn(1, 2, 128, 128, dtype=q.dtype, device=q.device, generator=gen)
+    zeros = torch.zeros_like(bias)
+    assert _rel(_bias_dq(q, k, v, do, bias), _bias_dq(q, k, v, do, zeros)) > 1e-2
+
+
+def test_bias_and_causal_are_rejected_together():
+    """As in the forward: a bias already is an additive mask."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        bwd_dq_plan(BwdDqInputMetadata(num_heads=2, head_dim=64, causal=True, bias=True))
+
+
+def test_return_dbias_requires_bias():
+    with pytest.raises(ValueError, match="needs bias"):
+        bwd_dq_plan(BwdDqInputMetadata(num_heads=2, head_dim=64, causal=False, return_dbias=True))
