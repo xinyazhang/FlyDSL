@@ -197,3 +197,84 @@ rather than forking it:
 - A short outcome section appended to `sdpa-bwd-plan-gfx950.md`, in the style
   of the forward's: what was measured, what surprised you, what is not done.
   If you hit a hazard of the kind `sdpa_lore_gfx950.md` describes, add it there.
+
+---
+
+# Addendum: B3 — the ladder to 512
+
+B1 and B2 shipped dense non-causal at head_dim 64/128, both **unpipelined, one
+tile in flight** — which is already the *wide* shape. B3 is therefore not "port
+to a second body"; it is "make the body you have reach the whole ladder".
+
+Extend `LADDER` to the forward's `(32, 64, 96, 128, 160, 192, 224, 256, 384,
+512)`, with the 8xD input contract and padded heads. Still no causal, windows,
+varlen, dropout or bias input — those are B4–B6 and land on top.
+
+## The two kernels hit different walls, and this is the whole brief
+
+Per staging slot at 64 rows: `64 * head_dim * ~2.07 B`. Accumulators are
+`d/2` VGPRs per lane at 32 rows per wave, `d/4` at 16.
+
+| head_dim | dK/dV LDS (2 slots) | dQ LDS (3 slots) | dK/dV acc @32 | dQ acc @32 |
+|---|---|---|---|---|
+| 256 | 66 KB | 99 KB | **256** | 128 |
+| 384 | 99 KB | 149 KB | **384** | 192 |
+| 512 | **133 KB** | **199 KB — over** | **512** | **256** |
+
+Cap is 163840 B; 256 arch + 256 acc VGPRs, with operands and P/dS on top.
+
+**dK/dV is register-bound and its LDS is fine all the way to 512.** Two tiles
+read two ways is a cheap layout and it keeps paying. The accumulators are the
+problem: two of them, `d/2` each at 32 rows per wave.
+
+**dQ is LDS-bound before it is register-bound**, and the cause is already
+known: it stages **K twice** (K layout for GEMM1, V layout for GEMM3), which is
+the third slot. B2 deferred that to B7. **It is now a B3 blocker** — at two
+slots dQ fits 512 in 133 KB, at three it does not fit at all. Fix the double
+staging before reaching for `D_STAGES`; B2's own notes name two ways (a K
+reader parameterised on the V line stride, or double-buffering into the unused
+fourth slot). Also stop allocating the unused fourth slot, which is over the
+cap at 384 by itself.
+
+## Order of attack — cheapest lever first
+
+B1's measurement is the reason this is written as an order rather than a list.
+At head_dim 128 it found 4 waves alone gave 403 TF and *the same build* with
+`waves_per_eu=1` gave 721; 2 waves reached 788 with zero spills. A build at 0
+AGPRs with a nonzero spill count is not short of registers, it is forbidden
+from using half of them.
+
+1. **`(num_waves, waves_per_eu)` as a pair.** Free, and it answered head_dim
+   128. Read `agpr_count` alongside spills; that pair is the discriminator.
+2. **Rows per wave 32 → 16.** Halves the dK/dV accumulators outright. Costs
+   `BLOCK_N` at a fixed wave count. Contract §4 already required this to be a
+   trait rather than a literal — this is the phase that spends it.
+3. **Fix dQ's double-K staging.** Structural, and it is what makes 512 fit.
+4. **`D_STAGES`** — split the D axis in time, one LDS residency per pass.
+   The forward's mechanism; see `fmha_wide_gfx950.py`.
+5. **d-axis sharding** (`VO_SHARDS`'s analogue) — last, because it costs wave
+   count and cross-shard reduction. dK/dV will likely still need it at 384/512
+   even after 1–3; dQ should not.
+
+**Do not skip to 4 or 5 because the table says the accumulator is too big.**
+The table is demand, not what the allocator will grant, and B1 already showed
+those two differ by 1.8x.
+
+## Gates
+
+- The full `LADDER`, both bodies, error-ratio gate per rung.
+- The **8xD contract**: every multiple of 8 from 8 to 512 correct with plainly
+  contiguous tensors, and nothing written past the last row. The forward's
+  `test_grid8_contiguous_is_exact_and_writes_nothing_past_o` is the model, and
+  it found a real class of bug there.
+- Padded heads, and note B2's finding: the two head extents are used the *other
+  way round* in dQ — GEMM2 reads V through the K register path whose mask is
+  written against `hdim_qk`, while dQ stores through the O path whose
+  suppression is against `hdim_vo`. Two one-line sites, but they are crossed.
+- **From P7: enforce the rows-per-wave ceiling** rather than commenting it. The
+  forward shipped twelve silently-wrong configurations because `make_traits`
+  stated that invariant in prose and checked nothing.
+- **8-minute build cap.** A configuration whose register allocator runs away is
+  telling you it does not fit. The forward's P7 sweep wedged four shards on
+  exactly this; treat a slow build as a result.
+- The joint dQ + dK/dV autograd check must still pass, at every new rung.
