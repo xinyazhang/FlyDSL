@@ -208,7 +208,7 @@ rows per wave the accumulators are `[d][16]` and cost `d/4` each, halving every
 number above and pushing the wide threshold *later* than the forward's rather
 than earlier — paid for by halving `BLOCK_N` at a given wave count, so the same
 work needs more workgroups or more waves. That trade is precisely what AITER's
-`ts_qo` knob selects, and it is the first thing B4 should sweep. Read the split
+`ts_qo` knob selects, and it is the first thing B3 should sweep. Read the split
 below as the 32-row case:
 
 ```
@@ -311,25 +311,50 @@ Three GEMMs, `kt_lds_layout` for GEMM3, delta as a tensor.
 autograd call** — they are separate kernels computing parts of one gradient,
 and testing them apart hides a scale or transpose error that cancels.
 
-### B3 — causal and windows
-
-`decompose_causal_regions` with the axes swapped for dK/dV; the forward's
-two-sided guard for dQ. The forward's P3 lesson applies directly: the
-**bit-identical sentinel oracle** (a window build fed `WINDOW_BOTRIGHT` must
-reproduce plain causal exactly) is the sharpest test available, and the tile
-cut must be verified by *timing*, because a dead tile is a no-op.
-
-Watch for the literal-zero tile base: P3 found four instances of it in the
-forward, and the backward has the same shape of prologue.
-
-### B4 — the head_dim ladder and the wide body
+### B3 — the head_dim ladder and the wide body *(before the features, deliberately)*
 
 Extend to the forward's `LADDER` (32…512), adding `D_STAGES` and d-axis
-sharding for dK/dV per §3. This is where the 8-minute build rule bites; expect
-the wide body to be a separate file, as `fmha_wide_gfx950.py` is.
+sharding for dK/dV per §3, and sweeping the rows-per-wave choice that section
+identifies. Expect the wide body to be a separate file, as
+`fmha_wide_gfx950.py` is, and expect the 8-minute build rule to bite.
+
+**This phase runs before masking, and the ordering is the lesson rather than a
+preference.** On the forward, head_dim 512 was not a wider version of head_dim
+128 — it was a second kernel body, arrived at over P8.0–P8.2 with the LDS
+blocker, the wave-count effect, cross-phase prefetch and three separate
+addressing bugs found one at a time. It needed frequent review and it needed
+the *simplest possible* kernel underneath it, because every one of those
+investigations was a bisection and each extra live feature is another variable
+in it.
+
+The backward is worse on both counts: two accumulators instead of one (§3),
+four GEMMs instead of two, and a tiling axis the forward did not have (§2). So
+get 512 working against a dense, non-causal, no-feature kernel — then add the
+features, where each one is a `const_expr` arm over a structure that already
+holds.
+
+Doing it the other way costs twice. Every wide-path bisection would carry a
+causal mask and a window guard through it, and every masking bug found at 512
+would be ambiguous between the feature and the tiling.
 
 *Gate:* the 8xD input contract, the padded-head path, and — from P7 — the
 rows-per-wave ceiling enforced rather than commented.
+
+### B4 — causal and windows
+
+Now cheap, because the structure is settled. `decompose_causal_regions` with
+the axes swapped for dK/dV; the forward's two-sided guard for dQ. The forward's
+P3 lesson applies directly: the **bit-identical sentinel oracle** (a window
+build fed `WINDOW_BOTRIGHT` must reproduce plain causal exactly) is the
+sharpest test available, and the tile cut must be verified by *timing*, because
+a dead tile is a no-op.
+
+Watch for the literal-zero tile base: P3 found four instances of it in the
+forward, and the backward has the same shape of prologue. **Both bodies**, and
+that is a direct P3 finding — the wide body's KV loop started at a literal tile
+0, so its window was correct and its tile cut inert, measuring 0.92x where the
+dual-wave body got 6.7x. Running B3 first is also what makes that check
+possible here at all.
 
 ### B5 — varlen
 
@@ -513,9 +538,19 @@ none; varlen against *N* dense calls. Every one of these transfers.
 
 B0 no longer gates the *design* — §1 settled that — only the lane map B1 and B2
 are written against, which is half a day. B1 and B2 are independent after it
-and can proceed in parallel if there are two people; B3–B6 are ordered,
-because each phase's tests are what make the next one's failures legible. B7 is last, after the register
-budget has settled — which is the same reason the forward's sweep was P7.
+and can proceed in parallel if there are two people.
+
+**Then B3 — the full ladder including 512 — before any feature work.** That is
+the one reordering against the forward's own phase sequence, and it is
+deliberate: the forward reached 384/512 at P8, *after* windows, and paid for it
+by debugging a second kernel body with the masking already in place. §B3 gives
+the argument. Get the hard structural width working against the simplest
+possible kernel; the features are then `const_expr` arms over a structure that
+already holds.
+
+B4–B6 are ordered after it, because each phase's tests are what make the next
+one's failures legible. B7 is last, once the register budget has settled —
+which is the same reason the forward's sweep was P7.
 
 **Done** is: dK/dV and dQ on the full `LADDER`, with causal, windows, varlen,
 dropout, bias and padded heads, passing the §7.1 error-ratio gate against the
