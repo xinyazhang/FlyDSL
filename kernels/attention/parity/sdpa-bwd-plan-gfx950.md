@@ -98,6 +98,14 @@ the loop. All of it is reusable as-is:
 | the geometry guard and the rows-per-wave ceiling | `fmha_traits_gfx950` | P7 found the second one the hard way |
 | `SharedAllocator`, DMA helpers, alias scopes | `flash_attn_utils` | imported, never edited |
 
+**AOTriton is the algorithm reference for all of this**, and it is worth
+reading directly rather than only through the gfx1201 port:
+`bwd_kernel_dk_dv.py` / `bwd_inner_dk_dv.py`, `bwd_kernel_dq.py` /
+`bwd_inner_dq.py`, `bwd_kernel_fuse.py`, plus `bwd_preprocess.py` and
+`bwd_postprocess.py`. The gfx1201 files are a port *of* those with our ABI
+substituted, so where the two disagree the Triton source says what the
+algorithm requires and the gfx1201 source says what a previous port chose.
+
 `decompose_causal_regions` deserves its own line: gfx1201 discovered that a KV
 block's Q range is **the same function with the axes swapped**, called as
 `decompose_causal_regions(start_k, k_len, q_len, w_right, w_left, BLOCK_N, BLOCK_M, alive)`.
@@ -169,10 +177,14 @@ the occupancy cost measured rather than assumed.
 ## 5. `delta` — take the tensor first, fuse later
 
 `delta = rowsum(dO * O)` is a preprocess. AOTriton has a `bwd_preprocess`
-kernel; gfx1201 takes it as a host-computed tensor and says so. Do the same:
-one argument, `(dO.float() * O.float()).sum(-1)` on the host, and a fused
-gfx950 preprocess kernel as a later, separately-measured step. It changes one
-argument and nothing else.
+kernel and AITER ships it as 12 separate `odo` binaries, so both tuned
+implementations keep it out of the main kernel. gfx1201 takes it as a
+host-computed tensor and says so.
+
+Do the same: one argument, `(dO.float() * O.float()).sum(-1)` on the host, then
+a gfx950 preprocess kernel as a later, separately-measured step. It changes one
+argument and nothing else, and the two references agreeing on the split is
+reason enough not to fuse it early.
 
 ---
 
@@ -244,9 +256,13 @@ through `philox_seed_output`/`philox_offset_output`. P6's tiling-independence
 test becomes a *cross-kernel* test here: forward and backward at different tile
 geometries must agree.
 
-Then `dB`, which neither AOTriton's gfx1201 port nor ours has today: `dB = dS`,
-so it is an extra store in the dK/dV kernel rather than new arithmetic, and it
-is the one place this work goes beyond the gfx1201 surface.
+Then `dB`. **AOTriton has it and our gfx1201 port dropped it** --
+`bwd_kernel_dq` takes `B` and emits `DQ, DB`, with `store_db` guarding a
+`db_ptr` store inside `bwd_inner_dq`, while `fmha_bwd_dq_gfx1201_kernel.py`
+mentions neither. `dB = dS`, so it is an extra store on a value the kernel
+already has, not new arithmetic. It belongs to the **dQ** kernel, not dK/dV,
+because that is where `dS` is materialised per (q, k) element with the query
+rows resident.
 
 ### B7 — tuning, with P7's method
 
@@ -259,29 +275,111 @@ lacked.
 
 ---
 
-## 7. Verification standard
+## 7. Verification: three sources, and what each is good for
 
 The forward had a *bitwise* oracle — a production kernel computing the same
-thing in the same order. **The backward has no such oracle**, and pretending
-otherwise is the main way this work could go wrong. Three substitutes, in
-decreasing sharpness:
+thing in the same order. **The backward has no such oracle.** It has three
+other sources, and confusing what each is for is the main way this work could
+go wrong.
 
-1. **Self-consistency with our own forward.** Run the gfx950 forward, take its
-   `O` and `LSE`, feed them to the backward, and compare against
-   `torch.autograd.grad` through the *same* forward. This catches every
-   convention mismatch — scale, `log2e` folding, LSE layout, causal alignment —
-   because both halves must agree on them.
-2. **fp64 reference** implementing §0 literally, for the tolerance tests.
-3. **Bit-identity across configurations**, which is available even without a
-   reference kernel and is what caught the most in the forward: a window build
-   with causal sentinels against a causal build; `lpt_tile_order` on against
-   off; two wave geometries against each other; `p = 0` dropout against no
-   dropout.
+### 7.1 PyTorch's math backend — the correctness gate
 
-Two forward-specific traps that will recur:
+The reference is `torch.nn.attention.SDPBackend.MATH` autograd, used the way
+`test/test_transformers.py::test_flash_attention_vs_math_ref_grads` uses it,
+and **that methodology matters more than the reference does**. A fixed
+tolerance on a bf16 backward is either so loose it accepts real bugs or so
+tight it fails on arithmetic order. The test instead computes the same problem
+three ways:
+
+```
+ours      = our kernel, bf16/f16
+ref_low   = math backend, same dtype           <- an equally imprecise honest answer
+ref_high  = math backend, fp64                 <- ground truth
+```
+
+and asserts `err(ours, ref_high) <= fudge * err(ref_low, ref_high)`, per output
+tensor. The bound is then *the precision the problem inherently has*, measured
+rather than guessed, and it scales automatically with sequence length, head dim
+and dtype. Per-tensor fudge factors, because dQ accumulates over the key axis
+and is legitimately looser than dK/dV.
+
+This subsumes the fp64 reference an earlier draft of this plan proposed, and it
+is better: writing the equations of §0 out by hand is a second implementation
+that can be wrong in the same way ours is.
+
+**Additionally, self-consistency with our own forward.** Take `O` and `LSE`
+from the gfx950 forward, feed them to the backward, and compare against
+`torch.autograd.grad` through that same forward. This is not redundant with the
+math gate — it catches convention mismatches (scale folding, `log2e`, LSE
+layout, causal alignment) that a standalone comparison against math would
+attribute to the backward when they are really a disagreement between our two
+halves.
+
+### 7.2 AOTriton — the algorithm reference, not the oracle
+
+`../aotriton/modules/flash/kernel/` is the specification for *what to compute*:
+`bwd_kernel_dk_dv` + `bwd_inner_dk_dv`, `bwd_kernel_dq` + `bwd_inner_dq`,
+`bwd_kernel_fuse`, `bwd_preprocess`, `bwd_postprocess`. Read it directly, not
+only through the gfx1201 port — where the two disagree, Triton says what the
+algorithm requires and gfx1201 says what one previous port chose.
+
+**It is not a differential oracle for everything**, and the boundary is sharp:
+
+- Its varlen is `cu_seqlens_q/k` + `num_seqlens` + `seq_strides`, i.e.
+  AOTriton's four-`VarlenType` enum. **`VarlenBits` is not in it.**
+  `sdpa-varlen-plan.md` §0.1 already says this phase overshoots AOTriton and
+  that the oracle there is *N separate dense calls*, an oracle built from our
+  own dense path. The same applies to B5: for `0x150B` and `0x040B` there is
+  nothing in AOTriton to differentially test against.
+- It *does* have `dB` (§B6) and `BIAS_TYPE` on both kernels, so bias is a place
+  AOTriton **is** available as a reference and our gfx1201 port is not.
+
+### 7.3 AITER — ASM clues, and a design AITER chose that we must not
+
+`../aiter/hsa/gfx950/fmha_v3_bwd/` is hand-written gfx950 assembly, and it is
+the only source here that has actually been tuned on this architecture. Worth
+reading for scheduling and LDS technique. It is **not** a functional reference,
+for two reasons that are visible in its own file list.
+
+**It is one fused `dqdkdv` kernel with dQ accumulated by atomic add to VRAM.**
+Floating-point addition is not associative and atomic ordering is not
+reproducible, so its dQ is **non-deterministic run to run**. We want
+deterministic kernels; that alone rules the design out, and it is why the split
+dK/dV + dQ shape of §4 is a requirement here rather than a preference.
+
+**Its feature surface is a small subset of ours.** From `fmha_bwd_dqdkdv.csv`,
+91 variants over: dtype {fp16, bf16}, hdim pairs {64/64, 128/128, 192/128,
+192/192}, mask {0, 1, 2}, `mode` {0, 1} (batch/group), plus `pssk`, `pddv`,
+`atomic32` and `bf16_cvt`. No bias, no dropout, no arbitrary head dim, no
+`VarlenBits`. Measuring against it is measuring a different problem.
+
+Three things it does teach, and they are actionable:
+
+- **The pipeline is four kernels, not one**: `odo` (12 variants) is exactly the
+  `delta = rowsum(dO * O)` preprocess of §5, shipped separately — which
+  supports taking delta as a tensor first and fusing later.
+- **`dq_convert` and `dq_shuffle` (12 + 4 variants) exist only to clean up
+  after the atomics** — an fp32 accumulation buffer converted and reshuffled
+  into the output layout. A deterministic dQ kernel needs neither, so their
+  absence from our plan is a consequence of the §4 decision, not an omission.
+- **`bf16_cvt` takes four values**, i.e. the bf16 rounding mode is a tuned
+  parameter. Our forward already carries `daz`/`fp_mode` knobs and P5 found
+  that `ninf` is not affordable once `-inf` reaches arithmetic. Expect rounding
+  to matter more in the backward, where dQ sums over the whole key axis.
+
+### 7.4 Bit-identity across configurations
+
+Available without any reference kernel, and in the forward it caught the most:
+a window build with causal sentinels against a causal build; `lpt_tile_order`
+on against off; two wave geometries against each other; `p = 0` dropout against
+none; varlen against *N* dense calls. Every one of these transfers.
+
+### 7.5 Two traps that will recur
 
 - **`torch`'s `is_causal` is top-left aligned and these kernels are
-  bottom-right.** They agree only when `Sq == Sk`. P4 lost time to this.
+  bottom-right.** They agree only when `Sq == Sk`. P4 lost time to this, and
+  the backward has more places for it to hide because dK/dV walks the transpose
+  of the same region.
 - **Always run a known-good control.** Three wrong conclusions in the forward
   work came from a probe with no control.
 
@@ -297,6 +395,8 @@ Two forward-specific traps that will recur:
 | the dropout mask disagrees across fwd/bwd | silent wrong gradients, no shape check notices | cross-kernel tiling-independence test in B6 |
 | wide-path builds that never terminate | P7 wedged four sweep shards on exactly this | per-build timeout in every harness; treat a slow build as a result |
 | split-K + backward | the forward's combine kernel is not stride-general and is guarded, not fixed | out of scope; keep the guard |
+| reaching for AITER's design under schedule pressure | it is the only gfx950-tuned source, and its dQ atomics are genuinely faster | its dQ is non-deterministic by construction; read it for scheduling, never for structure |
+| bf16 rounding in the dQ reduction | AITER makes `bf16_cvt` a tuned 4-valued parameter, so it is not noise | the §7.1 error-ratio gate prices it automatically; do not paper over a ratio regression with a bigger fudge factor |
 
 ---
 
