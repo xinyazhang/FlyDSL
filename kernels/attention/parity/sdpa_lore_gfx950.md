@@ -333,3 +333,29 @@ head_dim 96 is a normal rung again.
   uses the AGPR file for the O accumulator or abandons it entirely and spills
   to scratch, and the difference is 1.4-1.6x. Four waves keeps it; eight loses
   it.
+- **Sweep `sm_scale`, not only the shape.** Several arithmetic choices are
+  correct at `1/sqrt(head_dim)` and progressively wrong away from it, because
+  they perturb the softmax *exponent* and the damage scales with `|S|`. The
+  backward's dQ found one: folding `sm_scale * log2e` into Q and rounding the
+  product back to bf16 -- which is what the forward does, and which the forward
+  can afford because `O` is a normalised average -- measured an error ratio of
+  1.29 at scale 0.05 and **10.9 at scale 1.0**. A single-scale test called it a
+  passing kernel. The discriminator is that the ratio *climbs monotonically
+  with the scale*; a genuine transpose or indexing bug does not.
+- **A fudge factor is not a tuning knob.** The error-ratio gate
+  (`err(ours, fp64) <= fudge * err(same-dtype-reference, fp64)`) prices bf16
+  arithmetic order automatically, so a ratio that moves is a *result*. Raising
+  the factor to make a rung pass discards the only signal the method produces.
+- **`waves_per_eu` is a register budget wearing a scheduling hat, and on the
+  backward it decided 1.8x.** The forward's advice above -- "four waves keeps
+  the AGPR file, eight loses it" -- is really about how many registers a wave
+  may *address*, and the wave count is only one of the two inputs. Measured on
+  the dK/dV kernel at head_dim 128, which holds two accumulators rather than
+  one: 8 waves gave 0 AGPRs / 118 spills / 444 TF, 4 waves gave 0 AGPRs / 126
+  spills / **403** TF -- and the *same* 4-wave build with `waves_per_eu=1`
+  gave 721 TF, with 2 waves reaching 788. So halving the wave count bought
+  nothing on its own; the occupancy *hint* was still capping the budget at 256
+  and the allocator was still spilling rather than reaching AGPRs. Sweep the
+  pair, not the wave count, and read `agpr_count` as the discriminator: a build
+  at 0 AGPRs with a nonzero spill count is not short of registers, it is
+  forbidden from using half of them.

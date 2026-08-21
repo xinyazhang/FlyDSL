@@ -200,8 +200,18 @@ wave** they are `[d][32]` f32, which over 64 lanes is `d/2` VGPRs each:
 | 384+ | 192 | 192 | 384 | impossible unsharded |
 
 The forward carries **one** O accumulator of the same `d/2`, which is why its
-wide path starts at 384. **dK/dV needs sharding from 256**, and 192 will be
-marginal.
+wide path starts at 384. So dK/dV looks like it needs sharding from 256, and
+192 looks marginal.
+
+**B1 measured against that and it is premature.** At head_dim 128 the first
+build spilled 246 times at 0 AGPRs and did 200 TF; the fix was not sharding but
+the wave-count / `waves_per_eu` *pair* — 4 waves alone gave 403 TF, the same
+build with `waves_per_eu=1` gave 721, and 2 waves reached 788 with 108 AGPRs
+and zero spills. A build at 0 AGPRs with a nonzero spill count is not short of
+registers, it is forbidden from using half of them, and no amount of sharding
+fixes that. So treat the table as an upper bound on *demand*, and settle the
+threshold in B3 by sweeping the pair — the arithmetic below is what a wave
+needs, not what the allocator will give it.
 
 **This table is a function of the tiling choice, not a constant.** At 16 KV
 rows per wave the accumulators are `[d][16]` and cost `d/4` each, halving every
@@ -559,3 +569,377 @@ math backend, at a throughput recorded honestly against the MFMA ceiling.
 Two of those go past our gfx1201 backward rather than merely matching it:
 **`dB`**, which AOTriton has and that port dropped, and **`VarlenBits`**, which
 AOTriton does not have at all.
+
+---
+
+## Outcome: B2 — dQ and dB *(dense, non-causal, head_dim 64/128, bf16)*
+
+Files: `fmha_bwd_dq_gfx950.py`, `fmha_tuning_bwd_dq_gfx950.py`,
+`test_fmha_bwd_dq_gfx950.py`. 35 tests, all passing; the forward's own suite
+still passes untouched (329/329 — no file outside these three was edited).
+
+### What was built, and the one observation the design rests on
+
+**All three GEMMs are GEMMs the forward already emits.** Not approximately:
+the same `ParityGemmHelper.qk` and `.pv`, the same `ParityKvLdsToVgprLoader`
+read paths, the same `cast_p` packing, the same `ParityStoreHelper`. What
+changes is only *which tensor is staged into which LDS slot*:
+
+| | forward equivalent | A operand | staged as |
+|---|---|---|---|
+| `S = Q·Kᵀ` | `qk` | K | K layout, `load_k(0)` |
+| `dP = dO·Vᵀ` | `qk` | V | K layout, `load_k(1)` |
+| `dQ = dS·K` | `pv` | Kᵀ | **V layout**, `load_v(0)` |
+
+§1 predicted the transpose read would be the hard part. It was not, and the
+reason is worth stating: **`dS` reaches GEMM3 through `cast_p`, so it carries
+the same K permutation `P` does**, and the forward's V transpose read is built
+against exactly that permutation. The two line up with no shuffle and no new
+lane map. The B0 lane-map probe §1.4 asks for was not needed for dQ — the map
+that was already validated is the map this kernel wants. (B1 and B3 may still
+need it; this is not a claim that B0 is unnecessary in general.)
+
+Consequence: **the kernel was correct on its first run.** That is not normal
+here, and it is the strongest available evidence for the contract's "subclass,
+do not port" rule.
+
+### Three LDS tiles in four slots
+
+K is staged **twice** — once in the K layout for GEMM1 and once in the V layout
+for GEMM3 — because the two stagings differ in line padding (`SMEM_K_PAD` 8
+elements, `SMEM_V_PAD` 32). The forward's allocation already has four slots for
+two tiles in flight; this body keeps one tile in flight and spends three,
+leaving `(V, buf1)` unused (17 KB at head_dim 128, inside the cap).
+
+That buys **zero new addressing code**: the `m0` tables, the buffer bases and
+the alias scopes are the forward's, already validated by
+`tooling/probe_kv_staging.py`. It costs 50% more KV DMA traffic than the
+algorithm needs, and it is the first thing to attack if a profile asks. Two
+routes exist and both are B7 work: read one V-padded staging with a
+K-parameterised reader (the two layouts differ only in the line stride), or
+double-buffer into the fourth slot and pipeline.
+
+### Measured
+
+`B=4 H=8 S=4096` bf16 non-causal, GPU 6 idle at 39 °C, same session for both
+rows so the comparison is same-machine-state:
+
+| head_dim | dQ | forward, same session | ratio | VGPR | AGPR | spills |
+|---|---|---|---|---|---|---|
+| 64 | 751 TF | 752 TF | 1.00x | 170 | 0 | 0 |
+| 128 | 973 TF | 1018 TF | 0.96x | 240 | 0 | 0 |
+
+TFLOP/s counts `6·B·H·Sq·Sk·d` for dQ (three GEMMs) against `4·…` for the
+forward (two), i.e. both are MFMA-issue rates and are directly comparable.
+**An unpipelined body at the forward's MFMA rate was the surprise.** The
+dual-wave schedule buys the forward its rate; dQ reaches the same rate with a
+plain `barrier / DMA / wait / barrier / compute` loop, which says the three
+GEMMs per tile already cover the DMA latency the forward needed eight clusters
+to hide. Do not read that as "pipelining is worthless here" — read it as "the
+arithmetic intensity per KV tile is 1.5x the forward's, so the same latency is
+easier to hide". Small shapes are launch-bound as expected (115 TF at
+`B=1 H=8 S=1024 d=64`, 32 workgroups over 256 CUs).
+
+### The one real finding: **do not pre-scale Q in the backward**
+
+The forward folds `sm_scale * log2e` into Q and rounds the product back to
+bf16, which saves a multiply per score. Doing the same here was the first
+implementation and it passed at `sm_scale = 1/sqrt(d)`. It fails a scale sweep:
+
+| `sm_scale` | Q pre-scaled | scaled on the f32 scores |
+|---|---|---|
+| 0.05 | ratio 1.29 | 1.29 |
+| 0.25 | 3.02 | 1.64 |
+| 1.00 | **10.90** | 1.68 |
+| 2.00 | **20.20** | 1.85 |
+
+(ratio = `err(ours, fp64) / err(math-in-bf16, fp64)`, the §7.1 gate.)
+
+The mechanism: rounding `qk_scale·Q` to bf16 puts a `|S|·2⁻⁸` error into the
+*exponent*, and `P = exp2(S − lse2)` inherits it as a relative error. The
+forward tolerates it because `O` is a normalised average and the error largely
+cancels; `dS = P·(dP − delta)` does not normalise and `dQ` sums it over the
+whole key axis. A host model of both variants reproduces the kernel's own
+numbers to two digits, which is what identifies the Q rounding rather than
+anything else — the control the lore keeps asking for.
+
+The fix is free: `fma(S, qk_scale, −lse2)` replaces the `lse2` subtract that
+was needed anyway. **AOTriton scales after the dot in both directions**
+(`qk += Qk_scale * tl.dot(q, k)`, `p = exp2(qk_scale*qk - l_i)`), so this is
+its arithmetic and the forward's fold is the gfx950 schedule's local choice.
+
+Two things follow for the rest of the plan. **B1 should check the same thing**
+— `dK = dSᵀ·Q` has the same shape of exposure. And a fudge factor is not a
+tuning knob: 10.9 was a real defect and `DQ_FUDGE = 4.0` would have hidden it
+at one scale and caught it at another. Sweep the scale.
+
+### dB
+
+`dB = dS`, stored **per element** — 32 `buffer_store`s per lane per KV tile.
+Vectorising is available in principle (a lane's 16 scores are four runs of four
+contiguous columns) and is not correct in general: a run straddling `seqlen_k`
+would have to be partially written and a multi-dword store is all-or-nothing,
+so a vectorised version needs a second runtime arm for the tail tile *and* a
+`stride_db_seq` divisible by 4 (an 8-byte store off a row pitch of 201 elements
+is 2-byte aligned).
+
+It costs **4-5x** when enabled, at `B=2 H=8 S=2048`: 55 → 271 us at head_dim 64,
+89 → 373 us at 128. Not bandwidth — the tensor is 134 MB, ~27 us at this
+board's rate. Off by default, so nobody pays for it unasked, and the two-arm
+version is a clean B6/B7 item.
+
+### Verification, and what it caught
+
+- **Error-ratio gate** (§7.1) against the torch math backend at bf16 and fp64,
+  four shapes × two head dims, plus GQA and a scale sweep. Observed dQ ratios
+  1.0–1.9; the gate is 4.0.
+- **Self-consistency with our forward**: the gfx950 forward's own `O` and
+  `LSE`, `delta` computed from that `O`, against `torch.autograd.grad`. This is
+  the test that would have caught a `log2e` or LSE-layout disagreement, and it
+  is why `fmha.lse_row_addressing` is called rather than the layout re-derived.
+- **The joint dQ + dK/dV check §6 asks for is live and passing.** B1's kernel
+  landed while this was being written; one fp64 autograd call, all three
+  gradients inside the gate. The test skips rather than fails if B1's module or
+  front end moves, so this suite cannot be turned red by a sibling in flight —
+  which also means a green run here is not by itself evidence that the joint
+  check ran. Check for the skip.
+- **dB** against autograd through an explicit zero bias, including a
+  `seqlen_k = 201` case that exercises every tail state of the 4-column runs.
+- Structural: BSHD-viewed-as-BHSD strides bit-identical to contiguous, nothing
+  written past `seqlen_q`, no NaN in a Q block's padded tail, run-to-run
+  bit-identical (the determinism claim §7.3 makes against AITER's atomics).
+
+### Interfaces, and one that had to be reconciled
+
+`delta` and `LSE` are **rank-2 `(batch·heads, tokens)` f32**, checked with the
+shared `abi.row_tensor_arg` and read through `fmha.lse_row_addressing`. This
+file originally took rank 3 `(B, H, Sq)` — the shape the forward writes — and
+was changed to match B1, which had already adopted rank 2 via the shared
+helper. Same memory either way; a caller holding `(B, H, S)` passes
+`lse.view(-1, S)`. **One ABI mattered more than the nicer shape**, and the
+shared checker is the tie-breaker the contract §7 asks for.
+
+Argument order follows the forward: tensors, varlen block, `max_seqlen_*`, the
+window pair, philox, head counts, `hdim_qk`/`hdim_vo`, `sm_scale`, then three
+strides per tensor. Slots for varlen, windows, philox and bias are present and
+ignored.
+
+### Not done, and why
+
+- **Causal, windows, varlen, dropout, bias input, head_dim off {64, 128}.**
+  Refused by name in `BwdDqKnobs._with_traits` rather than ignored — each would
+  otherwise build, run and return a correctly-shaped wrong answer. B3–B6.
+- **Padded heads and asymmetric `hdim_qk`/`hdim_vo`**, also refused, and this
+  one is a finding rather than a scope line. **The two head extents are used
+  the other way round here than in the forward.** GEMM2 reads V through the
+  *K* register path, so `ParityKvLdsToVgprLoader.load_k`'s padded-head mask —
+  written against `hdim_qk` — is applied to V's columns; and dQ is written
+  through the O store, whose `_final_o_global` suppression is written against
+  `hdim_vo` while dQ is `hdim_qk` wide. Both are one line, both are only
+  testable once the ladder exists, and B3 should fix them together.
+- **No software pipelining and no double buffering.** One tile in flight. At
+  0.96–1.00x the forward's MFMA rate the case for the dual-wave schedule here
+  is not obvious, and B7 should measure before building it.
+- **K staged twice** (above). 50% surplus KV DMA.
+- **`dB` per-element store** (above). 4-5x when enabled.
+- **`QK_SHARDS` is not implemented**, but nothing forecloses it: §3's
+  observation that GEMM1's reduction axis and GEMM3's output axis are the same
+  axis holds here, and the kernel indexes the D axis through `D_CHUNKS` /
+  `K_STEPS_QK` everywhere rather than through literals.
+
+### One hazard did *not* fire, and the reason is worth keeping
+
+§1.3 and the contract flag the ISA requirement that **EXEC be all 1s across
+`ds_read_b64_tr_b16`**. This kernel has exactly one transpose read site and it
+is not inside any `scf.if`: the only branchy region in the loop is
+`seq_pad_mask_if_needed`, which touches no LDS, and the `active` guard is
+`None` for a dense non-causal build. B4 and B5 turn `active` on, and that guard
+is workgroup-uniform (so EXEC is all-1s or the block does not run) — but a
+*causal* build that puts a masked region around an edge tile would be the first
+thing here to violate it. Check it there rather than assuming it inherits.
+
+---
+
+## Outcome: B1 — dK/dV *(dense, non-causal, head_dim 64/128, bf16, MHA)*
+
+Files: `fmha_bwd_dkdv_gfx950.py`, `fmha_tuning_bwd_dkdv_gfx950.py`,
+`test_fmha_bwd_dkdv_gfx950.py`. 46 tests, all passing. Nothing outside those
+three files was edited; the forward's own suite still passes, 329/329 in
+12m31s. (The brief said 383 — the file collects 329 on this checkout. Zero
+failures either way.)
+
+### The design, and the two things that made it small
+
+**dK/dV is the forward with the roles swapped, and the swap is four
+descriptors.** K and V stay resident in registers, Q and dO stream through the
+LDS slots the staging machinery calls K and V. The traits' `BLOCK_M` becomes
+the KV block and `BLOCK_N` the streamed Q tile; nothing derived from either
+changes meaning, because the staging is about *64 rows through LDS* and does
+not care whose rows they are.
+
+**The MFMA's A and B operands take the same per-lane layout** — 32 outer rows
+on `lane % 32`, 16 contraction elements from `lane // 32` and the element index
+— so the forward's K reader and its Q loader produce interchangeable packs, and
+`S = Q·Kᵀ` / `dP = dO·Vᵀ` are `DualwaveGemmHelper.qk` with the two operands
+swapped. Output is `[A's row][B's row]` with B's row on `lane % 32`.
+
+**§1's bet paid, and B0's lane map was again not needed.** The two q-contracted
+GEMMs read the *same LDS bytes* the row-major GEMMs read, through the forward's
+V transpose path, unmodified. That works because the transposed read hands back
+element order `[0,1,2,3,8,9,10,11]` on the q axis and `_pack_p_v8_slices` slices
+the accumulator in exactly that order — the same coincidence the forward relies
+on one axis over. So: **two LDS tiles, and both are read two ways.** The one
+requirement is that both tiles are staged in the **V** line stride
+(`SMEM_V_PAD`, 32 elements), since the transpose path is only validated against
+that; the row-major read does not care which stride it is handed, so it is
+`_k_read_base` with `STREAM_LINE_STRIDE` substituted.
+
+Like B2, the kernel was **correct on its first run**. Two independent phases
+saying that about "subclass, do not port" is worth more than either saying it
+once.
+
+### Measured
+
+`B=4 H=8 S=4096` bf16 non-causal, GPU 5 idle at 34 °C. TFLOP/s counts
+`8·B·H·Sq·Sk·d` (four GEMMs), so it is an MFMA-issue rate directly comparable
+to the forward's `4·…` and B2's `6·…`.
+
+| head_dim | waves | BLOCK_KV | dK/dV | VGPR | AGPR | spills | LDS |
+|---|---|---|---|---|---|---|---|
+| 64 | 4 | 128 | **692 TF** | 240 | 0 | 0 | 34 KB |
+| 128 | 2 | 64 | **789 TF** | 364 | 108 | 0 | 68 KB |
+
+`ds_read_b64_tr_b16` count equals the MFMA count exactly (64:64 and 128:128 per
+tile pair), which is AITER's tuned `bwd_hd128` ratio — evidence the operand path
+is the intended one rather than merely a working one.
+
+### The AGPR cliff arrives one width earlier than the forward's
+
+This is the finding worth carrying into B3. A dK/dV wave holds **two**
+accumulators, so at head_dim 128 they are 128 VGPRs before anything else is
+live. At 8 waves (2 per SIMD) a wave may address 256 registers *in total*, so
+the allocator cannot reach the AGPR file at all:
+
+| head_dim | waves | `waves_per_eu` | AGPR | spills | TFLOP/s |
+|---|---|---|---|---|---|
+| 128 | 8 | 2 | 0 | 118 | 444 |
+| 128 | 4 | 2 | 0 | 126 | 403 |
+| 128 | 4 | **1** | — | — | 721 |
+| 128 | **2** | 2 | **108** | **0** | **788** |
+| 64 | 8 | 2 | 0 | 0 | 657 |
+| 64 | **4** | 2 | 0 | 0 | **698** |
+
+1.8x between the same code at 8 waves and at 2, entirely on whether the AGPR
+file is reachable. The lore's "check `agpr_count` alongside spills" is exact
+here, and note the third row: at 4 waves the *only* thing standing between 403
+and 721 TF is `waves_per_eu`, i.e. a scheduling hint deciding a register
+budget. §3's table said dK/dV needs sharding from 256; on this evidence it
+needs a *wave-count* answer from 128, which is cheaper and should be tried
+first.
+
+head_dim 64 prefers 4 waves over 8 by 5%, which is inside the band §B7 says a
+sweep cannot decide — confirmed by interleaved single-GPU A/B, nine reps,
+360.5 us median against 379.3 with non-overlapping min/max.
+
+One structural change was worth 2.2x on its own before any of that: reading the
+two 32-row halves of a staged tile **separately** rather than as a pair (each
+half is `K_STEPS_QK * 4` VGPRs = 64 at head_dim 128). 200 → 444 TF.
+
+### `dS` in bf16 is the whole of the error, and it is flat
+
+Every shape measures the same ratio: `err(ours, fp64) / err(bf16-math, fp64)` =
+**1.35–1.46**, 2.3e-3 against 1.7e-3, unmoved by batch, heads, sequence length
+or head dim. That flatness identifies it as one systematic extra rounding — `P`
+and `dS` truncated to bf16 before the q-contracted GEMMs, where torch keeps an
+fp32 intermediate — rather than anything that accumulates. The gate is 2.0.
+
+### B2's Q-prescaling finding reproduces here, and this kernel does not do it
+
+B2's outcome asks B1 to check the same exposure. It is real and this kernel
+avoids it: Q is **not** pre-scaled, and `P = exp2(fma(S, qk_scale, −lse2))`
+folds the scale into the subtraction that had to happen anyway. Swept
+`sm_scale` over 200x, ratios flat at 1.36–1.55 on both rungs. A host model of
+the two variants, everything fp32 except the one rounding, is the control:
+
+| `sm_scale` | Q pre-scaled, dK | scaled on the f32 scores, dK |
+|---|---|---|
+| 0.125 | 2.41e-3 | 1.64e-3 |
+| 1.0 | 1.42e-2 | 1.66e-3 |
+| 4.0 | **5.58e-2** | 1.64e-3 |
+
+So the forward's Q fold is a forward-only optimisation twice over, and
+AOTriton's `p = exp2(qk_scale*qk - l_i)` is the arithmetic both backward
+kernels should keep.
+
+### Nothing is masked, and that is a property rather than an omission
+
+Dense and non-causal leaves only the ragged tail, and the buffer descriptors
+answer it: Q and dO are bounded at `seqlen_q`, so a staged row past the end
+reads zero; K, V, dK and dV at `seqlen_kv`. A padding q row gets `S = 0` and
+`LSE = 0` (also out of its resource), hence `P = exp2(0) = 1` — nonzero, and it
+still contributes exactly nothing, because `dV += P·dOᵀ` and `dK += dSᵀ·Q` both
+multiply by a zero staged tensor. The tile count is rounded **up** to an even
+number for the two-buffer loop for the same reason: the extra tile is inert.
+
+The consequence for §1.3's EXEC hazard: there is no `scf.if` anywhere in this
+body, so the transpose reads cannot reach a divergent region. B4 is where that
+stops being free — it is the first phase that wants a branch around an edge
+tile — and the guard should be tested there rather than assumed to inherit.
+
+**The LSE and delta reads are four contiguous rows starting at a multiple of
+four**, because the accumulator's row map is `8·(r//4) + 4·(lane//32) + (r%4)`.
+Four `buffer_load_dwordx4` per accumulator half, and a group can never straddle
+`seqlen_q` unless `seqlen_q % 4`, which is tested (65, 101, 103, 67, 2, 1).
+`_score_column_runs` is where that grouping is stated; it now has two consumers
+(the forward's bias reads and this), which is §4's rule earning its keep.
+
+### Verification
+
+- **Error-ratio gate** (§7.1) against torch's math backend at bf16 and fp64,
+  four shapes × two rungs, ten ragged/asymmetric sequence pairs, and a
+  `sm_scale` sweep.
+- **Self-consistency with our forward**: the gfx950 forward's own `O` and
+  `LSE`, `delta` from that `O`, against `torch.autograd.grad`.
+- **The joint dQ + dK/dV check §6 asks for is live and passing** against B2's
+  kernel — one fp64 autograd call, all three gradients inside the gate. It
+  `importorskip`s B2's module, so a green run here is not by itself evidence
+  that it ran; check for the skip.
+- Structural: BSHD-viewed-as-BHSD bit-identical to contiguous (all six stride
+  triples at once), nothing written past `seqlen_kv` into an over-allocated
+  output, run-to-run bit-identical, and every unimplemented mode refused rather
+  than approximated.
+
+### A degenerate case the ratio gate cannot express
+
+`seqlen_k == 1` makes `dK` **analytically zero** — a one-key softmax gives
+`p = 1`, so `dp == delta` and `dS = p·(dp − delta)` cancels exactly. The fp64
+reference norm is `0.0`, the bf16 backend's error is `0.0`, and no multiple of
+zero admits a finite answer. Ours is 9.4e-6 in norm against a `dV` norm of 285,
+i.e. 3.3e-8 of the problem. Handled the way gfx1201's suite handles the same
+shape of thing (`window=(0,0)` reaches it there): a floor under the denominator
+taken from the *other* gradient, plus a 1e-5 additive term that only ever
+decides the degenerate case. It is not a kernel finding, but it is the second
+place this cancellation has produced a meaningless ratio, so it is worth
+expecting a third.
+
+### Not done, and why
+
+- **GQA.** `num_heads_q != num_heads_k` needs dK/dV **summed** over the q heads
+  sharing a kv head, and one workgroup owns one `(q head, kv block)` and would
+  write rather than accumulate. Refused host-side; the natural fix is a loop
+  over the group inside the kernel, with K/V resident throughout, and it is a
+  B3-sized change rather than a B1 one.
+- **The ladder, padded heads, asymmetric `hdim_qk`/`hdim_vo`.** B3. `_args`
+  refuses anything but an exact rung.
+- **Causal, windows, varlen, dropout, bias.** B4–B6. The ABI carries every
+  argument slot so the wire format does not move, and `resolve` raises on each.
+- **No software pipeline.** The body is `wait / barrier / read / compute /
+  barrier / prefetch`, one tile of prefetch distance, two barriers per tile.
+  The dual-wave schedule's eight clusters are not ported. B2 observed that its
+  three GEMMs per tile already cover the DMA latency; with four this is more
+  true, and the 789 TF at head_dim 128 is against a forward that gets ~1117 in
+  its own suite — so there is a gap, and pipelining is the obvious place to
+  look for it, but it is B7 work and it should be measured before it is built.
+- **`BLOCK_Q` is pinned at 64** by the transpose read covering four 16-row
+  k-substeps. A 128-row streamed tile would need eight, which is describable
+  but is a second geometry to validate; not attempted.

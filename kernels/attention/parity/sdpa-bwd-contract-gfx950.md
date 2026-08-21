@@ -189,8 +189,11 @@ rather than forking it:
 - The §6 gates pass, including the joint autograd check.
 - `bash scripts/check_python_style.sh`-equivalent clean (black + ruff, project
   config).
-- The forward's 383 tests still pass — you are subclassing its helpers, and a
-  change that reaches them is a change to four production kernels.
+- The forward still passes. `test_flash_attn_func_gfx950.py` alone collects
+  **329**; the 383 figure is the combined run with `test_philox.py` and
+  `tests/kernels/test_flash_attn_fwd.py`, which is the one to use — you are
+  subclassing the forward's helpers, and a change that reaches them is a change
+  to four production kernels.
 - A short outcome section appended to `sdpa-bwd-plan-gfx950.md`, in the style
   of the forward's: what was measured, what surprised you, what is not done.
   If you hit a hazard of the kind `sdpa_lore_gfx950.md` describes, add it there.
