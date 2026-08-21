@@ -227,8 +227,22 @@ Cap is 163840 B; 256 arch + 256 acc VGPRs, with operands and P/dS on top.
 read two ways is a cheap layout and it keeps paying. The accumulators are the
 problem: two of them, `d/2` each at 32 rows per wave.
 
-**dQ is LDS-bound before it is register-bound**, and the cause is already
-known: it stages **K twice** (K layout for GEMM1, V layout for GEMM3), which is
+**dQ is LDS-bound before it is register-bound *with `store_db` off*.** With dB
+on it is both, and the ladder has to be established as a **rung x dB matrix**
+rather than a single line — establishing it on the cheap arm leaves dB's
+ceiling undiscovered, which is the same shape of mistake as testing one
+`sm_scale`.
+
+Costed at head_dim 512, 32 rows per wave: the dQ accumulator is 256 VGPRs (the
+whole AGPR file), Q resident is 128 arch VGPRs, the f32 `dS` tile ~32 and its
+packed bf16 form ~16, before K/V operands and addressing. The dB store then
+holds `dS` live across a 32-element per-lane store sequence, in the one place
+there is no room. **If dB is what tips it, the lever is the live range, not the
+accumulator**: store from the packed bf16 rather than the f32 (dB is a bf16
+tensor, so that rounding happens anyway), or interleave the store into the
+GEMM3 loop so only the consumed slice is live.
+
+The LDS wall is separate and comes first, and the cause is already known: it stages **K twice** (K layout for GEMM1, V layout for GEMM3), which is
 the third slot. B2 deferred that to B7. **It is now a B3 blocker** — at two
 slots dQ fits 512 in 133 KB, at three it does not fit at all. Fix the double
 staging before reaching for `D_STAGES`; B2's own notes name two ways (a K
