@@ -164,10 +164,35 @@ Traps that have already cost time on the forward:
 
 ---
 
-## 7. Interfaces the two of you share
+## 7. Interfaces the two of you share — and what you should *not* share
 
-Agree these before writing, and if one of you needs to change one, say so
-rather than forking it:
+The line is between **what the other kernel or a caller can observe** and
+**how you choose to go fast**. Only the first is an agreement.
+
+**Shared, and a unilateral change is a bug:** the tensor argument order and the
+rest of the ABI, `delta` as a host-computed tensor, the LSE layout via
+`lse_row_addressing`, the traits base class, and any lane map or hardware fact
+one of you measures (publish it; do not re-derive it).
+
+**Per-kernel, and divergence is expected rather than tolerated:** everything in
+your tuning module. Block sizes, wave counts, `waves_per_eu`, shard counts,
+rows-per-wave, and *the rung at which a family switches*. dK/dV holds K/V
+resident and streams Q/dO; dQ holds Q and streams K/V. Different access
+patterns, different resource characters, different answers — B3 already showed
+`waves_per_eu` mattering 1.8x on one and 4x on the other, and B3.5 has dQ
+switching families at 384 for reasons that say nothing about dK/dV.
+
+Two consequences worth stating because the wording above used to invite the
+opposite. dQ's `BLOCK_N` and dK/dV's `BLOCK_KV` are *different axes of
+different kernels* and have no reason to be equal. And if one of you keeps
+`SCORE_MSTEPS` at 2 while the other does not, you each override in your own
+subclass — that is not a conflict and neither choice constrains the other.
+
+What is still shared about a *finding*: that `16x16x16` runs at half the
+flops/pass of `16x16x32` is a property of the machine, so both of you must know
+it. Which rungs you then build on which family is yours.
+
+The originals, unchanged:
 
 - **`delta`** is a host-computed tensor argument, `(dO.float()*O.float()).sum(-1)`,
   shaped like LSE. Both kernels take it; neither computes it. (Plan §5.)
