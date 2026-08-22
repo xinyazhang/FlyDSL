@@ -108,6 +108,26 @@ ignoring it -- every one of them would otherwise build, run and return a
 correctly-shaped wrong answer, and `D_STAGES` nearly did: the forward's knob
 policy turns it on above head_dim 256 and the inherited GEMM helpers then
 reduce over one stage of the head dim while this loop never advances the stage.
+
+--- Tensor argument order is the ABI ------------------------------------------
+
+    q, k, v, b, do, dq, db, lse, delta
+
+Four groups, and the grouping is the mnemonic: the **forward's inputs**
+(`q, k, v, b`), then the **backward's input** (`do`), then this kernel's
+**outputs**, then the **lower-rank** tensors (`lse`, `delta`, both rank 2).
+
+It is also AOTriton's order -- `bwd_kernel_dq(Q, K, V, B, sm_scale, DO, DQ, DB,
+L, D, ...)` and `bwd_kernel_dk_dv(Q, K, V, B, sm_scale, DO, DK, DV, L, D, ...)`
+-- so a reader moving between the Triton reference and this file does not have
+to re-derive the mapping, and neither does anyone eventually dispatching the
+compiled hsaco directly.
+
+`b` sits in the forward-input group even though no build here reads it yet: the
+slot is held so adding bias in B6 does not move the wire format. It was
+initially placed after `delta`, at the end, which is where an unused argument
+naturally lands and is exactly why the grouping is written down rather than
+left to accrete.
 """
 
 from dataclasses import replace
@@ -644,12 +664,12 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         Q: fx.Tensor,
         K: fx.Tensor,
         V: fx.Tensor,
+        Bias: fx.Tensor,
         DO: fx.Tensor,
         DQ: fx.Tensor,
         DB: fx.Tensor,
         LSE: fx.Tensor,
         Delta: fx.Tensor,
-        Bias: fx.Tensor,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
@@ -894,12 +914,12 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         Q: fx.Tensor,
         K: fx.Tensor,
         V: fx.Tensor,
+        Bias: fx.Tensor,
         DO: fx.Tensor,
         DQ: fx.Tensor,
         DB: fx.Tensor,
         LSE: fx.Tensor,
         Delta: fx.Tensor,
-        Bias: fx.Tensor,
         batch_size: fx.Int32,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
@@ -962,12 +982,12 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             Q,
             K,
             V,
+            Bias,
             DO,
             DQ,
             DB,
             LSE,
             Delta,
-            Bias,
             seqinfo_q0,
             seqinfo_q1,
             seqinfo_k0,
@@ -1100,12 +1120,12 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             Q,
             K,
             V,
+            DQ,  # Bias: no build here reads it; the slot is held for B6
             DO,
             DQ,
             db_t,
             LSE,
             Delta,
-            DQ,  # Bias: this build reads none; the slot is held for B6.
             int(batch_size),
             abi.NULL_PTR,
             abi.NULL_PTR,
