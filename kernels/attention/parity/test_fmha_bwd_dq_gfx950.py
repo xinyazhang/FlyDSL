@@ -704,10 +704,7 @@ def test_run_to_run_deterministic():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [("bias", True), ("dropout", True)],
-)
+@pytest.mark.parametrize("field,value", [("bias", True)])
 def test_unimplemented_modes_are_refused(field, value):
     """Refused by name, not ignored.
 
@@ -1262,11 +1259,11 @@ def test_the_window_tile_cut_is_not_inert(rows):
 
 @pytest.mark.parametrize("rows,head_dim", [(32, 128), (16, 512)])
 @pytest.mark.parametrize(
-    "window_build,varlen_build",
-    [(False, False), (True, False), (False, True)],
-    ids=["causal", "window", "varlen-causal"],
+    "window_build,varlen_build,dropout_build",
+    [(False, False, False), (True, False, False), (False, True, False), (False, False, True)],
+    ids=["causal", "window", "varlen-causal", "dropout-causal"],
 )
-def test_no_transpose_read_under_a_restricted_exec(rows, head_dim, window_build, varlen_build):
+def test_no_transpose_read_under_a_restricted_exec(rows, head_dim, window_build, varlen_build, dropout_build):
     """CDNA4 11.4: `ds_read_b64_tr_b16` requires **EXEC all 1s**.
 
     B4 is the first phase where a branch exists to violate it, and the failure
@@ -1281,6 +1278,11 @@ def test_no_transpose_read_under_a_restricted_exec(rows, head_dim, window_build,
     (`s_cbranch`) and never a `saveexec` pair. If a guard ever became lane-
     varying, `s_and_saveexec_b64` would appear and this fails, whether or not
     a transpose read happened to land inside it that day.
+
+    The dropout arm is here because dropout lands in the branch-densest place
+    in the kernel -- the per-element `dP` mask and, with dB on, a per-element
+    store beside it -- so B4's clean result does not simply carry. It is all
+    `select`, no `scf.if`, and this is what says so.
 
     The varlen arm is here because B5 adds a *second* branchy region: the
     `active` guard, which wraps the whole body and therefore every transpose
@@ -1298,13 +1300,17 @@ def test_no_transpose_read_under_a_restricted_exec(rows, head_dim, window_build,
         "import math, torch\n"
         "from fmha_bwd_dq_gfx950 import build_fmha_bwd_dq_gfx950_module as b\n"
         "import fmha_common_gfx1201 as fmha\n"
-        f"d, rows, win, vl = {head_dim}, {rows}, {int(window_build)}, {int(varlen_build)}\n"
+        f"d, rows, win, vl, dp = {head_dim}, {rows}, {int(window_build)}, "
+        f"{int(varlen_build)}, {int(dropout_build)}\n"
         "DT=torch.bfloat16; bb,h,s=1,2,256\n"
         "q,k,v,do=(torch.randn(bb,h,s,d,device='cuda',dtype=DT) for _ in range(4))\n"
         "dq=torch.zeros(bb,h,s,d,device='cuda',dtype=DT)\n"
         "l=torch.zeros(bb*h,s,device='cuda',dtype=torch.float32)\n"
         "import fmha_abi_gfx1201 as abi\n"
-        "fn=b(num_heads=h,head_dim=d,causal=True,window=bool(win),varlen=bool(vl),mfma_rows=rows)\n"
+        "fn=b(num_heads=h,head_dim=d,causal=True,window=bool(win),varlen=bool(vl),"
+        "dropout=bool(dp),mfma_rows=rows)\n"
+        "sd0=torch.tensor([1],device='cuda',dtype=torch.int64)\n"
+        "kw=dict(dropout_p=0.3,philox_seed=sd0,philox_offset1=sd0,philox_offset2=0) if dp else {}\n"
         "w=(fmha.WINDOW_BOTRIGHT,fmha.WINDOW_BOTRIGHT) if win else None\n"
         "if vl:\n"
         "    cu=torch.tensor([0,64,192,256],device='cuda',dtype=torch.int32)\n"
@@ -1315,7 +1321,7 @@ def test_no_transpose_read_under_a_restricted_exec(rows, head_dim, window_build,
         "    fn(q,k,v,do,dq,lv,lv,1,128,seqlen_k=128,scale=1.0/math.sqrt(d),window=w,"
         "varlen=vk,num_seqlens=3)\n"
         "else:\n"
-        "    fn(q,k,v,do,dq,l,l,bb,s,seqlen_k=s,scale=1.0/math.sqrt(d),window=w)\n"
+        "    fn(q,k,v,do,dq,l,l,bb,s,seqlen_k=s,scale=1.0/math.sqrt(d),window=w,**kw)\n"
         "torch.cuda.synchronize()\n"
     )
     with tempfile.TemporaryDirectory() as tmp:
@@ -1580,3 +1586,371 @@ def test_db_under_varlen(rows):
         )
         torch.cuda.synchronize()
         assert torch.equal(db[:, :, a:b, :m].contiguous(), want), f"dB for sequence {i} is not its dense counterpart"
+
+
+# ---------------------------------------------------------------------------
+# B5 gap: 0x0202, the one mode with a runtime per-batch length
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+def test_varlen_padded_equals_n_dense_calls_bitwise(rows):
+    """`0x0202` -- a real batch axis with short sequences.
+
+    Added because no *dense* test reaches it: a dense call has one length for
+    every batch element, and this is the mode where the length is per batch and
+    read at runtime. The two packed modes exercise the row-origin arithmetic;
+    this one exercises the length alone.
+    """
+    import fmha_abi_gfx1201 as _abi
+
+    torch.manual_seed(32)
+    d = 64
+    cu = _cumsum(_VL_Q)
+    scale = _sm_scale(d)
+    q, k, v, do = (_rand(_VL_N, _VL_H, _VL_MAXQ, d) for _ in range(4))
+    side = _abi.VARLEN_PADDED_SIDE
+
+    # A real batch axis, so the LSE token pitch is `max_seqlen_q` -- not the
+    # batch total the stacked modes use. `lse_token_pitch` decides which.
+    lse = torch.zeros(_VL_N * _VL_H, _VL_MAXQ, device="cuda", dtype=torch.float32)
+    delta = torch.zeros_like(lse)
+    for i, n in enumerate(_VL_Q):
+        li, di = _vl_stats(
+            q[i : i + 1, :, :n],
+            k[i : i + 1, :, :n],
+            v[i : i + 1, :, :n],
+            do[i : i + 1, :, :n],
+            scale=scale,
+            causal=False,
+        )
+        lse.view(_VL_N, _VL_H, _VL_MAXQ)[i, :, :n] = li[0].float()
+        delta.view(_VL_N, _VL_H, _VL_MAXQ)[i, :, :n] = di[0].float()
+
+    def build(varlen):
+        return build_dq(num_heads=_VL_H, head_dim=d, causal=False, num_kv_heads=_VL_H, varlen=varlen, mfma_rows=rows)
+
+    packed = torch.full_like(q, float("nan"))
+    build(True)(
+        q,
+        k,
+        v,
+        do,
+        packed,
+        lse,
+        delta,
+        _VL_N,
+        _VL_MAXQ,
+        seqlen_k=_VL_MAXQ,
+        scale=scale,
+        varlen=dict(
+            bits=_abi.varlen_bits(side, side),
+            max_seqlen_q=_VL_MAXQ,
+            max_seqlen_k=_VL_MAXQ,
+            seqinfo_q0=_i32(cu),
+            seqinfo_k0=_i32(cu),
+        ),
+        num_seqlens=0,
+    )
+    torch.cuda.synchronize()
+
+    dense = build(False)
+    for i, n in enumerate(_VL_Q):
+        qi, ki = q[i : i + 1, :, :n].contiguous(), k[i : i + 1, :, :n].contiguous()
+        vi, doi = v[i : i + 1, :, :n].contiguous(), do[i : i + 1, :, :n].contiguous()
+        li, di = _vl_stats(qi, ki, vi, doi, scale=scale, causal=False)
+        want = torch.full_like(qi, float("nan"))
+        dense(
+            qi,
+            ki,
+            vi,
+            doi,
+            want,
+            li.float().reshape(-1, n).contiguous(),
+            di.float().reshape(-1, n).contiguous(),
+            1,
+            n,
+            seqlen_k=n,
+            scale=scale,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(packed[i : i + 1, :, :n].contiguous(), want), f"0x0202 sequence {i} (len {n})"
+
+
+# ---------------------------------------------------------------------------
+# B6: dropout
+# ---------------------------------------------------------------------------
+
+
+def _forward_with_dropout(q, k, v, *, scale, p, seed_value=1234):
+    """Run the gfx950 forward with dropout and hand back what it *reported*.
+
+    `(O, lse, seed_out, offset_out)`. The last two are the contract: under a
+    captured graph the caller's offset is a pointer the forward re-reads, so
+    the backward must use what came back, not what went in.
+    """
+    from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module as build_fwd
+
+    b, h, s, d = q.shape
+    o = torch.empty(b, h, s, v.shape[3], device="cuda", dtype=q.dtype)
+    lse = torch.empty(b, h, s, device="cuda", dtype=torch.float32)
+    seed = torch.tensor([seed_value], device="cuda", dtype=torch.int64)
+    seed_out = torch.zeros(1, device="cuda", dtype=torch.int64)
+    off_out = torch.zeros(1, device="cuda", dtype=torch.int64)
+    build_fwd(num_heads=h, head_dim=d, causal=False, dtype_str="bf16", dropout=True, return_lse=True)(
+        q,
+        k,
+        v,
+        o,
+        b,
+        s,
+        seqlen_k=k.shape[2],
+        scale=scale,
+        lse=lse,
+        dropout_p=p,
+        philox_seed=seed,
+        philox_offset2=0,
+        philox_seed_out=seed_out,
+        philox_offset_out=off_out,
+    )
+    torch.cuda.synchronize()
+    return o, lse, seed_out, off_out
+
+
+def _identity_v(b, h, s):
+    """`V = I`, which makes the forward's `O` **reveal the mask it used**.
+
+    With `V` the identity, `O = P * keep / (1-p)` element for element, so
+    `O != 0` recovers the exact mask -- no second transcription of the PRNG,
+    and therefore a real cross-kernel oracle rather than two implementations
+    of one formula agreeing with each other.
+    """
+    return torch.eye(s, device="cuda", dtype=DT).expand(b, h, s, s).contiguous()
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+@pytest.mark.parametrize("p", [0.0, 0.25, 0.5])
+def test_dropout_regenerates_the_forwards_own_mask(p, rows):
+    """**The cross-kernel contract**: the backward's mask must be the forward's.
+
+    Not "a mask with the right statistics" -- the *same* mask, or the gradients
+    are quietly wrong and no shape check notices. The oracle is built from what
+    the forward actually did: `V = I` makes `O` reveal its mask exactly, and
+    the fp64 dQ reference is then computed with that mask. A backward drawing a
+    different one fails by O(1), not by a tolerance.
+
+    Also pins the keep rate, which is the cheap statistical check that the
+    threshold is being applied at all.
+    """
+    torch.manual_seed(40)
+    b, h, s = 1, 4, 128
+    d = s  # `V = I` needs head_dim == seqlen_k
+    q, k, do = (_rand(b, h, s, d) for _ in range(3))
+    v = _identity_v(b, h, s)
+    scale = _sm_scale(d)
+
+    o, lse, seed_out, off_out = _forward_with_dropout(q, k, v, scale=scale, p=p)
+    keep = o.float() != 0.0
+    assert abs(keep.float().mean().item() - (1.0 - p)) < 0.02, "keep rate is not 1-p"
+
+    delta = (do.float() * o.float()).sum(-1)
+    got = torch.full_like(q, float("nan"))
+    build_dq(num_heads=h, head_dim=d, causal=False, dropout=True, mfma_rows=rows)(
+        q,
+        k,
+        v,
+        do,
+        got,
+        lse.reshape(-1, s).contiguous(),
+        delta.reshape(-1, s).contiguous(),
+        b,
+        s,
+        seqlen_k=s,
+        scale=scale,
+        dropout_p=p,
+        philox_seed=seed_out,
+        philox_offset1=off_out,
+        philox_offset2=0,
+    )
+    torch.cuda.synchronize()
+
+    qd, kd, vd, dod = (t.double() for t in (q, k, v, do))
+    prob = torch.softmax((qd @ kd.transpose(-1, -2)) * scale, dim=-1)
+    dp = (dod @ vd.transpose(-1, -2)) * keep.double() / (1.0 - p)
+    ref = ((prob * (dp - delta.double().unsqueeze(-1))) @ kd) * scale
+    assert _max_err(got, ref) / max(ref.abs().max().item(), 1.0) < 5.0e-3, (
+        "dQ does not match a reference built from the mask the forward actually used: the two kernels "
+        "are drawing different randoms."
+    )
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+def test_p_zero_is_bitwise_a_no_dropout_build(rows):
+    """`p = 0` must reproduce a build with no dropout at all, bit for bit.
+
+    Everything survives at `p = 0` and the survivor scale is exactly 1, so the
+    two differ only in emitted code -- which makes this the cheapest check that
+    the dropout arm perturbs nothing it should not.
+    """
+    torch.manual_seed(41)
+    b, h, s, d = 1, 4, 256, 64
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    scale = _sm_scale(d)
+    lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
+    seed = torch.tensor([7], device="cuda", dtype=torch.int64)
+    off = torch.zeros(1, device="cuda", dtype=torch.int64)
+
+    plain = _run_dq(q, k, v, do, lse, delta, scale=scale, mfma_rows=rows)
+    dropped = torch.full_like(q, float("nan"))
+    build_dq(num_heads=h, head_dim=d, causal=False, dropout=True, mfma_rows=rows)(
+        q,
+        k,
+        v,
+        do,
+        dropped,
+        lse,
+        delta,
+        b,
+        s,
+        seqlen_k=s,
+        scale=scale,
+        dropout_p=0.0,
+        philox_seed=seed,
+        philox_offset1=off,
+        philox_offset2=0,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(plain, dropped)
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+def test_dropout_is_deterministic_per_seed(rows):
+    """Same seed and offset, same gradient, bit for bit.
+
+    Plan section 7.3 rules out AITER's atomic-add dQ because it is
+    non-deterministic by construction; with a PRNG in the loop that claim needs
+    restating rather than inheriting.
+    """
+    torch.manual_seed(42)
+    b, h, s, d = 1, 4, 256, 64
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    scale = _sm_scale(d)
+    lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
+    seed = torch.tensor([99], device="cuda", dtype=torch.int64)
+    off = torch.zeros(1, device="cuda", dtype=torch.int64)
+    fn = build_dq(num_heads=h, head_dim=d, causal=False, dropout=True, mfma_rows=rows)
+
+    def once():
+        out = torch.full_like(q, float("nan"))
+        fn(
+            q,
+            k,
+            v,
+            do,
+            out,
+            lse,
+            delta,
+            b,
+            s,
+            seqlen_k=s,
+            scale=scale,
+            dropout_p=0.3,
+            philox_seed=seed,
+            philox_offset1=off,
+            philox_offset2=0,
+        )
+        torch.cuda.synchronize()
+        return out
+
+    assert torch.equal(once(), once())
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+def test_db_under_dropout_is_the_dropped_ds(rows):
+    """**dB carries the dropout**, because `dB = dS` and `dS` is built from `dP`.
+
+    AOTriton stores `ds` *after* `dp = where(keep, dp*scale, 0)`, so dB is the
+    post-dropout value. Getting this backwards is a silently wrong bias
+    gradient -- right shape, plausible magnitude -- which is why it is asserted
+    against a reference rather than reasoned about.
+    """
+    torch.manual_seed(43)
+    b, h, s = 1, 2, 128
+    d = s
+    p = 0.35
+    q, k, do = (_rand(b, h, s, d) for _ in range(3))
+    v = _identity_v(b, h, s)
+    scale = _sm_scale(d)
+
+    o, lse, seed_out, off_out = _forward_with_dropout(q, k, v, scale=scale, p=p)
+    keep = o.float() != 0.0
+    delta = (do.float() * o.float()).sum(-1)
+
+    db = torch.full((b, h, s, s), float("nan"), device="cuda", dtype=DT)
+    build_dq(num_heads=h, head_dim=d, causal=False, dropout=True, store_db=True, mfma_rows=rows)(
+        q,
+        k,
+        v,
+        do,
+        torch.empty_like(q),
+        lse.reshape(-1, s).contiguous(),
+        delta.reshape(-1, s).contiguous(),
+        b,
+        s,
+        seqlen_k=s,
+        scale=scale,
+        db=db,
+        dropout_p=p,
+        philox_seed=seed_out,
+        philox_offset1=off_out,
+        philox_offset2=0,
+    )
+    torch.cuda.synchronize()
+
+    qd, kd, vd, dod = (t.double() for t in (q, k, v, do))
+    prob = torch.softmax((qd @ kd.transpose(-1, -2)) * scale, dim=-1)
+    dp = (dod @ vd.transpose(-1, -2)) * keep.double() / (1.0 - p)
+    ref = prob * (dp - delta.double().unsqueeze(-1))
+    assert torch.isfinite(db.float()).all()
+    assert _max_err(db, ref) / max(ref.abs().max().item(), 1.0) < 5.0e-3
+    # And it is *not* the undropped value -- the two differ by construction, so
+    # a build that stored the wrong one would pass the bound above only if the
+    # mask were all ones.
+    undropped = prob * ((dod @ vd.transpose(-1, -2)) - delta.double().unsqueeze(-1))
+    assert _max_err(db, undropped) / max(ref.abs().max().item(), 1.0) > 0.1
+
+
+def test_the_forwards_mask_does_not_depend_on_its_tiling():
+    """Cross-kernel tiling independence, the P6 property restated across kernels.
+
+    `grid_plane` is given `max_seqlen_q`/`max_seqlen_k` and never
+    `BLOCK_M`/`BLOCK_N`, so the mask is a function of element coordinates
+    alone. That is what lets the backward -- at either MFMA family, with tiles
+    that match neither the forward's nor each other's -- regenerate it. Here
+    the forward's own mask is recovered at two wave geometries and required to
+    be **bit-identical**; `test_dropout_regenerates_the_forwards_own_mask` then
+    holds both backward families to it.
+    """
+    from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module as build_fwd
+
+    torch.manual_seed(44)
+    b, h, s = 1, 4, 128
+    d = s
+    p = 0.4
+    q, k = (_rand(b, h, s, d) for _ in range(2))
+    v = _identity_v(b, h, s)
+    scale = _sm_scale(d)
+    seed = torch.tensor([2024], device="cuda", dtype=torch.int64)
+
+    def mask_at(geometry):
+        o = torch.empty_like(q)
+        lse = torch.empty(b, h, s, device="cuda", dtype=torch.float32)
+        build_fwd(num_heads=h, head_dim=d, causal=False, dtype_str="bf16", dropout=True, return_lse=True, **geometry)(
+            q, k, v, o, b, s, seqlen_k=s, scale=scale, lse=lse, dropout_p=p, philox_seed=seed, philox_offset2=0
+        )
+        torch.cuda.synchronize()
+        return o.float() != 0.0
+
+    a = mask_at({})
+    c = mask_at(dict(num_waves=4, block_m=128, block_n=64, head_dim_granule=64))
+    assert torch.equal(a, c), "the forward's dropout mask moved with its tile geometry"

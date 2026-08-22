@@ -396,7 +396,10 @@ class BwdDkDvInputMetadata:
     # with the head dim, so the narrow rungs pay most. `_args` checks the
     # descriptor's bits against the build.
     lse_layout_th: bool = False
-    # B6.
+    # B6. Whether this build regenerates the forward's philox mask. The rate,
+    # the seed and the counter are runtime arguments; only the decision to
+    # compile the PRNG at all is here, because a build without dropout must
+    # emit none of it.
     dropout: bool = False
     bias: bool = False
 
@@ -466,12 +469,11 @@ class BwdDkDvKnobs:
         a GQA call returns one q head's contribution where the sum over the
         group belongs. Both are the right shape.
         """
-        for name in ("dropout", "bias"):
-            if getattr(meta, name):
-                raise NotImplementedError(
-                    f"{name}=True is not implemented. B1-B4 are dense, MHA, bf16, causal and windows "
-                    "only; see sdpa-bwd-plan-gfx950.md phases B5-B6."
-                )
+        if meta.bias:
+            raise NotImplementedError(
+                "bias=True is not implemented; see sdpa-bwd-plan-gfx950.md. dB belongs to the dQ kernel, "
+                "which is where dS is materialised per (q, k) element."
+            )
         if meta.window and not meta.causal:
             # A window without the causal machinery has no masked region to
             # apply itself to, and silently dropping it would return dense
@@ -638,6 +640,7 @@ class BwdDkDvKnobs:
             causal=meta.causal,
             window=meta.window,
             varlen=meta.varlen,
+            dropout=meta.dropout,
             # **A causal varlen build has no `cross_seqlen` analogue here**, and
             # that is a property of the gradient rather than an omission. The
             # forward needs it because a Q block with no live key must have `O`

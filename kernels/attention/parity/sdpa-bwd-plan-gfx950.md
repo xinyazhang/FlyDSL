@@ -2406,3 +2406,354 @@ covers the same 3.5x–5.8x band. Dense head_dim 384 is still the worst rung.
   cost of a branch on the hot path; not attempted, because the layout is
   something a caller knows at build time.
 - Dense head_dim 384 at 5.8x, unchanged since B3.5.
+
+---
+
+## Outcome: B6/dQ — dropout, and the last feature phase
+
+Philox dropout on both MFMA families, over causal, windows and varlen, with dB.
+246 tests pass with no skips. The feature surface is complete: **causal,
+windows, varlen, dropout, padded heads, asymmetric hdim and dB**, on the full
+ladder in both families. Only a bias *input* remains out of scope.
+
+### Wall-clock, dropout
+
+`B=4 H=8 S=4096` bf16 non-causal, idle GPU 6, `(t_dQ + t_dKdV) / t_fwd`:
+
+| hdim | p | fwd | dK/dV | dQ | bwd | bwd/fwd |
+|---|---|---|---|---|---|---|
+| 64 | 0 | 168 us | 390 | 269 | 658 | 3.92x |
+| 64 | 0.25 | 481 | 1520 | 566 | 2087 | 4.34x |
+| 128 | 0 | 260 | 755 | 580 | 1334 | 5.14x |
+| 128 | 0.25 | 572 | 1761 | 853 | 2615 | 4.57x |
+| 512 | 0 | 2359 | 5307 | 3691 | 8998 | 3.82x |
+| 512 | 0.25 | 2936 | 6263 | 3227 | 9490 | 3.23x |
+
+The PRNG is not free -- dQ pays 2.1x at head_dim 64, 1.5x at 128 and 0.9x at
+512, tracking the ratio of randoms drawn to MFMA work. The *ratio* to the
+forward improves because the forward pays it too.
+
+### Where the mask goes, and why it is not where the forward puts it
+
+**On `dP`, not on `P`**, following AOTriton's `bwd_inner_dq`. The forward's
+output is `sum_j (P_j keep_j scale) V_j`, so the gradient with respect to the
+undropped `P_j` carries the same `keep_j * scale`. `P` itself stays undropped
+-- it is `exp2(qk_scale*S - lse2)` and `lse2` is the **undropped** logsumexp
+the forward wrote.
+
+**`delta` needs no adjustment, and that is not luck.**
+`delta = rowsum(dO * O)` with the *dropped* `O` is exactly
+`sum_j P_j keep_j scale (dO . V_j)`, which is the reduction term a masked `dP`
+wants. The host already computes it from the forward's own `O`.
+
+**The survivor scale cannot be folded the way the forward folds it.** There
+`1/(1-p)` becomes one multiply on `1/l` per output row, because a row sum
+exists to fold into; here the row sum is an *input*. Folding it into `dO`
+before GEMM2 would be one multiply instead of one per element -- and would
+round `dO` through bf16 a second time, which is the mistake B2 measured at
+10.9x on the Q pre-scale. It stays an f32 multiply on the scores.
+
+**And `cast_p` had to be overridden.** `ParitySoftmaxHelper.cast_p` is where
+the *forward* applies its mask; inheriting it would drop `dS` on the way into
+GEMM3 as well, applying the mask twice. It failed loudly only because the
+forward's block reads a `tile_idx` this call site does not pass -- a signature
+that matched would have been a silently halved gradient. In the lore.
+
+### The oracle: `V = I` reads the forward's mask back
+
+The contract is that the backward regenerates the forward's mask **bit
+identically**, and there was no way to check that without either a mask kernel
+or a second transcription of the PRNG -- which can agree with the kernel and
+both be wrong.
+
+With `V` the identity, `O == P * keep / (1-p)` element for element, so
+`O != 0` recovers the exact mask the forward drew. The fp64 dQ reference is
+then built from *that* mask. A backward drawing a different one fails by O(1);
+measured error is 5.7e-4 at `p = 0.25` and 6.5e-4 at `p = 0.5`, on both
+families -- bf16 noise. Keep rate 0.7502 against 0.75 and 0.5016 against 0.5.
+In the lore, because the trick generalises.
+
+Also gated: `p = 0` **bitwise** identical to a no-dropout build; determinism
+per seed; dB against the same reference, plus an assertion that it is *not*
+the undropped `dS` (AOTriton stores `ds` after the mask, and getting that
+backwards is a plausible-looking wrong bias gradient); and the forward's own
+mask bit-identical across two wave geometries, which is the P6 property this
+whole scheme rests on.
+
+### Seed and offset
+
+Read from what the forward **reported** through
+`philox_seed_output`/`philox_offset_output`, not from what its caller passed --
+under a captured graph the latter is a pointer the forward re-reads.
+`init_philox` is inherited except for the report itself: the backward consumes
+the contract, it does not publish one.
+
+### EXEC, re-checked rather than assumed
+
+Dropout lands in the branch-densest part of the kernel -- a per-element `dP`
+mask and, with dB on, a per-element store beside it. Eight builds (both
+families x causal/window/varlen-causal/dropout-causal) report **0 `saveexec`
+and 0 writes to `exec`**: it is all `select`, no `scf.if`, so every transpose
+read still runs with EXEC all ones.
+
+### The B5 gap, closed
+
+`0x0202` -- a real batch axis with a **runtime per-batch** length, which no
+dense test can reach because a dense call has one length for every batch
+element. Against N dense calls, bitwise, both families.
+
+### Still not done
+
+- **Bias input** (`BIAS_TYPE`), the only remaining feature. dB is written; the
+  forward's bias *read* path is a separate arm.
+- Three `VarlenBits` modes (`0x0B0B`, `0x1313`, and the strided variants) still
+  lean on the shared decoder's forward coverage. `0x0202`, `0x150B` and
+  `0x040B` are covered here.
+- The EXEC scan remains inline rather than calling
+  `tooling/check_exec_hazard_gfx950.py`.
+- Dropout's cost at the narrow rungs (2.1x at head_dim 64) is the PRNG, not the
+  mask: one Philox call per four columns per lane. If it matters, the lever is
+  drawing wider, not masking cheaper.
+
+---
+
+## Outcome: B6 — dK/dV, dropout
+
+Philox dropout on both MFMA families, over the full ladder, causal, windows and
+varlen. **323 tests, all passing, no skips** (301 before B6). The dK/dV feature
+surface is now causal, windows, varlen, dropout, padded heads and the full
+ladder in two families; only a bias *input* and GQA remain out of scope.
+
+### The mask lands in two places, because two GEMMs consume it
+
+The forward computes `O_i = sum_j (keep_ij s P_ij) V_j` with `s = 1/(1-p)` and
+`P` the **undropped** softmax -- the row sum was taken before the mask, so
+`lse` is undropped and `P = exp2(qk*scale - lse2)` needs no adjustment. Both
+outputs follow from that one line:
+
+- **`dV_j = s sum_i keep_ij P_ij dO_i`** -- the mask multiplies `P` on the way
+  into GEMM3.
+- **`dS_ij = P_ij (keep_ij s dP_ij - delta_i)`**, with the **undropped** `P`
+  outside the bracket and the mask only on the `dP` term. `delta` needs no
+  adjustment for the reason the dQ phase records: `sum_k P_ik dP_ik` is
+  `dO_i . O_i` with the *dropped* `O`, which is what the host already computed.
+
+So the mask is applied to `P` for one GEMM and to `dP` for the other, from a
+single `keep` per accumulator element. **This composes with the causal mask
+rather than colliding with it**, and the ordering is why: causal zeroes `P`
+before `dS` is formed, and a `keep` that survives on a causally-dead element
+multiplies a `P` that is already zero. Both products vanish, in either order.
+Checked, not assumed -- the causal x dropout cells of the cross-kernel test are
+there for exactly this.
+
+### The survivor scale, which does not go where the forward puts it
+
+`1/(1-p)` is a per-row constant in the forward and folds into the reciprocal of
+the row sum, one multiply per output row. **Here there is no row sum to fold
+into on either side**, and the two outputs want it in different places:
+
+- **`dV` takes it in the epilogue**, one vector multiply per accumulator
+  alongside the one `dK` already does for `scale`. Free in practice.
+- **`dS` cannot**, because the scale multiplies only the `dP` term and `delta`
+  is subtracted from it. Pulling `s` out would need `delta/s`, which is a
+  per-row divide on a value that arrives as an input. It stays as one f32
+  multiply per element, fused into the `select` that applies `keep`.
+
+Folding it into `dO` before GEMM2 would have made it one multiply instead of
+one per element, and is the same mistake B2 measured at 10.9x on the Q
+pre-scale: it rounds `dO` through bf16 a second time.
+
+### The 4x the transposed loop pays, and why it is inherent
+
+A forward lane owns one q row and four adjacent k columns, so one Philox call
+covers all four. **A dK/dV lane owns one KV column and many q rows** -- the
+transpose -- so its accumulator elements are `row_stride` apart in the counter
+stream and there is no run to draw as a span. It is one `philox_4x` per
+element, of which one of the four results is wanted.
+
+That is a property of the accumulator's orientation, not of the code: the mask
+is indexed by `(row, col)` in the *forward's* frame and the frame is what makes
+a span. The one thing that is loop-invariant is *which* of the four results a
+lane wants, because a lane's KV column never changes -- so the slot select is
+hoisted out of the tile loop and only the call is per element.
+
+The cost is visible and it is the shape the dQ phase predicted: dropout's
+overhead **falls as the head dim rises**, because the PRNG work is per score
+element and the MFMA work is per score element times `d`.
+
+| head_dim | 32 | 64 | 96 | 128 | 160 | 192 | 224 | 256 | 384 | 512 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| dK/dV dense | 492 | 724 | 738 | 773 | 734 | 857 | 785 | 750 | 425 | 425 |
+| dK/dV dropout | 98 | 182 | 270 | 327 | 339 | 441 | 413 | 476 | 342 | 360 |
+| slowdown | 5.0x | 4.0x | 2.7x | 2.4x | 2.2x | 1.9x | 1.9x | 1.6x | 1.24x | 1.18x |
+
+**The lever, if it ever matters, is drawing wider rather than masking cheaper**
+-- four calls' worth of counters in one go, which the current per-element call
+throws three quarters of away.
+
+### The oracle is three-party, and no party can pass it alone
+
+The contract is bit-identical mask regeneration across two kernels, and a
+second transcription of the PRNG inside the test would be worthless: it can
+agree with the kernel and both be wrong. So the test uses three independent
+regenerations of the same mask:
+
+1. the **forward** draws it and reports the `(seed, offset)` it used;
+2. `dropout_mask_gfx1201` regenerates it **as a tensor, at its own tiling**;
+3. this kernel regenerates it again from that report.
+
+The fp64 reference is built from (2), so the `O` assertion checks (1) against
+(2) and *validates the reference* before the `dK`/`dV` assertions check (3)
+against it. If `O` matched and `dK` did not, the only remaining explanation
+would be this kernel drawing a different mask -- which is the failure the whole
+phase exists to prevent. Measured `2.4e-3` on `dK` and `dV` at bf16 noise, at
+head_dim 64/128/256 x both families x dense and causal. The keep rate is
+measured from the same mask tensor rather than assumed: 0.7499 against 0.75 at
+`p = 0.25`, 0.5021 at `p = 0.5`, and within 0.01 of `1 - p` at 0.1, 0.5 and
+0.9.
+
+**The seed and offset come from what the forward reported**, through
+`philox_seed_output`/`philox_offset_output`, not from what its caller passed:
+under a captured graph the latter is a pointer the forward re-read.
+`init_philox` is inherited from the forward's context except for the report --
+the backward consumes the contract, it does not publish one.
+
+### Tiling independence, bitwise, and what it costs the tuner
+
+The mask is a function of absolute `(batch, head, row, column)` and the
+*maximum* sequence lengths, never of the tile geometry, so two builds of one
+problem at different tilings must agree **bit for bit**. Held at three geometry
+changes -- 32-row at 4 waves against 2, 16-row at `BLOCK_Q` 64 against 32, and
+16-row at 4 waves against 2 -- within a family, because two families accumulate
+in different orders and would differ in the last bits for reasons unrelated to
+the mask.
+
+This is a standing constraint on `_GEOMETRY` from here on: it may move freely
+and a dropout mask may not follow it. Nothing in `grid_plane`/`grid_offset` is
+handed a `BLOCK_*`, which is what makes that structural rather than a promise.
+
+Also gated: `p = 0` **bitwise** identical to a build that compiles no dropout at
+all -- the scale is exactly 1.0 and every element is kept, so a survivor scale
+applied on the wrong side shows up as a bit difference where a tolerance would
+have missed it. And determinism per seed, in both directions: same seed
+identical, different seed different.
+
+### Registers: the marginal rung stayed marginal
+
+B4's lesson said to check the known-marginal rung first, and head_dim 224 at 32
+rows is the only one that spills: **512 VGPR with 6 spills**, against 486 and
+zero without dropout. VGPR counts across the ladder, `drop=0` -> `drop=1`:
+
+| hdim | 32 | 64 | 96 | 128 | 160 | 192 | 224 | 256 | 384 | 512 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| dense | 150 | 232 | 144 | 204 | 356 | 224 | **486** | 238 | 352 | 470 |
+| dropout | 151 | 229 | 151 | 203 | 442 | 234 | **512** | 244 | 361 | 504 |
+
+Dropout is +1 to +10 registers almost everywhere, so B4's rule reads exactly as
+written: **the cost lands on whichever rung was already at the cap**, and 224
+was the one at 486 of 512. 160 moves the most in absolute terms (+86) and does
+not care, because it had 156 to spare.
+
+It does not warrant an override. Both alternatives measured *worse* at that
+rung with dropout on -- 405 TF for the tight-register arm and 290 for the
+16-row family, against **414** for the 32-row loose default -- and the same
+ordering holds without dropout (752 / 409 against 824). Six spills on a kernel
+whose cost is now dominated by the PRNG are not where the time goes.
+
+### The tooling bug the dropout arms exposed
+
+Extending `tooling/check_exec_hazard_gfx950.py` with dropout configurations
+turned up that **`--varlen` was never placed in the child's argv**. It was
+parsed by the child and accepted by `check()`, so through B5 every "varlen" arm
+silently compiled a *dense* kernel and reported it clean. B5's "20
+configurations" were really 12 distinct ones.
+
+The scan was honest about what it scanned and wrong about what that was, which
+is the failure mode a checker that can only report "clean" is prone to. Fixed,
+and the scan now covers 32 configurations -- 2 head dims x both families x
+dense/causal/window/varlen/causal+varlen/dropout/causal+dropout/varlen+dropout
+-- reporting **zero EXEC-writing instructions of any kind** at every one.
+
+Dropout is the first genuinely per-lane predicate in this kernel: `keep` is a
+different bit in every lane. It is written as `select` rather than as control
+flow precisely so it stays a VALU predicate, and this is what confirms the
+compiler agreed rather than materialising a `v_cmpx`.
+
+### The tile-cut test failed, and the kernel was not why
+
+`test_causal_tile_cut_is_not_inert` failed at 1.17x against its 1.25 bar. The
+cause was the machine: a neighbouring job had the whole GPU running ~3.5x slow,
+dense 1.23 ms where it is normally 0.35. B5's committed code measured
+*identically* to B6's in an interleaved A/B, which is what settled it.
+
+The part worth keeping is that the wrong number was **stable** -- 1.14x and
+1.22x across eight repeats, tighter than the noise on a healthy machine. Low
+variance is not evidence that a measurement is valid. Both builds compress
+toward a common floor under contention because the cut's saving is a proportion
+of a term that is no longer dominant, so the *ratio* moves even though nothing
+in the code did.
+
+The test now checks the dense build's absolute throughput first (>400 TF
+against ~780 idle) and says which of the two failures it is seeing, and takes
+the best of three repeats. On a healthy GPU the cut measures 1.55x and 1.83x,
+and the sweep behind it shows why the shape matters: 1.09x at `B=4 H=8 S=2048`,
+1.80x/2.09x at `B=1 H=8 S=16384`.
+
+**The cut keeps its value under dropout**, which is the thing worth checking:
+a skipped tile skips its PRNG calls too, so the causal/dense throughput ratio
+tracks the no-dropout one rung for rung (at head_dim 96, 401/270 = 1.49x with
+dropout against 1135/738 = 1.54x without; at 384, 1.85x against 1.91x). The
+absolute saving is larger because the tiles cost more, but the cut is neither
+more nor less effective -- it removes whole tiles, and dropout is per element
+of a tile.
+
+### Measured, wall clock
+
+`B=2 H=8 S=4096` bf16, GPU 5 idle, all three kernels in one session, `p = 0.25`.
+`bwd/fwd` is `(t_dkdv + t_dq) / t_fwd`, microseconds; rates are nominal
+TFLOP/s on 2/4/3 `S*S*d` GEMM-equivalents for fwd/dKdV/dQ.
+
+| hdim | rows | fwd | dK/dV | dQ | bwd eff | t_fwd | t_bwd | bwd/fwd |
+|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | **dropout** |
+| 32 | 32 | 153 | 98 | 211 | 91 | 225 | 945 | 4.20x |
+| 64 | 32 | 299 | 182 | 377 | 167 | 229 | 1028 | 4.48x |
+| 96 | 16 | 388 | 270 | 495 | 239 | 265 | 1077 | 4.06x |
+| 128 | 16 | 515 | 327 | 507 | 276 | 267 | 1246 | 4.67x |
+| 160 | 32 | 495 | 339 | 552 | 290 | 347 | 1480 | 4.26x |
+| 192 | 16 | 535 | 441 | 611 | 358 | 385 | 1441 | 3.74x |
+| 224 | 32 | 589 | 413 | 638 | 348 | 408 | 1729 | 4.23x |
+| 256 | 16 | 608 | 476 | 710 | 396 | 452 | 1735 | 3.83x |
+| 384 | 16 | 608 | 342 | 518 | 286 | 678 | 3606 | 5.32x |
+| 512 | 16 | 403 | 360 | 562 | 304 | 1365 | 4518 | 3.31x |
+| | | | | | | | | **dropout + causal** |
+| 32 | 32 | 161 | 99 | 224 | 93 | 213 | 924 | 4.33x |
+| 64 | 32 | 317 | 187 | 413 | 174 | 217 | 985 | 4.54x |
+| 96 | 16 | 429 | 401 | 555 | 325 | 240 | 793 | 3.30x |
+| 128 | 16 | 585 | 516 | 663 | 407 | 235 | 844 | 3.59x |
+| 160 | 32 | 613 | 578 | 744 | 456 | 280 | 941 | 3.36x |
+| 192 | 16 | 672 | 716 | 820 | 541 | 307 | 953 | 3.11x |
+| 224 | 32 | 741 | 653 | 898 | 528 | 325 | 1138 | 3.51x |
+| 256 | 16 | 772 | 659 | 939 | 539 | 356 | 1274 | 3.58x |
+| 384 | 16 | 752 | 632 | 867 | 511 | 548 | 2019 | 3.68x |
+| 512 | 16 | 605 | 654 | 878 | 525 | 908 | 2619 | 2.88x |
+
+**`bwd/fwd` improves under dropout** -- 2.9x-5.3x against dense's 3.2x-4.7x at
+the same shapes -- and that is not a compliment to the backward. The forward
+pays the PRNG too, and pays it on a smaller denominator. The wall clock is
+what moved: `t_bwd` at head_dim 64 goes from 326 us to 1028.
+
+The no-dropout rungs measured in the same session are within noise of B5's
+(dense dK/dV 492/724/738/773/734/857/785/750/425/425 against B5's
+486/725/740/766/747/848/798/751/422/434), which is the check that a
+`const_expr`-gated feature stayed gated.
+
+### Not done
+
+- **Bias input and GQA** -- refused by name, in the tuner, with a reason.
+- **The PRNG draws four randoms and uses one.** Worth 1.6x-5x at the narrow
+  rungs if a wider draw can be staged across the four q rows a lane holds in
+  one accumulator quad -- but they are `row_stride` apart, so it needs the
+  counter walked rather than the mask re-tiled.
+- head_dim 224 at 32 rows carries 6 spills with dropout on.
+- Dense head_dim 384 at 5.8x, unchanged since B3.5 and untouched by this phase.

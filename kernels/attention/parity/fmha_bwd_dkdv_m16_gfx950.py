@@ -317,6 +317,21 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
             out.append(dualwave._fmul(fx.Float32(one), scale, self.fm_fast))
         return out
 
+    def q_rows(self, tile_idx, sub):
+        """The absolute q row each of this sub-block's four elements holds.
+
+        `(sub//2)*32 + (sub%2)*4 + 8*(lane//16) + i` -- the permuted row map of
+        this family, stated once and read by `load_row_values`,
+        `mask_if_clipped` and the dropout mask. Never taken from the 32-row
+        family's table.
+        """
+        base = (
+            tile_idx * fx.Index(self.traits.BLOCK_Q)
+            + fx.Index((sub // 2) * MFMA16_K + (sub % 2) * 4)
+            + (self.lane // fx.Index(MFMA16_M)) * fx.Index(8)
+        )
+        return [base + fx.Index(i) for i in range_constexpr(ACC16)]
+
     def probabilities(self, v_s, neg_lse2):
         """`P = exp2(qk_scale * S - log2(e) * LSE)`.
 
@@ -336,9 +351,21 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
             for r in range_constexpr(ACC16)
         ]
 
-    def dscores(self, p_list, v_dp, delta):
-        """`dS = P * (dP - delta)`. `dP` is unscaled; `sm_scale` belongs to dK."""
+    def dscores(self, p_list, v_dp, delta, keep=None):
+        """`dS = P * (dP - delta)`. `dP` is unscaled; `sm_scale` belongs to dK.
+
+        **Under dropout `dP` picks up `keep` and the survivor scale and `P`
+        does not** -- the softmax denominator is the undropped sum, so the `P`
+        outside the bracket is the undropped one. See the 32-row family's
+        `dscores` for the derivation; the two differ only in the element count.
+        """
         values = [Vec(v_dp)[r] for r in range_constexpr(ACC16)]
+        if const_expr(keep is not None):
+            s = self.ctx_ref.c_dropout_scale
+            values = [
+                keep[r].select(dualwave._fmul(values[r], s, self.fm_fast), self.c_zero_f)
+                for r in range_constexpr(ACC16)
+            ]
         return [
             dualwave._fmul(p_list[r], dualwave._fsub(values[r], delta[r], self.fm_fast), self.fm_fast)
             for r in range_constexpr(ACC16)
@@ -457,7 +484,7 @@ class M16TileBody(dualwave.DualwaveKernelContext):
     body, so the kernel's tile loop does not know which family it is driving.
     """
 
-    def __init__(self, ctx, *, stream, reader, gemm, softmax, hdim_qk, hdim_vo):
+    def __init__(self, ctx, *, stream, reader, gemm, softmax, hdim_qk, hdim_vo, keep_fn=None):
         super().__init__(ctx)
         self.stream = stream
         self.reader = reader
@@ -465,6 +492,10 @@ class M16TileBody(dualwave.DualwaveKernelContext):
         self.softmax = softmax
         self.hdim_qk = hdim_qk
         self.hdim_vo = hdim_vo
+        # `philox_keep`, injected rather than imported: it is family-neutral and
+        # lives in the module that owns the builder, which already imports this
+        # one. Passing it keeps the dependency one-way.
+        self.keep_fn = keep_fn
 
     def run(self, tile_idx, buf_id, prefetch_idx, v_k, v_v, dv, dk):
         traits = self.traits
@@ -499,8 +530,14 @@ class M16TileBody(dualwave.DualwaveKernelContext):
                 if const_expr(traits.CAUSAL):
                     p_list = self.softmax.mask_if_clipped(p_list, tile_idx, sub)
                 delta = self.softmax.load_row_values(ctx.delta_rsrc, tile_base, sub, ctx.c_one_f)
+                # After the row sum, before the accumulation (P6's ordering).
+                keep = None
+                if const_expr(traits.ENABLE_DROPOUT):
+                    keep = self.keep_fn(ctx, self.softmax.q_rows(tile_idx, sub))
+                ds_half.append(self.softmax.dscores(p_list, dp, delta, keep))
+                if const_expr(traits.ENABLE_DROPOUT):
+                    p_list = [keep[r].select(fx.Float32(p_list[r]), ctx.c_zero_f) for r in range_constexpr(ACC16)]
                 p_half.append(p_list)
-                ds_half.append(self.softmax.dscores(p_list, dp, delta))
             p_packs[g] = self.softmax.pack_group(p_half[0], p_half[1])
             ds_packs[g] = self.softmax.pack_group(ds_half[0], ds_half[1])
 

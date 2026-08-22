@@ -524,10 +524,41 @@ class M16DqSoftmax:
             [dualwave.rocdl.exp2(T.f32, as_mlir_value(Vec(h)[r])) for r in range_constexpr(self.n)] for h in v_s
         )
 
-    def dscores(self, p_lists, v_dp, delta):
-        """`dS = P * (dP - delta)`, elementwise."""
+    def dropout_dp(self, dp_lists, tile_idx, lane, q_row):
+        """`dP <- keep ? dP * (1/(1-p)) : 0`, at 16 rows.
+
+        Same placement and same reasoning as the 32-row family's
+        `BwdDqSoftmaxHelper.dropout_dp` -- the mask is on the gradient of the
+        dropped output, `P` stays undropped, and `delta` already carries the
+        factor through the forward's `O`.
+
+        The span is simpler here and that is the family's own map, not a
+        transcription: a lane's four accumulator elements are four
+        **contiguous** KV columns starting at `4 * (lane // 16)`, which is a
+        multiple of `randoms_per_offset`, so each half is exactly one Philox
+        call with no partial draw. The 32-row path needs
+        `_score_column_runs` because its four are scattered.
+        """
+        ctx = self.ctx
+        rng = ctx.philox_rng
+        scale = fx.Float32(ctx.dropout_scale_arg)
+        zero = ctx.c_zero_f
+        for step in range_constexpr(2):
+            first = rng.grid_offset(
+                ctx.philox_plane_base,
+                ctx.philox_row_stride,
+                fx.Int64(q_row),
+                fx.Int64(self.kv_col(tile_idx, lane, step, 0)),
+            )
+            keep = rng.keep_span(ctx.philox_seed, first, self.n, ctx.idropout_p)
+            for i in range_constexpr(self.n):
+                kept = dualwave._fmul(dp_lists[step][i], scale, ctx.fm_fast)
+                dp_lists[step][i] = keep[i].select(fx.Float32(kept), zero)
+        return dp_lists
+
+    def dscores(self, p_lists, dp, delta):
+        """`dS = P * (dP - delta)`, elementwise. `dp` is already a list pair."""
         fm = self.ctx.fm_fast
-        dp = self.to_lists(v_dp)
         return tuple(
             [dualwave._fmul(p_lists[h][r], dualwave._fsub(dp[h][r], delta, fm), fm) for r in range_constexpr(self.n)]
             for h in (0, 1)
@@ -658,7 +689,10 @@ def make_m16_dq_body(
                 v_s = softmax.causal_mask(v_s, j, lane, q_row)
             v_dp = gemm.qk(v_reader.load_a_all(lane), do_packs)
 
-            ds = softmax.dscores(softmax.exp2(v_s), v_dp, delta)
+            dp_lists = softmax.to_lists(v_dp)
+            if const_expr(traits.ENABLE_DROPOUT):
+                dp_lists = softmax.dropout_dp(dp_lists, j, lane, q_row)
+            ds = softmax.dscores(softmax.exp2(v_s), dp_lists, delta)
             ds_pack = softmax.pack_ds(ds)
             if const_expr(store_db):
                 db_store.store_tile_m16(ds_pack, j, q_row, lane)

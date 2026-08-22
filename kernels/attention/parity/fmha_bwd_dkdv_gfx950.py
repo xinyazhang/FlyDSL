@@ -123,6 +123,7 @@ from fmha_dualwave_gfx950 import (
 )
 from fmha_tuning_bwd_dkdv_gfx950 import BwdDkDvInputMetadata, bwd_dkdv_knobs
 from gfx950_standalone import buffer_ops, dualwave
+from philox import Philox, keep_mask
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -211,6 +212,40 @@ def _masked_ks_steps(traits, hdim_floor):
     wasted MFMA columns.
     """
     return [ks for ks in range(traits.K_STEPS_QK) if (ks + 1) * traits.K_STEP_QK > hdim_floor]
+
+
+def philox_keep(ctx, q_rows):
+    """`keep` per accumulator element, given each element's absolute q row.
+
+    **One philox implementation, two row maps.** The families differ only in
+    which q row an element holds, so they pass that in and share everything
+    else -- which is the contract's rule for anything keyed on a lane->(row,
+    col) map, applied to the one piece of code that would otherwise be
+    transcribed twice.
+
+    A dK/dV lane owns **one KV column and many q rows**, the transpose of the
+    forward, so the elements are `row_stride` apart in the stream and there is
+    no run to draw as a span: it is one `philox_4x` per element, of which one
+    of the `randoms_per_offset` results is wanted. The forward gets four
+    elements per call. That 4x is inherent to the accumulator's orientation,
+    not a missed optimisation -- lanes 0..3 of a group compute the same call
+    and keep different slots, and recovering it would need a cross-lane
+    exchange on the hot path.
+
+    Which slot is loop-invariant (`philox_slot`), because the lane's KV column
+    is.
+    """
+    rng = ctx.philox_rng
+    kv = fx.Int64(ctx.kv_row)
+    slot = ctx.philox_slot
+    out = []
+    for q in q_rows:
+        vals = rng.u32(ctx.philox_seed, rng.grid_offset(ctx.philox_plane_base, ctx.philox_row_stride, fx.Int64(q), kv))
+        picked = fx.Int32(vals[0])
+        for j in range_constexpr(len(vals) - 1):
+            picked = fx.Int32((slot == fx.Index(j + 1)).select(fx.Int32(vals[j + 1]), picked))
+        out.append(keep_mask([picked], ctx.idropout_p)[0])
+    return out
 
 
 def _lds_pack_read(traits, lds_ptr, elem_idx, scope_name, pack_type):
@@ -377,6 +412,37 @@ class BwdDkDvKernelContext(ParityKernelContext):
         # Global first D column of this wave's accumulators. Runtime, because
         # the shard comes from `wave_id`; zero and folded away when unsharded.
         self.dkv_col_base = self.dkv_shard_id * fx.Index(traits.D_CHUNKS_PER_SHARD * traits.D_CHUNK)
+
+    def init_philox(self):
+        """Seed, counter and this workgroup's plane. Prologue-only.
+
+        `ParityKernelContext.init_philox` with the **report removed**, and that
+        is the whole difference. The forward *writes* the `(seed, offset)` it
+        drew from, because under graph capture the effective offset is
+        `*offset1 + offset2` -- a sum formed on the device from a counter the
+        host cannot read without synchronising. The backward is the consumer of
+        that record; writing it back would be a second opinion about a fact the
+        forward already settled, so this kernel has no output slots for it.
+
+        Everything else is the forward's, called through the same
+        `Philox.grid_plane`: the plane is `(batch, head)`, and its arguments
+        are `max_seqlen_q` / `max_seqlen_k` rather than the tile geometry or
+        the per-sequence lengths. **That is the reproducibility contract** --
+        the mask is a function of element coordinates alone, so neither a
+        re-tuned tile size nor a varlen batch can move a single random.
+        """
+        if const_expr(not self.traits.ENABLE_DROPOUT):
+            return
+        self.philox_rng = Philox.for_arch("gfx950")
+        plane = fx.Int32(self.batch_idx) * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
+        self.philox_seed = fmha.philox_seed_value(self.philox_seed_ptr)
+        offset = fmha.philox_offset_base(self.philox_offset1, self.philox_offset2)
+        self.philox_plane_base, self.philox_row_stride = self.philox_rng.grid_plane(
+            offset, plane, self.seq_len_v, self.seq_len_kv_v
+        )
+        # A lane owns one KV column for the whole kernel, so which of the
+        # `randoms_per_offset` slots of a philox call it wants is loop-invariant.
+        self.philox_slot = fx.Index(self.kv_row) % fx.Index(self.philox_rng.randoms_per_offset)
 
     def compute_active_guard(self):
         """Whether this workgroup's KV block exists in *this* sequence.
@@ -902,20 +968,41 @@ class BwdDkDvSoftmaxHelper(ParitySoftmaxHelper):
             for r in range_constexpr(16)
         ]
 
-    def dscores(self, p_list, v_dp, delta):
-        """`dS = P * (dP - delta)`.
+    def dscores(self, p_list, v_dp, delta, keep=None):
+        """`dS = P * (dP - delta)`, with dropout's chain rule folded into `dP`.
 
-        `dP` is deliberately unscaled: it is `dO . V^T` exactly, and `sm_scale`
-        belongs to `dK` alone -- `dS` is the gradient with respect to the
-        *scaled* logits, which is what `P` was built from. Applying the scale
-        here instead would be a plausible, finite, wrong answer of the kind the
-        joint autograd check in contract section 6 exists to catch.
+        `dP` is deliberately unscaled by `sm_scale`: it is `dO . V^T` exactly,
+        and `sm_scale` belongs to `dK` alone -- `dS` is the gradient with
+        respect to the *scaled* logits, which is what `P` was built from.
+
+        **Under dropout `dP` picks up `keep` and the survivor scale, and `P`
+        does not**, which is the one place the two masks do not compose. The
+        forward computes `O = sum_j keep*P*s*V`, so differentiating gives
+        `dS = P * (keep*s*dP - delta)` -- with the *undropped* `P` outside the
+        bracket, because the softmax denominator is the undropped sum. Reusing
+        the dropped `P` there (as the causal mask lets you) drops the
+        `-P*delta` term wherever a survivor was dropped, which is finite,
+        plausible and wrong.
         """
         values = [Vec(v_dp)[r] for r in range_constexpr(16)]
+        if const_expr(keep is not None):
+            s = self.ctx_ref.c_dropout_scale
+            values = [
+                keep[r].select(dualwave._fmul(values[r], s, self.fm_fast), self.c_zero_f) for r in range_constexpr(16)
+            ]
         return [
             dualwave._fmul(p_list[r], dualwave._fsub(values[r], delta[r], self.fm_fast), self.fm_fast)
             for r in range_constexpr(16)
         ]
+
+    def q_rows(self, tile_idx, half):
+        """The absolute q row each of this half's 16 accumulator elements holds.
+
+        `8*(r//4) + 4*(lane//32) + (r%4)`, which `_ROW_THRESHOLDS` states once
+        and `load_row_values`, `mask_if_clipped` and the dropout mask all read.
+        """
+        base = tile_idx * fx.Index(self.traits.BLOCK_Q) + fx.Index(half * 32) + self.lane_div_32 * fx.Index(4)
+        return [base + fx.Index(_ROW_THRESHOLDS[r]) for r in range_constexpr(16)]
 
     def mask_if_clipped(self, p_list, tile_idx, half):
         """Zero `P` outside the band, for the tiles that can be clipped.
@@ -1149,7 +1236,23 @@ class BwdDkDvTileBody(dualwave.DualwaveKernelContext):
             if const_expr(traits.CAUSAL):
                 p_list = {h: self.softmax.mask_if_clipped(p_list[h], tile_idx, h) for h in group}
             delta = {h: self.softmax.load_row_values(ctx.delta_rsrc, tile_base, h, ctx.c_one_f) for h in group}
-            ds_list = {h: self.softmax.dscores(p_list[h], dp[h], delta[h]) for h in group}
+            # **After the row sum, before the accumulation** -- P6's ordering.
+            # The softmax denominator is the *undropped* sum, and it is already
+            # baked into the LSE the forward wrote, so dropout applies here and
+            # nowhere earlier. It composes with the causal mask because that
+            # one zeroes `P` first: a dropped survivor of a dead element is
+            # still zero.
+            keep = {h: None for h in group}
+            if const_expr(traits.ENABLE_DROPOUT):
+                keep = {h: philox_keep(ctx, self.softmax.q_rows(tile_idx, h)) for h in group}
+            ds_list = {h: self.softmax.dscores(p_list[h], dp[h], delta[h], keep[h]) for h in group}
+            if const_expr(traits.ENABLE_DROPOUT):
+                # `dV` accumulates `keep * P`; the survivor scale is a constant
+                # and rides the epilogue instead of 16 multiplies per tile.
+                p_list = {
+                    h: [keep[h][r].select(fx.Float32(p_list[h][r]), ctx.c_zero_f) for r in range_constexpr(16)]
+                    for h in group
+                }
             for h in group:
                 p_packs[2 * h : 2 * h + 2] = self.softmax.pack_half(p_list[h])
                 ds_packs[2 * h : 2 * h + 2] = self.softmax.pack_half(ds_list[h])
@@ -1339,11 +1442,13 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         ctx.init_lds_read_bases()
         ctx.init_dma_m0_tables()
         ctx.init_kv_row()
+        ctx.init_philox()
         # `-log2(e)` and `1.0`, so `load_row_values` is one function for both
         # row tensors: LSE has to cross into the base-2 domain the exponent
         # lives in, and delta is already in dP's units.
         ctx.c_neg_log2e = fx.Float32(-dualwave._LOG2E)
         ctx.c_one_f = fx.Float32(1.0)
+        ctx.c_dropout_scale = fx.Float32(dropout_scale)
 
         stream = BwdDkDvStreamLoader(ctx)
         if const_expr(M16):
@@ -1358,7 +1463,14 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             softmax = m16.M16SoftmaxHelper(ctx)
             store = m16.M16StoreHelper(ctx)
             tile = m16.M16TileBody(
-                ctx, stream=stream, reader=reader, gemm=gemm, softmax=softmax, hdim_qk=hdim_qk, hdim_vo=hdim_vo
+                ctx,
+                stream=stream,
+                reader=reader,
+                gemm=gemm,
+                softmax=softmax,
+                hdim_qk=hdim_qk,
+                hdim_vo=hdim_vo,
+                keep_fn=philox_keep,
             )
             n_acc = m16.d_chunks16(traits)
             zero_acc = Vec.filled(m16.ACC16, 0.0, fx.Float32).ir_value()
@@ -1387,6 +1499,7 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         t0 = ctx.split_t0
         t_end = ctx.split_t_end
         scale_vec = Vec.from_elements([ctx.c_sm_scale], fx.Float32).broadcast_to(acc_width)
+        drop_vec = Vec.from_elements([ctx.c_dropout_scale], fx.Float32).broadcast_to(acc_width)
 
         @flyc.jit
         def _dkdv_body():
@@ -1437,6 +1550,13 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             # a linear factor commutes with the accumulation.
             for dc in range_constexpr(n_acc):
                 dk[dc] = dualwave._fmul(Vec(dk[dc]), scale_vec, ctx.fm_fast)
+            if const_expr(traits.ENABLE_DROPOUT):
+                # `dV = s * sum_i keep*P*dO`. A per-kernel constant, so it
+                # belongs on the accumulator once rather than on `P` every
+                # tile. `dK` does not get it: its `s` is already inside `dS`,
+                # where it multiplies only the `dP` term.
+                for dc in range_constexpr(n_acc):
+                    dv[dc] = dualwave._fmul(Vec(dv[dc]), drop_vec, ctx.fm_fast)
             store.store_accs(dv, "dv", hdim_vo)
             store.store_accs(dk, "dk", hdim_qk)
 
@@ -1681,6 +1801,10 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         window=None,
         varlen=None,
         num_seqlens=0,
+        dropout_p=None,
+        philox_seed=None,
+        philox_offset1=None,
+        philox_offset2=0,
         stream=None,
     ):
         """Every kernel argument but the stream, in launch order.
@@ -1761,6 +1885,24 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         # whatever the layout, and a packed `num_seqlens` must agree with the
         # length array.
         _vl = abi.varlen_args(STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens)
+        # **The seed and the counter are the ones the *forward* reported**, not
+        # the ones its caller passed: under graph capture the effective offset
+        # is `*offset1 + offset2`, summed on the device. `abi.dropout_args` is
+        # gfx1201's and takes the same (pointer, immediate) pair, so a caller
+        # can hand the forward's `philox_seed_output` / `philox_offset_output`
+        # straight back. The threshold and `1/(1-p)` are computed once here
+        # rather than per element.
+        *_dp, _dp_keepalive = abi.dropout_args(
+            bool(traits.ENABLE_DROPOUT),
+            dropout_p,
+            philox_seed,
+            philox_offset1,
+            philox_offset2,
+            device=Q.device,
+            stream=stream,
+        )
+        if dropout_p is not None and not traits.ENABLE_DROPOUT:
+            raise ValueError("this build was not compiled for dropout; pass dropout=True in BwdDkDvInputMetadata")
 
         return (
             Q,
@@ -1781,11 +1923,11 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             int(num_seqlens),
             *_vl[5:],  # max_seqlen_q, max_seqlen_k -- the decode's MAX fallback
             *_resolve_window_args(window),
-            abi.NULL_PTR,
-            abi.NULL_PTR,
-            0,  # philox_offset2
-            0,  # idropout_p
-            1.0,  # dropout_scale
+            _dp[0],
+            _dp[1],
+            _dp[2],
+            _dp[3],
+            _dp[4],
             num_head_q,
             num_head_k,
             hdim_qk,

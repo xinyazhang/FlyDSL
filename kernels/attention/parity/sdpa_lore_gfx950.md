@@ -539,3 +539,69 @@ head_dim 96 is a normal rung again.
   a shared batch index also breaks `varlen_padded`, and that one passed. When a
   failure lands exactly where the lore predicts, check the modes the prediction
   says should fail *with* it before believing it.
+- **`V = I` turns the forward's output into a readout of its dropout mask.**
+  With the identity as V, `O == P * keep / (1-p)` element for element, so
+  `O != 0` recovers the exact mask the forward drew -- and an fp64 backward
+  reference built from *that* is a real cross-kernel oracle. The alternative,
+  reimplementing the PRNG host-side, is a second transcription of the thing
+  under test: it can agree with the kernel and both be wrong. Needs
+  `head_dim == seqlen_k`, which is cheap to arrange in a test.
+- **A subclass that inherits the forward's `cast_p` inherits its dropout.**
+  The forward masks `P` inside `cast_p` -- after the row sum, before the O
+  accumulation. The backward must mask `dP` instead and leave `P` undropped,
+  because `P` is defined by the *undropped* `lse` it reads. Inheriting the
+  forward's `cast_p` applies the mask a second time, to a quantity that must
+  not carry it. It happened to fail loudly here only because the forward's
+  block reads a `tile_idx` the backward's call site does not pass; a signature
+  that matched would have been a silently halved gradient. Override it and say
+  why.
+- **Low variance is not evidence that a timing measurement is valid.** A ratio
+  gate in the dK/dV suite failed at 1.17x against a 1.25 bar, *stably*, over
+  eight repeats -- tighter than the noise on a healthy machine. The GPU was
+  running ~3.5x slow under a neighbouring job, and under contention the two
+  builds compress toward a common floor, so the ratio moves even though nothing
+  in the code did. Interleaving the previous commit against the current one
+  settled it in one run: they measured identically to three decimal places. Any
+  timing gate should assert an **absolute** floor first and say which of the two
+  failures it is seeing, or it will one day cost somebody a day of bisecting.
+- **A checker that can only report "clean" needs its own negative control.**
+  `check_exec_hazard_gfx950.py` parsed `--varlen` in the child and accepted it
+  in `check()`, but never placed it in the child's argv -- so for a whole phase
+  every "varlen" arm compiled a *dense* kernel and reported it clean. The scan
+  was honest about what it scanned and wrong about what that was. It was caught
+  only when a later phase added arms and someone read the plumbing. The cheap
+  guard that did survive is worth copying: the scan fails outright if the ISA
+  contains zero of the instruction it is looking for, which at least proves it
+  is looking at a kernel.
+- **The accumulator's orientation decides how many randoms you waste.** Philox
+  draws four values per call, and whether that is a 4x win or a 4x waste depends
+  on which axis a lane's elements run along. A forward lane owns one q row and
+  four adjacent k columns: one call covers all four. A dK/dV lane owns one KV
+  column and many q rows -- the transpose -- so its elements are `row_stride`
+  apart in the counter stream and it needs one call per element, using one
+  result of four. Same PRNG, same mask, 4x the calls. What *is* hoistable is
+  which of the four slots a lane wants, because a lane's column never changes.
+- **A dropout mask must not depend on the tile geometry, and the way to keep
+  that true is to never hand the tiling to the PRNG.** The mask is a function of
+  absolute `(batch, head, row, column)` and the *maximum* sequence lengths.
+  Nothing in `grid_plane`/`grid_offset` takes a `BLOCK_*`, so two builds of one
+  problem at different tilings agree bit for bit -- which makes it a standing
+  constraint on the tuner rather than a promise: `_GEOMETRY` may move and the
+  mask may not follow it. Test it *within* one MFMA family; two families
+  accumulate in different orders and differ in the last bits for reasons that
+  have nothing to do with the mask.
+- **`p = 0` must be bitwise identical to a build with no dropout compiled in,
+  not merely close.** At `p = 0` the survivor scale is exactly 1.0 and every
+  element is kept, so the arithmetic is unchanged and any difference is a bug.
+  A tolerance would not notice `1/(1-p)` applied on the wrong side of a
+  subtraction, which is the mistake the scale invites.
+- **The survivor scale goes where a constant factor is free, and that is not
+  where the forward puts it.** The forward folds `1/(1-p)` into the reciprocal
+  of the row sum -- one multiply per output row -- because a row sum exists to
+  fold into. In the backward the row sum is an *input*. `dV` takes the scale in
+  its epilogue for free, one vector multiply per accumulator. `dS` cannot,
+  because the scale multiplies only the `dP` term and `delta` is subtracted
+  from it: pulling it out would need `delta/s`, a per-row divide on an input.
+  It stays one f32 multiply per element, fused into the `select`. Folding it
+  into `dO` before the GEMM instead would round `dO` through bf16 a second
+  time.

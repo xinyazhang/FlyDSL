@@ -516,13 +516,12 @@ class BwdDqKnobs(Gfx950Knobs):
         # backward plan is written to avoid.
         for name, value in (
             ("bias", meta.bias),
-            ("dropout", meta.dropout),
             ("paged", self.paged),
         ):
             if value:
                 raise NotImplementedError(
-                    f"{name}=True is not implemented by the backward dQ kernel yet; B5 adds varlen. "
-                    "See the phase ladder in sdpa-bwd-plan-gfx950.md."
+                    f"{name}=True is not implemented by the backward dQ kernel yet; B6 adds dropout "
+                    "and is the last feature phase. See sdpa-bwd-plan-gfx950.md."
                 )
         if meta.window and not meta.causal:
             # `make_traits` says the same thing, and this repeats it only so the
@@ -588,6 +587,7 @@ class BwdDqKnobs(Gfx950Knobs):
             lazy_rescale=self.lazy_rescale,
             setprio=self.setprio,
             stagger=self.stagger,
+            dropout=meta.dropout,
             lpt_tile_order=self.lpt_tile_order,
             num_kv_splits=1,
             varlen=self.varlen,

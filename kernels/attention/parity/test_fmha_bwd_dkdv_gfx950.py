@@ -526,6 +526,18 @@ def test_causal_tile_cut_is_not_inert(rows):
     `kv_start = 0`, which walks every tile in both builds. Measured 0.94x
     there and 1.53x at the shape below, from the same code: a working cut is as
     easy to misdiagnose as an inert one.
+
+    **A shared machine can fail this test without the kernel changing**, and it
+    did in B6. Under a neighbouring job the whole GPU ran ~3.5x slow -- dense
+    1.23 ms where it is normally 0.35 -- and the ratio compressed to 1.17x, well
+    under the bar. It was *stable* at 1.17x across eight repeats, which is the
+    part worth remembering: a throttled machine gives quiet, repeatable, wrong
+    numbers, so low variance is not evidence that a measurement is valid. Both
+    builds compress toward a common floor because whatever the contention is
+    costs the same in each, and the cut's saving is a proportion of a term that
+    is no longer dominant. The absolute check below is the guard: a ratio
+    measured while the machine is not at speed is not evidence about the cut in
+    either direction, so the failure says which of the two it is.
     """
     _require_rocm_path()
     head_dim = 64
@@ -548,16 +560,26 @@ def test_causal_tile_cut_is_not_inert(rows):
         kw = dict(seqlen_k=s, scale=scale)
         fn(*args, **kw)
         torch.cuda.synchronize()
+        best = float("inf")
         for _ in range(3):
-            fn(*args, **kw)
-        torch.cuda.synchronize()
-        t = time.perf_counter()
-        for _ in range(10):
-            fn(*args, **kw)
-        torch.cuda.synchronize()
-        return time.perf_counter() - t
+            for _ in range(3):
+                fn(*args, **kw)
+            torch.cuda.synchronize()
+            t = time.perf_counter()
+            for _ in range(10):
+                fn(*args, **kw)
+            torch.cuda.synchronize()
+            best = min(best, time.perf_counter() - t)
+        return best
 
     dense, causal = _time(False), _time(True)
+    # Nominal, on the four GEMMs, at the fastest of the three dense repeats.
+    dense_tf = 4 * 2 * b * h * s * s * head_dim / (dense / 10) / 1e12
+    assert dense_tf > 400, (
+        f"the machine is not at speed: the dense build measured {dense_tf:.0f} TFLOP/s where it "
+        "reaches ~780 on an idle GPU, so the ratio below is not evidence about the tile cut. Check "
+        "for a neighbouring job before reading this as a kernel regression."
+    )
     # A causal KV block walks about half the q tiles on average, so the ceiling
     # is ~1.9x. 1.25 is well clear of both that and of run-to-run noise, and
     # well above the 1.0 an inert cut would give.
@@ -794,6 +816,199 @@ def test_varlen_build_and_descriptor_must_agree():
 
 
 # ---------------------------------------------------------------------------
+# Dropout
+# ---------------------------------------------------------------------------
+#
+# **The contract is cross-kernel and it is the whole difficulty.** The backward
+# must regenerate the forward's mask bit for bit or the gradients are quietly
+# wrong, and neither kernel can check that alone. Three parties make it
+# testable: the forward *draws* the mask and reports the `(seed, offset)` it
+# actually used, `dropout_mask_gfx1201` *regenerates* it as a tensor at a
+# tiling of its own, and this kernel regenerates it again from the same
+# report. All three call `Philox.grid_plane` / `grid_offset` rather than
+# transcribing the formula, which is what makes their agreement mean something.
+
+
+def _u64(x):
+    return torch.tensor([int(x)], device="cuda", dtype=torch.int64)
+
+
+def _dropout_case(d=64, b=1, h=2, s=256, p=0.25, rows=None, causal=False, seed=1234, mask_tile=(64, 32)):
+    """Forward -> reported (seed, offset) -> mask tensor -> fp64 reference -> backward."""
+    from dropout_mask_gfx1201 import dropout_mask
+    from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module as build_fwd
+    from philox import dropout_threshold
+
+    torch.manual_seed(7)
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    scale = 1.0 / d**0.5
+
+    o = torch.empty_like(q)
+    lse = torch.empty(b * h, s, device="cuda", dtype=torch.float32)
+    seed_out, off_out = torch.zeros(1, device="cuda", dtype=torch.int64), torch.zeros(
+        1, device="cuda", dtype=torch.int64
+    )
+    fwd = build_fwd(
+        num_heads=h, head_dim=d, num_kv_heads=h, causal=causal, dtype_str="bf16", return_lse=True, dropout=True
+    )
+    fwd(
+        q,
+        k,
+        v,
+        o,
+        b,
+        s,
+        seqlen_k=s,
+        scale=scale,
+        lse=lse,
+        dropout_p=p,
+        philox_seed=_u64(seed),
+        philox_offset1=_u64(0),
+        philox_offset2=0,
+        philox_seed_out=seed_out,
+        philox_offset_out=off_out,
+    )
+    torch.cuda.synchronize()
+    delta = (do.float() * o.float()).sum(-1).reshape(b * h, s).contiguous()
+
+    raw = dropout_mask(
+        b, h, s, s, int(seed_out.item()), int(off_out.item()), block_m=mask_tile[0], block_n=mask_tile[1]
+    )
+    keep = raw > dropout_threshold(p)
+
+    qf, kf, vf = (t.float().detach().requires_grad_() for t in (q, k, v))
+    sc = (qf @ kf.transpose(-1, -2)) * scale
+    if causal:
+        sc = sc.masked_fill(~_band(s, s, (s, 0)), float("-inf"))
+    pd = torch.where(keep, torch.softmax(sc, -1) * (1.0 / (1.0 - p)), torch.zeros_like(sc))
+    o_ref = pd @ vf
+    dk_ref, dv_ref = torch.autograd.grad(o_ref, (kf, vf), do.float())
+
+    knobs = {} if rows is None else _family_knobs(d, rows)
+    dk, dv = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
+    fn = build(num_heads=h, head_dim=d, num_kv_heads=h, dropout=True, causal=causal, **knobs)
+    fn(
+        q,
+        k,
+        v,
+        do,
+        dk,
+        dv,
+        lse,
+        delta,
+        b,
+        s,
+        seqlen_k=s,
+        scale=scale,
+        dropout_p=p,
+        philox_seed=seed_out,
+        philox_offset1=off_out,
+        philox_offset2=0,
+    )
+    torch.cuda.synchronize()
+    return o, o_ref.detach(), dk, dk_ref, dv, dv_ref, float(keep.float().mean())
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_dropout_regenerates_the_forwards_mask(head_dim, rows, causal):
+    """The cross-kernel gate, and the only test that can see a mask disagreement.
+
+    The reference is built from the mask `dropout_mask_gfx1201` regenerates, so
+    it is only a valid reference if that kernel agrees with the forward -- which
+    the `O` assertion below checks first. Once `O` matches, a `dK`/`dV`
+    mismatch can only be this kernel drawing a different mask, and that is the
+    failure the whole phase exists to prevent.
+    """
+    _require_rocm_path()
+    o, o_ref, dk, dk_ref, dv, dv_ref, keep_rate = _dropout_case(d=head_dim, rows=rows, causal=causal)
+    assert _rel(o, o_ref.double()) < 1e-2, "the debug mask kernel disagrees with the forward; the reference is invalid"
+    for name, got, ref in (("dk", dk, dk_ref), ("dv", dv, dv_ref)):
+        e = _rel(got, ref.double())
+        assert e < 1e-2, f"{name}: {e:.3e} -- the backward drew a different mask from the forward"
+    assert abs(keep_rate - 0.75) < 0.01, f"keep rate {keep_rate:.4f}, expected ~0.75 at p=0.25"
+
+
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+def test_dropout_keep_rate(p):
+    """The rate the mask actually realises, not the one that was asked for."""
+    _require_rocm_path()
+    _o, _oref, _dk, _dkref, _dv, _dvref, keep = _dropout_case(d=64, p=p, s=512)
+    assert abs(keep - (1.0 - p)) < 0.01, f"keep rate {keep:.4f} at p={p}, expected ~{1 - p}"
+
+
+def _dropout_run(knobs, p, seed=99, d=64, b=1, h=2, s=512, drop=True):
+    torch.manual_seed(5)
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    lse = torch.randn(b * h, s, device="cuda", dtype=torch.float32)
+    delta = torch.randn_like(lse)
+    dk, dv = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
+    fn = build(num_heads=h, head_dim=d, num_kv_heads=h, dropout=drop, **knobs)
+    extra = dict(dropout_p=p, philox_seed=_u64(seed), philox_offset1=_u64(0), philox_offset2=0) if drop else {}
+    fn(q, k, v, do, dk, dv, lse, delta, b, s, seqlen_k=s, scale=1.0 / d**0.5, **extra)
+    torch.cuda.synchronize()
+    return dk.clone(), dv.clone()
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+def test_dropout_p_zero_is_bitwise_a_build_without_it(rows):
+    """`p = 0` must change nothing at all, not merely little.
+
+    The dropout arm multiplies `dP` by `1/(1-p)` and selects on `keep`; at
+    `p = 0` the scale is exactly 1.0 and every element is kept, so the
+    arithmetic is unchanged and the answer must be identical to a build that
+    emits none of it. A tolerance would not notice a survivor scale applied on
+    the wrong side.
+    """
+    _require_rocm_path()
+    knobs = _family_knobs(64, rows)
+    on = _dropout_run(knobs, 0.0, drop=True)
+    off = _dropout_run(knobs, None, drop=False)
+    assert torch.equal(on[0], off[0]) and torch.equal(on[1], off[1])
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+def test_dropout_is_deterministic_per_seed(rows):
+    """Same seed bit-identical, different seed different. Both halves matter."""
+    _require_rocm_path()
+    knobs = _family_knobs(64, rows)
+    a, b = _dropout_run(knobs, 0.3), _dropout_run(knobs, 0.3)
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]), "not deterministic at a fixed seed"
+    c = _dropout_run(knobs, 0.3, seed=100)
+    assert not torch.equal(a[0], c[0]), "a different seed produced the same mask"
+
+
+@pytest.mark.parametrize(
+    "rows,alt",
+    [
+        (32, dict(mfma_rows=32, dkv_shards=1, num_waves=2, block_kv=64, block_q=64, head_dim_granule=64)),
+        (16, dict(mfma_rows=16, dkv_shards=1, num_waves=4, block_kv=64, block_q=32, head_dim_granule=64)),
+        (16, dict(mfma_rows=16, dkv_shards=1, num_waves=2, block_kv=32, block_q=64, head_dim_granule=64)),
+    ],
+    ids=["m32_waves", "m16_blockq", "m16_waves"],
+)
+def test_dropout_mask_does_not_depend_on_the_tiling(rows, alt):
+    """P6's contract, and the reason `grid_plane` never sees a `BLOCK_*`.
+
+    The mask is a function of absolute `(batch, head, row, column)` and the
+    *maximum* sequence lengths -- never of the tile geometry -- so two builds
+    of the same problem at different tilings must agree **bit for bit**. This
+    is a constraint on the tuner from here on: `_GEOMETRY` may move freely and
+    a dropout mask may not follow it.
+
+    Within one MFMA family, because two families accumulate in different orders
+    and would differ in the last bits for reasons that have nothing to do with
+    the mask.
+    """
+    _require_rocm_path()
+    base = _dropout_run(_family_knobs(64, rows), 0.3)
+    other = _dropout_run(alt, 0.3)
+    assert torch.equal(base[0], other[0]), "dK moved when the tiling changed: the mask depends on it"
+    assert torch.equal(base[1], other[1]), "dV moved when the tiling changed: the mask depends on it"
+
+
+# ---------------------------------------------------------------------------
 # Structural
 # ---------------------------------------------------------------------------
 
@@ -1021,8 +1236,8 @@ def test_refuses_what_it_does_not_compute():
     """Every one of these would otherwise be a plausible, finite, wrong gradient."""
     with pytest.raises(ValueError, match="window=True requires causal=True"):
         build(num_heads=8, head_dim=64, window=True)
-    with pytest.raises(NotImplementedError, match="dropout"):
-        build(num_heads=8, head_dim=64, dropout=True)
+    with pytest.raises(NotImplementedError, match="bias"):
+        build(num_heads=8, head_dim=64, bias=True)
     with pytest.raises(NotImplementedError, match="GQA"):
         build(num_heads=8, head_dim=64, num_kv_heads=2)
     with pytest.raises(ValueError, match="exceeds the widest tile"):

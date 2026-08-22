@@ -205,6 +205,7 @@ from fmha_dualwave_gfx950 import (
     ParityQLoader,
     ParitySoftmaxHelper,
     ParityStoreHelper,
+    _score_column_runs,
 )
 
 # Private to `fmha_dualwave_gfx950`, and imported anyway: they are the
@@ -217,6 +218,7 @@ from fmha_dualwave_gfx950 import _ks_offset as _parity_ks_offset
 from fmha_tuning_bwd_dq_gfx950 import BwdDqKnobs, bwd_dq_knobs
 from fmha_tuning_gfx950 import FmhaInputMetadata
 from gfx950_standalone import buffer_ops, dualwave
+from philox import Philox
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -353,6 +355,39 @@ class BwdDqKernelContext(ParityKernelContext):
                     )
                 ),
             )
+
+    def init_philox(self):
+        """The forward's philox prologue, minus the report.
+
+        **The backward *consumes* the reproducibility contract; it does not
+        publish one.** `ParityKernelContext.init_philox` ends by calling
+        `fmha.philox_report`, which writes the seed and offset back for a
+        later backward to pick up -- correct there, meaningless here, and it
+        would need two output pointers on the wire that nothing reads.
+
+        Everything else is inherited verbatim, and that is the whole point:
+        the mask has to be regenerated *bit-identically*, and it is because
+        both kernels call the same `Philox.grid_plane` with the same
+        `(seed, offset)` and the same plane -- not because two transcriptions
+        of one formula happened to agree.
+
+        The consequence worth naming: `grid_plane` is given `max_seqlen_q` and
+        `max_seqlen_k`, never `BLOCK_M`/`BLOCK_N`, so the mask is a function of
+        element coordinates only and **the tile geometry may differ between
+        the two kernels**. What may *not* differ is the pair of max lengths, or
+        the plane index -- which is why `batch_idx` and `q_head_idx` are read
+        after the varlen decode here exactly as they are in the forward.
+        """
+        if const_expr(not self.traits.ENABLE_DROPOUT):
+            return
+        self.philox_rng = Philox.for_arch("gfx950")
+        plane = fx.Int32(self.batch_idx) * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
+        seed = fmha.philox_seed_value(self.philox_seed_ptr)
+        offset = fmha.philox_offset_base(self.philox_offset1, self.philox_offset2)
+        self.philox_seed = seed
+        self.philox_plane_base, self.philox_row_stride = self.philox_rng.grid_plane(
+            offset, plane, self.seq_len_v, self.seq_len_kv_v
+        )
 
     def compute_active_guard(self):
         """`q_start < seqlen_q`, and **not** the cross-sequence term.
@@ -576,6 +611,73 @@ class BwdDqSoftmaxHelper(ParitySoftmaxHelper):
         lo = fmath.fma(Vec(s_lo), scale_v, neg_v, fastmath=self.fm_fast)
         hi = fmath.fma(Vec(s_hi), scale_v, neg_v, fastmath=self.fm_fast)
         return as_mlir_value(lo), as_mlir_value(hi)
+
+    def cast_p(self, v_p, tile_idx=None):
+        """Pack to bf16 with **no dropout**, unlike the forward's `cast_p`.
+
+        `ParitySoftmaxHelper.cast_p` is where the *forward* applies its mask --
+        after the row sum, before the O accumulation. Inheriting it here would
+        drop `dS` on the way into GEMM3 while `dropout_dp` has already dropped
+        `dP`, i.e. **apply the mask twice**: once correctly and once to a
+        quantity that must not carry it, since `P` is the undropped softmax
+        the undropped `lse` defines.
+
+        It fails loudly today only by accident -- the forward's block reads
+        `tile_idx`, which this call site does not pass. That is a bad reason to
+        be safe, so the override is explicit.
+        """
+        return dualwave.DualwaveSoftmaxHelper.cast_p(self, v_p)
+
+    def dropout_dp(self, dp_lists, tile_idx, q_row):
+        """`dP <- keep ? dP * (1/(1-p)) : 0`, on the **dP** rather than on P.
+
+        AOTriton's `bwd_inner_dq` applies the mask here and this follows it,
+        because that is what the chain rule says: the forward's output is
+        `sum_j (P_j * keep_j * scale) V_j`, so the gradient with respect to the
+        *undropped* `P_j` carries the same `keep_j * scale` factor. `P` itself
+        stays undropped -- it is `exp2(qk_scale*S - lse2)` and `lse2` is the
+        undropped logsumexp the forward wrote.
+
+        **`delta` needs no adjustment**, and that is not luck:
+        `delta = rowsum(dO * O)` with `O` the *dropped* output is exactly
+        `sum_j P_j keep_j scale (dO . V_j)`, which is the reduction term the
+        softmax backward wants against a masked `dP`. The host already computes
+        it from the forward's own `O`.
+
+        **The survivor scale cannot be folded the way the forward folds it.**
+        There it becomes one multiply on `1/l` per output row, because a row
+        sum exists to fold into; here the row sum is an *input*. Folding it
+        into `dO` before GEMM2 would be one multiply instead of one per
+        element -- and would round `dO` through bf16 a second time, which is
+        the mistake B2 measured at 10.9x on the Q pre-scale. It stays an f32
+        multiply on the scores.
+
+        The column runs are the bias and forward-dropout ones: a lane's 16
+        scores are a few contiguous spans starting at multiples of
+        `randoms_per_offset`, so each is a whole number of Philox calls with no
+        partial draw.
+        """
+        traits = self.traits
+        ctx = self.ctx_ref
+        rng = ctx.philox_rng
+        lo, hi = dp_lists
+        lane_n_off = 8 if traits.KV_VECTORIZED else 4
+        col_base = fx.Int64(tile_idx * traits.BLOCK_N) + fx.Int64(self.lane_div_32 * fx.Index(lane_n_off))
+        scale = fx.Float32(ctx.dropout_scale_arg)
+        zero = fx.Float32(0.0)
+        for half, values in ((0, lo), (1, hi)):
+            for elem0, col_off, width in _score_column_runs(traits.KV_VECTORIZED):
+                first = rng.grid_offset(
+                    ctx.philox_plane_base,
+                    ctx.philox_row_stride,
+                    fx.Int64(q_row),
+                    col_base + fx.Int64(col_off + half * 32),
+                )
+                keep = rng.keep_span(ctx.philox_seed, first, width, ctx.idropout_p)
+                for j in range_constexpr(width):
+                    kept = dualwave._fmul(values[elem0 + j], scale, self.fm_fast)
+                    values[elem0 + j] = keep[j].select(fx.Float32(kept), zero)
+        return (lo, hi)
 
 
 class BwdSecondaryQLoader(ParityQLoader):
@@ -993,6 +1095,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         ctx.init_sequence_lengths()
         ctx.init_descriptors()
         ctx.init_workspace()
+        ctx.init_philox()
         ctx.init_atoms_and_lds_ptrs()
         ctx.init_dma_thread_offsets()
         ctx.init_tile_bounds()
@@ -1086,6 +1189,11 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
                 # dS = P * (dP - delta), elementwise over the 32 scores a lane
                 # holds. `delta` is a per-row scalar and a lane owns one row.
                 dp_lo, dp_hi = softmax_helper.v_s_vec_to_lists(v_dp)
+                if const_expr(traits.ENABLE_DROPOUT):
+                    # **On dP, before dS.** See `dropout_dp`: the mask belongs
+                    # on the gradient of the dropped output, not on `P`, and
+                    # `delta` already carries it through the forward's `O`.
+                    dp_lo, dp_hi = softmax_helper.dropout_dp((dp_lo, dp_hi), j, ctx.q_row)
                 ds_lo = [None] * ACC_ELEMS
                 ds_hi = [None] * ACC_ELEMS
                 for r in range_constexpr(ACC_ELEMS):
@@ -1345,6 +1453,10 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         window=None,
         varlen=None,
         num_seqlens=0,
+        dropout_p=None,
+        philox_seed=None,
+        philox_offset1=None,
+        philox_offset2=0,
         stream=None,
     ):
         """Every kernel argument but the stream, in launch order.
@@ -1439,6 +1551,26 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
                 raise ValueError(f"dB needs a contiguous seqlen_k axis; strides are {tuple(db.stride())}")
             if db.dtype != Q.dtype:
                 raise ValueError(f"dB must match Q's dtype ({Q.dtype}), got {db.dtype}")
+        # **The seed and offset the forward *reported*, not what its caller
+        # passed.** Under a captured graph the caller's offset is a pointer the
+        # forward re-reads, so the two need not be equal -- and the mask has to
+        # be regenerated bit-identically or the gradients are quietly wrong.
+        # `abi.dropout_args` is gfx1201's: it turns the probability into the
+        # i32 threshold the raw random is compared against and the `1/(1-p)`
+        # survivor scale, once per call, and keeps the counter as the
+        # (pointer, immediate) pair torch splits it into.
+        *_dp, _dp_keepalive = abi.dropout_args(
+            bool(traits.ENABLE_DROPOUT),
+            dropout_p,
+            philox_seed,
+            philox_offset1,
+            philox_offset2,
+            device=Q.device,
+            stream=stream,
+        )
+        if dropout_p is not None and not traits.ENABLE_DROPOUT:
+            raise ValueError("this build was not compiled for dropout; pass dropout=True to the builder")
+
         db_t = db if db is not None else DQ
         db_st = tuple(int(x) for x in db.stride()[:3]) if db is not None else (0, 0, 0)
 
@@ -1461,11 +1593,11 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             int(num_seqlens),
             *_vl[5:],  # max_seqlen_q, max_seqlen_k -- the decode's MAX fallback
             *_resolve_window_args(window),
-            abi.NULL_PTR,
-            abi.NULL_PTR,
-            0,
-            0,  # idropout_p
-            1.0,  # dropout_scale
+            _dp[0],
+            _dp[1],
+            _dp[2],
+            _dp[3],  # idropout_p
+            _dp[4],  # dropout_scale
             num_head_q,
             num_head_k,
             hdim_qk,
