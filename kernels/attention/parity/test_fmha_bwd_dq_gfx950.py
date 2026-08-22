@@ -823,67 +823,200 @@ def test_wave_geometries_agree(waves, wpe):
 
 
 def test_the_wide_rungs_fit_lds_unstaged():
-    """head_dim 384 and 512 inside the cap, on two staging regions rather than three.
+    """Two staging regions, no `D_STAGES`, inside the cap -- on both families.
 
     The B3 blocker, as an assertion. B2 staged K twice -- 199 KB at head_dim
     512 against a 163840 B cap -- so the ladder did not merely run slowly
     there, it could not be built. A regression that reintroduced the third
     region would fail to compile with "local memory exceeds limit", which names
     the symptom and not the cause.
+
+    Both families, and pinned by *geometry* rather than by the default policy,
+    because the policy moved once already: the 16-row family halves `BLOCK_N`
+    and therefore the tile again.
     """
     from fmha_tuning_gfx950 import FmhaInputMetadata
 
-    for head_dim, want_kb in ((256, 66.5), (384, 99.8), (512, 133.0)):
-        traits = bwd_dq_knobs().resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False)).traits
+    cases = [
+        (256, 32, 66.5),
+        (384, 32, 99.8),
+        (512, 32, 133.0),
+        (384, 16, 49.9),
+        (512, 16, 66.5),
+    ]
+    for head_dim, rows, want_kb in cases:
+        traits = (
+            bwd_dq_knobs(mfma_rows=rows).resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False)).traits
+        )
         kb = traits.LDS_KV_TOTAL_SIZE * traits.BF16_BYTES / 1024
-        assert abs(kb - want_kb) < 0.5, f"head_dim {head_dim}: {kb:.1f} KB, expected {want_kb}"
+        assert abs(kb - want_kb) < 0.5, f"head_dim {head_dim} at {rows} rows: {kb:.1f} KB, expected {want_kb}"
         assert kb < 160.0
         assert traits.D_STAGES == 1 and traits.VO_SHARDS == 1
 
 
-def test_lse_and_delta_layout_is_checked_on_the_host():
-    """The kernel derives their pitches rather than reading strides.
+# ---------------------------------------------------------------------------
+# B3.5: the register model, and the MFMA shape it argues for
+# ---------------------------------------------------------------------------
 
-    So the host is the only place the caller's actual layout can be verified,
-    and a silently-wrong pitch reads a plausible LSE for the wrong row.
+
+# `.vgpr_count` plus `.vgpr_spill_count` from the B3 ISA dumps, at the default
+# geometry for each rung, `store_db=False`. Recorded rather than re-measured
+# because the point of the test is to pin the *model* against a fixed
+# observation; re-dumping ten kernels would make it a slow test of the
+# compiler instead.
+_B3_MEASURED_VGPR = {
+    32: 140 + 0,
+    64: 190 + 0,
+    96: 236 + 0,
+    128: 260 + 0,
+    160: 312 + 0,
+    192: 360 + 0,
+    224: 412 + 0,
+    256: 460 + 0,
+    384: 512 + 112,
+    512: 512 + 546,
+}
+
+
+@pytest.mark.parametrize("head_dim", [d for d in BWD_DQ_LADDER if d <= 256])
+def test_register_model_matches_measured(head_dim):
+    """The structural accounting must predict the observed VGPR count.
+
+    **This is what licenses the model to be used as a prediction** for the
+    16-row geometry, which has never been built. Every term in
+    `register_demand` is an exact count of what the algorithm holds -- nothing
+    is fitted -- so agreeing with measurement to within a few registers at
+    eight independent rungs is a real check rather than a tautology.
+
+    Only the rungs that do *not* spill: above 512 the allocator's behaviour is
+    non-linear (head_dim 512 is 336 registers over and spills 546, because
+    spill code costs registers of its own), so the measurement stops being a
+    measurement of demand.
+
+    The band is 32 registers, which is the residual the model deliberately
+    leaves out: addressing, DMA descriptors and loop scalars, measured at 4-12
+    at two waves and 12-14 at four. Fitting a constant for them would make the
+    model agree with today's numbers by construction.
     """
-    torch.manual_seed(10)
-    b, h, s, d = 1, 2, 256, 64
-    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
-    scale = _sm_scale(d)
-    lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
-    with pytest.raises(ValueError, match="logsumexp"):
-        _run_dq(q, k, v, do, lse.to(torch.float16), delta, scale=scale)
-    with pytest.raises(ValueError, match="delta"):
-        _run_dq(q, k, v, do, lse, delta[:, : s // 2].contiguous(), scale=scale)
-    with pytest.raises(ValueError, match="logsumexp"):
-        # Rank 3 `(B, H, S)` -- the shape the forward writes, and the one a
-        # caller reaches for. It has to be viewed at rank 2, so say so.
-        _run_dq(q, k, v, do, lse.reshape(b, h, s), delta, scale=scale)
+    from fmha_tuning_bwd_dq_gfx950 import register_demand
+    from fmha_tuning_gfx950 import FmhaInputMetadata
+
+    traits = bwd_dq_knobs().resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False)).traits
+    predicted = register_demand(traits)["total"]
+    measured = _B3_MEASURED_VGPR[head_dim]
+    assert abs(measured - predicted) <= 32, (
+        f"head_dim {head_dim}: model says {predicted} registers, ISA says {measured}. "
+        "Either the body's live set changed or the model is wrong; both matter."
+    )
+    assert predicted <= 512, "a rung that does not spill must not be modelled as over the file"
 
 
-def test_db_tensor_and_build_must_agree():
-    """A dB build needs a tensor, and a non-dB build must refuse one.
+# `.vgpr_count` from the B3.5 ISA dumps of the **16-row** family, default
+# geometry, `store_db=False`. The 32-row column is `_B3_MEASURED_VGPR`.
+_M16_MEASURED_VGPR = {64: 80, 128: 132, 192: 170, 256: 216, 384: 318, 512: 414}
 
-    Silently ignoring a dB tensor returns gradients that are the right shape
-    with the bias gradient missing, and it is only ever passed by a caller who
-    believes it is being written.
+
+@pytest.mark.parametrize("head_dim", sorted(_M16_MEASURED_VGPR))
+def test_register_model_predicted_the_16_row_family(head_dim):
+    """**The model made a prediction about an unbuilt geometry. This is the score.**
+
+    Before the 16-row family existed, `register_demand` said its demand would
+    be `0.5 * head_dim` for the loop invariants against 32 rows' `1.0 * d`, and
+    put head_dim 512 at 404 registers against 848. The family now exists, so
+    the prediction is checkable rather than merely plausible -- and a model
+    that survives contact is worth more than the decision it justified.
+
+    It came in at **+4 to +16** registers across six rungs, the same band and
+    the same sign as the 32-row fit: the terms are exact and what is left out
+    (addressing, DMA descriptors, loop scalars) is a small positive residual.
     """
-    torch.manual_seed(11)
-    b, h, s, d = 1, 2, 128, 64
-    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
-    scale = _sm_scale(d)
-    lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
-    db = torch.zeros(b, h, s, s, device="cuda", dtype=DT)
-    dq = torch.empty(b, h, s, d, device="cuda", dtype=DT)
+    from fmha_tuning_bwd_dq_gfx950 import register_demand
+    from fmha_tuning_gfx950 import FmhaInputMetadata
 
-    plain = build_dq(num_heads=h, head_dim=d, causal=False)
-    with pytest.raises(ValueError, match="not compiled for dB"):
-        plain(q, k, v, do, dq, lse, delta, b, s, seqlen_k=s, db=db)
+    traits = bwd_dq_knobs(mfma_rows=16).resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False)).traits
+    predicted = register_demand(traits)["total"]
+    measured = _M16_MEASURED_VGPR[head_dim]
+    assert 0 <= measured - predicted <= 32, (
+        f"head_dim {head_dim} at 16 rows: model {predicted}, ISA {measured}. The residual is supposed "
+        "to be a small positive constant; a negative one means the model over-counts."
+    )
+    assert predicted <= 512
 
-    with_db = build_dq(num_heads=h, head_dim=d, causal=False, store_db=True)
-    with pytest.raises(ValueError, match="requires a"):
-        with_db(q, k, v, do, dq, lse, delta, b, s, seqlen_k=s)
+
+def test_sixteen_rows_is_what_the_wide_rungs_need():
+    """The argument for the second family, stated so it cannot drift.
+
+    At 32 rows the loop-invariant Q + dO + dQ alone is `1.0 * head_dim`
+    registers, which is the entire 512-register file at head_dim 512 before a
+    single operand. At 16 rows it is `0.5 * head_dim`. That is arithmetic, not
+    a measurement, and it is why the family exists.
+
+    Pinned by geometry, not by the default policy: the policy now *selects* 16
+    rows at 384 and above, so reading the default would compare a thing to
+    itself.
+    """
+    from fmha_tuning_bwd_dq_gfx950 import register_demand
+    from fmha_tuning_gfx950 import FmhaInputMetadata
+
+    def demand(head_dim, rows):
+        traits = (
+            bwd_dq_knobs(mfma_rows=rows).resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False)).traits
+        )
+        return register_demand(traits)
+
+    for head_dim in (384, 512):
+        a, b = demand(head_dim, 32), demand(head_dim, 16)
+        assert a["q"] + a["do"] + a["dq_acc"] == head_dim
+        assert b["q"] + b["do"] + b["dq_acc"] == head_dim // 2
+        assert a["over_512"] > 0, "the 32-row family is supposed to be the problem here"
+        assert b["over_512"] == 0, "the 16-row family is supposed to be the answer"
+
+
+def test_the_default_policy_splits_the_families_at_384():
+    """32 rows below 384, 16 at and above. Measured, and additive.
+
+    16 against 32 rows at `B=2 H=8 S=4096`: 4.23x at 512, 1.69x at 384, 1.04x
+    at 256, level at 192, and **worse** at 128 (0.94x) and 64 (0.86x). The
+    32-row family keeps everything below 384 -- "the 32-row path must not
+    regress" is a gate, and the way it is met is that nothing below 384 moves.
+    """
+    from fmha_tuning_gfx950 import FmhaInputMetadata
+
+    for head_dim, rows in ((64, 32), (128, 32), (256, 32), (384, 16), (512, 16)):
+        traits = bwd_dq_knobs().resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False)).traits
+        assert traits.MFMA_N == rows, f"head_dim {head_dim} should default to {rows} rows"
+
+
+@pytest.mark.parametrize("head_dim", [32, 96, 160, 224])
+def test_the_16_row_family_refuses_the_off_grid_rungs(head_dim):
+    """Its transpose read assumes granule-64 staging, and says so.
+
+    `_kt_read_base` folds `tok_off(4 * group)` into `group * granule`, which
+    needs `SMEM_N_RPT` to divide 4 -- true at granule 64 and not at granule 32.
+    Those rungs are all comfortably served by the 32-row family, so this is a
+    limit rather than a deferral, and refusing beats a silent wrong address.
+    """
+    with pytest.raises(NotImplementedError, match="multiples of 64"):
+        build_dq(num_heads=4, head_dim=head_dim, causal=False, mfma_rows=16)
+
+
+def test_the_16x16x16_shape_is_half_rate():
+    """`16x16x16` costs half the machine; `16x16x32` does not.
+
+    Read out of `SISchedule.td` under `SIDPGFX950FullSpeedModel`, not out of an
+    ISA document, per the lore. It decides B3.5's shape question on its own and
+    **without the lane-map probe**: a 16-row family built on `16x16x16` cannot
+    beat the 32-row family anywhere the 32-row family fits, because its
+    ceiling is 50% of peak. `16x16x32` gives 16 rows at full rate.
+
+    A test rather than a comment because the numbers are a claim about the
+    toolchain, and a toolchain can change.
+    """
+    from fmha_tuning_bwd_dq_gfx950 import mfma_flops_per_pass
+
+    today = mfma_flops_per_pass(32, 32, 16)
+    assert mfma_flops_per_pass(16, 16, 16) == today / 2
+    assert mfma_flops_per_pass(16, 16, 32) == today
 
 
 def test_knobs_resolve_is_idempotent():

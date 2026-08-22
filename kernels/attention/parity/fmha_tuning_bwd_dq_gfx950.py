@@ -43,11 +43,106 @@ from fmha_tuning_gfx950 import LADDER, Gfx950Knobs, tile_width_for
 
 __all__ = [
     "BWD_DQ_LADDER",
+    "MFMA_PASSES",
     "BwdDqKnobs",
     "BwdDqTraits",
     "bwd_dq_knobs",
     "make_bwd_dq_traits",
+    "mfma_flops_per_pass",
+    "register_demand",
 ]
+
+# Passes per MFMA on gfx950, from the *scheduling model* rather than from an
+# ISA doc -- `SISchedule.td`, `let SchedModel = SIDPGFX950FullSpeedModel`. The
+# lore is explicit that this is where the number lives and that getting it
+# wrong invalidates everything derived from it.
+#
+# The consequence is the one number that decides B3.5's shape question, and it
+# needs no lane-map probe:
+#
+#     shape        flops      passes   flops/pass
+#     16x16x16      8192        4         2048     <- half rate
+#     16x16x32     16384        4         4096
+#     32x32x16     32768        8         4096
+#
+# **`v_mfma_f32_16x16x16_bf16` is exactly half the peak rate of the shape this
+# kernel uses today.** A 16-row family built on it cannot beat the 32-row
+# family on any rung where the 32-row family fits, and its ceiling is 50% of
+# the machine. `16x16x32` gives 16 rows per wave at *full* rate, and both are
+# already dispatched by `fx.rocdl.MFMA(m, n, k, bf16)`
+# (`lib/Dialect/FlyROCDL/CDNA3/MmaAtom.cpp`), so neither needs C++ work.
+MFMA_PASSES = {(16, 16, 16): 4, (16, 16, 32): 4, (32, 32, 16): 8}
+
+
+def mfma_flops_per_pass(m, n, k):
+    """Throughput of one MFMA shape, in flops per XDL pass.
+
+    The comparison that matters is *per pass*, not per instruction: a shape
+    that does half the work in half the passes is the same rate, and a shape
+    that does a quarter of the work in half the passes is half.
+    """
+    if (m, n, k) not in MFMA_PASSES:
+        raise KeyError(f"no gfx950 pass count recorded for {m}x{n}x{k}; read it out of SISchedule.td")
+    return 2 * m * n * k / MFMA_PASSES[(m, n, k)]
+
+
+def register_demand(traits, *, store_db=False, a_tiles_live=1):
+    """Per-lane 32-bit register demand for the dQ body, by term.
+
+    **Structural, not fitted.** Every term below is an exact count of what the
+    algorithm holds; nothing here is tuned against a measurement. That is what
+    makes it usable as a prediction for a geometry that has never been built,
+    which is the whole point of computing it in B3.5.
+
+    Let `R` = rows per wave (the MFMA's N extent, since the query row is the N
+    axis of both GEMM1 and GEMM3), `d` = head_dim, `n` = BLOCK_N, `W` = 64
+    lanes. bf16 values pack two per register.
+
+        q, do    R*d / 2W    loop-invariant B operands, one each
+        dq       R*d / W     the f32 accumulator, loop-carried
+        score    R*n / W     S and dP, one each, f32
+        ds       R*n / 2W    the packed bf16 B operand of GEMM3
+        a_tile   n*d / 2W    one fully materialised A operand (K, V or K-T)
+
+    **`a_tiles_live` is the one modelling choice**, and it is the only place
+    the compiler's judgement enters: the body reads three A tiles per KV block
+    and consumes each immediately, so the scheduler decides how many are alive
+    at once. `1` reproduces the measured VGPR count to within 4-30 registers at
+    every rung that does not spill (see `test_register_model_matches_measured`),
+    so the scheduler is in fact sinking two of the three.
+
+    What the model does **not** include is addressing, the DMA descriptors and
+    the loop scalars. Measured residual is 4-12 registers at two waves and
+    28-30 at four; it is left out rather than fitted, because a constant chosen
+    to make today's numbers work is not a prediction.
+
+    `store_db` adds the dB store's address arithmetic. Measured at +34 (four
+    waves) and +70 (two waves) -- itself wave-count-dependent and therefore
+    also not modelled, but recorded here because it is what tips head_dim 256
+    from zero spills into 14.
+    """
+    r, d, n, w = traits.ROWS_PER_WAVE, traits.HEAD_DIM, traits.BLOCK_N, traits.WARP_SIZE
+    terms = {
+        "q": r * d // (2 * w),
+        "do": r * d // (2 * w),
+        "dq_acc": r * d // w,
+        "score_s": r * n // w,
+        "score_dp": r * n // w,
+        "ds_packs": r * n // (2 * w),
+        "a_tiles": a_tiles_live * (n * d // (2 * w)),
+    }
+    if store_db:
+        # Not a term of its own: the dB store reads `ds_packs`, which is
+        # already counted. What it adds is address arithmetic, and that is the
+        # part the model declines to guess at.
+        pass
+    terms["total"] = sum(terms.values())
+    # The unified register file at one wave per SIMD. Above this the allocator
+    # spills, and B3 measured that it does so non-linearly -- head_dim 512 is
+    # 320 registers over and spills 546.
+    terms["over_512"] = max(0, terms["total"] - 512)
+    return terms
+
 
 # The rungs this kernel is built and tested for. B3 brings it to the forward's
 # `LADDER` in full; `tile_width_for` still owns the rounding rule, so a
@@ -80,8 +175,63 @@ class BwdDqTraits(ParityDualwaveTraits):
     # nothing else would keep them together.
     HDIM_VO_FLOOR: int = 0
 
+    # --- B3.5: the MFMA shape, named on all three axes -----------------------
+    #
+    # `(M, N, K)` of the one MFMA this body issues. Contract section 4 required
+    # the shape to be a trait rather than a literal; the parent carries only
+    # `D_CHUNK`, `K_STEP_QK` and `MFMA_LANE_K`, which at 32x32x16 happen to
+    # equal M, K and M*K/64 -- so today the shape is *inferable* from them and
+    # therefore not stated.
+    #
+    # **Three coincidences are load-bearing at 32x32x16 and none survives 16
+    # rows**, which is why the axes get separate names before anything moves:
+    #
+    #     MFMA_M == D_CHUNK          GEMM3's A operand M is the d chunk (32)
+    #     MFMA_M == BLOCK_N / 2      GEMM1's A operand M is the KV token, and
+    #                                a 64-token tile is exactly two M steps
+    #     MFMA_N == ROWS_PER_WAVE    the query row is the N axis of GEMM1 and
+    #                                GEMM3 both
+    #
+    # At 16x16x32 the first two part company from `D_CHUNK` and from
+    # `BLOCK_N/2` independently, and `MFMA_K` stops equalling `K_STEP_QK`.
+    # Defaults reproduce today exactly, so a build is unchanged.
+    MFMA_M: int = 32
+    MFMA_N: int = 32
+    MFMA_K: int = 16
 
-def make_bwd_dq_traits(*, store_db=False, hdim_vo_floor=0, **kwargs):
+    @property
+    def ACC_ELEMS(self):
+        """f32 accumulator elements one lane holds for one MFMA.
+
+        16 at 32x32x16, 4 at either 16-row shape. Every `range_constexpr(16)`
+        over a score half in the body is this number, and every one of them is
+        a different quarter of the kernel, so it is derived once here.
+        """
+        return self.MFMA_M * self.MFMA_N // self.WARP_SIZE
+
+    @property
+    def SCORE_MSTEPS(self):
+        """MFMA steps along the KV-token axis of one score tile.
+
+        2 at BLOCK_N 64 with a 32-row M extent -- the `lo`/`hi` pair the whole
+        softmax path is written around -- and 4 at a 16-row one. The pair is
+        spelled out as `s_lo, s_hi` in `flash_attn_utils`, so a shape that
+        makes this 4 needs that path generalised and not merely re-parameterised.
+        """
+        return self.BLOCK_N // self.MFMA_M
+
+    @property
+    def OPERAND_LANE_ELEMS(self):
+        """bf16 values one lane holds of an A or B operand, for one MFMA.
+
+        8 at 32x32x16 and at 16x16x32; **4** at 16x16x16. `MFMA_LANE_K` on the
+        parent is this same number, and it is kept separate here because the
+        parent's is tied to `K_STEP_QK`.
+        """
+        return self.MFMA_M * self.MFMA_K // self.WARP_SIZE
+
+
+def make_bwd_dq_traits(*, store_db=False, hdim_vo_floor=0, mfma_shape=(32, 32, 16), **kwargs):
     """`fmha_traits_gfx950.make_traits`, widened, and cut to **one** LDS buffer.
 
     Delegating rather than transcribing is the whole point: every derived
@@ -103,12 +253,49 @@ def make_bwd_dq_traits(*, store_db=False, hdim_vo_floor=0, **kwargs):
     staging of K was a B3 blocker rather than a B7 optimisation.
     """
     base = make_traits(**kwargs)
+    m, n, k = mfma_shape
+    if (m, n, k) not in MFMA_PASSES:
+        raise ValueError(f"unknown MFMA shape {mfma_shape}; add its gfx950 pass count to MFMA_PASSES first")
+    if (m, n, k) not in ((32, 32, 16), (16, 16, 32)):
+        # `16x16x16` is describable and half rate (see `MFMA_PASSES`), so it is
+        # refused rather than merely unbuilt: a family on it could not beat the
+        # 32-row one anywhere the 32-row one fits.
+        raise NotImplementedError(
+            f"the dQ body has two families, 32x32x16 and 16x16x32; {m}x{n}x{k} is neither. "
+            "16x16x16 is half rate on gfx950 and is deliberately not built."
+        )
+    if (m, n, k) == (16, 16, 32) and base.HEAD_DIM % 64:
+        # The 16-row `_kt_read_base` folds `tok_off(4 * group)` into
+        # `group * granule`, which holds only when `SMEM_N_RPT` divides 4 --
+        # true at granule 64 (`SMEM_N_RPT == 4` with `BLOCK_N` 32) and not at
+        # granule 32, where it is 2. The rungs off the 64 grid are all
+        # comfortably served by the 32-row family, so this is a real limit
+        # rather than a deferral, and it is refused where it is decided.
+        raise NotImplementedError(
+            f"the 16-row family is built for head_dim tiles that are multiples of 64, not "
+            f"{base.HEAD_DIM}: its transpose read assumes the granule-64 staging shape"
+        )
+    if (m, n, k) == (16, 16, 32) and base.BLOCK_N != 2 * m:
+        # `BLOCK_N / MFMA_M` is the number of score M-steps, and the softmax
+        # path in `flash_attn_utils` is an `(s_lo, s_hi)` *pair* rather than a
+        # list. Two is not a tuning choice here, it is the shape of shared
+        # production code -- and 32 is also what closes head_dim 512's last 40
+        # registers, which is why the cheap port and the register fix agree.
+        raise ValueError(
+            f"the 16-row family needs BLOCK_N {2 * m}, got {base.BLOCK_N}: the score tile must stay two "
+            "MFMA steps or the (s_lo, s_hi) pair in flash_attn_utils stops describing it"
+        )
+    if n != base.ROWS_PER_WAVE:
+        raise ValueError(f"MFMA N extent {n} must equal ROWS_PER_WAVE {base.ROWS_PER_WAVE}: the query row is N")
     carried = {f.name: getattr(base, f.name) for f in fields(base) if f.name != "LDS_KV_TOTAL_SIZE"}
     return BwdDqTraits(
         **carried,
         STORE_DB=bool(store_db),
         HDIM_VO_FLOOR=int(hdim_vo_floor),
         LDS_KV_TOTAL_SIZE=base.DUALWAVE_SWP_KV_PER_BUFFER,
+        MFMA_M=m,
+        MFMA_N=n,
+        MFMA_K=k,
     )
 
 
@@ -122,6 +309,11 @@ class BwdDqKnobs(Gfx950Knobs):
     """
 
     store_db: bool | None = None
+
+    # 32 or 16. The MFMA's N extent, which is the query rows one wave owns --
+    # `_with_wave_geometry` turns it into the shape and the KV tile together,
+    # because at 16 rows `BLOCK_N` is not free.
+    mfma_rows: int | None = None
 
     # The forward's list plus the two-wave points. **Not a relaxation of the
     # check** -- the check exists because `_k_dma_m0_base` assumes one DMA
@@ -137,6 +329,9 @@ class BwdDqKnobs(Gfx950Knobs):
     _SUPPORTED_GEOMETRIES = Gfx950Knobs._SUPPORTED_GEOMETRIES + (
         (2, 64, 64, 64),
         (2, 64, 64, 32),
+        # The 16-row family: BLOCK_M is `4 waves * 16 rows` and BLOCK_N is 32,
+        # so a KV tile is four lines and each of the four waves issues one DMA.
+        (4, 64, 32, 64),
     )
 
     def resolve(self, meta) -> "BwdDqKnobs":
@@ -262,9 +457,26 @@ class BwdDqKnobs(Gfx950Knobs):
             )
         if me.block_dmodel is None:
             raise ValueError("_with_wave_geometry runs after _with_widths; block_dmodel is not resolved")
+        # **384 and up.** Measured at `B=2 H=8 S=4096`, 16 rows against 32:
+        # 512 is 4.23x (116 -> 490 TF, 546 spills -> 0), 384 is 1.69x (303 ->
+        # 511), 256 is 1.04x, 192 is exactly level, and 128 and 64 are *worse*
+        # (0.94x, 0.86x). So the families split where the register file does,
+        # and the 32-row one keeps everything below 384 -- this is additive,
+        # not a replacement.
+        #
+        # 256 at 1.04x is inside the band the lore says a sweep cannot settle;
+        # it stays on the 32-row family because that is the incumbent, not
+        # because 4% was measured as a loss.
+        rows = me.mfma_rows if me.mfma_rows is not None else (16 if me.block_dmodel >= 384 else 32)
+        if rows == 16:
+            # BLOCK_N 32 for the reason `_with_traits` states, and four waves
+            # because the wide rungs need one wave per SIMD to see all 512
+            # registers -- which is the whole premise of the family.
+            return replace(me, num_waves=4, block_m=4 * 16, block_n=32, head_dim_granule=64, mfma_rows=16)
         waves = 2 if 128 <= me.block_dmodel <= 256 else 4
         return replace(
             me,
+            mfma_rows=32,
             num_waves=waves,
             # `ROWS_PER_WAVE` is pinned at the MFMA's M extent, so BLOCK_M is
             # derived rather than chosen -- `make_traits` raises on any other
@@ -287,6 +499,17 @@ class BwdDqKnobs(Gfx950Knobs):
             raise NotImplementedError(
                 f"the backward dQ kernel is built for head_dim tiles {BWD_DQ_LADDER}, not "
                 f"{self.block_dmodel}. head_dim {meta.head_dim} rounds to {tile_width_for(meta.head_dim)}."
+            )
+        if (self.mfma_rows or 32) == 16 and self.block_dmodel % 64:
+            # Before `make_traits`, which would otherwise raise first with a
+            # message about the granule and leave the caller to work out that
+            # the granule came from the family. `_kt_read_base` folds
+            # `tok_off(4 * group)` into `group * granule`, which needs
+            # `SMEM_N_RPT` to divide 4 -- true at granule 64, not at 32.
+            raise NotImplementedError(
+                f"the 16-row family is built for head_dim tiles that are multiples of 64, not "
+                f"{self.block_dmodel}: its transpose read assumes the granule-64 staging shape, and "
+                "the off-grid rungs are all served by the 32-row family anyway"
             )
         # Refused rather than ignored. Each of these would build and run and
         # return the right *shape*, which is the failure mode the whole
@@ -334,7 +557,9 @@ class BwdDqKnobs(Gfx950Knobs):
         self.staging_shape()
         self._check_helpers_support_geometry()
         num_kv_heads = meta.num_heads if meta.num_kv_heads is None else meta.num_kv_heads
+        shape = (16, 16, 32) if (self.mfma_rows or 32) == 16 else (32, 32, 16)
         traits = make_bwd_dq_traits(
+            mfma_shape=shape,
             store_db=bool(self.store_db),
             hdim_vo_floor=self._hdim_vo_floor(meta),
             num_heads=meta.num_heads,

@@ -1385,3 +1385,512 @@ of the two things that make 512 slow.
 - **`BLOCK_Q` is pinned at 64** by the transpose read covering four 16-row
   k-substeps. 128 would need eight -- describable, a second geometry to
   validate, not attempted.
+
+---
+
+## B3.5 probe result: **the transpose read does serve a 16-row A operand**
+
+Published for both kernels. The maps and the addressing live in
+`fmha_mfma16_gfx950.py`; `tooling/probe_tr16_lanemap_gfx950.py` measured them
+and is what to re-run if any of it is doubted. **Do not re-derive either.**
+
+Measured at head_dim 64, 96, 128, 192 and 256, at both staging granules
+(64 and 32), with a known-good control alongside every arm. Every arm 0 wrong.
+
+### 1. What the instruction does, measured with no assumptions
+
+Every lane given a *distinct* address, LDS holding a pattern that names its own
+`(token, d)` so the dump identifies its own source:
+
+```
+O[j][i] = M[16*(j//16) + 4*i + ((j % 16)//4)][j % 4]
+```
+
+`M[p][q]` is the `q`-th of the four 16-bit elements lane `p` addressed.
+Equivalently, source lane `4a + b` element `q` lands at lane `4b + q`, element
+`a`, inside its 16-lane group. Two things checked rather than assumed:
+**every lane's own address is honoured** (the hardware does not derive a block
+from one lane's), and **nothing crosses a 16-lane group** (0 of 256).
+
+So one read gives, per 16-lane group: 16 output lanes × 1 value of whatever the
+address varies with `lane % 4` and the element index × 4 values of whatever it
+varies with `(lane % 16) // 4`. **That is exactly `v_mfma_f32_16x16x16`'s A
+operand**, and two reads are `16x16x32`'s.
+
+### 2. The operand maps
+
+| shape | reads | per lane | `m` | `k` |
+|---|---|---|---|---|
+| `32x32x16` (today's) | 2 | 8 | `dc*32 + lane%32` | `16*sub + 4*(lane//32) + [0,1,2,3,8,9,10,11][i]` |
+| `16x16x16` | **1** | 4 | `c*16 + lane%16` | `4*(lane//16) + i` |
+| `16x16x32` | 2 | 8 | `c*16 + lane%16` | `8*(lane//16) + i` |
+
+**The 16-row maps carry no permutation on `k`**, where the 32-row one does and
+every consumer has to match it. `B[k][n]` and the accumulator `D[m][n]` are the
+same shape with `m`/`n` exchanged: `n = lane % 16`, and `m = 4*(lane//16) + i`
+for the four f32 — so **a lane's four accumulator rows are contiguous**, and
+the LSE/delta reads become one `dwordx4` instead of `_score_column_runs`' four
+spans.
+
+### 3. Confirmed end to end, not just as a lane map
+
+A real `v_mfma_f32_16x16x16` and `v_mfma_f32_16x16x32` with A taken straight out
+of the transpose read and B from global, against a host reference: 0 of 256
+accumulator elements wrong, at every width and granule above. A lane map can be
+self-consistent and still be the wrong operand; this is what rules that out.
+
+### 4. **AITER's correlation is not causal**
+
+Both 16-row shapes work from a **single** staged orientation. The four-LDS-tile
+problem does not come back, and the addendum's contingency is not needed. What
+AITER's hd64/hd192 kernels do is a layout choice of theirs.
+
+### 5. One trap, and it is the house speciality
+
+`tok_off` is **mixed-radix** -- `(t // N_RPT) * granule + (t % N_RPT) * LINE` --
+so `g * tok_off(q)` is **not** `tok_off(g*q)`. It happens to hold at `quad = 8`
+with `SMEM_N_RPT = 8`, because eight tokens is exactly one granule slot. So the
+naive linear group term makes `16x16x32` work on the first run and
+`16x16x16` silently wrong: lanes 32..63 address past the end of the tile and
+read zeros. Half the operand, finite, no diagnostic. Use `tok_off_dyn` for
+anything scaled by a runtime lane term.
+
+That is also a plausible reading of AITER's table, if their generator only had
+the linear form: `16x16x32`'s group stride is one slot and `16x16x16`'s is not.
+
+---
+
+## Outcome: B3.5/dQ, part 1 — the accounting, and the shape it selects
+
+The 16-row family is **not built**. This is the probe-independent half the
+addendum asked dQ to do first: the register accounting, the shape decision that
+follows from it, and the shape-only part of the layout change. All of it is
+committed as code and tests rather than prose, and none of it changes a single
+emitted instruction — the ISA at head_dim 128 and 512 is byte-identical to B3,
+same 260 and 512 VGPRs, same spill counts.
+
+### dQ at one shape, one accounting
+
+`B=2 H=8 S=4096` bf16 non-causal, GPU 6 idle at 40 °C, forward on `4·B·H·S²·d`,
+dQ on `6·…`, dK/dV on `8·…`, effective on `10·…` over the sum of the two
+backward times:
+
+| hdim | fwd | dK/dV | dQ | bwd eff | bwd/fwd |
+|---|---|---|---|---|---|
+| 64 | 816 | 710 | 828 | 540 | 3.78x |
+| 128 | 1033 | 662 | 700 | 484 | 5.34x |
+| 192 | 788 | 648 | 714 | 482 | 4.09x |
+| 256 | 742 | 439 | 728 | 378 | 4.90x |
+| 384 | 691 | 318 | **303** | 222 | 7.76x |
+| 512 | 452 | 269 | **110** | 119 | 9.52x |
+
+Same curve and same cliff as the coordinator's table. The wide rungs agree
+closely (384: 303 vs 297; 512: 110 vs 102); the mid rungs run **~15% lower** on
+this board (128: 700 vs 841, 256: 728 vs 858). Re-measured solo, one kernel per
+process, on an idle GPU 6: 810 / 711 / 762 at 64 / 128 / 256 — so it is not
+contention in the combined harness. Board or clock state; flagged rather than
+explained, and it does not affect the conclusion because it is uniform across
+the mid rungs and absent at the wide ones.
+
+### The register model, validated
+
+`register_demand()` in `fmha_tuning_bwd_dq_gfx950`. Every term is an exact
+count of what the algorithm holds — **nothing is fitted** — which is what
+licenses using it on a geometry that has never been built:
+
+    q, do    R*d / 2W      loop-invariant B operands
+    dq       R*d / W       the f32 accumulator, loop-carried
+    score    R*n / W       S and dP
+    ds       R*n / 2W      GEMM3's packed B operand
+    a_tile   n*d / 2W      one materialised A operand
+
+Against the B3 ISA dumps at the eight rungs that do not spill, it agrees to
+**−12…+14 registers** (`test_register_model_matches_measured`). The one
+modelling choice is `a_tiles_live=1`: the body reads three A tiles per KV block
+and the fit says the scheduler is sinking two of them. Addressing and DMA
+descriptors are left out rather than fitted.
+
+What it then predicts, and the reason this phase exists:
+
+| head_dim | R32/BN64 | R16/BN64 | R16/BN32 | file |
+|---|---|---|---|---|
+| 128 | 272 | 168 | 116 | 512 |
+| 256 | 464 | 296 | 212 | 512 |
+| 384 | **656** | 424 | 308 | 512 |
+| 512 | **848** | **552** | 404 | 512 |
+
+**16 rows finishes 384 outright and leaves 512 forty registers short.**
+`BLOCK_N` 32 closes it — and independently keeps `SCORE_MSTEPS` at 2, which is
+what lets the whole `(s_lo, s_hi)` pair structure in `flash_attn_utils` survive
+unchanged. The cheapest port and the register fix are the same choice; that
+convergence is the most useful thing in this section.
+
+### The shape: `16x16x32`, and it needed no probe
+
+From `SISchedule.td` under `SIDPGFX950FullSpeedModel` — the scheduling model,
+per the lore, not an ISA document:
+
+| shape | flops | passes | flops/pass |
+|---|---|---|---|
+| `16x16x16` | 8192 | 4 | **2048** |
+| `16x16x32` | 16384 | 4 | 4096 |
+| `32x32x16` | 32768 | 8 | 4096 |
+
+**`v_mfma_f32_16x16x16_bf16` is exactly half rate.** A 16-row family built on
+it cannot beat the 32-row family anywhere the 32-row family fits, and its
+ceiling is half the machine — so the addendum's "wait for the probe before
+committing to a shape" resolves without the probe for one of the three
+candidates. `16x16x32` gives 16 rows at full rate.
+
+It is also the cheaper port, which is a third argument: `OPERAND_LANE_ELEMS`
+stays 8, so `_pack_p_v8_slices`, `_bf16_trunc_pack_v8` and the v8 shape of
+every LDS read are unchanged. At `16x16x16` all of them become 4-wide. Both
+shapes are already dispatched by `fx.rocdl.MFMA(m, n, k, bf16)`, so neither
+needs C++ work. `test_the_16x16x16_shape_is_half_rate` pins the claim, because
+it is a claim about the toolchain.
+
+### Shape-only layout change, verified inert
+
+`BwdDqTraits` now names `MFMA_M/N/K` and derives `ACC_ELEMS`, `SCORE_MSTEPS`
+and `OPERAND_LANE_ELEMS`. Every literal in the dQ body that meant one of those
+— the `16`s over a score half, the `8`s over an operand pack, the `32` in the
+dB store's hi-half column offset — is now written as one. Three coincidences
+that are load-bearing today are now named apart, because none survives 16 rows:
+
+    MFMA_M == D_CHUNK        GEMM3's A operand M is the d chunk
+    MFMA_M == BLOCK_N / 2    a 64-token tile is exactly two M steps
+    MFMA_N == ROWS_PER_WAVE  the query row is the N axis of GEMM1 and GEMM3
+
+`make_bwd_dq_traits` accepts `mfma_shape` and **refuses anything but
+`(32,32,16)`**: the fields describe the shape, they do not yet select it, and a
+build that selected one would emit 32-row addressing under a 16-row MFMA.
+
+### Against the published probe
+
+`fmha_mfma16_gfx950` landed while this was being written and confirms the
+design, with two consequences specific to dQ:
+
+- The transpose read **does** serve a 16-row A operand from one staged tile, so
+  the four-LDS-tile risk does not materialise. AITER's zero-transpose
+  correlation is its own layout choice.
+- **The 16-row maps carry no permutation on the contraction index.** GEMM3
+  currently works because `cast_p`'s pack order happens to reproduce the 32-row
+  read's `k` permutation — an identity nothing checks. At 16 rows `dS` only has
+  to be in plain order, so that coincidence stops being load-bearing.
+
+### What is left, in dependency order
+
+`fmha_bwd_dq_gfx950`'s module docstring carries the list. In short: settle
+`BLOCK_N` 32 first (it decides whether the `(s_lo, s_hi)` pair survives), then
+`_seq_pad_score_threshold`, the `permlane32_swap` O store, and
+`_init_dualwave_q_row`'s `lane_mod_32`. All three of those live in
+`flash_attn_utils.py`, so each becomes an override here rather than an edit
+there.
+
+**Nothing measured yet at 16 rows**, and the 32-row path is untouched — 179
+tests pass, including the joint dQ + dK/dV check at all ten rungs.
+
+---
+
+## Outcome: B3.5/dQ, part 2 — the 16-row family, built
+
+`fmha_bwd_dq_m16_gfx950.py`. **`v_mfma_f32_16x16x32_bf16`, `BLOCK_N` 32, four
+waves**, selected by the default policy at head_dim 384 and above and by
+`mfma_rows=16` anywhere it is legal. Additive: nothing below 384 changed.
+
+### Measured, one shape, one accounting
+
+`B=2 H=8 S=4096` bf16 non-causal, idle GPU 6, forward on `4·B·H·S²·d`, dQ on
+`6·…`, dK/dV on `8·…`, effective on `10·…` over the sum of the two:
+
+| hdim | fwd | dK/dV | dQ | bwd eff | bwd/fwd | (dQ before) | (eff before) |
+|---|---|---|---|---|---|---|---|
+| 64 | 816 | 719 | 828 | 544 | 3.75x | 828 | 540 |
+| 128 | 1032 | 713 | 699 | 505 | 5.11x | 700 | 484 |
+| 192 | 789 | 759 | 702 | 524 | 3.76x | 714 | 482 |
+| 256 | 764 | 691 | 726 | 504 | 3.79x | 728 | 378 |
+| 384 | 698 | 419 | **508** | 324 | 5.39x | 303 | 222 |
+| 512 | 456 | 417 | **479** | 315 | **3.62x** | 110 | 119 |
+
+head_dim 512 was **11.55x** the forward when B3.5 opened and is **3.62x** now.
+dK/dV's own 16-row family landed in the same window, so the effective column
+moves for both reasons; the dQ column is this file's.
+
+Isolated, 16 rows against 32 at every rung:
+
+| hdim | 32 rows (vgpr/agpr/spill) | 16 rows (vgpr/agpr/spill) | 16/32 |
+|---|---|---|---|
+| 64 | 829 (190/0/0) | 711 (80/0/0) | 0.86x |
+| 128 | 689 (260/4/0) | 648 (132/0/0) | 0.94x |
+| 192 | 701 (360/104/0) | 701 (170/0/0) | 1.00x |
+| 256 | 732 (460/204/0) | 763 (216/0/0) | 1.04x |
+| 384 | 303 (512/256/**112**) | 511 (318/62/**0**) | **1.69x** |
+| 512 | 116 (512/256/**546**) | 490 (414/158/**0**) | **4.23x** |
+
+**Both cliffs were spills and nothing else** — every spill is gone, and the
+rungs that were already spill-free gain nothing or lose a little. That is why
+the policy splits at 384 rather than switching wholesale: 0.86x at head_dim 64
+is a real loss and 1.04x at 256 is inside the band the lore says a sweep cannot
+settle, so 256 stays on the incumbent.
+
+LDS halves again at the wide rungs (`BLOCK_N` 32): 99.8 -> 49.9 KB at 384,
+133.0 -> 66.5 at 512.
+
+### The model's score
+
+B3.5 part 1 predicted this geometry before it existed. Now it can be marked:
+
+| hdim | predicted | measured | residual |
+|---|---|---|---|
+| 64 | 68 | 80 | +12 |
+| 128 | 116 | 132 | +16 |
+| 192 | 164 | 170 | +6 |
+| 256 | 212 | 216 | +4 |
+| 384 | 308 | 318 | +10 |
+| 512 | 404 | 414 | +10 |
+
+**+4 to +16 registers, six rungs, same band and same sign as the 32-row fit.**
+The structural terms are exact and the residual is what the model declines to
+model (addressing, DMA descriptors, loop scalars).
+`test_register_model_predicted_the_16_row_family` keeps the score, so the next
+geometry can be argued for on the model's record rather than on its plausibility.
+
+### The one permutation, and the bug it hid
+
+The score accumulator gives lane `j` (group `g = j // 16`) tokens `{4g+e}` from
+`s_lo` and `{16+4g+e}` from `s_hi`. GEMM3's B operand wants 8 contraction
+values per lane and the published transpose map delivers `k = 8g + i`, which is
+a different set — so one of the two has to bend, exactly as in the 32-row
+family.
+
+**The transpose read bends.** Permuting GEMM1/GEMM2's token order instead would
+leave the accumulator holding a scrambled token map, which the KV tail mask and
+the dB store both read; bending one read keeps the natural map everywhere else.
+The order needed is `T(g, 4r + i) = 4g + 16r + i`, which is separable, so the
+group term becomes `4 * (lane // 16)` tokens instead of `8 * (lane // 16)` and
+the second read sits at `+16` tokens instead of `+4`.
+
+The `+16` is where the one real bug was: it was written `2 * MFMA16_M`, which
+reads past the tile and returns **finite garbage** — `1e20`-scale values mixed
+with a few correct ones at shifted columns. Caught in the first run because a
+handful of outputs matched the reference at the *wrong* column, which is the
+signature of a permutation rather than of arithmetic.
+
+### What made it cheap, and what it cost
+
+Cheap, in the order it mattered:
+
+- **The LDS staging is untouched.** K still goes to the V region and V to the
+  K region; only the register reads changed.
+- **`OPERAND_LANE_ELEMS` stays 8** at `16x16x32`, so `_bf16_trunc_pack_v8` and
+  the v8 shape of every read carry over. At `16x16x16` they would all be
+  4-wide — a third argument for the shape, beyond half rate.
+- **`BLOCK_N` 32 keeps `SCORE_MSTEPS` at 2**, so the `(s_lo, s_hi)` pair that
+  `flash_attn_utils` *is written around* still describes the score tile. That
+  file is shared production code; the alternative was overriding a structure
+  four kernels depend on.
+- **No `permlane32_swap` in the store.** At 16 rows a lane's four accumulator
+  elements are four *contiguous* d columns of one query row, so the dQ store is
+  one 8-byte write per chunk where the 32-row path needs a cross-lane
+  transpose.
+
+The costs, stated plainly:
+
+- **The off-grid rungs are refused** (`32, 96, 160, 224`). `_kt_read_base`
+  folds `tok_off(4 * group)` into `group * granule`, which needs `SMEM_N_RPT`
+  to divide 4 — true at granule 64, not at granule 32 where it is 2. Those
+  rungs are all comfortably served by the 32-row family, so this is a limit
+  rather than a deferral, and it is refused by name.
+- **Everything shaped by the accumulator had to be re-spelled** —
+  `_score_pair_to_lists`, `_sub_score_pair`, `_exp2_score_slice`,
+  `_pack_p_v8_slices` all hardcode 16 where this family needs 4. Each is a
+  handful of lines in `M16DqSoftmax`; none could be parameterised in place,
+  because `flash_attn_utils` is not editable.
+
+### Gates
+
+188 tests, no skips: full ladder both families, 8xD contract, padded heads with
+a poisoned pad, asymmetric hdim, dB at every rung, the rows-per-wave ceiling,
+and the joint dQ + dK/dV autograd check at all ten rungs. The 32-row path is
+byte-identical where it is still selected. Style clean.
+
+### Still not done
+
+- **dQ at 384/512 is now ~500 TF against ~730 in the middle of the ladder**, so
+  the family closed the cliff without closing the gap. Both rungs are now
+  spill-free, so the next lever is not registers — it is the KV tile: `BLOCK_N`
+  32 halves the work per barrier pair, and this body still has no software
+  pipelining and one tile in flight.
+- **head_dim 128 and 64 are slightly worse at 16 rows** (0.94x, 0.86x) and are
+  left on the 32-row family. Worth understanding rather than routing around, if
+  the two families are ever to be one.
+- `dB` unchanged. Causal, windows, varlen, dropout and bias input still refused
+  by name.
+
+---
+
+## Outcome: B3.5 — dK/dV, the 16-row family *(`v_mfma_f32_16x16x32`)*
+
+Files: `fmha_mfma16_gfx950.py` (the published maps),
+`fmha_bwd_dkdv_m16_gfx950.py` (the body),
+`tooling/probe_tr16_lanemap_gfx950.py` (the probe), plus the family selector in
+`fmha_bwd_dkdv_gfx950.py` and `fmha_tuning_bwd_dkdv_gfx950.py`. 155 tests, all
+passing, no skips.
+
+The probe result is published separately above, under **"B3.5 probe result"**;
+this section is what was built on it.
+
+### Measured, at one shape with one accounting
+
+`B=2 H=8 S=4096` bf16 non-causal, GPU 5 idle, all three kernels in one session.
+Nominal TFLOP/s per kernel's own GEMM count; "bwd effective" is the five GEMMs
+the maths requires over the two kernels' combined time,
+`5 / (4/dkdv + 3/dq)`.
+
+| hdim | fwd | dK/dV | dQ | bwd eff | bwd/fwd | rows |
+|---|---|---|---|---|---|---|
+| 32 | 515 | 504 | 576 | 380 | 1.35x | 32 |
+| 64 | 760 | 735 | 767 | 535 | 1.42x | 32 |
+| 96 | 812 | 733 | 878 | 563 | 1.44x | **16** |
+| 128 | 1028 | 775 | 766 | 551 | 1.87x | **16** |
+| 160 | 801 | 735 | 742 | 527 | 1.52x | 32 |
+| 192 | 838 | **849** | 778 | 584 | 1.44x | **16** |
+| 224 | 848 | 799 | 768 | 561 | 1.51x | 32 |
+| 256 | 847 | **743** | 820 | 553 | 1.53x | **16** |
+| 384 | 768 | **423** | 524 | 329 | 2.33x | **16** |
+| 512 | 520 | **429** | 491 | 324 | 1.61x | **16** |
+
+Against the entry numbers, dK/dV alone: 472 → 743 at 256 (**1.57x**), 326 → 423
+at 384 (1.30x), 271 → 429 at 512 (**1.58x**). `bwd/fwd` was 3.36x at best and
+11.55x at 512; it is now **1.35x to 2.33x**, inside the ~2.5x that flash
+attention's backward normally costs, at every rung.
+
+### `16x16x16` was built first, and it is half rate
+
+Worth recording because the addendum left the shape open. The family was
+implemented on `16x16x16`, was correct on its first run, and measured **280
+TFLOP/s at head_dim 64 against the 32-row family's 713**. `SISchedule.td`'s
+`SIDPGFX950FullSpeedModel` says why -- `16x16x16` and `16x16x32` are both
+`Write4PassMAI`, so the narrow-K shape does half the FLOPs in the same passes:
+
+| shape | FLOPs | passes | FLOPs/pass |
+|---|---|---|---|
+| `16x16x16` | 8192 | 4 | **2048** |
+| `16x16x32` | 16384 | 4 | 4096 |
+| `32x32x16` | 32768 | 8 | 4096 |
+
+Rebuilding on `16x16x32` took head_dim 64 from 280 to 605 -- the 2.15x is the
+rate, and the residual gap to the 32-row family was `BLOCK_KV`. **A 16-row
+family on `16x16x16` cannot beat a 32-row one anywhere the 32-row one fits**,
+because its ceiling is half the machine. It also completes the AITER reading:
+its `16x16x16`-only kernels are simply an older generation at half rate.
+
+### The one thing that did not line up, and why it cost nothing
+
+The `16x16x32` B operand wants eight contraction values per lane,
+`k = 8*(lane//16) + i`, while a `16x16` accumulator holds four,
+`m = 4*(lane//16) + i`. So `P` for a 32-row q group has to come from **two**
+score accumulators -- and the halves do not pair: lane group `g` needs
+`q = 8g..8g+7`, and sub-blocks 0 and 1 offer it `4g..4g+3` and `16+4g..+3`.
+Half the values sit in a *different quarter wave*, which a `permlane` could fix
+and should not have to.
+
+It does not have to, because **which q row lands on which accumulator row is
+ours to choose**: the score GEMM's A operand is the staged Q tile, read at a
+per-lane row index. Feeding sub-block `s` the permutation
+`q(m) = 8*(m//4) + (m%4) + 4*s` makes the accumulator hold
+`q = 8*(lane//16) + i + 4*s`, so the two halves concatenate into
+`k = 8*(lane//16) + 0..7` exactly. A different address, not a shuffle, and
+loop-invariant. It also leaves a lane's four rows **contiguous**, so the LSE
+and delta reads stay one `dwordx4` each.
+
+The general lesson, and it is reusable: **when an accumulator's row map and an
+operand's contraction map disagree, check whether the operand that *produced*
+the accumulator can be permuted instead.** The forward's 32-row path gets the
+same alignment by coincidence; this one gets it by construction.
+
+### `BLOCK_Q` became a per-rung knob, and it is worth 1.5x at 512
+
+The 32-row family's transposed operand spans 64 q rows, so `BLOCK_Q` was
+pinned there. The 16-row family's spans 32, so it can take either -- and at the
+wide rungs it wants 32:
+
+| head_dim | `BLOCK_Q` 64 | `BLOCK_Q` 32 |
+|---|---|---|
+| 256 | 642 TF (8 waves) | **671** (4 waves) |
+| 384 | 405 TF, 0 spills | 406 |
+| 512 | 280 TF, **36 spills**, 1 buffer | **416**, 0 spills, 2 buffers |
+
+Half the transposed reads are live at once, and the halved LDS buys the second
+stream buffer back -- so the prefetch distance returns at exactly the width
+that had lost it. This is the knob that removed the last spills anywhere in the
+kernel: **every rung now compiles with zero scratch.**
+
+### No rung shards any more, and none is single-buffered
+
+`DKV_SHARDS` was B3's answer to head_dim 256+ and it cost `BLOCK_KV` and
+recomputed S and dP. The 16-row family's `0.75 * d` fits unsharded everywhere,
+so the table selects `shards = 1` at every rung, and with `BLOCK_Q` 32 at the
+wide ones nothing needs single-buffering either. Both mechanisms stay in the
+code -- they are what the 32-row family uses if it is ever selected at a wide
+rung -- but nothing reaches them.
+
+### Where each family wins, decided by interleaved A/B
+
+Every choice below 10% went through interleaved single-GPU A/B at the reporting
+shape, nine reps, rather than through the sweep. The sweep and the A/B
+**disagreed at head_dim 96** -- the sweep shape (`B=4 H=8 S=4096`) preferred 32
+rows by 7% and the A/B at `B=2 H=8 S=4096` preferred 16 rows by 16% -- which is
+P7's lesson arriving again from a new direction: not just "a sweep can be
+noisy" but "a sweep at another shape is measuring another question."
+
+| head_dim | 32 rows | 16 rows | picked |
+|---|---|---|---|
+| 32 | **540** | 514 | 32 |
+| 64 | **759** | 709 | 32 |
+| 96 | 665 | **773** | 16 |
+| 128 | 740 | **815** | 16 |
+| 160 | **773** | 672 | 32 |
+| 192 | 725 | **873** | 16 |
+| 224 | **790** | 409 | 32 |
+| 256 | 469 | **762** | 16 |
+| 384 | 221 | **424** | 16 |
+| 512 | 173 | **428** | 16 |
+
+The 32-row family keeps 32, 64, 160 and 224. **96, 160 and 224 are the
+granule-32 rungs**, and two of the three go to 32 rows for a structural reason
+rather than a tuning one: at granule 32 the staged tile has `SMEM_N_RPT = 4`
+lines, so the wave count cannot exceed 4, and the 16-row family's `BLOCK_KV` is
+then capped at 64 against the 32-row family's 128. 224 pays 2x for that (409
+against 790). `BLOCK_Q` 128 would restore `SMEM_N_RPT = 8` and is the obvious
+thing to try; it was not, because the 32-row family already wins there.
+
+### The 32-row path did not regress
+
+The gate, checked two ways. **Register allocation is byte-identical** to the B3
+commit at head_dim 32, 64, 160 and 224 (150/0/0, 232/0/0, 356/100/0, 486/230/0
+for vgpr/agpr/spills), and the instruction count moved by +2 of 1769 at 64 --
+VALU redistribution from `store_accs` taking its row from the context rather
+than an argument. Interleaved cross-process A/B against the B3 build, five
+alternating reps: head_dim 64 gives 202.3 against 203.2 us and head_dim 224
+gives 645.3 against 641.2, both inside the run-to-run spread and in opposite
+directions.
+
+### Coverage does not depend on the tuning policy
+
+`test_both_mfma_families_at_every_rung` pins **both** families at all ten rungs,
+20 builds. Testing only what `_GEOMETRY` selects would leave the 32-row family
+covered at four rungs today and at a different four after the next tuning
+change, which is a coverage hole that moves.
+
+### Not done
+
+- **`BLOCK_Q` 128 at the granule-32 rungs.** It would lift the 16-row family's
+  wave cap from 4 to 8 there, and 224 is the rung that would benefit (409
+  against 790). Not attempted; the 32-row family wins those today.
+- **No software pipeline** in either family: one tile in flight, two barriers
+  per tile.
+- **head_dim 384 is the worst rung left at 2.33x**, and unlike 512 it is not
+  obviously register-bound -- 352 VGPR, 96 AGPR, zero spills. It is the one
+  place a profile would be worth more than another knob.
+- Causal, windows, varlen, dropout, bias input and GQA remain refused by name.

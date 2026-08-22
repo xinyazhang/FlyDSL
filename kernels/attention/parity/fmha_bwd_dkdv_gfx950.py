@@ -110,6 +110,7 @@ left to accrete.
 import weakref
 
 import fmha_abi_gfx1201 as abi
+import fmha_bwd_dkdv_m16_gfx950 as m16
 from fmha_common_gfx1201 import MaskedAxis
 from fmha_dualwave_gfx950 import (
     ParityGemmHelper,
@@ -358,10 +359,19 @@ class BwdDkDvKernelContext(ParityKernelContext):
         self.dkv_col_base = self.dkv_shard_id * fx.Index(traits.D_CHUNKS_PER_SHARD * traits.D_CHUNK)
 
     def init_kv_row(self):
-        """The 32 KV rows this wave owns. `init_q_row`'s arithmetic, renamed."""
+        """The KV rows this wave owns: `ROWS_PER_WAVE` of them, at `lane % rows`.
+
+        `init_q_row`'s arithmetic at 32 rows, where `lane_mod_32` is already the
+        row selector. The 16-row family's accumulator puts `n` on `lane % 16`,
+        so the row it names is a different one.
+        """
         self.init_q_row()
-        self.kv_row_in_block = self.q_row_in_block
-        self.kv_row = self.q_row
+        rows = self.traits.MFMA_ROWS
+        if const_expr(rows == 32):
+            self.kv_row_in_block = self.q_row_in_block
+        else:
+            self.kv_row_in_block = self.wave_kv_offset + self.lane % fx.Index(rows)
+        self.kv_row = self.kv_start + self.kv_row_in_block
 
     # -- descriptors -------------------------------------------------------
 
@@ -444,6 +454,25 @@ class BwdDkDvKernelContext(ParityKernelContext):
         )
         self.o_div = self.dk_div
 
+        # Raw bounded resources over the same four slabs, for the 16-row
+        # family's 64-bit loads and stores. A `_slab_view` carries a copy atom
+        # whose width is fixed at 128 bits; these take an element offset and a
+        # width per access, and they bound identically -- `rows * stride_seq`
+        # elements, so a row past the sequence reads zero and a store to one is
+        # dropped.
+        self.k_res_rsrc = self._slab_rsrc(
+            self.K, self.stride_k_batch, self.stride_k_head, self.stride_k_seq, self.kv_head_idx, self.seqlen_kv_v
+        )
+        self.v_res_rsrc = self._slab_rsrc(
+            self.V, self.stride_v_batch, self.stride_v_head, self.stride_v_seq, self.kv_head_idx, self.seqlen_kv_v
+        )
+        self.dk_rsrc = self._slab_rsrc(
+            self.DK, self.stride_dk_batch, self.stride_dk_head, self.stride_dk_seq, self.kv_head_idx, self.seqlen_kv_v
+        )
+        self.dv_rsrc = self._slab_rsrc(
+            self.DV, self.stride_dv_batch, self.stride_dv_head, self.stride_dv_seq, self.kv_head_idx, self.seqlen_kv_v
+        )
+
         self.k_res_elem_base = self.kv_start * self.stride_k_seq_v
         self.v_res_elem_base = self.kv_start * self.stride_v_seq_v
         # First element past each output's descriptor. A store redirected here
@@ -462,6 +491,15 @@ class BwdDkDvKernelContext(ParityKernelContext):
         head_bytes = self.batch_idx * per_batch_bytes + self.q_head_idx * row_bytes
         self.lse_rsrc = dualwave._make_ws_rsrc(fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))), head_bytes, row_bytes)
         self.delta_rsrc = dualwave._make_ws_rsrc(fx.Int64(fx.ptrtoint(fx.get_iter(self.Delta))), head_bytes, row_bytes)
+
+    def _slab_rsrc(self, tensor, s0, s1, s2, head_idx, rows):
+        """A raw buffer resource over one (batch, head) slab, bounded at `rows`."""
+        span_bytes = rows * fx.Index(s2) * fx.Index(self.traits.BF16_BYTES)
+        return dualwave._make_ws_rsrc(
+            fx.Int64(fx.ptrtoint(fx.get_iter(tensor))),
+            self._slab_byte_base(s0, s1, s2, fx.Index(0), head_idx),
+            span_bytes,
+        )
 
     # -- bounds ------------------------------------------------------------
 
@@ -525,8 +563,12 @@ class BwdDkDvResidentLoader(dualwave.DualwaveKernelContext):
     K on the hot path and measured 27-54% for it.
     """
 
-    def load_rows(self, div, elem_base, stride_seq, row_in_block, hdim):
+    def load_resident(self, which, hdim):
         traits = self.traits
+        div = self.k_res_div if which == "k" else self.v_res_div
+        elem_base = self.k_res_elem_base if which == "k" else self.v_res_elem_base
+        stride_seq = self.stride_k_seq_v if which == "k" else self.stride_v_seq_v
+        row_in_block = self.kv_row_in_block
         cols = None
         if const_expr(self.PADDED_HEAD):
             # Loop-invariant and dead immediately after the prologue, so the
@@ -774,7 +816,7 @@ class BwdDkDvStoreHelper(dualwave.DualwaveStoreHelper):
     extent are parameters, because two output tensors go through one helper.
     """
 
-    def store_accs(self, accs, div, row, stride_seq, hdim, oob_off):
+    def store_accs(self, accs, which, hdim):
         """Store this wave's `D_CHUNKS_PER_SHARD` chunks of one output.
 
         **Address the chunk from its global column, not its local one.** Under
@@ -786,7 +828,10 @@ class BwdDkDvStoreHelper(dualwave.DualwaveStoreHelper):
         absolute error, finite and with no fault.
         """
         traits = self.traits
-        base = row * stride_seq + self.dkv_col_base + self.lane_div_32 * fx.Index(8)
+        div = self.dk_div if which == "dk" else self.dv_div
+        stride_seq = self.stride_dk_seq_v if which == "dk" else self.stride_dv_seq_v
+        oob_off = self.dk_oob_off if which == "dk" else self.dv_oob_off
+        base = self.kv_row * stride_seq + self.dkv_col_base + self.lane_div_32 * fx.Index(8)
         cols = MaskedAxis(fx.Index(hdim)) if const_expr(self.PADDED_HEAD) else None
         for dc in range_constexpr(traits.D_CHUNKS_PER_SHARD):
             for g in range_constexpr(2):
@@ -935,6 +980,8 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
     STRIDES_CONSTEXPR = knobs.strides_constexpr
     BUILD_SM_SCALE = meta.sm_scale
     NBUF = traits.NUM_STREAM_BUFFERS
+    # Which MFMA family this build is. See `fmha_bwd_dkdv_m16_gfx950`.
+    M16 = traits.MFMA_ROWS == 16
     # One knob for the whole register-against-ILP trade; see
     # `BwdDkDvTileBody._row_reader` and `_with_register_pressure`.
     TIGHT_REGISTERS = knobs.tight_registers
@@ -948,7 +995,7 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         STRIDES_CONSTEXPR,
         BUILD_SM_SCALE,
         (knobs.num_waves, knobs.block_kv, knobs.block_q, knobs.head_dim_granule),
-        (knobs.dkv_shards, NBUF, knobs.waves_per_eu, TIGHT_REGISTERS),
+        (knobs.dkv_shards, NBUF, knobs.waves_per_eu, TIGHT_REGISTERS, traits.MFMA_ROWS),
     )
 
     _lds_elem_dtype = dualwave.dtype_to_elem_type(traits.DTYPE_STR)
@@ -1090,37 +1137,52 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         ctx.c_one_f = fx.Float32(1.0)
 
         stream = BwdDkDvStreamLoader(ctx)
-        reader = BwdDkDvStreamReader(ctx)
-        reader.masked_steps = MASKED_STEPS
-        resident = BwdDkDvResidentLoader(ctx)
-        gemm = BwdDkDvGemmHelper(ctx)
-        softmax = BwdDkDvSoftmaxHelper(ctx)
-        store = BwdDkDvStoreHelper(ctx)
-        tile = BwdDkDvTileBody(
-            ctx,
-            stream=stream,
-            reader=reader,
-            gemm=gemm,
-            softmax=softmax,
-            hdim_qk=hdim_qk,
-            hdim_vo=hdim_vo,
-            tight_registers=TIGHT_REGISTERS,
-        )
+        if const_expr(M16):
+            # The 16-row family. Same `run` signature, same barriers, same
+            # prefetch discipline -- only the operand algebra differs, which is
+            # why the loop below does not know which family it is driving.
+            reader = m16.M16StreamReader(ctx)
+            reader.init16(HDIM_QK_FLOOR)
+            resident = m16.M16ResidentLoader(ctx)
+            gemm = m16.M16GemmHelper(ctx)
+            gemm.init16()
+            softmax = m16.M16SoftmaxHelper(ctx)
+            store = m16.M16StoreHelper(ctx)
+            tile = m16.M16TileBody(
+                ctx, stream=stream, reader=reader, gemm=gemm, softmax=softmax, hdim_qk=hdim_qk, hdim_vo=hdim_vo
+            )
+            n_acc = m16.d_chunks16(traits)
+            zero_acc = Vec.filled(m16.ACC16, 0.0, fx.Float32).ir_value()
+            acc_width = m16.ACC16
+        else:
+            reader = BwdDkDvStreamReader(ctx)
+            reader.masked_steps = MASKED_STEPS
+            resident = BwdDkDvResidentLoader(ctx)
+            gemm = BwdDkDvGemmHelper(ctx)
+            softmax = BwdDkDvSoftmaxHelper(ctx)
+            store = BwdDkDvStoreHelper(ctx)
+            tile = BwdDkDvTileBody(
+                ctx,
+                stream=stream,
+                reader=reader,
+                gemm=gemm,
+                softmax=softmax,
+                hdim_qk=hdim_qk,
+                hdim_vo=hdim_vo,
+                tight_registers=TIGHT_REGISTERS,
+            )
+            n_acc = traits.D_CHUNKS_PER_SHARD
+            zero_acc = ctx.c_zero_v16f32
+            acc_width = 16
 
-        zero_acc = ctx.c_zero_v16f32
         t_end = ctx.split_t_end
-        n_acc = traits.D_CHUNKS_PER_SHARD
-        scale_vec = Vec.from_elements([ctx.c_sm_scale], fx.Float32).broadcast_to(16)
+        scale_vec = Vec.from_elements([ctx.c_sm_scale], fx.Float32).broadcast_to(acc_width)
 
         @flyc.jit
         def _dkdv_body():
             """K/V resident, Q/dO streaming, two tiles per iteration."""
-            v_k = resident.load_rows(
-                ctx.k_res_div, ctx.k_res_elem_base, ctx.stride_k_seq_v, ctx.kv_row_in_block, hdim_qk
-            )
-            v_v = resident.load_rows(
-                ctx.v_res_div, ctx.v_res_elem_base, ctx.stride_v_seq_v, ctx.kv_row_in_block, hdim_vo
-            )
+            v_k = resident.load_resident("k", hdim_qk)
+            v_v = resident.load_resident("v", hdim_vo)
 
             # Prime every buffer. From here each tile's DMA is issued by the
             # body `NUM_STREAM_BUFFERS` tiles earlier, so this is the only
@@ -1160,8 +1222,8 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             # a linear factor commutes with the accumulation.
             for dc in range_constexpr(n_acc):
                 dk[dc] = dualwave._fmul(Vec(dk[dc]), scale_vec, ctx.fm_fast)
-            store.store_accs(dv, ctx.dv_div, ctx.kv_row, ctx.stride_dv_seq_v, hdim_vo, ctx.dv_oob_off)
-            store.store_accs(dk, ctx.dk_div, ctx.kv_row, ctx.stride_dk_seq_v, hdim_qk, ctx.dk_oob_off)
+            store.store_accs(dv, "dv", hdim_vo)
+            store.store_accs(dk, "dk", hdim_qk)
 
         _dkdv_body()
 

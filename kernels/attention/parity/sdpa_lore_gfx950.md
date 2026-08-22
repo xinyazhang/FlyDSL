@@ -406,3 +406,41 @@ head_dim 96 is a normal rung again.
   duplicated across all of them instead of distinct work being spread over
   them. Head-fastest wins on both the forward and the backward, for opposite
   reasons; do not port the *reason*.
+- **An MFMA shape's rate is FLOPs per *pass*, not FLOPs.** `SISchedule.td`'s
+  per-subtarget model is the only place this is written down, and on gfx950
+  `V_MFMA_.32_16X16X16` and `V_MFMA_.32_16X16X32` are both `Write4PassMAI`
+  while `V_MFMA_.32_32X32X16` is `Write8PassMAI` -- so the narrow-K 16-row
+  shape is **half rate** and the other two are equal. A 16-row family built on
+  `16x16x16` measured 280 TFLOP/s where a 32-row one measured 713; rebuilding
+  it on `16x16x32` took it to 605 on the same code. Look the pass count up
+  before choosing a shape, in the model for *your* subtarget: this is the same
+  file the lore already says decides whether an MFMA is 8-pass or 16-pass, and
+  it decides the shape choice too.
+- **A ratio of rates is not a ratio of times, and one of them flatters.** The
+  backward's headline was reported as "bwd/fwd 1.35x-2.33x, inside the ~2.5x
+  norm". The column was `fwd_TFLOPs / bwd_effective_TFLOPs`; the wall-clock
+  ratio at the same rungs is **3.4x-6.1x**. The two differ by exactly the FLOP
+  ratio the backward does more of -- ten GEMM-equivalents against the forward's
+  four -- so a rate ratio *looks* like it clears a 2.5x wall-clock norm
+  precisely because it has already divided by 2.5. Both numbers are meaningful
+  and they answer different questions: the rate ratio says how well the
+  backward uses the machine, the time ratio says what a training step pays.
+  Label which one, and sanity-check that a claimed wall-clock ratio is
+  computable from times alone.
+- **A disassembly correlation is not a hardware constraint.** AITER's kernels
+  that use `16x16x16` exclusively issue zero `ds_read_b64_tr_b16`, and the ones
+  with hundreds of them use the wide-K shapes -- which reads as "the transpose
+  does not serve a 16-row operand" and is false. It serves both 16-row shapes
+  from a single staged orientation, measured end to end. The correlation was
+  with AITER's own generation, not with the instruction. When a competitor's
+  ISA is the only evidence, the probe is cheaper than the inference.
+- **When an accumulator's row map and an operand's contraction map disagree,
+  permute the operand that produced the accumulator.** A `16x16` accumulator
+  holds four rows per lane and a `16x16x32` B operand wants eight contraction
+  values, so `P` has to come from two accumulators -- and the halves land in
+  different quarter waves, which looks like a `permlane`. It is not: *which*
+  row lands on which accumulator row is set by the A operand's per-lane row
+  index, so a different read address makes the two halves concatenate exactly.
+  Free, loop-invariant, and it also keeps the accumulator's rows contiguous for
+  the row-tensor loads. Check the producer's addressing before reaching for a
+  cross-lane op.

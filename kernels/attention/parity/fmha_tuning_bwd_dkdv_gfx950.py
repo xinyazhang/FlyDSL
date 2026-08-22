@@ -74,11 +74,12 @@ __all__ = [
 # masked, which is what `padded_head` records.
 LADDER = (32, 64, 96, 128, 160, 192, 224, 256, 384, 512)
 
-# The streamed tile is always 64 q rows: `ds_read_b64_tr_b16` covers 16 rows per
-# k-substep and the MFMA takes four of them, so 64 is what one pass of the
-# transposed operand spans. A 128-row tile would need eight substeps -- legal,
-# and a second geometry to validate; not built.
-DEFAULT_BLOCK_Q = 64
+# Q rows one streamed tile carries. 64 is what one pass of the 32-row family's
+# transposed operand spans (four 16-row k-substeps); the 16-row family's spans
+# 32, so it can take either, and at the wide rungs it wants 32 -- half the
+# transposed reads live at once, and the halved LDS buys the second stream
+# buffer back. Measured at head_dim 512: 280 TFLOP/s at 64 with 36 spills, 416
+# at 32 with none. Per-rung in `_GEOMETRY`.
 
 # The addressable LDS cap. Measured elsewhere, not inferred: the compiler
 # reports "local memory (N) exceeds limit (163840)" and says nothing about
@@ -101,79 +102,84 @@ LDS_CAP_BYTES = 163840
 # MFMAs rather than gathered first.
 
 
-# (num_waves, waves_per_eu, dkv_shards) by tile width. `BLOCK_KV` follows as
-# `32 * num_waves / shards` and is *not* stored beside them; see
-# `_with_geometry`.
+# `(num_waves, waves_per_eu, dkv_shards, mfma_rows, block_q)` by tile width.
+# `BLOCK_KV` follows as `mfma_rows * num_waves / shards` and is *not* stored
+# beside them; see `_with_geometry`.
 #
-# **The AGPR cliff is the first lever and it decided head_dim 128**, which
-# carries two accumulators where the forward carries one. At 8 waves (2 per
-# SIMD) a wave may address 256 registers *in total*, so the allocator cannot
-# reach the AGPR file at all and spills to scratch instead:
+# **Four levers, found in this order, and each one reframed the last.**
 #
-#   head_dim  waves  waves_per_eu  AGPR  spills   TFLOP/s
-#     128       8         2          0    118       444
-#     128       4         2          0    126       403
-#     128       4         1          -      -       721
-#     128       2         2        108      0       788
+# 1. **The AGPR cliff** (B1). At 8 waves -- 2 per SIMD -- a wave may address
+#    256 registers *in total*, so the allocator cannot reach the AGPR file at
+#    all and spills to scratch instead. At head_dim 128, 8 waves gave 0 AGPRs
+#    and 118 spills at 444 TFLOP/s; 2 waves gave 108 AGPRs, no spills, 788. And
+#    at 4 waves the only thing between 403 and 721 was the occupancy *hint*:
+#    sweep `(num_waves, waves_per_eu)` as a pair, never the wave count alone. A
+#    build at 0 AGPRs with a nonzero spill count is not short of registers, it
+#    is forbidden from using half of them.
 #
-# Note the third row: at 4 waves the only thing between 403 and 721 TF is the
-# occupancy *hint*. Sweep the pair, never the wave count alone. A build at 0
-# AGPRs with a nonzero spill count is not short of registers, it is forbidden
-# from using half of them.
+# 2. **`BLOCK_KV` is a bandwidth lever** (B3). Every workgroup streams the whole
+#    of Q and dO for its head, so the read traffic is `seqlen / BLOCK_KV`
+#    copies of that slab. Raising the wave count while still at one wave per
+#    SIMD is free traffic relief -- head_dim 160 went 408 -> 690 TF and 224 went
+#    486 -> 723, with the register allocation unchanged. It also reframes
+#    `dkv_shards`, which *divides* `BLOCK_KV` and so pays this back at the same
+#    time as it buys accumulator space.
 #
-# **The second lever is `BLOCK_KV`, and B3 found it matters more than the
-# first above head_dim 128.** Every workgroup streams the whole of Q and dO
-# for its head, so the read traffic is `seqlen / BLOCK_KV` copies of that slab
-# -- and `BLOCK_KV` is `32 * waves / shards`, so *raising* the wave count is
-# free traffic relief whenever the registers still fit at one wave per SIMD:
+# 3. **16 rows per wave** (B3.5). The loop invariant is `0.75 * d` rather than
+#    `1.5 * d`, which fits at head_dim 512 unsharded -- removing the duplicated
+#    S/dP *and* doubling `BLOCK_KV` at once. It must be `16x16x32`:
+#    `16x16x16` is `Write4PassMAI` for half the FLOPs, i.e. half rate, and a
+#    family built on it measured 280 TF at head_dim 64 against 713.
 #
-#   head_dim  waves  BLOCK_KV   TFLOP/s
-#     160       2       64        408
-#     160       4      128        690      <- same registers per wave, half the traffic
-#     224       2       64        486
-#     224       4      128        723
+# 4. **`BLOCK_Q`** (B3.5). The 16-row transposed operand spans 32 q rows rather
+#    than 64, so it can take either -- and at the wide rungs 32 halves the live
+#    transposed reads and buys the second stream buffer back. head_dim 512:
+#    280 TF with 36 spills at `BLOCK_Q` 64, 416 with none at 32.
 #
-# That is why every rung but 128 lands on 4 waves. 8 crosses back over the
-# cliff (2 waves per SIMD) and is worse everywhere it was tried: 256 at 8
-# waves is 198 TF against 451, 384 is 91 against 283, 512 is 81 against 260.
+# Measured at `B=2 H=8 S=4096` bf16 non-causal, nominal FLOPs, with every
+# choice under 10% settled by interleaved single-GPU A/B rather than by the
+# sweep -- the two disagreed at head_dim 96, where a sweep at another shape
+# preferred 32 rows by 7% and the A/B at the reporting shape preferred 16 by
+# 16%:
 #
-# **`dkv_shards` is last and only 256 upward need it**, because it buys
-# accumulator space by making every shard recompute S and dP -- 1.5x the MFMA
-# work at 2 shards, 2.5x at 4 -- *and* it divides `BLOCK_KV`, so it pays the
-# traffic lever back. Measured at `B=4 H=8 S=4096` bf16 non-causal on nominal
-# FLOPs (`8 * B * H * Sq * Sk * d`, so the duplicated work is *not* credited):
+#   head_dim  rows  waves  wpe  block_q  BLOCK_KV  AGPR  spills   TFLOP/s
+#      32      32     4     2      64      128        0      0       504
+#      64      32     4     1      64      128        0      0       735
+#      96      16     4     1      64       64        0      0       733
+#     128      16     4     1      64       64        0      0       775
+#     160      32     4     2      64      128      100      0       735
+#     192      16     4     1      32       64        0      0       849
+#     224      32     4     1      64      128      230      0       799
+#     256      16     4     1      32       64        0      0       743
+#     384      16     4     1      32       64       96      0       423
+#     512      16     4     1      32       64      214      0       429
 #
-#   head_dim  waves  wpe  shards  tight  AGPR  spills   TFLOP/s
-#      32       4     2     1      yes      0      0       508
-#      64       4     1     1      no       0      0       713
-#      96       4     2     1      no       0      4       805
-#     128       2     2     1      no      74      0       744
-#     160       4     2     1      no     100      0       751
-#     192       4     1     1      no     232      0       636
-#     224       4     1     1      no     230      0       737
-#     256       4     1     2      no     168      0       451
-#     384       4     1     2      yes    256     31       283
-#     512       4     1     4      yes    256     38       260
+# **No rung shards and none is single-buffered any more**, and every one
+# compiles with zero scratch. Builds peak at under three seconds, far inside
+# plan B3's eight-minute cap.
 #
-# Every build here compiles in under two seconds, far inside plan B3's
-# eight-minute cap; no configuration in the sweep ever approached it.
-# Whether the tile body is written for minimum live registers rather than
+# 96, 160 and 224 are the granule-32 rungs, and two of the three keep 32 rows
+# for a structural reason: at granule 32 a staged tile has `SMEM_N_RPT = 4`
+# lines, so the wave count cannot exceed 4 and the 16-row family's `BLOCK_KV`
+# is capped at 64 against the 32-row family's 128. `BLOCK_Q` 128 would restore
+# `SMEM_N_RPT = 8` there and is the obvious thing to try next.
+# Whether the **32-row** body is written for minimum live registers rather than
 # maximum instruction-level parallelism; see `_with_register_pressure`. The
-# crossover is where the two accumulators stop leaving room for the transients,
-# and below it the tight arm gives up real overlap for a saving nothing needed:
+# 16-row body has no such knob -- a q group's live set there is two 16x16
+# accumulators, a quarter of what the 32-row body holds, so there is nothing to
+# trade. Measured at `B=4 H=8 S=4096` on the 32-row family:
 #
 #   head_dim   loose            tight
 #      32      472 TF, 0 sp     511 TF, 0 sp
 #      64      712 TF, 0 sp     703 TF, 0 sp
 #     128      744 TF, 0 sp     606 TF, 0 sp
 #     224      723 TF, 0 sp     645 TF, 0 sp
-#     256      148 TF, 246 sp   375 TF, 166 sp   (at shards 1; both want a shard)
 #     384      197 TF, 368 sp   283 TF,  31 sp
-#     512      213 TF, 294 sp   261 TF,  38 sp
 #
-# head_dim 32 is the odd one at the narrow end and it is not a register story:
+# head_dim 32 is the odd one at the narrow end and is not a register story:
 # with `D_CHUNKS == 1` there is barely any independent work for the loose arm
-# to overlap, so all it does is lengthen the live ranges.
+# to overlap, so all it does is lengthen live ranges. The wide rungs that
+# wanted the tight arm are all on the 16-row family now, so only 32 reaches it.
 _TIGHT_REGISTERS = {
     32: True,
     64: False,
@@ -188,16 +194,17 @@ _TIGHT_REGISTERS = {
 }
 
 _GEOMETRY = {
-    32: (4, 2, 1),
-    64: (4, 1, 1),
-    96: (4, 2, 1),
-    128: (2, 2, 1),
-    160: (4, 2, 1),
-    192: (4, 1, 1),
-    224: (4, 1, 1),
-    256: (4, 1, 2),
-    384: (4, 1, 2),
-    512: (4, 1, 4),
+    # head_dim: (waves, waves_per_eu, shards, mfma_rows, block_q)
+    32: (4, 2, 1, 32, 64),
+    64: (4, 1, 1, 32, 64),
+    96: (4, 1, 1, 16, 64),
+    128: (4, 1, 1, 16, 64),
+    160: (4, 2, 1, 32, 64),
+    192: (4, 1, 1, 16, 32),
+    224: (4, 1, 1, 32, 64),
+    256: (4, 1, 1, 16, 32),
+    384: (4, 1, 1, 16, 32),
+    512: (4, 1, 1, 16, 32),
 }
 
 
@@ -254,6 +261,13 @@ class BwdDkDvTraits(ParityDualwaveTraits):
     # prefetch distance collapsed to zero, which is what head_dim 384 and 512
     # buy their LDS with. See `_with_buffers`.
     NUM_STREAM_BUFFERS: int = 2
+
+    # KV rows one wave owns, and therefore which MFMA family the body is: 32
+    # for `v_mfma_f32_32x32x16` (`fmha_bwd_dkdv_gfx950`) or 16 for
+    # `v_mfma_f32_16x16x16` (`fmha_bwd_dkdv_m16_gfx950`). Contract section 4
+    # asked for the shape to be a trait rather than a literal; B3.5 is where
+    # that became true in fact.
+    MFMA_ROWS: int = 32
 
     @property
     def BLOCK_KV(self):
@@ -361,6 +375,7 @@ class BwdDkDvKnobs:
     # Per-width policy a sweep wants to vary on its own, so not part of the
     # four-field set above.
     dkv_shards: int | None = None
+    mfma_rows: int | None = None
     num_stream_buffers: int | None = None
     waves_per_eu: int | None = None
     tight_registers: bool | None = None
@@ -475,23 +490,25 @@ class BwdDkDvKnobs:
         shards = self.dkv_shards
         pinned = (self.num_waves, self.block_kv, self.block_q, self.head_dim_granule)
         if all(x is not None for x in pinned):
-            if shards is None:
-                raise ValueError("a pinned geometry must pin dkv_shards too; it decides BLOCK_KV")
+            if shards is None or self.mfma_rows is None:
+                raise ValueError("a pinned geometry must pin dkv_shards and mfma_rows too; they decide BLOCK_KV")
             return self
         if any(x is not None for x in pinned):
             raise ValueError(
                 f"pin num_waves, block_kv, block_q and head_dim_granule together or not at all, got {pinned}"
             )
-        num_waves, waves_per_eu, table_shards = _GEOMETRY[self.block_dmodel]
+        num_waves, waves_per_eu, table_shards, table_rows, table_bq = _GEOMETRY[self.block_dmodel]
         if shards is None:
             shards = table_shards
+        rows = self.mfma_rows if self.mfma_rows is not None else table_rows
         return replace(
             self,
             num_waves=num_waves,
             waves_per_eu=self.waves_per_eu if self.waves_per_eu is not None else waves_per_eu,
             dkv_shards=shards,
-            block_kv=32 * (num_waves // shards),
-            block_q=DEFAULT_BLOCK_Q,
+            mfma_rows=rows,
+            block_kv=rows * (num_waves // shards),
+            block_q=table_bq,
             head_dim_granule=_granule_for(self.block_dmodel),
         )
 
@@ -567,7 +584,18 @@ class BwdDkDvKnobs:
             waves_per_eu=self.waves_per_eu,
             daz=self.daz,
         )
-        traits = _as_bwd_traits(base, NUM_STREAM_BUFFERS=self.num_stream_buffers)
+        traits = _as_bwd_traits(base, NUM_STREAM_BUFFERS=self.num_stream_buffers, MFMA_ROWS=self.mfma_rows)
+        if self.mfma_rows not in (16, 32):
+            raise ValueError(f"mfma_rows must be 16 or 32, got {self.mfma_rows}")
+        if self.mfma_rows == 16 and self.dkv_shards != 1:
+            # The 16-row family exists so that sharding is unnecessary, and it
+            # keeps `a16_chunk_offset` a compile-time immediate by not having a
+            # runtime shard origin. Rejected rather than left as a precondition.
+            raise ValueError(
+                f"mfma_rows 16 with dkv_shards {self.dkv_shards}: the 16-row family does not shard. Its "
+                "loop invariant is 0.75*d, which fits unsharded at every rung; sharding would also make "
+                "the transpose read's chunk offset a runtime value. Pass dkv_shards=1."
+            )
 
         # **P7's ceiling, enforced rather than commented.** A wave holds
         # exactly the MFMA's 32-row M extent in KV rows: more would address
@@ -576,17 +604,13 @@ class BwdDkDvKnobs:
         # the first; this rejects the second, and together they make the
         # invariant checkable instead of stated. The forward shipped twelve
         # silently-wrong configurations for want of exactly this.
-        if traits.ROWS_PER_WAVE != 32:
+        if traits.ROWS_PER_WAVE != self.mfma_rows:
             raise ValueError(
                 f"block_kv {self.block_kv} over {self.num_waves} waves at {self.dkv_shards} shards gives "
-                f"{traits.ROWS_PER_WAVE} KV rows per wave, and this kernel serves exactly 32. It is "
-                f"`v_mfma_f32_32x32x16`'s N extent, and everything downstream is written against it: the "
-                f"v16f32 accumulator pair, the `8*(r//4) + 4*(lane//32) + (r%4)` row map the LSE and delta "
-                f"reads are grouped by, the `_pack_p_v8_slices` operand packing, and the `permlane32_swap` "
-                f"store. **16 rows per wave is the accumulator lever plan section 3 names and it is not "
-                f"built** -- it needs `v_mfma_f32_16x16x16`, whose v4f32 accumulator is a second operand "
-                f"algebra and a re-derived transpose-read lane map, not a parameter. "
-                f"Pass block_kv={32 * (self.num_waves // self.dkv_shards)}."
+                f"{traits.ROWS_PER_WAVE} KV rows per wave, and this build's family serves exactly "
+                f"{self.mfma_rows}. It is the MFMA's N extent, and the accumulator, the LSE/delta row "
+                f"map, the operand packing and the store are all written against it. "
+                f"Pass block_kv={self.mfma_rows * (self.num_waves // self.dkv_shards)}."
             )
         if traits.STREAM_TILE_ELEMS * traits.BF16_BYTES != self._stream_slot_bytes():
             raise AssertionError(

@@ -97,7 +97,7 @@ def _math_backward(q, k, v, do, scale, dtype):
     return o.detach(), lse, delta, dq, dk, dv
 
 
-def _run(q, k, v, do, lse, delta, *, scale, dk=None, dv=None, batch=None):
+def _run(q, k, v, do, lse, delta, *, scale, dk=None, dv=None, batch=None, knobs=None):
     """Build for this shape and dispatch, returning `(dk, dv)`."""
     b, hq, sq, d = q.shape
     sk = k.shape[2]
@@ -108,6 +108,7 @@ def _run(q, k, v, do, lse, delta, *, scale, dk=None, dv=None, batch=None):
         head_dim=d,
         num_kv_heads=k.shape[1],
         dtype_str="bf16" if q.dtype is torch.bfloat16 else "f16",
+        **(knobs or {}),
     )
     fn(q, k, v, do, dk, dv, lse, delta, b if batch is None else batch, sq, seqlen_k=sk, scale=scale)
     return dk, dv
@@ -139,7 +140,7 @@ def _rel(got, ref64, floor=0.0):
 DEGENERATE_ATOL = 1e-5
 
 
-def _ratio_check(b, h, sq, sk, d, scale=None):
+def _ratio_check(b, h, sq, sk, d, scale=None, knobs=None):
     """The plan section 7.1 gate, and the numbers it measured, for one shape."""
     torch.manual_seed(hash((b, h, sq, sk, d)) & 0xFFFF)
     q, k, v, do = _rand(b, h, sq, d), _rand(b, h, sk, d), _rand(b, h, sk, d), _rand(b, h, sq, d)
@@ -150,7 +151,7 @@ def _ratio_check(b, h, sq, sk, d, scale=None):
 
     lse = lse64.reshape(b * h, sq).float().contiguous()
     delta = delta64.reshape(b * h, sq).float().contiguous()
-    dk, dv = _run(q, k, v, do, lse, delta, scale=scale)
+    dk, dv = _run(q, k, v, do, lse, delta, scale=scale, knobs=knobs)
 
     out = {}
     for name, ours, low, high, other in (
@@ -186,6 +187,44 @@ def _ratio_check(b, h, sq, sk, d, scale=None):
 def test_matches_math_backend(shape, head_dim):
     _require_rocm_path()
     _ratio_check(*shape, head_dim)
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+@pytest.mark.parametrize("head_dim", LADDER)
+def test_both_mfma_families_at_every_rung(head_dim, rows):
+    """Both families, everywhere, whatever the tuning table happens to pick.
+
+    B3.5 added a 16-row family beside the 32-row one and routed six of the ten
+    rungs to it. Testing only what `_GEOMETRY` selects would leave the other
+    family covered at four rungs, and the next tuning change would silently
+    move which four -- so the *coverage* must not depend on the *policy*.
+
+    `block_kv` and `block_q` are pinned to what each family can serve: a wave
+    owns `mfma_rows` KV rows, and the 16-row family's staging needs
+    `SMEM_N_RPT` to divide the wave count, which at granule 32 rules out the
+    32-row default.
+    """
+    _require_rocm_path()
+    granule = 64 if head_dim % 64 == 0 else 32
+    waves = 4
+    block_q = 32 if (rows == 16 and head_dim >= 192 and granule == 64) else 64
+    if block_q // (512 // granule) % waves:
+        pytest.skip(f"granule {granule} at block_q {block_q} does not divide across {waves} waves")
+    _ratio_check(
+        1,
+        2,
+        256,
+        256,
+        head_dim,
+        knobs=dict(
+            mfma_rows=rows,
+            dkv_shards=1,
+            num_waves=waves,
+            block_kv=rows * waves,
+            block_q=block_q,
+            head_dim_granule=granule,
+        ),
+    )
 
 
 @pytest.mark.parametrize("head_dim", LADDER)

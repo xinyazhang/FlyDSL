@@ -100,6 +100,68 @@ store writes dQ, which is Q-shaped:
 They coincide in every symmetric build, so only `test_asymmetric_hdim` can tell
 the fix from its absence.
 
+--- B3.5: what a 16-row family still needs, after the shape is named -----------
+
+`BwdDqTraits` now names `MFMA_M/N/K` and derives `ACC_ELEMS`,
+`SCORE_MSTEPS` and `OPERAND_LANE_ELEMS` from them, and every literal in this
+file that meant one of those is now written as one. That change is a no-op
+today -- the ISA is byte-identical, same 260 VGPRs at head_dim 128 -- so what
+is left is exactly the list below, and nothing else.
+
+**Two findings that do not need the lane-map probe**, both in
+`fmha_tuning_bwd_dq_gfx950`:
+
+- `v_mfma_f32_16x16x16_bf16` is **4 passes for 8192 flops** against
+  `32x32x16`'s **8 for 32768** (`SISchedule.td`, `SIDPGFX950FullSpeedModel`).
+  It is *half rate*, so a family built on it cannot beat the 32-row one
+  anywhere the 32-row one fits. `16x16x32` is 4 passes for 16384 -- full rate,
+  16 rows.
+- `register_demand` says 16 rows takes head_dim 384 from 144 registers over the
+  file to **fitting**, and 512 from 336 over to **40 over**. So 16 rows
+  finishes 384 and leaves 512 needing one more lever.
+
+**16x16x32 is also structurally the cheaper port**, and that is a third
+argument for it: `OPERAND_LANE_ELEMS` stays 8, so `_pack_p_v8_slices`,
+`_bf16_trunc_pack_v8` and the v8 shape of every LDS read are unchanged. At
+16x16x16 all of them become 4-wide.
+
+What still has to be re-derived, in dependency order:
+
+1. **`SCORE_MSTEPS == 2` is structural, not parametric.** The softmax path is
+   written as an explicit `(s_lo, s_hi)` *pair* throughout
+   `flash_attn_utils` -- `_score_pair_to_lists`, `_reduce_score_pair`,
+   `_sub_score_pair`, `_exp2_score_slice`, `_pack_p_v8_slices`,
+   `seq_pad_mask_inplace`. At 16 rows and `BLOCK_N` 64 there are four M steps.
+   **`BLOCK_N` 32 keeps the pair, and it is also what closes head_dim 512.**
+   `register_demand` at `(16 rows, BLOCK_N 32)` is 404 at head_dim 512 and 308
+   at 384, against 552 and 424 at `BLOCK_N` 64 -- so the cheapest port and the
+   register fix are the same choice, and there is no need to generalise the
+   pair. Settle this before anything else.
+2. `_seq_pad_score_threshold` -- the element -> KV column map, derived from the
+   32x32 accumulator layout. The KV tail mask and the dB store both read it,
+   so they stay consistent for free once it is right. `fmha_mfma16_gfx950`
+   gives the replacement: a lane's four accumulator elements are four
+   *contiguous* KV tokens at `4 * (lane // 16)`, where at 32 rows they are the
+   scattered `8*(i//4) + 4*(lane//32) + (i%4)`.
+3. The `permlane32_swap` O store (`_fused_o_128_dwords`): it transposes the
+   `[d][q]` accumulator for a 128-bit row-major store, and `permlane32_swap` is
+   a 32-lane primitive.
+4. `_init_dualwave_q_row`'s `q_row = ... + lane_mod_32`, which the LSE/delta
+   row load reads. At 16 rows it is `lane % 16`; the two row inputs stay
+   per-lane scalars, because the query row is the accumulator's *n* axis here
+   (it is dK/dV, where the query row is *m*, that gets the `dwordx4`).
+5. The transpose read for GEMM3. **Answered by the probe, and favourably**
+   (`fmha_mfma16_gfx950`): it serves both 16-row shapes from *one* staged tile,
+   so the four-LDS-tile risk does not materialise. Better than that for this
+   kernel -- **the 16-row maps carry no permutation on the contraction index**,
+   where the 32-row one does. GEMM3 currently works because `cast_p`'s pack
+   order happens to reproduce the 32-row read's `k` permutation; at 16 rows
+   `dS` only has to be in plain order, so that coincidence stops being
+   load-bearing.
+
+Items 2-4 live in `flash_attn_utils.py`, which is imported and never edited, so
+each becomes an override here.
+
 --- Not implemented, deliberately ---------------------------------------------
 
 Causal, windows, varlen, dropout, bias *input*, split-K, paged, `D_STAGES`,
@@ -134,6 +196,7 @@ from dataclasses import replace
 
 import fmha_abi_gfx1201 as abi
 import fmha_common_gfx1201 as fmha
+from fmha_bwd_dq_m16_gfx950 import make_m16_dq_body
 from fmha_dualwave_gfx950 import (
     ParityGemmHelper,
     ParityKernelContext,
@@ -324,30 +387,39 @@ class BwdDqKernelContext(ParityKernelContext):
             fx.Int64(fx.ptrtoint(fx.get_iter(self.Delta))), self.batch_idx * per_batch_bytes, per_batch_bytes
         )
 
+    def load_row_scalars(self, q_row):
+        """`(lse2, delta)` for one query row. Per-lane scalars in both families.
 
-class BwdRowInputLoader(ParityStoreHelper):
-    """`lse2` and `delta` for this lane's query row, once per kernel.
-
-    A helper on the store base class only for the context copy it brings; it
-    stores nothing. Both values are per (query row) scalars, and a lane owns
-    exactly one query row (`lane_mod_32`), so these are the same shape as the
-    forward's running `m_row` -- one f32 register each, broadcast over the 16
-    score elements by every use.
-    """
-
-    def load(self, q_row):
-        ctx = self.ctx_ref
+        The query row is the *n* axis of GEMM1 and GEMM3, so a lane owns
+        exactly one of them whatever the MFMA's row count -- which is why this
+        is shape-independent and the dK/dV kernel's counterpart is not (there
+        the query row is *m*, and a lane holds four).
+        """
         off = self.row_base + q_row * self.row_pitch
         off = fx.Index((q_row < self.seqlen_q_v).select(off, self.row_oob_off))
         off_i32 = as_mlir_value(fx.Int32(off))
-        lse = buffer_ops.buffer_load(ctx.lse_rsrc, off_i32, vec_width=1, dtype=fx.Float32)
-        delta = buffer_ops.buffer_load(ctx.delta_rsrc, off_i32, vec_width=1, dtype=fx.Float32)
+        lse = buffer_ops.buffer_load(self.lse_rsrc, off_i32, vec_width=1, dtype=fx.Float32)
+        delta = buffer_ops.buffer_load(self.delta_rsrc, off_i32, vec_width=1, dtype=fx.Float32)
         # The forward writes LSE in natural units (`m_row*ln2 + ln(l)`), and
         # every exponent downstream is `exp2`, so the conversion happens once
         # here rather than per element. AOTriton's `l_i = tl.load(...) *
         # RCP_LN2` is the same fold.
         lse2 = dualwave._fmul(fx.Float32(lse), fx.Float32(dualwave._LOG2E), self.fm_fast)
         return lse2, fx.Float32(delta)
+
+
+class BwdRowInputLoader(ParityStoreHelper):
+    """`lse2` and `delta` for this lane's query row, once per kernel.
+
+    A thin wrapper on `BwdDqKernelContext.load_row_scalars`, kept because the
+    32-row body reaches it through a helper object like everything else. The
+    work is on the context because the 16-row body needs the same two values
+    at a different row map (`lane % 16`), and one copy of the addressing is
+    the point.
+    """
+
+    def load(self, q_row):
+        return self.ctx_ref.load_row_scalars(q_row)
 
 
 class BwdDqSoftmaxHelper(ParitySoftmaxHelper):
@@ -389,9 +461,10 @@ class BwdDqSoftmaxHelper(ParitySoftmaxHelper):
         records as the thing that silently deleted a mask on gfx1201.
         """
         s_lo, s_hi = v_s
-        scale_v = Vec.from_elements([fx.Float32(qk_scale)], fx.Float32).broadcast_to(16)
+        acc = self.traits.ACC_ELEMS
+        scale_v = Vec.from_elements([fx.Float32(qk_scale)], fx.Float32).broadcast_to(acc)
         neg_lse2 = dualwave._fsub(self.c_zero_f, lse2, self.fm_fast)
-        neg_v = Vec.from_elements([fx.Float32(neg_lse2)], fx.Float32).broadcast_to(16)
+        neg_v = Vec.from_elements([fx.Float32(neg_lse2)], fx.Float32).broadcast_to(acc)
         lo = fmath.fma(Vec(s_lo), scale_v, neg_v, fastmath=self.fm_fast)
         hi = fmath.fma(Vec(s_hi), scale_v, neg_v, fastmath=self.fm_fast)
         return as_mlir_value(lo), as_mlir_value(hi)
@@ -606,20 +679,51 @@ class BwdDbStoreHelper(ParityStoreHelper):
         row_base = q_row * fx.Index(ctx.stride_db_seq_q)
         col_base = dualwave._seq_pad_col_base(traits, tile_idx, lane_div_32=self.lane_div_32)
         in_row = q_row < self.seqlen_q_v
+        per_pack = traits.OPERAND_LANE_ELEMS
         for half, packs in ((0, lo_packs), (1, hi_packs)):
             for pks in range_constexpr(len(packs)):
-                vec = Vec(packs[pks], (8,), self.elem_dtype)
-                for j in range_constexpr(8):
+                vec = Vec(packs[pks], (per_pack,), self.elem_dtype)
+                for j in range_constexpr(per_pack):
                     # The same element -> column map the KV tail mask uses.
                     # Derived once, in `flash_attn_utils`, and read here rather
                     # than transcribed: the mask and this store must agree
                     # about which column an element is, or dB is a permutation
                     # of itself.
-                    r = pks * 8 + j
-                    col_i32 = col_base + fx.Int32(dualwave._seq_pad_score_threshold(traits, r) + half * 32)
+                    r = pks * per_pack + j
+                    col_i32 = col_base + fx.Int32(dualwave._seq_pad_score_threshold(traits, r) + half * traits.MFMA_M)
                     live = in_row & (col_i32 < self.seqlen_kv_i32)
                     off = fx.Index(live.select(row_base + fx.Index(col_i32), ctx.db_oob_off))
                     buffer_ops.buffer_store(as_mlir_value(vec[j]), ctx.db_rsrc, as_mlir_value(fx.Int32(off)))
+
+    def store_tile_m16(self, ds_pack, tile_idx, q_row, lane):
+        """`dB = dS` for the 16-row family.
+
+        Same device as `store_tile` -- per element, address-suppressed, read
+        out of the packed bf16 so the f32 form can die -- over the 16-row
+        column map instead of `_seq_pad_score_threshold`'s. A lane's four
+        accumulator elements are four *contiguous* KV tokens at
+        `4 * (lane // 16)`, so the map is an addition rather than a table.
+
+        Slot `4r + i` of the pack is half `r`, element `i`, which is the same
+        concatenation GEMM3's B operand relies on: if this indexing is wrong,
+        dB is a permutation of itself and dQ is simply wrong, so the two check
+        each other.
+        """
+        from fmha_bwd_dq_m16_gfx950 import MFMA16_M, acc_elems
+
+        traits = self.traits
+        ctx = self.ctx_ref
+        n = acc_elems(traits)
+        row_base = q_row * fx.Index(ctx.stride_db_seq_q)
+        in_row = q_row < self.seqlen_q_v
+        tok_lane = fx.Int32(4) * fx.Int32(lane // fx.Index(MFMA16_M))
+        vec = Vec(ds_pack, (n * 2,), self.elem_dtype)
+        for r in range_constexpr(2):
+            for i in range_constexpr(n):
+                col_i32 = fx.Int32(tile_idx * traits.BLOCK_N) + fx.Int32(r * MFMA16_M + i) + tok_lane
+                live = in_row & (col_i32 < self.seqlen_kv_i32)
+                off = fx.Index(live.select(row_base + fx.Index(col_i32), ctx.db_oob_off))
+                buffer_ops.buffer_store(as_mlir_value(vec[r * n + i]), ctx.db_rsrc, as_mlir_value(fx.Int32(off)))
 
 
 def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
@@ -636,7 +740,15 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
     BLOCK_DMODEL = knobs.block_dmodel
     PADDED_HEAD = knobs.padded_head
     HDIM_QK_FLOOR = knobs.hdim_qk_floor
+    # f32 accumulator elements per lane per MFMA -- 16 at 32x32x16. Every
+    # `16` the body used to spell over a score half was this, and each was a
+    # different quarter of the kernel. See `BwdDqTraits.ACC_ELEMS`.
+    ACC_ELEMS = traits.ACC_ELEMS
     STORE_DB = traits.STORE_DB
+    # Which MFMA family this build is. `MFMA_N` is the query rows a wave owns,
+    # so it is the discriminator rather than a width threshold -- the same
+    # shape of choice `WIDE` is in the forward.
+    M16 = traits.MFMA_N == 16
     BUILD_SM_SCALE = meta.sm_scale
 
     # `traits.cache_tag` does not know about the tile geometry or `STORE_DB`,
@@ -651,6 +763,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         STORE_DB,
         BUILD_SM_SCALE,
         (knobs.num_waves, knobs.block_m, knobs.block_n, knobs.head_dim_granule),
+        (traits.MFMA_M, traits.MFMA_N, traits.MFMA_K),
     )
 
     _lds_elem_dtype = dualwave.dtype_to_elem_type(traits.DTYPE_STR)
@@ -839,15 +952,15 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
                 # P = exp2(qk_scale*S - lse2). `exp2` is the forward's, split
                 # into two halves there for the pipeline and simply adjacent
                 # here.
-                v_p = softmax_helper.exp2(v_s, 0, 16)
-                v_p = softmax_helper.exp2(v_p, 16, 16)
+                v_p = softmax_helper.exp2(v_s, 0, ACC_ELEMS)
+                v_p = softmax_helper.exp2(v_p, ACC_ELEMS, ACC_ELEMS)
 
                 # dS = P * (dP - delta), elementwise over the 32 scores a lane
                 # holds. `delta` is a per-row scalar and a lane owns one row.
                 dp_lo, dp_hi = softmax_helper.v_s_vec_to_lists(v_dp)
-                ds_lo = [None] * 16
-                ds_hi = [None] * 16
-                for r in range_constexpr(16):
+                ds_lo = [None] * ACC_ELEMS
+                ds_hi = [None] * ACC_ELEMS
+                for r in range_constexpr(ACC_ELEMS):
                     ds_lo[r] = dualwave._fmul(v_p[0][r], dualwave._fsub(dp_lo[r], delta, ctx.fm_fast), ctx.fm_fast)
                     ds_hi[r] = dualwave._fmul(v_p[1][r], dualwave._fsub(dp_hi[r], delta, ctx.fm_fast), ctx.fm_fast)
 
@@ -896,6 +1009,23 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             softmax_helper.scale_o(v_dq, ctx.c_sm_scale)
             _s_barrier()
             output_store.store_final_o(v_dq, ctx.q_row)
+
+        # head_dim 384 and 512 run a second MFMA family, in its own file: 16
+        # rows per wave on `16x16x32`, which halves the loop-invariant Q + dO +
+        # dQ that is the whole 512-register file at 32 rows. See
+        # `fmha_bwd_dq_m16_gfx950` for why that shape and why `BLOCK_N` 32.
+        if const_expr(M16):
+            _body = make_m16_dq_body(
+                ctx,
+                traits,
+                kv_gmem_to_lds=kv_gmem_to_lds,
+                db_store=db_store,
+                hdim_qk=hdim_qk,
+                hdim_vo=hdim_vo,
+                hdim_qk_floor=HDIM_QK_FLOOR,
+                hdim_vo_floor=traits.HDIM_VO_FLOOR,
+                store_db=STORE_DB,
+            )
 
         active = ctx.active
         if active is None:
