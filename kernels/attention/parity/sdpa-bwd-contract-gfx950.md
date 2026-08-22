@@ -292,3 +292,109 @@ those two differ by 1.8x.
   telling you it does not fit. The forward's P7 sweep wedged four shards on
   exactly this; treat a slow build as a result.
 - The joint dQ + dK/dV autograd check must still pass, at every new rung.
+
+---
+
+# Addendum: B3.5 — the 16-row MFMA family, before any feature work
+
+B3 reached every rung and the top of the ladder is **correct but not
+performant**. Measured at one shape with one accounting, `B=2 H=8 S=4096` bf16
+non-causal on an idle GPU, nominal TFLOP/s per kernel's own GEMM count and
+"effective" over the five GEMMs the maths requires:
+
+| hdim | fwd | dK/dV | dQ | bwd effective | bwd/fwd |
+|---|---|---|---|---|---|
+| 64 | 777 | 770 | 870 | 578 | 3.36x |
+| 128 | 1037 | 782 | 841 | 576 | 4.51x |
+| 192 | 876 | 729 | 842 | 552 | 3.96x |
+| 256 | 897 | **472** | 858 | 417 | 5.37x |
+| 384 | 810 | **326** | **297** | 223 | 9.07x |
+| 512 | 523 | **271** | **102** | 113 | **11.55x** |
+
+Flash attention's backward is normally ~2.5x its forward. We are at 3.4x at
+best and 11.6x at 512.
+
+**This phase runs before B4 for the reason B3 ran before it**: a kernel with
+the minimum feature set is far cheaper to optimise than a fully-featured one.
+Every masking arm, every varlen mode and every `const_expr` branch added first
+is another variable in each bisection, and this phase is going to need a lot of
+bisections.
+
+## What is actually wrong
+
+Both cliffs are the same root cause seen from two sides: **32 rows per wave**.
+
+- **dK/dV at 256+**: sharding is the only accumulator lever left, and it
+  *divides* `BLOCK_KV` — which B3 established as the traffic lever, since each
+  workgroup streams all of Q and dO for its head. So buying registers costs
+  re-read bandwidth: 729 → 472 at 256, and 512 ends at four shards with
+  `BLOCK_KV` 32 and S/dP recomputed 2.5x.
+- **dQ at 384+**: no lever at all. At 32 rows, Q + dO + dQ is exactly 512
+  registers at head_dim 512 before a single operand.
+
+At 16 rows per wave the dK/dV loop invariant at 512 is `0.75*d` = 384 — the
+same as four-way sharding — but with **no duplicated S/dP** and `BLOCK_KV` 64
+rather than 32. Both of the things making 512 slow, removed together.
+
+## The deliverable
+
+A second MFMA family at **16 rows per wave**, selected per rung by measurement,
+living alongside the 32-row one rather than replacing it. Contract §4 already
+required the shape to be a trait rather than a literal; this is the phase that
+makes that true in fact.
+
+It touches, per B3's own inventory: the score accumulator (v4f32 rather than
+v16f32), the LSE/delta row map, `_pack_p_v8_slices`, the `permlane32_swap`
+store, and the transpose-read lane map.
+
+## **Check this before designing around it**
+
+The existing transpose lane map delivers `m = lane % 32`. A 16-row A operand
+wants `m = lane % 16`, with the upper 16 lanes carrying *different tokens* —
+so the map has to be re-derived, and **it may not line up at all**.
+
+AITER's disassembly is a warning here, not a reassurance. Its kernels that use
+`v_mfma_f32_16x16x16` **exclusively** issue **zero** `ds_read_b64_tr_b16`:
+
+| AITER kernel | `tr_b16` | `ds_read_b128` | MFMA shapes |
+|---|---|---|---|
+| hd64 | **0** | 120 | `16x16x16` ×480 |
+| hd192 | **0** | 128 | `16x16x16` ×240 |
+| hd128 | 512 | 220 | `16x16x32` ×384, `32x32x16` ×128 |
+| hd192_128 | 408 | 198 | `16x16x32` ×288, `16x16x16` ×120, `32x32x16` ×60 |
+
+The correlation is with the *wide-K* shapes, not with 16 rows. It is possible
+the transpose read simply does not serve a 16x16x16 A operand and AITER staged
+both orientations instead — which would put the four-LDS-tile problem back on
+the table for this family, at exactly the widths where LDS is tightest.
+
+**So B0's probe is finally needed for real, and it is the first task.** Note
+also `v_mfma_f32_16x16x32`, which AITER uses heavily *with* the transpose: if
+the K=32 shape is what the instruction pairs with, that may be the family to
+build rather than `16x16x16`.
+
+Do not start the layout work until the probe answers which of the three shapes
+the transpose read serves at 16 rows.
+
+## Ownership
+
+- **dK/dV owns the probe** and publishes the lane-map table as soon as it has
+  it — it has the deepest transpose-path context and named this task. Build it
+  on `tooling/probe_kv_staging.py`'s harness; a hand-rolled `SharedAllocator`
+  scaffold segfaults the compiler (see the lore).
+- **dQ starts on what does not depend on it** — its own register accounting at
+  16 rows, and the shape-only parts of the layout change — then picks up the
+  table.
+
+Say so rather than forking if either of you needs to change a shared interface.
+
+## Gates
+
+- Everything B3 gates, still: full ladder both kernels, 8xD contract, padded
+  heads, the joint autograd check, the rows-per-wave ceiling enforced.
+- **The 32-row path must not regress.** It wins below 256 and this family is
+  additive; a rung that gets slower is a bug, not a trade.
+- Report the same table as above — one shape, both kernels, nominal *and*
+  effective, against the forward. Per-kernel numbers at different shapes are
+  what hid this in the first place.
+- A perf claim under 10% needs interleaved single-GPU A/B, not a sweep.
