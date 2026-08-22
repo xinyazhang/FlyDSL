@@ -515,8 +515,6 @@ class BwdDqKnobs(Gfx950Knobs):
         # return the right *shape*, which is the failure mode the whole
         # backward plan is written to avoid.
         for name, value in (
-            ("causal", meta.causal),
-            ("window", meta.window),
             ("bias", meta.bias),
             ("dropout", meta.dropout),
             ("varlen", self.varlen),
@@ -524,9 +522,16 @@ class BwdDqKnobs(Gfx950Knobs):
         ):
             if value:
                 raise NotImplementedError(
-                    f"{name}=True is not implemented by the backward dQ kernel yet; B3 is dense and "
-                    "non-causal over the full ladder. See the phase ladder in sdpa-bwd-plan-gfx950.md."
+                    f"{name}=True is not implemented by the backward dQ kernel yet; B4 adds causal and "
+                    "windows. See the phase ladder in sdpa-bwd-plan-gfx950.md."
                 )
+        if meta.window and not meta.causal:
+            # `make_traits` says the same thing, and this repeats it only so the
+            # message names the *kernel* rather than the traits constructor: a
+            # window is a left bound on top of the causal right one, and
+            # dropping it silently would return dense attention -- right shape,
+            # finite, wrong.
+            raise ValueError("window=True requires causal=True; it is a left bound on top of the causal one")
         if self.num_kv_splits != 1:
             raise NotImplementedError("split-K is out of scope for every backward kernel; see plan section 9")
         for name, value in (("d_stages", self.d_stages), ("qk_shards", self.qk_shards), ("vo_shards", self.vo_shards)):
@@ -576,7 +581,8 @@ class BwdDqKnobs(Gfx950Knobs):
             v_n_group=self.v_n_group,
             v_k_substep=self.v_k_substep,
             v_dc_in_pair=self.v_dc_in_pair,
-            causal=False,
+            causal=meta.causal,
+            window=meta.window,
             dtype_str=meta.dtype_str,
             waves_per_eu=self.waves_per_eu,
             daz=self.daz,

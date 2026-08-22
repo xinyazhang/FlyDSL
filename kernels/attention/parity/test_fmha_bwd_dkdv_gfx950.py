@@ -42,7 +42,11 @@ than guessed, and it scales with sequence length and head dim on its own.
 """
 
 import os
+import subprocess
+import sys
+import time
 
+import fmha_common_gfx1201 as fmha
 import pytest
 import torch
 import torch.nn.functional as F
@@ -81,23 +85,65 @@ def _rand(*shape, dtype=DT):
     return torch.randn(*shape, device="cuda", dtype=dtype)
 
 
-def _math_backward(q, k, v, do, scale, dtype):
-    """`(o, lse, delta, dq, dk, dv)` from torch's math backend at `dtype`.
+def _band(sq, sk, window):
+    """The visible `(Sq, Sk)` band, or None for no masking.
+
+    **Bottom-right aligned**, which `torch`'s `is_causal` is not: `is_causal`
+    is top-left and the two agree only at `Sq == Sk`. Writing the band out is
+    the only way to compare against a kernel whose diagonal is
+    `delta = seqlen_k - seqlen_q`, and it is also what lets one expression
+    serve plain causal and a window -- plain causal *is* `(seqlen_q, delta)`.
+    """
+    if window is None:
+        return None
+    wl, wr = window
+    i = torch.arange(sq, device="cuda")[:, None]
+    j = torch.arange(sk, device="cuda")[None, :]
+    return (j <= i + wr) & (j >= i - wl)
+
+
+def _math_backward(q, k, v, do, scale, dtype, window=None):
+    """`(o, lse, delta, dq, dk, dv)` from an explicit fp-`dtype` reference.
 
     `lse` and `delta` are computed alongside rather than taken from the
     autograd graph, because this kernel consumes them as *inputs* and the whole
     point of the high-precision arm is that everything it hands over is exact.
+
+    The softmax is explicit rather than `F.scaled_dot_product_attention` as
+    soon as a band is involved: SDPA has no bottom-right or sliding-window
+    form. Without a band the two agree, and the unmasked arm still goes through
+    the math backend so the no-feature path is compared against torch's own
+    code rather than against this function.
     """
     qq, kk, vv = (t.to(dtype).detach().requires_grad_() for t in (q, k, v))
-    with sdpa_kernel(SDPBackend.MATH):
-        o = F.scaled_dot_product_attention(qq, kk, vv, scale=scale)
+    sq, sk = q.shape[2], k.shape[2]
+    band = _band(sq, sk, window)
+    if band is None:
+        with sdpa_kernel(SDPBackend.MATH):
+            o = F.scaled_dot_product_attention(qq, kk, vv, scale=scale)
+        s = (qq @ kk.transpose(-1, -2)).detach() * scale
+    else:
+        s = (qq @ kk.transpose(-1, -2)) * scale
+        s = s.masked_fill(~band, float("-inf"))
+        # A row with no live key: 0/0 in `softmax` and `-inf` in `logsumexp`.
+        # The kernel produces zero there because *every* element of such a row
+        # is masked, whatever LSE says, so the reference has to agree by
+        # construction rather than by arithmetic.
+        live = torch.isfinite(s).any(-1, keepdim=True)
+        o = torch.where(live, torch.softmax(s, -1), torch.zeros_like(s)) @ vv
+        s = s.detach()
     dq, dk, dv = torch.autograd.grad(o, (qq, kk, vv), do.to(dtype))
-    lse = torch.logsumexp((qq @ kk.transpose(-1, -2)).detach() * scale, dim=-1)
+    lse = torch.logsumexp(s, -1)
+    # Finite stand-in for a dead row's `-inf` logsumexp. Its value cannot reach
+    # the output -- the mask zeroes those elements first -- and leaving an
+    # infinity in an input the kernel multiplies by `log2(e)` would test the
+    # `ninf` fastmath licence rather than the mask.
+    lse = torch.where(torch.isfinite(lse), lse, torch.full_like(lse, 1e30))
     delta = (do.to(dtype) * o.detach()).sum(-1)
     return o.detach(), lse, delta, dq, dk, dv
 
 
-def _run(q, k, v, do, lse, delta, *, scale, dk=None, dv=None, batch=None, knobs=None):
+def _run(q, k, v, do, lse, delta, *, scale, dk=None, dv=None, batch=None, knobs=None, causal=False, window=None):
     """Build for this shape and dispatch, returning `(dk, dv)`."""
     b, hq, sq, d = q.shape
     sk = k.shape[2]
@@ -108,9 +154,12 @@ def _run(q, k, v, do, lse, delta, *, scale, dk=None, dv=None, batch=None, knobs=
         head_dim=d,
         num_kv_heads=k.shape[1],
         dtype_str="bf16" if q.dtype is torch.bfloat16 else "f16",
+        causal=causal,
+        window=window is not None,
         **(knobs or {}),
     )
-    fn(q, k, v, do, dk, dv, lse, delta, b if batch is None else batch, sq, seqlen_k=sk, scale=scale)
+    extra = {} if window is None else {"window": window}
+    fn(q, k, v, do, dk, dv, lse, delta, b if batch is None else batch, sq, seqlen_k=sk, scale=scale, **extra)
     return dk, dv
 
 
@@ -140,18 +189,24 @@ def _rel(got, ref64, floor=0.0):
 DEGENERATE_ATOL = 1e-5
 
 
-def _ratio_check(b, h, sq, sk, d, scale=None, knobs=None):
-    """The plan section 7.1 gate, and the numbers it measured, for one shape."""
+def _ratio_check(b, h, sq, sk, d, scale=None, knobs=None, causal=False, window=None):
+    """The plan section 7.1 gate, and the numbers it measured, for one shape.
+
+    `causal=True` with `window=None` is plain bottom-right causal, which the
+    reference spells as the band `(seqlen_q, seqlen_k - seqlen_q)` -- the same
+    thing the kernel's sentinels resolve to.
+    """
     torch.manual_seed(hash((b, h, sq, sk, d)) & 0xFFFF)
     q, k, v, do = _rand(b, h, sq, d), _rand(b, h, sk, d), _rand(b, h, sk, d), _rand(b, h, sq, d)
     scale = 1.0 / d**0.5 if scale is None else scale
+    ref_window = window if window is not None else ((sq, sk - sq) if causal else None)
 
-    _o64, lse64, delta64, _dq64, dk64, dv64 = _math_backward(q, k, v, do, scale, torch.float64)
-    _o16, _l16, _d16, _dq16, dk16, dv16 = _math_backward(q, k, v, do, scale, torch.bfloat16)
+    _o64, lse64, delta64, _dq64, dk64, dv64 = _math_backward(q, k, v, do, scale, torch.float64, ref_window)
+    _o16, _l16, _d16, _dq16, dk16, dv16 = _math_backward(q, k, v, do, scale, torch.bfloat16, ref_window)
 
     lse = lse64.reshape(b * h, sq).float().contiguous()
     delta = delta64.reshape(b * h, sq).float().contiguous()
-    dk, dv = _run(q, k, v, do, lse, delta, scale=scale, knobs=knobs)
+    dk, dv = _run(q, k, v, do, lse, delta, scale=scale, knobs=knobs, causal=causal, window=window)
 
     out = {}
     for name, ours, low, high, other in (
@@ -189,9 +244,32 @@ def test_matches_math_backend(shape, head_dim):
     _ratio_check(*shape, head_dim)
 
 
+def _family_knobs(head_dim, rows):
+    """A pinned geometry each family can actually serve at this width.
+
+    A wave owns `mfma_rows` KV rows, and the 16-row family's staging needs
+    `SMEM_N_RPT` to divide the wave count -- which at granule 32 rules out the
+    32-row default `block_q`. Returns None where no legal geometry exists.
+    """
+    granule = 64 if head_dim % 64 == 0 else 32
+    waves = 4
+    block_q = 32 if (rows == 16 and head_dim >= 192 and granule == 64) else 64
+    if block_q // (512 // granule) % waves:
+        return None
+    return dict(
+        mfma_rows=rows,
+        dkv_shards=1,
+        num_waves=waves,
+        block_kv=rows * waves,
+        block_q=block_q,
+        head_dim_granule=granule,
+    )
+
+
+@pytest.mark.parametrize("mode", ["dense", "causal", "window"])
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
 @pytest.mark.parametrize("head_dim", LADDER)
-def test_both_mfma_families_at_every_rung(head_dim, rows):
+def test_both_mfma_families_at_every_rung(head_dim, rows, mode):
     """Both families, everywhere, whatever the tuning table happens to pick.
 
     B3.5 added a 16-row family beside the 32-row one and routed six of the ten
@@ -199,32 +277,19 @@ def test_both_mfma_families_at_every_rung(head_dim, rows):
     family covered at four rungs, and the next tuning change would silently
     move which four -- so the *coverage* must not depend on the *policy*.
 
-    `block_kv` and `block_q` are pinned to what each family can serve: a wave
-    owns `mfma_rows` KV rows, and the 16-row family's staging needs
-    `SMEM_N_RPT` to divide the wave count, which at granule 32 rules out the
-    32-row default.
+    **And with every feature**, for the same reason one step further: a mask
+    implemented at 32 rows and not 16 is a wrong answer at half the ladder, and
+    each family's mask is keyed on its *own* lane->(row, col) map. `Sq != Sk`
+    so bottom-right alignment is exercised rather than the one case where it
+    coincides with top-left.
     """
     _require_rocm_path()
-    granule = 64 if head_dim % 64 == 0 else 32
-    waves = 4
-    block_q = 32 if (rows == 16 and head_dim >= 192 and granule == 64) else 64
-    if block_q // (512 // granule) % waves:
-        pytest.skip(f"granule {granule} at block_q {block_q} does not divide across {waves} waves")
-    _ratio_check(
-        1,
-        2,
-        256,
-        256,
-        head_dim,
-        knobs=dict(
-            mfma_rows=rows,
-            dkv_shards=1,
-            num_waves=waves,
-            block_kv=rows * waves,
-            block_q=block_q,
-            head_dim_granule=granule,
-        ),
-    )
+    knobs = _family_knobs(head_dim, rows)
+    if knobs is None:
+        pytest.skip(f"no legal {rows}-row geometry at head_dim {head_dim}")
+    causal = mode != "dense"
+    window = (96, 16) if mode == "window" else None
+    _ratio_check(1, 2, 320, 256, head_dim, knobs=knobs, causal=causal, window=window)
 
 
 @pytest.mark.parametrize("head_dim", LADDER)
@@ -358,6 +423,168 @@ def test_joint_with_dq_against_one_autograd_call(head_dim):
     for name, ours, low, high in (("dq", dq, dq16, dq64), ("dk", dk, dk16, dk64), ("dv", dv, dv16, dv64)):
         e_ours, e_low = _rel(ours, high), _rel(low, high)
         assert e_ours <= 3.0 * e_low, f"{name}: {e_ours:.3e} against {e_low:.3e}"
+
+
+# ---------------------------------------------------------------------------
+# Causal and windows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("head_dim", LADDER)
+@pytest.mark.parametrize("sq,sk", [(256, 256), (199, 333), (512, 128), (128, 512)])
+def test_causal_matches_the_band(sq, sk, head_dim):
+    """Bottom-right causal at every rung, including both `Sq != Sk` directions.
+
+    `Sq > Sk` is the case that produces q rows with **no live key at all** --
+    the reference's `logsumexp` is `-inf` there and the kernel's mask zeroes
+    every element of the row before that can matter. It was a real NaN in
+    gfx1201's suite, in the test rather than the kernel.
+    """
+    _require_rocm_path()
+    _ratio_check(1, 2, sq, sk, head_dim, causal=True)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
+@pytest.mark.parametrize(
+    "window",
+    [(64, 0), (128, 32), (32, -8), (10000, 10000), (0, 0)],
+    ids=["band64", "band128r32", "negative_left", "unbounded", "diagonal_only"],
+)
+def test_window_matches_the_band(window, head_dim):
+    """Generalized sliding windows, including the two degenerate ends.
+
+    `negative_left` pushes the whole band to the *right* of the diagonal, so
+    the leading masked run spans several tiles rather than clipping one -- the
+    case `decompose_causal_regions` warns not to carry two-region intuition
+    into. `diagonal_only` makes `dK` analytically zero (`p == 1`, so
+    `dp == delta` and `dS` cancels), which is what `_rel`'s floor is for.
+    """
+    _require_rocm_path()
+    _ratio_check(1, 2, 256, 256, head_dim, causal=True, window=window)
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_window_sentinel_reproduces_causal_bitwise(head_dim, rows):
+    """A window build fed `WINDOW_BOTRIGHT` must equal a causal build **exactly**.
+
+    The sharpest test available here, and the reason is that the two builds are
+    not the same code: a non-window build `const_expr`s the left-bound
+    comparison away entirely, while a window build emits it with a bound that
+    never bites. Bit-identity says the left-bound arm is inert when it should
+    be -- a tolerance would not, and it caught four separate bugs in the
+    forward's P3.
+
+    Both families, because each has its own copy of the comparison.
+    """
+    _require_rocm_path()
+    knobs = _family_knobs(head_dim, rows)
+    if knobs is None:
+        pytest.skip(f"no legal {rows}-row geometry at head_dim {head_dim}")
+    b, h, sq, sk = 1, 2, 512, 384
+    torch.manual_seed(head_dim + rows)
+    q, k, v, do = (
+        _rand(b, h, sq, head_dim),
+        _rand(b, h, sk, head_dim),
+        _rand(b, h, sk, head_dim),
+        _rand(b, h, sq, head_dim),
+    )
+    lse = torch.randn(b * h, sq, device="cuda", dtype=torch.float32)
+    delta = torch.randn_like(lse)
+    scale = 1.0 / head_dim**0.5
+    plain = _run(q, k, v, do, lse, delta, scale=scale, knobs=knobs, causal=True)
+    sentinel = _run(
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        scale=scale,
+        knobs=knobs,
+        causal=True,
+        window=(fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT),
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(plain[0], sentinel[0]), "dK differs between a causal build and a sentinel-fed window build"
+    assert torch.equal(plain[1], sentinel[1]), "dV differs between a causal build and a sentinel-fed window build"
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+def test_causal_tile_cut_is_not_inert(rows):
+    """The cut must be **timed**, because a dead tile changes no output bit.
+
+    A causal build that walked every q tile and masked the dead ones would be
+    bit-for-bit correct and do twice the work. The forward's wide body shipped
+    exactly that -- right answers at 0.92x -- and only a timing assertion found
+    it.
+
+    **The shape has to fill the machine**, and that is the trap on this side.
+    At `B=1 H=2 S=1024` there are 16 workgroups on 256 CUs, every one runs
+    concurrently, and the wall clock is set by the *longest* -- the KV block at
+    `kv_start = 0`, which walks every tile in both builds. Measured 0.94x
+    there and 1.53x at the shape below, from the same code: a working cut is as
+    easy to misdiagnose as an inert one.
+    """
+    _require_rocm_path()
+    head_dim = 64
+    knobs = _family_knobs(head_dim, rows)
+    b, h, s = 4, 8, 4096
+    torch.manual_seed(1)
+    q, k, v, do = (_rand(b, h, s, head_dim) for _ in range(4))
+    lse = torch.randn(b * h, s, device="cuda", dtype=torch.float32)
+    delta = torch.randn_like(lse)
+    dk, dv = torch.empty_like(k), torch.empty_like(v)
+    scale = 1.0 / head_dim**0.5
+
+    def _time(causal):
+        # Built once, outside the loop. `_run` rebuilds per call, which is
+        # fine for a correctness helper and would make this measure the JIT
+        # dispatch path instead of the kernel -- 6.2 s against 14.4 s the
+        # first time it was written that way.
+        fn = build(num_heads=h, head_dim=head_dim, num_kv_heads=h, causal=causal, **knobs)
+        args = (q, k, v, do, dk, dv, lse, delta, b, s)
+        kw = dict(seqlen_k=s, scale=scale)
+        fn(*args, **kw)
+        torch.cuda.synchronize()
+        for _ in range(3):
+            fn(*args, **kw)
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        for _ in range(10):
+            fn(*args, **kw)
+        torch.cuda.synchronize()
+        return time.perf_counter() - t
+
+    dense, causal = _time(False), _time(True)
+    # A causal KV block walks about half the q tiles on average, so the ceiling
+    # is ~1.9x. 1.25 is well clear of both that and of run-to-run noise, and
+    # well above the 1.0 an inert cut would give.
+    assert dense / causal > 1.25, (
+        f"the causal tile cut looks inert at {rows} rows: dense {dense * 1e3:.1f} ms against causal "
+        f"{causal * 1e3:.1f} ms, ratio {dense / causal:.2f}x. A dead tile masks to nothing, so "
+        "correctness cannot see this."
+    )
+
+
+def test_no_transpose_read_under_a_narrowed_exec():
+    """CDNA4 section 11.4: `ds_read_b64_tr_b16` requires EXEC all 1s.
+
+    B4 is the first phase where this is reachable -- before it neither kernel
+    contained an `scf.if` at all. The kernel holds a stronger invariant than
+    "no read inside a branch": every mask predicate is wave-uniform, so the
+    branches are *scalar* and EXEC is never narrowed anywhere. The checker
+    reports both, and this asserts the one that must hold.
+
+    Shelled out because it needs `FLYDSL_DUMP_IR` set before the interpreter
+    starts, and it builds twelve configurations, so it is also the slowest
+    thing in the file.
+    """
+    _require_rocm_path()
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tooling", "check_exec_hazard_gfx950.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True, timeout=2400)
+    assert r.returncode == 0, f"exec-hazard scan failed:\n{r.stdout}\n{r.stderr}"
+    assert "EXEC HAZARD: clean" in r.stdout, r.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -586,8 +813,8 @@ def test_deterministic(head_dim):
 
 def test_refuses_what_it_does_not_compute():
     """Every one of these would otherwise be a plausible, finite, wrong gradient."""
-    with pytest.raises(NotImplementedError, match="causal"):
-        build(num_heads=8, head_dim=64, causal=True)
+    with pytest.raises(ValueError, match="window=True requires causal=True"):
+        build(num_heads=8, head_dim=64, window=True)
     with pytest.raises(NotImplementedError, match="dropout"):
         build(num_heads=8, head_dim=64, dropout=True)
     with pytest.raises(NotImplementedError, match="GQA"):

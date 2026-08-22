@@ -193,6 +193,14 @@ _TIGHT_REGISTERS = {
     512: True,
 }
 
+# **The mask costs about 19 live registers**, which only matters where a build
+# was already at the cap. head_dim 224 at 32 rows is the one: 486 VGPR and no
+# spills dense, 512 and **53 spills** causal, worth 777 TFLOP/s against 1199
+# for the same build with the tight arm. Every other rung's causal build has
+# the same register count as its dense one to within twenty and spills nothing,
+# so this is an override rather than a second table.
+_TIGHT_REGISTERS_CAUSAL = {**_TIGHT_REGISTERS, 224: True}
+
 _GEOMETRY = {
     # head_dim: (waves, waves_per_eu, shards, mfma_rows, block_q)
     32: (4, 2, 1, 32, 64),
@@ -343,8 +351,8 @@ class BwdDkDvInputMetadata:
     head_dim_v: int | None = None
     sm_scale: float | None = None
 
-    # B4. Left where the feature goes, so the ABI and the tuning surface do not
-    # move when it arrives. `resolve` rejects a True.
+    # B4. `window` is a *left* bound on top of the causal right one, so it
+    # requires `causal`; see `_checked_scope`.
     causal: bool = False
     window: bool = False
     # B6.
@@ -405,7 +413,7 @@ class BwdDkDvKnobs:
             ._with_widths(meta)
             ._with_geometry()
             ._with_buffers()
-            ._with_register_pressure()
+            ._with_register_pressure(meta)
             ._with_traits(meta)
         )
 
@@ -417,12 +425,19 @@ class BwdDkDvKnobs:
         a GQA call returns one q head's contribution where the sum over the
         group belongs. Both are the right shape.
         """
-        for name in ("causal", "window", "dropout", "bias"):
+        for name in ("dropout", "bias"):
             if getattr(meta, name):
                 raise NotImplementedError(
-                    f"{name}=True is not implemented. B1-B3 are dense, non-causal, MHA, bf16; see "
-                    "sdpa-bwd-plan-gfx950.md phases B4-B6."
+                    f"{name}=True is not implemented. B1-B4 are dense, MHA, bf16, causal and windows "
+                    "only; see sdpa-bwd-plan-gfx950.md phases B5-B6."
                 )
+        if meta.window and not meta.causal:
+            # A window without the causal machinery has no masked region to
+            # apply itself to, and silently dropping it would return dense
+            # attention -- the right shape, finite, and wrong. An unbounded
+            # `window_right` expresses a pure left-band, so nothing is lost.
+            # `make_traits` says the same; this says it before the ladder runs.
+            raise ValueError("window=True requires causal=True; it is a left bound on top of the causal one")
         if meta.dtype_str != "bf16":
             raise NotImplementedError(f"this kernel builds bf16 only, got {meta.dtype_str!r}")
         num_kv_heads = meta.num_heads if meta.num_kv_heads is None else meta.num_kv_heads
@@ -546,7 +561,7 @@ class BwdDkDvKnobs:
         line = 512 + 32
         return smem_n_rpt * (self.block_dmodel // granule) * line * 2
 
-    def _with_register_pressure(self):
+    def _with_register_pressure(self, meta):
         """Trade instruction-level parallelism for live registers, or not.
 
         One knob for two linked choices in the tile body -- whether a staged
@@ -558,7 +573,8 @@ class BwdDkDvKnobs:
         """
         if self.tight_registers is not None:
             return self
-        return replace(self, tight_registers=_TIGHT_REGISTERS[self.block_dmodel])
+        table = _TIGHT_REGISTERS_CAUSAL if meta.causal else _TIGHT_REGISTERS
+        return replace(self, tight_registers=table[self.block_dmodel])
 
     def _with_traits(self, meta):
         """Build the traits this configuration implies.
@@ -579,7 +595,8 @@ class BwdDkDvKnobs:
             block_n=self.block_q,
             granule=self.head_dim_granule,
             vo_shards=self.dkv_shards,
-            causal=False,
+            causal=meta.causal,
+            window=meta.window,
             dtype_str=meta.dtype_str,
             waves_per_eu=self.waves_per_eu,
             daz=self.daz,

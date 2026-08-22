@@ -354,6 +354,64 @@ class BwdDqKernelContext(ParityKernelContext):
                 ),
             )
 
+    def init_tile_bounds(self, **kwargs):
+        """The inherited bounds, re-tightened for a **one-tile** loop.
+
+        `ParityKernelContext` resolves the window and re-points `delta_i32`,
+        and the base class then derives `max_num_tiles` from it -- all of which
+        this body wants. What it does not want is the two lines after: the base
+        rounds the count up to even and floors it at 4, because the dual-wave
+        pipeline consumes two tiles per iteration and its prologue plus
+        epilogue need four to exist. This loop consumes one and needs none.
+
+        Left alone it is still *correct* -- the extra tiles are fully masked and
+        contribute nothing -- which is exactly the problem the contract warns
+        about: **a dead tile is a no-op, so correctness cannot show the cut
+        works.** Up to three dead tiles per Q block is also enough to hide the
+        cut from a timing test, which is the only test that can see it.
+        """
+        super().init_tile_bounds(**kwargs)
+        traits = self.traits
+        if const_expr(traits.CAUSAL):
+            # `causal_end_raw_i32` is `q_start + BLOCK_M + delta_i32`, and
+            # `delta_i32` is the resolved *right* bound under a window -- which
+            # is why re-pointing it generalises the tile count as well as the
+            # mask.
+            end_i32 = fx.Int32((self.causal_end_raw_i32 > fx.Int32(0)).select(self.causal_end_raw_i32, fx.Int32(0)))
+            n = (fx.Index(end_i32) + fx.Index(traits.BLOCK_N - 1)) // fx.Index(traits.BLOCK_N)
+            n = fx.Index((n < self.num_kv_tiles).select(n, self.num_kv_tiles))
+        else:
+            n = self.num_kv_tiles
+        self.max_num_tiles = n
+        # **Not a literal 0.** P3 found four literal tile bases in the forward,
+        # and a window moves this one: `_skip_dead_leading_tiles` below is the
+        # only thing that writes it, and spelling the non-window arm as 0 here
+        # would be correct and would throw the left-bound saving away.
+        self.split_t0 = fx.Index(0)
+        self.split_t_end = n
+        if const_expr(traits.WINDOW):
+            self._skip_dead_leading_tiles()
+
+    def _skip_dead_leading_tiles(self):
+        """Start the KV walk at the window's left edge. Exact, for a one-tile loop.
+
+        The inherited version rounds the base down to even and caps it at
+        `split_t_end - 4`, both because the dual-wave pipeline needs an even
+        segment with four tiles in it. Neither applies here, and both would
+        blunt the cut -- the cap in particular pins the base to zero for any Q
+        block whose live range is short, which is the case a left bound is for.
+
+        The lowest column any row of this Q block can reach is
+        `q_start - window_left`, since `q_start` is the smallest row. Clamped
+        before the divide rather than after: `fx.Index` is unsigned, so a
+        negative would come out enormous and skip the whole range.
+        """
+        traits = self.traits
+        first_col_i32 = fx.Int32(self.q_start) - self.window_left_i32
+        first_col_i32 = fx.Int32((first_col_i32 > fx.Int32(0)).select(first_col_i32, fx.Int32(0)))
+        t0 = fx.Index(first_col_i32) // fx.Index(traits.BLOCK_N)
+        self.split_t0 = fx.Index((t0 < self.split_t_end).select(t0, self.split_t_end))
+
     def init_row_inputs(self):
         """Descriptors and the shared row addressing for LSE and delta.
 
@@ -941,7 +999,27 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
                 # which is a *score of zero*, not an absent key: without the
                 # mask `exp2(0 - lse2)` contributes a spurious P. After the
                 # scale, so the `-inf` it writes never reaches an FMA.
+                #
+                # **Kept under causal too**, where the forward drops it. Under
+                # plain causal it is redundant -- row `i`'s bound is
+                # `i + seqlen_kv - seqlen_q <= seqlen_kv - 1`, so the causal
+                # mask already kills every column past the sequence -- but a
+                # *window* re-points `delta_i32` at an arbitrary right bound
+                # and that argument stops holding. Both guards fire only on the
+                # last tile, so keeping the cheap one unconditionally costs
+                # nothing and removes the case.
                 v_s = softmax_helper.seq_pad_mask_if_needed(v_s, j)
+                if const_expr(traits.CAUSAL):
+                    # The forward's mask and the forward's two-sided guard,
+                    # inherited whole: `_causal_mask_inplace` applies the right
+                    # bound through `delta_i32` and, under `WINDOW`, the left
+                    # one. **No transpose read is inside this region** -- it
+                    # touches `v_s` only, and `load_v` sits below. CDNA4 11.4
+                    # requires EXEC all 1s across `ds_read_b64_tr_b16`, and
+                    # B4 is the first phase where a branch exists to violate
+                    # it; `test_no_transpose_read_under_a_restricted_exec`
+                    # is what keeps that true.
+                    v_s = softmax_helper.causal_mask_prologue_if_needed(v_s, j, kv_end_tile=j + fx.Index(1))
 
                 # -- GEMM2. dP. V is read through the K path, so this is
                 #    GEMM1's code with the two operands substituted -- and with
@@ -1167,6 +1245,37 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             stream=stream,
         )
 
+    def _resolve_window_args(window):
+        """`(window_left, window_right)` for the wire, as signed i32.
+
+        The forward's, verbatim in behaviour: always a pair, even for a build
+        that ignores it, so every build shares one ABI. A *sentinel* rather
+        than a bound goes on the wire for the fixed alignments, because the
+        kernel resolves it against each sequence's own lengths -- the only
+        correct thing to do once varlen means there is more than one pair of
+        lengths to resolve against.
+        """
+        if not traits.CAUSAL:
+            if window is not None:
+                raise ValueError("window= requires a causal build; this one has causal=False")
+            return 0, 0
+        if not traits.WINDOW:
+            if window is not None:
+                raise ValueError(
+                    "this build is not compiled for windows; pass window=True in the builder to get "
+                    "generalized sliding-window attention"
+                )
+            # Bottom-right causal, which is what `delta = seqlen_kv - seqlen_q`
+            # already means on this kernel.
+            return fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT
+        if window is None:
+            raise ValueError(
+                "a window build requires window=(left, right); pass "
+                "(fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT) for bottom-right causal"
+            )
+        wl, wr = window
+        return int(wl), int(wr)
+
     def _args(
         Q,
         K,
@@ -1180,6 +1289,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         seqlen_k=None,
         scale=None,
         db=None,
+        window=None,
         stream=None,
     ):
         """Every kernel argument but the stream, in launch order.
@@ -1265,8 +1375,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             0,  # num_seqlens
             int(seqlen_q),
             int(seqlen_k),
-            fmha.WINDOW_BOTRIGHT,
-            fmha.WINDOW_BOTRIGHT,
+            *_resolve_window_args(window),
             abi.NULL_PTR,
             abi.NULL_PTR,
             0,

@@ -111,6 +111,7 @@ import weakref
 
 import fmha_abi_gfx1201 as abi
 import fmha_bwd_dkdv_m16_gfx950 as m16
+import fmha_common_gfx1201 as fmha
 from fmha_common_gfx1201 import MaskedAxis
 from fmha_dualwave_gfx950 import (
     ParityGemmHelper,
@@ -162,6 +163,16 @@ _COMPILE_HINTS = {
 # forward derives the same runs for its bias reads; deriving them once is
 # contract section 4's rule, and this is the second consumer that proves it.
 _ROW_RUNS = _score_column_runs(False)
+
+# The same runs flattened: `_ROW_THRESHOLDS[r]` is the q row accumulator element
+# `r` holds, before the tile base and the lane term. Derived from `_ROW_RUNS`
+# rather than written out, because a mask keyed on a lane->(row, col) map is
+# exactly the code that tempts a second transcription -- and the 32-row and
+# 16-row families each get this from their own map, never from each other's.
+_ROW_THRESHOLDS = [0] * 16
+for _e0, _c0, _w in _ROW_RUNS:
+    for _j in range(_w):
+        _ROW_THRESHOLDS[_e0 + _j] = _c0 + _j
 
 
 def _stream_row_read_base(traits, lane_mod_32, lane_div_32):
@@ -354,6 +365,15 @@ class BwdDkDvKernelContext(ParityKernelContext):
         else:
             self.dkv_shard_id = fx.Index(0)
         self.wave_kv_offset = self.wave_q_offset
+        # The same offset from the *uniform* wave id. The causal predicate is
+        # wave-uniform and must stay so: built from `wave_id` it would be a
+        # lane-varying compare, and the branch it feeds would then narrow EXEC
+        # -- which is the one thing the transpose reads cannot tolerate.
+        rows_uni = traits.ROWS_PER_WAVE
+        if const_expr(traits.DKV_SHARDS > 1):
+            self.wave_kv_offset_uni = (self.wave_id_uni // traits.DKV_SHARDS) * rows_uni
+        else:
+            self.wave_kv_offset_uni = self.wave_id_uni * rows_uni
         # Global first D column of this wave's accumulators. Runtime, because
         # the shard comes from `wave_id`; zero and folded away when unsharded.
         self.dkv_col_base = self.dkv_shard_id * fx.Index(traits.D_CHUNKS_PER_SHARD * traits.D_CHUNK)
@@ -504,24 +524,67 @@ class BwdDkDvKernelContext(ParityKernelContext):
     # -- bounds ------------------------------------------------------------
 
     def init_tile_bounds(self, **kwargs):
-        """Count **q** tiles, rounded up to an even number.
+        """The q tiles this KV block walks, rounded out to an even count.
 
         The body consumes two tiles per iteration, so an odd count would leave
-        the second half of the last iteration reading a tile that does not
-        exist. Rounding up costs one dead tile rather than an epilogue: its
-        rows are past `seqlen_q`, so Q and dO stage as zeros and it contributes
-        exactly nothing (module docstring).
+        the second half of the last iteration reading a tile the walk did not
+        intend. Rounding up costs one tile and is safe in both modes: dense,
+        because rows past `seqlen_q` stage as zeros; causal, because the
+        per-tile predicate below is a *superset* test and masks a tile outside
+        the live range to nothing.
+
+        **Under causal the walk does not start at tile 0**, and that is the
+        whole of the tile cut. P3 found four literal-zero tile bases in the
+        forward; `split_t0` is the one knob the prologue and the loop both read,
+        so there is one place to get it right.
         """
         traits = self.traits
         self.kv_tile_size = traits.BLOCK_Q
-        tiles = (self.seqlen_q_v + fx.Index(traits.BLOCK_Q - 1)) // fx.Index(traits.BLOCK_Q)
-        tiles = ((tiles + fx.Index(1)) // fx.Index(2)) * fx.Index(2)
-        tiles = fx.Index((tiles < fx.Index(2)).select(fx.Index(2), tiles))
-        self.num_q_tiles = tiles
-        self.max_num_tiles = tiles
+        if const_expr(not traits.CAUSAL):
+            self.window_left_i32 = None
+            self.causal_lo_i32 = None
+            tiles = (self.seqlen_q_v + fx.Index(traits.BLOCK_Q - 1)) // fx.Index(traits.BLOCK_Q)
+            tiles = ((tiles + fx.Index(1)) // fx.Index(2)) * fx.Index(2)
+            tiles = fx.Index((tiles < fx.Index(2)).select(fx.Index(2), tiles))
+            self.split_t0 = fx.Index(0)
+            self.split_t_end = tiles
+        else:
+            # **The sentinels resolve on the device**, against this sequence's
+            # own lengths, because under varlen (B5) they differ per sequence.
+            # A non-window build forwards `WINDOW_BOTRIGHT` for both, so the
+            # left bound comes back as `seqlen_q` -- unbounded -- and every
+            # left-bound comparison below is `const_expr`-ed away regardless.
+            left, right = fmha.resolve_window(
+                self.window_left_arg, self.window_right_arg, fx.Int32(self.seqlen_q_v), self.seqlen_kv_i32
+            )
+            self.window_left_i32 = fx.Int32(left)
+            # A (q, kv) element is live iff `kv - right <= q <= kv + left`, so
+            # what the causal side compares against is `-right`. Stored negated
+            # because that is the form every element test wants.
+            self.causal_lo_i32 = fx.Int32(fx.Int32(0) - fx.Int32(right))
+            # **The same function the forward cuts a Q block's KV range with,
+            # axes swapped**: a KV block's Q range. gfx1201's dK/dV established
+            # the identity and the contract says not to re-derive it. Row axis
+            # is KV here, column axis is Q, so `window_left` takes the resolved
+            # *right* bound and vice versa.
+            regions = fmha.decompose_causal_regions(
+                fx.Int32(self.kv_start),
+                self.seqlen_kv_i32,
+                fx.Int32(self.seqlen_q_v),
+                fx.Int32(right),
+                fx.Int32(left),
+                traits.BLOCK_KV,
+                traits.BLOCK_Q,
+                fx.Boolean(True),
+            )
+            n_tiles = regions.n_left + regions.n_full + regions.n_right
+            n_tiles = fx.Index((n_tiles > fx.Int32(0)).select(n_tiles, fx.Int32(0)))
+            n_tiles = ((n_tiles + fx.Index(1)) // fx.Index(2)) * fx.Index(2)
+            self.split_t0 = fx.Index(regions.left_col0) // fx.Index(traits.BLOCK_Q)
+            self.split_t_end = self.split_t0 + n_tiles
+        self.num_q_tiles = self.split_t_end - self.split_t0
+        self.max_num_tiles = self.num_q_tiles
         self.causal_end_raw_i32 = None
-        self.split_t0 = 0
-        self.split_t_end = tiles
 
 
 class BwdDkDvStreamLoader(ParityKvGmemToLdsLoader):
@@ -790,6 +853,82 @@ class BwdDkDvSoftmaxHelper(ParitySoftmaxHelper):
             for r in range_constexpr(16)
         ]
 
+    def mask_if_clipped(self, p_list, tile_idx, half):
+        """Zero `P` outside the band, for the tiles that can be clipped.
+
+        **The mask goes on `P`, not on `S`, and that is both cheaper and
+        safer.** `dS = P * (dP - delta)` and `dV += P . dO`, so a zero in `P`
+        kills every downstream contribution -- one select per element covers
+        both gradients, where the forward has to mask `S` because its `O`
+        depends on the softmax denominator. It also keeps `-inf` out of the
+        arithmetic entirely: `fm_fast` carries `ninf`, and plan1 records that
+        licence deleting a KV tail mask on gfx1201.
+
+        The predicate is **wave-uniform** -- it is built from the wave's own KV
+        row range and the tile index, both `readfirstlane`-derived -- and it is
+        a *superset* test: any tile that needs any masking takes the branch,
+        including one entirely outside the live range, which is what makes the
+        even-rounded tile count safe.
+
+        Masking unconditionally would also be correct. The forward measured
+        that at 197 us against causal's 126, because it forces the mask onto
+        every interior tile in the walk.
+
+        **No transpose read is inside this region**, and that is a correctness
+        requirement rather than tidiness (CDNA4 section 11.4: EXEC must be all
+        1s across `ds_read_b64_tr_b16`). The q-contracted GEMMs run in their own
+        loop after the softmax; see `tooling/check_exec_hazard_gfx950.py`, which
+        scans the ISA for a transpose read under a narrowed EXEC.
+        """
+        traits = self.traits
+        ctx = self.ctx_ref
+        lo_i32 = ctx.causal_lo_i32
+        left_i32 = ctx.window_left_i32
+        rows = traits.MFMA_ROWS
+        # Per-lane, per-tile: `q - kv` for accumulator element 0 of this half.
+        rel0 = (
+            fx.Int32(tile_idx * fx.Index(traits.BLOCK_Q))
+            + fx.Int32(half * 32)
+            + fx.Int32(self.lane_div_32) * fx.Int32(4)
+            - fx.Int32(ctx.kv_row)
+        )
+        # Wave-uniform bounds on the same quantity, over the whole tile and the
+        # wave's whole KV row block.
+        kv_lo = fx.Int32(ctx.kv_start) + fx.Int32(ctx.wave_kv_offset_uni)
+        tile_q0 = fx.Int32(tile_idx * fx.Index(traits.BLOCK_Q))
+        # `q >= kv - right` can fail somewhere in this tile iff the tile's
+        # first q is below the *largest* kv row's bound.
+        need = tile_q0 < kv_lo + fx.Int32(rows - 1) + lo_i32
+        if const_expr(traits.WINDOW):
+            # `q <= kv + left` can fail iff the tile's last q is above the
+            # *smallest* kv row's bound.
+            need = need | (tile_q0 + fx.Int32(traits.BLOCK_Q - 1) > kv_lo + left_i32)
+        zero_f = self.c_zero_f
+        window = traits.WINDOW
+
+        def _apply(vals):
+            out = list(vals)
+            for r in range_constexpr(16):
+                rel = rel0 + fx.Int32(_ROW_THRESHOLDS[r])
+                keep = rel >= lo_i32
+                if const_expr(window):
+                    keep = keep & (rel <= left_i32)
+                out[r] = keep.select(fx.Float32(vals[r]), zero_f)
+            return out
+
+        @flyc.jit
+        def _mask_if_needed(p_vec):
+            out = p_vec
+            if need:
+                out = Vec.from_elements(
+                    [as_mlir_value(v) for v in _apply([Vec(p_vec)[r] for r in range_constexpr(16)])],
+                    fx.Float32,
+                ).ir_value()
+            return out
+
+        packed = Vec.from_elements([as_mlir_value(fx.Float32(v)) for v in p_list], fx.Float32).ir_value()
+        return [Vec(_mask_if_needed(packed))[r] for r in range_constexpr(16)]
+
     def pack_half(self, values):
         """The two bf16 B-operand packs for one 32-row half of a q tile.
 
@@ -943,6 +1082,8 @@ class BwdDkDvTileBody(dualwave.DualwaveKernelContext):
             dp = {h: self.gemm.contract_d(self._row_reader(do_base, do_scope, h, self.hdim_vo), v_v) for h in group}
             neg_lse2 = {h: self.softmax.load_row_values(ctx.lse_rsrc, tile_base, h, ctx.c_neg_log2e) for h in group}
             p_list = {h: self.softmax.probabilities(s[h], neg_lse2[h]) for h in group}
+            if const_expr(traits.CAUSAL):
+                p_list = {h: self.softmax.mask_if_clipped(p_list[h], tile_idx, h) for h in group}
             delta = {h: self.softmax.load_row_values(ctx.delta_rsrc, tile_base, h, ctx.c_one_f) for h in group}
             ds_list = {h: self.softmax.dscores(p_list[h], dp[h], delta[h]) for h in group}
             for h in group:
@@ -1175,6 +1316,7 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             zero_acc = ctx.c_zero_v16f32
             acc_width = 16
 
+        t0 = ctx.split_t0
         t_end = ctx.split_t_end
         scale_vec = Vec.from_elements([ctx.c_sm_scale], fx.Float32).broadcast_to(acc_width)
 
@@ -1187,16 +1329,21 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             # Prime every buffer. From here each tile's DMA is issued by the
             # body `NUM_STREAM_BUFFERS` tiles earlier, so this is the only
             # staging whose latency is not covered by compute.
+            # `t0`, not a literal 0. Under causal the walk starts at the
+            # window's first live tile, and P3 found four prologues in the
+            # forward that assumed otherwise -- the answer stays right (a dead
+            # tile masks to nothing) while the tile cut goes inert, which only
+            # a timing assertion catches.
             for b in range_constexpr(NBUF):
-                stream.stage_q_tile(fx.Index(b), b)
-                stream.stage_do_tile(fx.Index(b), b)
+                stream.stage_q_tile(t0 + fx.Index(b), b)
+                stream.stage_do_tile(t0 + fx.Index(b), b)
 
             init_args = []
             for _ in range_constexpr(2 * n_acc):
                 init_args.append(zero_acc)
             loop_results = init_args
 
-            for j, loop_args in range(fx.Index(0), t_end, fx.Index(2), init=init_args):
+            for j, loop_args in range(t0, t_end, fx.Index(2), init=init_args):
                 dv = [loop_args[i] for i in range_constexpr(n_acc)]
                 dk = [loop_args[n_acc + i] for i in range_constexpr(n_acc)]
                 # Two tiles per iteration, one LDS buffer each when there are
@@ -1364,6 +1511,36 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             stream=stream,
         )
 
+    def _resolve_window_args(window):
+        """`(window_left, window_right)` for the wire, as signed i32.
+
+        Always a pair, even for a build that ignores it, so every build shares
+        one ABI and stays directly comparable -- the same reason the strides are
+        passed under `strides_constexpr`. A *sentinel* rather than a bound goes
+        on the wire for the fixed alignments: the kernel resolves it against
+        each sequence's own lengths, which is the only correct thing to do once
+        varlen means there is more than one pair to resolve against. The
+        forward's `_resolve_window_args`, verbatim in intent.
+        """
+        if not traits.CAUSAL:
+            if window is not None:
+                # Dropping it silently returns dense attention's gradient:
+                # right shape, finite, wrong. A window is only ever passed by a
+                # caller who believes it is being applied.
+                raise ValueError("window= requires a causal build; this one has causal=False")
+            return 0, 0
+        if not traits.WINDOW:
+            if window is not None:
+                raise ValueError("this build is not compiled for windows; pass window=True in BwdDkDvInputMetadata")
+            return fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT
+        if window is None:
+            raise ValueError(
+                "a window build requires window=(left, right); pass "
+                "(fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT) for plain bottom-right causal"
+            )
+        wl, wr = window
+        return int(wl), int(wr)
+
     def _check_8x_d_contract(named):
         """Refuse a layout the kernel's 8-wide accesses would overrun.
 
@@ -1413,6 +1590,7 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         seqlen_q,
         seqlen_k=None,
         scale=None,
+        window=None,
         stream=None,
     ):
         """Every kernel argument but the stream, in launch order.
@@ -1495,8 +1673,7 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             0,  # num_seqlens
             int(seqlen_q),
             int(seqlen_k),
-            0,  # window_left
-            0,  # window_right
+            *_resolve_window_args(window),
             abi.NULL_PTR,
             abi.NULL_PTR,
             0,  # philox_offset2

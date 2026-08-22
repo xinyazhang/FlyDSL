@@ -457,6 +457,68 @@ class M16DqSoftmax:
 
         return _mask_if_needed(v_s, tile_idx)
 
+    def causal_mask(self, v_s, tile_idx, lane, q_row):
+        """The causal right bound, and a window's left one, at 16 rows.
+
+        **Derived from this family's own lane map**, not transcribed from the
+        32-row one: `kv_col` is the single place the element -> column map
+        lives here, and the KV tail mask and the dB store read the same
+        function. The 32-row path cannot be reused at all -- its
+        `_causal_pair_thresholds` table describes a 16-element accumulator half
+        whose columns are four scattered runs, where this one holds four
+        contiguous tokens.
+
+        The guard is the forward's two-sided test, over the *wave's* row range
+        rather than the workgroup's, because a wave owns 16 rows here:
+
+        - a column can overrun the right bound only if the **lowest** row's
+          bound lands inside the tile;
+        - a column can fall behind the left bound only if the **highest** row's
+          edge is still above `kv_start`.
+
+        Both terms are wave-uniform (`wave_id_uni` is `readfirstlane`d), so the
+        branch is scalar and **EXEC is untouched** -- which is what keeps the
+        transpose read below it legal under CDNA4 11.4. A divergent condition
+        here would be a correctness bug, not a slow one.
+
+        Plain `select`s rather than the 32-row path's paired inline asm: that
+        exists because the causal mask is on the innermost path of every
+        forward build, and reaching for it here before a measurement asks would
+        be copying a decision rather than its reason.
+        """
+        traits = self.traits
+        ctx = self.ctx
+        neg_inf = ctx.c_neg_inf
+        delta_i32 = ctx.delta_i32
+        to_lists, to_vecs, kv_col, n = self.to_lists, self.to_vecs, self.kv_col, self.n
+        windowed = const_expr(traits.WINDOW)
+        window_left_i32 = ctx.window_left_i32 if windowed else None
+        # The wave's first row, uniform. `q_row` is this lane's and is not.
+        qs_i32 = fx.Int32(ctx.q_start) + fx.Int32(ctx.wave_id_uni) * fx.Int32(MFMA16_M)
+        q_row_i32 = fx.Int32(q_row)
+
+        @flyc.jit
+        def _mask_if_needed(v_s, tile_idx):
+            s_lo, s_hi = v_s
+            kv_end = fx.Int32((tile_idx + fx.Index(1)) * traits.BLOCK_N)
+            need = qs_i32 + delta_i32 < kv_end
+            if windowed:
+                kv_start = fx.Int32(tile_idx * traits.BLOCK_N)
+                need = need | (kv_start < qs_i32 + fx.Int32(MFMA16_M - 1) - window_left_i32)
+            if need:
+                lists = to_lists(v_s)
+                for step in range_constexpr(2):
+                    for i in range_constexpr(n):
+                        col = kv_col(tile_idx, lane, step, i)
+                        keep = col <= q_row_i32 + delta_i32
+                        if windowed:
+                            keep = keep & (col >= q_row_i32 - window_left_i32)
+                        lists[step][i] = keep.select(fx.Float32(lists[step][i]), neg_inf)
+                s_lo, s_hi = to_vecs(lists)
+            return s_lo, s_hi
+
+        return _mask_if_needed(v_s, tile_idx)
+
     def exp2(self, v_s):
         return tuple(
             [dualwave.rocdl.exp2(T.f32, as_mlir_value(Vec(h)[r])) for r in range_constexpr(self.n)] for h in v_s
@@ -588,6 +650,12 @@ def make_m16_dq_body(
             v_s = gemm.qk(k_reader.load_a_all(lane), q_packs)
             v_s = softmax.scale_and_sub_lse(v_s, ctx.c_sm_scale_log2e, lse2)
             v_s = softmax.seq_pad_mask(v_s, j, lane)
+            if const_expr(traits.CAUSAL):
+                # Same placement argument as the 32-row body's: this touches
+                # `v_s` only, and every transpose read is below it. The guard
+                # is wave-uniform, so the branch is scalar and EXEC stays all
+                # ones across `load_kt`.
+                v_s = softmax.causal_mask(v_s, j, lane, q_row)
             v_dp = gemm.qk(v_reader.load_a_all(lane), do_packs)
 
             ds = softmax.dscores(softmax.exp2(v_s), v_dp, delta)

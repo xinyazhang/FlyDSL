@@ -444,3 +444,60 @@ head_dim 96 is a normal rung again.
   Free, loop-invariant, and it also keeps the accumulator's rows contiguous for
   the row-tensor loads. Check the producer's addressing before reaching for a
   cross-lane op.
+- **A bitwise oracle that generates its own inputs is not an oracle.** The
+  sentinel check -- a window build fed `WINDOW_BOTRIGHT` must reproduce plain
+  causal *exactly* -- reported 130962 of 131072 elements differing, by up to
+  2.28. Both builds were correct to 0.003 against fp64; the runner called
+  `torch.randn` inside the per-build helper, so the two builds saw different
+  Q/K/V. This is the fourth instance of "always run a known-good control" in
+  this work and the first where the missing control was *the inputs* rather
+  than a second configuration. A bitwise test must hoist its data above every
+  build it compares, and the tell is that both sides pass their own tolerance
+  check while failing equality.
+- **A tile-cut timing ratio is bounded by occupancy before it is bounded by
+  work, and the number alone tells you nothing.** Three measurements in this
+  codebase read ~0.92x and meant three different things:
+
+  | case | shape | ratio | truth |
+  |---|---|---|---|
+  | forward P3, wide body | narrow window vs unbounded, 512 WGs | 0.92x | cut **inert** -- the fix gave 8.04x |
+  | backward dQ | dense vs causal, 256 WGs | 0.92x | cut **working** -- 0.69x at 1024 WGs |
+  | backward dK/dV | dense vs causal, 16 WGs | 0.94x | cut **working** -- 1.84x at 2048 WGs |
+
+  Two mechanisms, and they point opposite ways. **Too few workgroups** and
+  every one is resident, so the clock is set by the *longest* -- the block at
+  `kv_start = 0`, which walks every tile either way -- while the cut's whole
+  saving is in the *average*. And **causal is only a factor of two even when it
+  works**, because block `i` walks `2i + 2` tiles, where a narrow window is a
+  factor of seven. So P3 nearly shipped an inert cut on a 0.92x reading and
+  dK/dV nearly deleted a working one on a 0.94x reading, from the same number.
+
+  The rule that survives all three: **state what the ratio would be if the cut
+  worked, at the shape you are about to use, before you measure it.** If that
+  number is near 1 the test cannot discriminate and the shape is wrong. Then
+  pin the shape and the workgroup count in the assertion beside the bound, not
+  just the ratio.
+- **A feature's register cost lands on whichever rung was already at the cap.**
+  Causal masking added ~19 live registers uniformly across the gfx950 dK/dV
+  ladder. Nine rungs did not notice; head_dim 224 went from 486 VGPR / 0 spills
+  to 512 / **53 spills**, and was the one rung where enabling causal bought no
+  speedup at all (777 TFLOP/s against 791 dense, where its neighbours went to
+  1400). One knob flip fixed it, at 1182. So a per-width tuning table has to be
+  keyed on the **feature set** too, and a new feature wants a spill check at
+  every rung rather than at the widest one.
+- **Keep a mask predicate wave-uniform and the branch stays scalar.** CDNA4
+  §11.4 requires EXEC all 1s across `ds_read_b64_tr_b16`, and the cheap way to
+  guarantee it is not to audit `scf.if` placement but to build every predicate
+  from `readfirstlane`-derived values -- the wave's own row range and the tile
+  index. The gfx950 backward's causal and window builds then emit **zero
+  EXEC-writing instructions of any kind**, at both MFMA families; the masked
+  regions are `s_cbranch` and nothing else. That is a checkable invariant, and
+  `tooling/check_exec_hazard_gfx950.py` scans the final ISA for it. Deriving
+  the offset from `wave_id` rather than `wave_id_uni` is all it takes to lose.
+- **Mask the value the outputs are linear in, not the scores.** The gfx950
+  dK/dV backward masks `P` rather than `S`, because `dS = P * (dP - delta)` and
+  `dV += P . dO` both inherit a zero from one select per element. The forward
+  cannot -- its output depends on the softmax denominator -- but a backward
+  can, and it is cheaper *and* keeps `-inf` out of arithmetic that runs under
+  `fm_fast`'s `ninf` licence. plan1 records that licence deleting a KV tail
+  mask on gfx1201.

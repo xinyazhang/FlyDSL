@@ -1894,3 +1894,284 @@ change, which is a coverage hole that moves.
   obviously register-bound -- 352 VGPR, 96 AGPR, zero spills. It is the one
   place a profile would be worth more than another knob.
 - Causal, windows, varlen, dropout, bias input and GQA remain refused by name.
+
+---
+
+## Outcome: B4/dQ — causal and windows, on both families
+
+Both MFMA families, the full ladder, causal and generalized sliding windows.
+218 tests pass with no skips. Nothing outside the four dQ files was edited.
+
+### Wall-clock, causal, one shape
+
+`B=4 H=8 S=4096` bf16 **causal**, idle GPU 6. **Wall-clock** `bwd/fwd`, i.e.
+`(t_dQ + t_dKdV) / t_fwd` — not a ratio of rates:
+
+| hdim | fwd | dK/dV | dQ | bwd | bwd/fwd |
+|---|---|---|---|---|---|
+| 64 | 135 us | 248 | 191 | 439 | **3.26x** |
+| 128 | 190 | 435 | 342 | 778 | **4.10x** |
+| 256 | 450 | 841 | 703 | 1544 | **3.43x** |
+| 512 | 1397 | 2677 | 1980 | 4657 | **3.33x** |
+
+Causal cuts both directions, so the ratio is flatter than the dense one and
+512 is no longer the worst rung.
+
+### What was inherited, and what had to be new
+
+**The 32-row family needed almost no new code.** The gfx950 forward implements
+causal as three things this kernel already subclasses — `max_num_tiles`
+truncating the walk through `delta_i32`, `_skip_dead_leading_tiles` moving the
+base for a window's left bound, and a per-tile mask behind a two-sided guard —
+so the body gained one call. Nothing was re-derived.
+
+Two overrides were needed and both are about the *loop*, not the mask:
+
+- **`init_tile_bounds`.** The base rounds the tile count up to even and floors
+  it at 4, because the dual-wave pipeline consumes two tiles an iteration and
+  its prologue plus epilogue need four. This loop consumes one. Left alone it
+  is still *correct* — the extra tiles are fully masked — which is exactly the
+  trap: up to three dead tiles per Q block is enough to hide the cut from the
+  only test that can see it.
+- **`_skip_dead_leading_tiles`.** Same story: the inherited version rounds the
+  base down to even and caps it at `split_t_end - 4`, and the cap pins the base
+  to zero for precisely the short live ranges a left bound is for.
+
+**The 16-row family needed its own mask**, because the 32-row one is a
+transcription of a 16-element accumulator half whose columns are four scattered
+runs (`_causal_pair_thresholds`), where this family's four are contiguous. It
+is derived from `M16DqSoftmax.kv_col` — the same function the KV tail mask and
+the dB store read, so the three cannot disagree.
+
+`dB` needed **no change at all**: the mask drives `P` to zero, so `dS` is zero
+in the masked region, which is what AOTriton stores there too.
+
+### The EXEC hazard: checked, not assumed
+
+CDNA4 §11.4 requires **EXEC all 1s** across `ds_read_b64_tr_b16`, and B4 is the
+first phase with a branch that could violate it. The invariant this kernel
+holds is stronger than "no transpose read inside a divergent region":
+
+**the kernel restricts EXEC nowhere at all.** Every masking guard is
+wave-uniform — the tile index, and the wave's first row via `wave_id_uni`,
+which is `readfirstlane`d — so the compiler emits scalar branches. Measured on
+four builds (both families × causal/window):
+
+| build | `ds_read_b64_tr` | `saveexec` | writes to `exec` | `s_cbranch` |
+|---|---|---|---|---|
+| d128, 32 rows, causal | 32 | **0** | **0** | 8 |
+| d128, 32 rows, window | 32 | **0** | **0** | 9 |
+| d512, 16 rows, causal | 64 | **0** | **0** | 8 |
+| d512, 16 rows, window | 64 | **0** | **0** | 9 |
+
+`test_no_transpose_read_under_a_restricted_exec` asserts the zero, and fails if
+a guard ever becomes lane-varying — whether or not a transpose read happened to
+land inside it that day. That is the property worth pinning, because the
+failure mode is finite, wrong and silent.
+
+### The sentinel oracle, and the way it first "failed"
+
+A window build fed `WINDOW_BOTRIGHT` on both bounds reproduces a plain causal
+build **bit for bit**, on both families, at head_dim 64 and 512.
+
+It reported a difference first: 130962 of 131072 elements, up to 2.28. Both
+builds were correct to 0.003 against fp64 — **the runner called `torch.randn`
+inside the per-build helper**, so the two saw different inputs. Fourth instance
+of the lore's "always run a known-good control" in this work, and the first
+where the missing control was the *data*. Added there, because the tell
+generalises: both sides pass their own tolerance check and fail equality.
+
+### The tile cut, and why the timing test needed a bigger shape
+
+A dead tile changes no output bit, so correctness cannot show the cut works.
+Measured at `head_dim 64`, dense against causal, same binary:
+
+| workgroups | dense | causal | ratio |
+|---|---|---|---|
+| 256 (`b=1 h=8 s=4096`) | 84 us | 77 | 0.92x |
+| 512 (`b=2`) | 129 | 107 | 0.83x |
+| 1024 (`b=4`) | 269 | 187 | **0.69x** |
+
+**0.92x is what a working cut measures at one workgroup per CU** — causal load
+is `2i + 2` tiles for block `i`, so the longest block sets the clock and the
+halved *total* work is invisible. That is indistinguishable from the inert cut
+P3 found in the forward, so the test is pinned at 1024 workgroups with the
+count quoted next to the bound. Also in the lore.
+
+The window cut is unmistakable everywhere — a 128-wide left band against an
+unbounded one is 0.17x–0.36x, because it moves the base as well as truncating
+the end.
+
+### Gates
+
+Causal at every rung both families serve, `Sq == Sk` throughout (torch's
+`is_causal` is top-left, these kernels bottom-right — they agree nowhere else);
+windows at `(64,0)`, `(128,32)`, `(16,16)` and the degenerate `(0,0)`; the
+sentinel bit-identity oracle; two timing assertions; the EXEC scan; and
+everything B3/B3.5 gated, unchanged.
+
+### Still not done
+
+- Varlen (B5), dropout (B6) and bias input, still refused by name.
+- `decompose_causal_regions` is **not** used. dQ gets its region cut from the
+  forward's mechanism, which it already subclasses; the function is the
+  three-region cut gfx1201 needs and would be a second way to say the same
+  thing here. If B5's varlen makes the two-region form insufficient, that is
+  when to reach for it.
+- The causal mask at 16 rows uses plain `select`s where the 32-row path uses a
+  paired inline asm. That asm exists because the mask is on the forward's
+  innermost path; reaching for it here before a measurement asks would be
+  copying a decision rather than its reason.
+
+---
+
+## Outcome: B4 — dK/dV, causal and generalized windows
+
+Files: the mask and the region cut in `fmha_bwd_dkdv_gfx950.py` (32-row) and
+`fmha_bwd_dkdv_m16_gfx950.py` (16-row), the feature axes in
+`fmha_tuning_bwd_dkdv_gfx950.py`, and `tooling/check_exec_hazard_gfx950.py`.
+**264 tests, all passing, no skips** (155 before B4). The forward's suite and
+dQ's still pass alongside.
+
+### Measured, wall clock
+
+`B=2 H=8 S=4096` bf16, GPU 5 idle, all three kernels in one session. Nominal
+TFLOP/s per kernel's own GEMM count, "bwd eff" over the five GEMMs the maths
+requires, and **`bwd/fwd` as a ratio of times** -- `(t_dkdv + t_dq) / t_fwd`,
+not of rates. B3.5's headline divided by the 2.5x extra work and then compared
+against it, which flattered by exactly that factor.
+
+| hdim | rows | fwd | dK/dV | dQ | bwd eff | t_fwd (us) | t_bwd (us) | bwd/fwd |
+|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | **dense** |
+| 32 | 32 | 492 | 485 | 580 | 373 | 70 | 230 | 3.30x |
+| 64 | 32 | 782 | 720 | 790 | 535 | 88 | 321 | 3.66x |
+| 96 | 16 | 847 | 729 | 874 | 561 | 122 | 460 | 3.78x |
+| 128 | 16 | 1038 | 779 | 757 | 550 | 132 | 625 | 4.72x |
+| 160 | 32 | 792 | 737 | 745 | 529 | 217 | 812 | 3.74x |
+| 192 | 16 | 829 | 847 | 780 | 584 | 249 | 883 | 3.55x |
+| 224 | 32 | 826 | 791 | 762 | 556 | 291 | 1081 | 3.72x |
+| 256 | 16 | 848 | 771 | 815 | 564 | 324 | 1219 | 3.76x |
+| 384 | 16 | 769 | 424 | 524 | 330 | 536 | 3123 | **5.83x** |
+| 512 | 16 | 521 | 436 | 491 | 327 | 1056 | 4200 | 3.98x |
+| | | | | | | | | **causal** |
+| 32 | 32 | 577 | 526 | 689 | 418 | 60 | 206 | 3.45x |
+| 64 | 32 | 928 | 844 | 936 | 629 | 74 | 273 | 3.69x |
+| 96 | 16 | 1055 | 1147 | 1096 | 803 | 98 | 321 | 3.28x |
+| 128 | 16 | 1336 | 1258 | 1056 | 830 | 103 | 414 | 4.02x |
+| 160 | 32 | 1024 | 1261 | 1040 | 825 | 168 | 520 | 3.10x |
+| 192 | 16 | 1062 | 1397 | 1054 | 876 | 194 | 589 | 3.03x |
+| 224 | 32 | 1100 | 1182 | 1081 | 812 | 219 | 741 | 3.39x |
+| 256 | 16 | 1089 | 1414 | 1091 | 896 | 252 | 767 | 3.04x |
+| 384 | 16 | 973 | 811 | 881 | 600 | 424 | 1719 | 4.06x |
+| 512 | 16 | 771 | 816 | 770 | 568 | 713 | 2418 | 3.39x |
+
+Causal costs about half the work and both halves take it, so `bwd/fwd` is flat
+across the two modes. Dense head_dim 384 remains the worst rung at 5.83x.
+
+### The mask goes on `P`, not on `S`
+
+`dS = P * (dP - delta)` and `dV += P . dO`, so **one select per element on `P`
+kills both gradients**. The forward has to mask `S` because its output depends
+on the softmax denominator; dK/dV does not, so it gets the cheaper site.
+
+It also keeps `-inf` out of the arithmetic entirely, which is not a detail:
+`fm_fast` carries `ninf`, and plan1 records that licence silently deleting a KV
+tail mask on gfx1201. Masking `S` here would have put a real infinity into a
+multiply by `qk_scale` and an add of `lse2`.
+
+### The tile cut works, and the way it was nearly misdiagnosed is the finding
+
+`fmha.decompose_causal_regions` with the axes swapped, as the contract says --
+`left_col0 / BLOCK_Q` is the first live q tile and `n_left + n_full + n_right`
+is how many. `split_t0` is the single value the prologue and the loop base both
+read, which is the answer to P3's four literal-zero tile bases: there is one
+place to get it right.
+
+The first timing said the cut was **inert** -- 0.94x at head_dim 64, 0.98x at
+128, 0.71x at 256:
+
+| shape | workgroups | dense/causal |
+|---|---|---|
+| `B=1 H=2 S=1024`, d64, 32 rows | 16 | **0.94x** |
+| `B=4 H=8 S=4096`, d64, 32 rows | 1024 | **1.53x** |
+| `B=4 H=8 S=4096`, d64, 16 rows | 2048 | **1.84x** |
+| `B=4 H=8 S=4096`, d128, 32 rows | 1024 | 1.72x |
+
+Same code. **At 16 workgroups on 256 CUs every one runs concurrently and the
+wall clock is set by the longest** -- the KV block at `kv_start = 0`, which
+walks every tile in both builds. The cut halves the *average* tiles walked and
+the average is invisible until the machine is full.
+
+That is the inverse of P3's failure and it fails the same way: P3 shipped an
+inert cut that timed at 0.92x, and this would have *removed* a working one for
+reading 0.94x. `test_causal_tile_cut_is_not_inert` therefore pins the shape as
+well as the ratio, and says why in the docstring.
+
+A second version of the same trap sat inside the test itself: the first draft
+called the `_run` correctness helper in the timing loop, which rebuilds the
+module per call, and measured 6.2 s against 14.4 s -- the JIT dispatch path,
+not the kernel.
+
+### The EXEC hazard, closed by construction and checked
+
+CDNA4 §11.4 requires **EXEC all 1s** across `ds_read_b64_tr_b16`, and B4 is the
+first phase where a divergent region exists at all. Two things hold it:
+
+- **Structure.** The mask sits between the d-contracted GEMMs and the
+  q-contracted ones; every transpose read is in the later loop, outside every
+  `scf.if`.
+- **Uniformity.** Every mask predicate is built from the wave's own KV row
+  range (`wave_id_uni`) and the tile index, so it is *wave-uniform* and the
+  branch is **scalar**. `wave_kv_offset_uni` exists only for this: built from
+  `wave_id` instead, the compare would be lane-varying and the branch would
+  narrow EXEC.
+
+`tooling/check_exec_hazard_gfx950.py` compiles twelve configurations (two head
+dims × both families × dense/causal/window) and scans the final ISA. Result:
+**zero EXEC-writing instructions of any kind**, at every one -- the masked
+regions are `s_cbranch` and nothing else. The scan reports `exec_writes`
+separately from `unsafe_reads` so that a future legitimate EXEC write does not
+turn the gate into something nobody can satisfy.
+
+### The sentinel oracle passed first time, at both families
+
+A `WINDOW=True` build fed `WINDOW_BOTRIGHT` reproduces a `WINDOW=False` causal
+build **bit for bit**, at head_dim 64/128/256 and both MFMA families. The two
+are genuinely different code -- a non-window build `const_expr`s the left-bound
+comparison away, a window build emits it with a bound that never bites -- so
+the test says the left-bound arm is inert exactly when it should be.
+
+### The mask costs 19 registers, and one rung was already at the cap
+
+head_dim 224 at 32 rows: 486 VGPR and no spills dense, **512 and 53 spills**
+causal, for 777 TFLOP/s against its dense 791 -- the one rung where causal
+bought nothing. Every other rung's causal build is within twenty registers of
+its dense one and spills nothing.
+
+The fix is one entry: `_TIGHT_REGISTERS_CAUSAL` overrides 224 to the tight arm,
+which gives **1182 TF** and puts it back among its neighbours (192 at 1397, 256
+at 1414). Worth writing down as a shape rather than a number: **a feature's
+register cost lands on whichever rung was already at the cap**, so the tuning
+table has to be keyed on the feature set and not only on the width.
+
+### Both families, and one mask table each
+
+`test_both_mfma_families_at_every_rung` now runs `dense × causal × window` at
+all ten rungs in both families -- 60 builds -- at `Sq != Sk`, so bottom-right
+alignment is exercised rather than the one case where it coincides with
+top-left. Each family's mask is keyed on its *own* lane→(row, col) map: the
+32-row one on `_ROW_THRESHOLDS`, derived from `_score_column_runs` rather than
+transcribed, and the 16-row one on the same expression `load_row_values`
+addresses with. No map crosses between them.
+
+### Not done
+
+- **Varlen (B5), dropout (B6), bias input, GQA** -- refused by name.
+- **`decompose_causal_regions`' three regions are collapsed to one loop.** The
+  function returns `[masked][full][masked]`; this body takes only the visited
+  range from it and applies a per-tile uniform predicate inside, which is the
+  forward's dual-wave approach. Three loops would drop the predicate from the
+  full region entirely; it is one scalar compare and a branch, so the saving is
+  small and the restructure is not.
+- **Dense head_dim 384 at 5.83x** is unchanged and remains the worst rung.

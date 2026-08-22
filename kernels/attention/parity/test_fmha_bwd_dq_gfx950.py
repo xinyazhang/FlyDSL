@@ -46,7 +46,10 @@ this suite red either. The skip reason is the record that it has not run.
 """
 
 import math
+import sys
+import time
 
+import fmha_common_gfx1201 as fmha
 import pytest
 import torch
 import torch.nn.functional as F
@@ -122,7 +125,22 @@ def _fwd_stats(q, k, v, do, *, scale, dtype=torch.float64):
     return lse.float().reshape(-1, n).contiguous(), delta.float().reshape(-1, n).contiguous(), o
 
 
-def _run_dq(q, k, v, do, lse, delta, *, scale=None, db=None, dq=None):
+def _run_dq(
+    q,
+    k,
+    v,
+    do,
+    lse,
+    delta,
+    *,
+    scale=None,
+    db=None,
+    dq=None,
+    causal=False,
+    window_build=False,
+    window=None,
+    mfma_rows=None,
+):
     """Build for this shape and dispatch, returning dQ.
 
     `dq` is filled with NaN first, not zeroed: a kernel that fails to write a
@@ -141,12 +159,14 @@ def _run_dq(q, k, v, do, lse, delta, *, scale=None, db=None, dq=None):
         num_heads=hq,
         head_dim=d,
         head_dim_v=v.shape[3],
-        causal=False,
+        causal=causal,
+        window=window_build,
         dtype_str="bf16" if q.dtype is torch.bfloat16 else "f16",
         num_kv_heads=k.shape[1],
         store_db=db is not None,
+        **({} if mfma_rows is None else {"mfma_rows": mfma_rows}),
     )
-    fn(q, k, v, do, dq, lse, delta, b, sq, seqlen_k=k.shape[2], scale=scale, db=db)
+    fn(q, k, v, do, dq, lse, delta, b, sq, seqlen_k=k.shape[2], scale=scale, db=db, window=window)
     return dq
 
 
@@ -686,7 +706,7 @@ def test_run_to_run_deterministic():
 
 @pytest.mark.parametrize(
     "field,value",
-    [("causal", True), ("window", True), ("bias", True), ("dropout", True)],
+    [("bias", True), ("dropout", True)],
 )
 def test_unimplemented_modes_are_refused(field, value):
     """Refused by name, not ignored.
@@ -1034,3 +1054,264 @@ def test_knobs_resolve_is_idempotent():
     assert once == twice
     assert once.traits.STORE_DB is False
     assert bwd_dq_knobs("gfx950", store_db=True).resolve(meta).traits.STORE_DB is True
+
+
+# ---------------------------------------------------------------------------
+# B4: causal and windows
+# ---------------------------------------------------------------------------
+
+
+# Which MFMA family serves which rung is a *tuning* decision, and a feature
+# implemented in one family and not the other is a wrong answer at half the
+# ladder. So every B4 test names the family rather than taking the default.
+# `16` is legal only on the multiples of 64; see the off-grid refusal.
+_FAMILIES = (32, 16)
+
+
+def _causal_ref(q, k, v, do, *, scale, window=None, dtype=torch.float64):
+    """`(lse, delta, dq)` for a causal or windowed problem, at `dtype`.
+
+    The mask is written out rather than taken from `is_causal`, because
+    **torch's `is_causal` is top-left and these kernels are bottom-right**;
+    they agree only at `Sq == Sk`. Spelling it means a shape that violates that
+    fails loudly here rather than quietly disagreeing.
+    """
+    qf, kf, vf, dof = (t.to(dtype) for t in (q, k, v, do))
+    sq, sk = q.shape[2], k.shape[2]
+    rows = torch.arange(sq, device=q.device)[:, None]
+    cols = torch.arange(sk, device=q.device)[None, :]
+    right = sk - sq if window is None else window[1]
+    keep = cols <= rows + right
+    if window is not None:
+        keep = keep & (cols >= rows - window[0])
+    scores = ((qf @ kf.transpose(-1, -2)) * scale).masked_fill(~keep, float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)
+    p = torch.softmax(scores, dim=-1)
+    o = p @ vf
+    delta = (dof * o).sum(-1)
+    ds = p * ((dof @ vf.transpose(-1, -2)) - delta.unsqueeze(-1))
+    n = lse.shape[-1]
+    return (
+        lse.float().reshape(-1, n).contiguous(),
+        delta.float().reshape(-1, n).contiguous(),
+        ((ds @ kf) * scale).double(),
+    )
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+@pytest.mark.parametrize("head_dim", [d for d in BWD_DQ_LADDER if d % 64 == 0])
+def test_causal_error_ratio(head_dim, rows):
+    """Causal, every rung that both families serve, against the error-ratio gate.
+
+    `Sq == Sk` throughout, and that is not a convenience: these kernels are
+    **bottom-right** aligned and torch's `is_causal` is top-left, so any other
+    shape compares two different problems. The forward's P4 lost time to this.
+    """
+    torch.manual_seed(20)
+    b, h, s = 1, 4, 512
+    q, k, v, do = (_rand(b, h, s, head_dim) for _ in range(4))
+    scale = _sm_scale(head_dim)
+    lse, delta, hi = _causal_ref(q, k, v, do, scale=scale)
+    _, _, lo = _causal_ref(q, k, v, do, scale=scale, dtype=DT)
+    got = _run_dq(q, k, v, do, lse, delta, scale=scale, causal=True, mfma_rows=rows)
+    assert torch.isfinite(got.float()).all()
+    assert _max_err(got, hi) <= DQ_FUDGE * _max_err(lo, hi)
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+@pytest.mark.parametrize("window", [(64, 0), (128, 32), (16, 16), (0, 0)], ids=str)
+def test_window_error_ratio(window, rows):
+    """Generalized sliding windows, both families.
+
+    `(0, 0)` is the degenerate band -- one live column per row -- which is the
+    case where a leading masked run spans whole tiles rather than clipping one,
+    and where `_skip_dead_leading_tiles` has the most to do.
+    """
+    torch.manual_seed(21)
+    b, h, s, d = 1, 4, 512, 64
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    scale = _sm_scale(d)
+    lse, delta, hi = _causal_ref(q, k, v, do, scale=scale, window=window)
+    _, _, lo = _causal_ref(q, k, v, do, scale=scale, window=window, dtype=DT)
+    got = _run_dq(q, k, v, do, lse, delta, scale=scale, causal=True, window_build=True, window=window, mfma_rows=rows)
+    assert torch.isfinite(got.float()).all()
+    assert _max_err(got, hi) <= DQ_FUDGE * _max_err(lo, hi)
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+@pytest.mark.parametrize("head_dim", [64, 512])
+def test_sentinel_window_is_bitwise_plain_causal(head_dim, rows):
+    """**The sharpest test in this codebase**, and it earned that in the forward's P3.
+
+    A window build fed `WINDOW_BOTRIGHT` on both bounds describes exactly
+    bottom-right causal, so it must reproduce a plain causal build *bit for
+    bit* -- not to a tolerance. It fails on any difference in the tile walk, in
+    which elements the mask touches, or in the order the KV tiles accumulate,
+    none of which a tolerance would notice.
+
+    **One set of inputs for both builds.** The first version of this check
+    re-randomised between them and reported a difference of 2.28 that was
+    entirely the inputs; the lore's "always run a known-good control" is about
+    exactly that.
+    """
+    torch.manual_seed(22)
+    b, h, s = 1, 4, 512
+    q, k, v, do = (_rand(b, h, s, head_dim) for _ in range(4))
+    scale = _sm_scale(head_dim)
+    lse, delta, _ = _causal_ref(q, k, v, do, scale=scale)
+
+    plain = _run_dq(q, k, v, do, lse, delta, scale=scale, causal=True, mfma_rows=rows)
+    sentinel = _run_dq(
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        scale=scale,
+        causal=True,
+        window_build=True,
+        window=(fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT),
+        mfma_rows=rows,
+    )
+    assert torch.equal(plain, sentinel), "a window build fed the causal sentinels is not the causal build"
+
+
+def _time_us(fn, iters=20, warm=5):
+    for _ in range(warm):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e6
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+def test_the_causal_tile_cut_is_not_inert(rows):
+    """**A dead tile is a no-op, so only timing can show the cut works.**
+
+    The forward's wide body shipped with its tile cut inert: right answers,
+    0.92x, and nothing but a measurement found it. Causal halves the KV tiles a
+    Q block walks on average, so a working cut is worth close to 2x at a long
+    sequence; the bound here is 0.80x, loose enough to survive noise and the
+    residual load imbalance, and tight enough that an inert cut (1.0x) fails.
+
+    This is also what the `init_tile_bounds` override is for -- the inherited
+    bound rounds the tile count up to even and floors it at four, which is up
+    to three dead tiles per Q block and enough to hide the cut at short
+    sequences.
+    """
+    torch.manual_seed(23)
+    # **1024 workgroups, and the count is the point.** At `b=1` this shape
+    # dispatches 256 of them onto ~256 CUs, one each -- so the *longest* Q
+    # block sets the clock and halving the total work is invisible (measured
+    # 0.92x, with the cut demonstrably working). Causal load is `2i + 2` tiles
+    # for block `i`, so the saving only appears once several workgroups share a
+    # CU. A timing assertion that does not account for that is a flaky test
+    # about occupancy wearing a correctness hat.
+    #
+    # Measured here: 269 us dense against 187 causal, 0.69x. The ideal is 0.5x
+    # and the gap is the residual imbalance.
+    b, h, s, d = 4, 8, 4096, 64
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    dq = torch.empty_like(q)
+    lse = torch.zeros(b * h, s, device="cuda", dtype=torch.float32)
+    scale = _sm_scale(d)
+
+    def build(causal):
+        fn = build_dq(num_heads=h, head_dim=d, causal=causal, mfma_rows=rows)
+        return lambda: fn(q, k, v, do, dq, lse, lse, b, s, seqlen_k=s, scale=scale)
+
+    dense = _time_us(build(False))
+    causal = _time_us(build(True))
+    assert causal < 0.80 * dense, (
+        f"causal {causal:.0f} us against dense {dense:.0f} us at {rows} rows: the tile cut is inert. "
+        "A dead tile changes no output bit, so no correctness test can see this."
+    )
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+def test_the_window_tile_cut_is_not_inert(rows):
+    """The left bound must move the *base* of the walk, not just mask.
+
+    `max_num_tiles` truncates the walk on the right; only
+    `_skip_dead_leading_tiles` moves it on the left, and P3 found the forward's
+    wide body walking from a literal tile 0 with a correct mask on top -- 6.7x
+    left on the table and every answer right.
+    """
+    torch.manual_seed(24)
+    b, h, s, d = 1, 8, 4096, 64
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    dq = torch.empty_like(q)
+    lse = torch.zeros(b * h, s, device="cuda", dtype=torch.float32)
+    scale = _sm_scale(d)
+    fn = build_dq(num_heads=h, head_dim=d, causal=True, window=True, mfma_rows=rows)
+
+    def at(window):
+        return lambda: fn(q, k, v, do, dq, lse, lse, b, s, seqlen_k=s, scale=scale, window=window)
+
+    unbounded = _time_us(at((fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT)))
+    narrow = _time_us(at((128, 0)))
+    assert narrow < 0.5 * unbounded, (
+        f"a 128-wide left band takes {narrow:.0f} us against {unbounded:.0f} for an unbounded one at "
+        f"{rows} rows: the left bound is masking but not cutting."
+    )
+
+
+@pytest.mark.parametrize("rows,head_dim", [(32, 128), (16, 512)])
+@pytest.mark.parametrize("window_build", [False, True], ids=["causal", "window"])
+def test_no_transpose_read_under_a_restricted_exec(rows, head_dim, window_build):
+    """CDNA4 11.4: `ds_read_b64_tr_b16` requires **EXEC all 1s**.
+
+    B4 is the first phase where a branch exists to violate it, and the failure
+    mode is the house speciality -- finite, wrong, no diagnostic. Both kernels
+    reported at B3 that no `scf.if` existed yet and that this is the phase to
+    check rather than assume.
+
+    The invariant checked is stronger and simpler than "no transpose read
+    inside a divergent region": **the kernel restricts EXEC nowhere at all.**
+    Every masking guard here is wave-uniform -- the tile index and the wave's
+    first row, both `readfirstlane`d -- so the compiler emits scalar branches
+    (`s_cbranch`) and never a `saveexec` pair. If a guard ever became lane-
+    varying, `s_and_saveexec_b64` would appear and this fails, whether or not
+    a transpose read happened to land inside it that day.
+    """
+    import glob
+    import os
+    import re
+    import subprocess
+    import tempfile
+
+    script = (
+        "import math, torch\n"
+        "from fmha_bwd_dq_gfx950 import build_fmha_bwd_dq_gfx950_module as b\n"
+        "import fmha_common_gfx1201 as fmha\n"
+        f"d, rows, win = {head_dim}, {rows}, {int(window_build)}\n"
+        "DT=torch.bfloat16; bb,h,s=1,2,256\n"
+        "q,k,v,do=(torch.randn(bb,h,s,d,device='cuda',dtype=DT) for _ in range(4))\n"
+        "dq=torch.zeros(bb,h,s,d,device='cuda',dtype=DT)\n"
+        "l=torch.zeros(bb*h,s,device='cuda',dtype=torch.float32)\n"
+        "fn=b(num_heads=h,head_dim=d,causal=True,window=bool(win),mfma_rows=rows)\n"
+        "w=(fmha.WINDOW_BOTRIGHT,fmha.WINDOW_BOTRIGHT) if win else None\n"
+        "fn(q,k,v,do,dq,l,l,bb,s,seqlen_k=s,scale=1.0/math.sqrt(d),window=w)\n"
+        "torch.cuda.synchronize()\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "build.py")
+        open(src, "w").write(script)
+        env = dict(os.environ, FLYDSL_DUMP_IR="1", FLYDSL_DUMP_DIR=tmp, FLYDSL_RUNTIME_ENABLE_CACHE="0")
+        env["PYTHONPATH"] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + env.get("PYTHONPATH", "")
+        subprocess.run([sys.executable, src], env=env, cwd=tmp, capture_output=True, timeout=900)
+        dumps = glob.glob(os.path.join(tmp, "*", "*final_isa.s"))
+        assert dumps, "no ISA dump; the build did not get far enough for this test to mean anything"
+        isa = open(dumps[0]).read()
+
+    assert isa.count("ds_read_b64_tr") > 0, "no transpose read in the dump: this test would pass vacuously"
+    saveexec = re.findall(r"^\s+s_\w*saveexec\w*\b.*$", isa, re.M)
+    exec_write = re.findall(r"^\s+s_[a-z0-9_]+\s+exec\b.*$", isa, re.M)
+    assert not saveexec and not exec_write, (
+        f"the kernel restricts EXEC ({len(saveexec)} saveexec, {len(exec_write)} exec writes), so a "
+        "transpose read may execute under a partial mask. Every masking guard must be wave-uniform."
+    )

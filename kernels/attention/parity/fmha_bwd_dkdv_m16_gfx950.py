@@ -85,6 +85,7 @@ from fmha_common_gfx1201 import MaskedAxis
 from fmha_mfma16_gfx950 import MFMA16_M, a16_chunk_offset, a16_read_base, lds_elem, tok_off, tok_off_dyn
 from gfx950_standalone import buffer_ops, dualwave
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
@@ -332,6 +333,67 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
             for r in range_constexpr(ACC16)
         ]
 
+    def mask_if_clipped(self, p_list, tile_idx, sub):
+        """Zero `P` outside the band, for the tiles that can be clipped.
+
+        The 32-row family's `mask_if_clipped`, keyed on **this** family's row
+        map rather than on that one's: element `i` of score sub-block `sub`
+        holds `q = tile_base + (sub//2)*32 + (sub%2)*4 + 8*(lane//16) + i`,
+        which is the same expression `load_row_values` addresses with. One
+        table per family, no transcription -- B3.5's discipline, and masks are
+        exactly the code that tempts a second copy.
+
+        The mask goes on `P`, so `dS = P * (dP - delta)` and `dV += P . dO`
+        both inherit it from one select per element, and no `-inf` enters the
+        arithmetic. The predicate is wave-uniform and a superset test.
+
+        **No transpose read is inside this region** -- the q-contracted GEMMs
+        run in their own loop after the softmax. CDNA4 section 11.4 requires
+        EXEC all 1s across `ds_read_b64_tr_b16`, and
+        `tooling/check_exec_hazard_gfx950.py` is what keeps that true.
+        """
+        traits = self.traits
+        ctx = self.ctx_ref
+        lo_i32 = ctx.causal_lo_i32
+        left_i32 = ctx.window_left_i32
+        sub_base = (sub // 2) * MFMA16_K + (sub % 2) * 4
+        rel0 = (
+            fx.Int32(tile_idx * fx.Index(traits.BLOCK_Q))
+            + fx.Int32(sub_base)
+            + fx.Int32(self.lane // fx.Index(MFMA16_M)) * fx.Int32(8)
+            - fx.Int32(ctx.kv_row)
+        )
+        kv_lo = fx.Int32(ctx.kv_start) + fx.Int32(ctx.wave_kv_offset_uni)
+        tile_q0 = fx.Int32(tile_idx * fx.Index(traits.BLOCK_Q))
+        need = tile_q0 < kv_lo + fx.Int32(MFMA16_M - 1) + lo_i32
+        if const_expr(traits.WINDOW):
+            need = need | (tile_q0 + fx.Int32(traits.BLOCK_Q - 1) > kv_lo + left_i32)
+        zero_f = self.c_zero_f
+        window = traits.WINDOW
+
+        def _apply(vals):
+            out = list(vals)
+            for i in range_constexpr(ACC16):
+                rel = rel0 + fx.Int32(i)
+                keep = rel >= lo_i32
+                if const_expr(window):
+                    keep = keep & (rel <= left_i32)
+                out[i] = keep.select(fx.Float32(vals[i]), zero_f)
+            return out
+
+        @flyc.jit
+        def _mask_if_needed(p_vec):
+            out = p_vec
+            if need:
+                out = Vec.from_elements(
+                    [as_mlir_value(v) for v in _apply([Vec(p_vec)[i] for i in range_constexpr(ACC16)])],
+                    fx.Float32,
+                ).ir_value()
+            return out
+
+        packed = Vec.from_elements([as_mlir_value(fx.Float32(v)) for v in p_list], fx.Float32).ir_value()
+        return [Vec(_mask_if_needed(packed))[i] for i in range_constexpr(ACC16)]
+
     def pack_group(self, lo, hi):
         """One 32-wide B operand from a q group's two score accumulators.
 
@@ -423,6 +485,8 @@ class M16TileBody(dualwave.DualwaveKernelContext):
                 dp = self.gemm.contract_d(self._reader_for(do_base, do_scope, sub, self.hdim_vo), v_v)
                 neg_lse2 = self.softmax.load_row_values(ctx.lse_rsrc, tile_base, sub, ctx.c_neg_log2e)
                 p_list = self.softmax.probabilities(s, neg_lse2)
+                if const_expr(traits.CAUSAL):
+                    p_list = self.softmax.mask_if_clipped(p_list, tile_idx, sub)
                 delta = self.softmax.load_row_values(ctx.delta_rsrc, tile_base, sub, ctx.c_one_f)
                 p_half.append(p_list)
                 ds_half.append(self.softmax.dscores(p_list, dp, delta))
