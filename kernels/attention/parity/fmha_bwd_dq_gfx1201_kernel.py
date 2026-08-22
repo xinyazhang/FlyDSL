@@ -322,12 +322,10 @@ def build_bwd_dq_module_primary(meta, knobs):
     ENABLE_DROPOUT = bool(dropout)
     PHILOX = Philox.for_arch() if philox_width is None else Philox(width=philox_width)
 
-    # Attention bias, and its gradient. Two independent build axes: BIAS_TYPE 0
-    # emits nothing at all, and WITH_DB is off even for most bias builds since
-    # dB costs a BLOCK_M x BLOCK_N store per tile and is often unwanted.
+    # Attention bias. One build axis, not two: dB is `dS`, which this kernel
+    # already forms for GEMM3, so a bias build emits it unconditionally. A
+    # second knob would buy a store nobody has asked to skip.
     BIAS_TYPE = 1 if meta.bias else 0
-    WITH_DB = bool(meta.return_dbias)
-    assert not (WITH_DB and not BIAS_TYPE), "return_dbias needs bias"
     assert not (BIAS_TYPE and CAUSAL), "bias and causal are mutually exclusive, as in the forward"
 
     # ---- LDS layout ----
@@ -676,7 +674,6 @@ def build_bwd_dq_module_primary(meta, knobs):
                 + head_q * fx.Index(stride_b1)
                 + (_q_row_off_v + q_row) * fx.Index(stride_b2)
             )
-        if const_expr(WITH_DB):
             _db_ptr = fmha.pointer_to_llvm_ptr(DB)
 
         q_rows_axis = fmha.MaskedAxis(fx.Index(seqlen_q_i32))
@@ -1048,7 +1045,7 @@ def build_bwd_dq_module_primary(meta, knobs):
                     )
                 )
 
-            if const_expr(WITH_DB):
+            if const_expr(BIAS_TYPE):
                 # dB = dS. The bias is added to the score, so d(score)/d(bias)
                 # is 1 and the gradient the kernel already has for GEMM3 *is*
                 # the bias gradient -- this is a store, not a computation.
@@ -1397,7 +1394,7 @@ def build_bwd_dq_module_primary(meta, knobs):
             False, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
         )
         _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(ENABLE_DROPOUT, dropout_p, seed, off1, off2, Q.device)
-        _bp, _dbp, _sb0, _sb1, _sb2 = abi.bias_args(BIAS_TYPE, WITH_DB, bias, dbias, Q)
+        _bp, _dbp, _sb0, _sb1, _sb2 = abi.bias_args(BIAS_TYPE, True, bias, dbias, Q)
         return (
             # `ptrs` is (Q, K, V, DO, DQ); Bias goes in front of DQ and DB
             # behind it, so the pointer block stays inputs-then-outputs.

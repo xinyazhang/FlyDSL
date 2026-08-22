@@ -422,3 +422,112 @@ def test_lds_budget_is_checked_at_plan_time():
 def test_gqa_head_counts_are_validated():
     with pytest.raises(ValueError, match="num_head_q"):
         bwd_plan(BwdInputMetadata(num_head_q=6, num_head_k=4, head_dim=64))
+
+
+# --------------------------------------------------------------------------
+# Attention bias
+#
+# Two P sites here rather than one, and they are mirror images: the dK/dV half
+# holds one kv column and eight q rows (eight strided scalar loads), the dQ
+# half one q row and eight adjacent kv columns (one v8). Both must carry the
+# bias, or the gradients they produce are wrong by exp(-bias) -- the forward
+# folded it into the logsumexp both halves recompute P from.
+#
+# dB is not emitted here; it comes from the standalone dQ kernel.
+# --------------------------------------------------------------------------
+
+
+def _bias_ref(q, k, v, do, bias):
+    qf, kf, vf = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    bf = bias.detach().float().requires_grad_(True)
+    sm = 1.0 / (q.shape[3] ** 0.5)
+    s = (qf @ kf.transpose(-1, -2)) * sm + bf
+    o = torch.softmax(s, -1) @ vf
+    o.backward(do.float())
+    return (
+        torch.logsumexp(s, -1).detach(),
+        (do.float() * o.detach()).sum(-1),
+        qf.grad.detach(),
+        kf.grad.detach(),
+        vf.grad.detach(),
+    )
+
+
+def _bias_fuse(q, k, v, do, bias):
+    from fmha_bwd_fuse_gfx1201_kernel import build_fmha_bwd_fuse_module
+    from fmha_tuning_bwd_fuse_gfx1201 import BwdInputMetadata
+    from fmha_tuning_bwd_fuse_gfx1201 import plan as _plan
+
+    batch, heads, seq, head_dim = q.shape
+    lse, delta, _, _, _ = _bias_ref(q, k, v, do, bias)
+    p = _plan(
+        BwdInputMetadata(
+            num_head_q=heads,
+            num_head_k=heads,
+            head_dim=head_dim,
+            causal=False,
+            dtype_str="bf16" if q.dtype == torch.bfloat16 else "f16",
+            bias=True,
+        )
+    )
+    exe = build_fmha_bwd_fuse_module(p.meta, p.knobs)
+    dq, dk, dv = (torch.zeros_like(q) for _ in range(3))
+    exe(
+        q,
+        k,
+        v,
+        do,
+        dk,
+        dv,
+        dq,
+        lse.reshape(batch * heads, seq).contiguous(),
+        delta.reshape(batch * heads, seq).contiguous(),
+        batch,
+        seq,
+        seqlen_k=seq,
+        bias=bias,
+    )
+    return dq, dk, dv
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_bias_all_three_gradients_match_autograd(head_dim):
+    """Both P sites at once: dQ comes from one half, dK/dV from the other."""
+    _require_env()
+    gen = torch.Generator(device="cuda").manual_seed(21)
+
+    def _t(*shape):
+        return torch.randn(*shape, dtype=torch.float16, device="cuda", generator=gen)
+
+    q, k, v, do = (_t(1, 2, 128, head_dim) for _ in range(4))
+    bias = _t(1, 2, 128, 128)
+    _, _, dq_ref, dk_ref, dv_ref = _bias_ref(q, k, v, do, bias)
+    dq, dk, dv = _bias_fuse(q, k, v, do, bias)
+    for name, got, ref in (("dQ", dq, dq_ref), ("dK", dk, dk_ref), ("dV", dv, dv_ref)):
+        rel = ((got.float() - ref).abs().max() / ref.abs().max().clamp(min=1e-6)).item()
+        assert rel < 2e-2, f"{name} rel={rel:.3e}"
+
+
+def test_nonzero_bias_changes_every_gradient():
+    """A half that silently dropped the bias would pass a zero-bias check alone."""
+    _require_env()
+    gen = torch.Generator(device="cuda").manual_seed(23)
+
+    def _t(*shape):
+        return torch.randn(*shape, dtype=torch.float16, device="cuda", generator=gen)
+
+    q, k, v, do = (_t(1, 2, 128, 64) for _ in range(4))
+    bias = _t(1, 2, 128, 128)
+    with_b = _bias_fuse(q, k, v, do, bias)
+    with_z = _bias_fuse(q, k, v, do, torch.zeros_like(bias))
+    for name, a, b in zip(("dQ", "dK", "dV"), with_b, with_z):
+        rel = ((a.float() - b.float()).abs().max() / b.float().abs().max().clamp(min=1e-6)).item()
+        assert rel > 1e-2, f"{name} did not move with the bias: rel={rel:.3e}"
+
+
+def test_bias_and_causal_are_rejected_together_fuse():
+    from fmha_tuning_bwd_fuse_gfx1201 import BwdInputMetadata
+    from fmha_tuning_bwd_fuse_gfx1201 import plan as _plan
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _plan(BwdInputMetadata(num_head_q=2, num_head_k=2, head_dim=64, causal=True, bias=True))

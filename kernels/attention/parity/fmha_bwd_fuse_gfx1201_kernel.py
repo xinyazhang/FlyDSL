@@ -220,6 +220,10 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
     PADDED_HEAD = knobs.padded_head
     dtype_str = meta.dtype_str
     CAUSAL = bool(meta.causal)
+
+    # Attention bias. An input only -- dB comes from the standalone dQ kernel.
+    BIAS_TYPE = 1 if meta.bias else 0
+    assert not (BIAS_TYPE and CAUSAL), "bias and causal are mutually exclusive, as in the forward"
     sm_scale = meta.sm_scale
 
     # ---- Schedule ----
@@ -371,6 +375,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         K: fx.Pointer,
         V: fx.Pointer,
         DO: fx.Pointer,
+        Bias: fx.Pointer,
         DK: fx.Pointer,
         DV: fx.Pointer,
         DQ: fx.Pointer,
@@ -414,6 +419,9 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
+        stride_b0: fx.Int64,
+        stride_b1: fx.Int64,
+        stride_b2: fx.Int64,
         sm_scale_arg: fx.Float32,
     ):
         elem_type = elem_numeric_cls.ir_type
@@ -481,6 +489,13 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         _q_batch_v = fx.Index(q_batch)
         _k_batch_v = fx.Index(k_batch)
         _q_row_off_v = fx.Index(q_row_off)
+        # Bias is (B, H, Sq, Sk): its last axis is the KV column and is the
+        # contiguous one. `head_q` is a grid dimension here rather than a loop
+        # variable, so unlike the standalone dK/dV kernel the base is built
+        # once.
+        if const_expr(BIAS_TYPE):
+            bias_ptr = fmha.pointer_to_llvm_ptr(Bias)
+            _b_head = _q_batch_v * fx.Index(stride_b0) + head_q * fx.Index(stride_b1)
         _k_row_off_v = fx.Index(k_row_off)
 
         # `max(seqlen - 1, 0)`: `fx.Index` is unsigned, so a bare `seqlen - 1`
@@ -537,6 +552,14 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         row_base, row_pitch = fmha.lse_row_addressing(
             varlen_bits, _q_batch_v, head_q, num_head_q, lse_tokens, _q_row_off_v
         )
+
+        def load_bias_1(off64):
+            """One bias element, for the half whose eight values are eight q rows."""
+            return _pointer_load(elem_type, buffer_ops.get_element_ptr(bias_ptr, fx.Int64(off64), elem_type=elem_type))
+
+        def load_bias_8(off64):
+            """Eight adjacent KV columns, for the half that walks the key axis."""
+            return _pointer_load(v8f16_type, fmha.split_ptr(bias_ptr, fx.Int64(off64), fx.Index(0), elem_type))
 
         def load_row_f32(base_ptr, q_row):
             """`tensor[q_row]` of a row-wise f32 side input, address always legal.
@@ -716,6 +739,16 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                     # difference rather than the FMA form AOTriton flags in
                     # ROCm/aotriton#54. LSE arrives natural-log, hence log2e.
                     s = fastmath.mul(fx.Float32(Vec(s_acc)[e]), sm_log2e)
+                    if const_expr(BIAS_TYPE):
+                        # This half holds one kv column and eight q rows, so
+                        # the eight bias entries are `stride_b2` apart and each
+                        # is its own load -- the standalone dK/dV kernel pays
+                        # exactly this. Clamped, since a dead row still issues
+                        # the load and `dead` below is what removes it.
+                        _bq = fx.Index(q_g) if (q_g < seqlen_q_i32) else fx.Index(0)
+                        _bo = _b_head + (_q_row_off_v + _bq) * fx.Index(stride_b2) + fx.Index(kv_row_i32)
+                        _bv = fx.Float32(fx.as_dsl_value(load_bias_1(_bo)).to(fx.Float32))
+                        s = fastmath.add(s, fastmath.mul(_bv, fx.Float32(_LOG2E)))
                     s = fastmath.sub(s, fastmath.mul(fx.Float32(lse), fx.Float32(_LOG2E)))
                     if const_expr(MASKED):
                         dead = q_g >= seqlen_q_i32
@@ -886,10 +919,26 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                     st_acc = fmha.wmma_acc(b_k_ap.from_lds(lds_buf, lane16, col), q_packs[ks], st_acc)
                     dpt_acc = fmha.wmma_acc(b_v_ap.from_lds(lds_buf, lane16, col), do_packs[ks], dpt_acc)
 
+                if const_expr(BIAS_TYPE):
+                    # The mirror of the other half: one q row and eight
+                    # *adjacent* kv columns, so one v8 covers all eight and the
+                    # load hoists out of the element loop.
+                    _bq = fx.Index(q_row_i32) if (q_row_i32 < seqlen_q_i32) else fx.Index(0)
+                    _bo = (
+                        _b_head
+                        + (_q_row_off_v + _bq) * fx.Index(stride_b2)
+                        + fx.Index(start_k_i)
+                        + klane * fx.Index(WMMA_LANE_K)
+                    )
+                    _bvec = load_bias_8(_bo)
+
                 ds_vals = []
                 for e in range_constexpr(8):
                     kv_g = fx.Int32(start_k_i) + fx.Int32(klane * fx.Index(WMMA_LANE_K)) + fx.Int32(e)
                     s = fastmath.mul(fx.Float32(Vec(st_acc)[e]), sm_log2e)
+                    if const_expr(BIAS_TYPE):
+                        _bv = fx.Float32(Vec(_bvec)[e].to(fx.Float32))
+                        s = fastmath.add(s, fastmath.mul(_bv, fx.Float32(_LOG2E)))
                     s = fastmath.sub(s, lse_log2e)
                     if const_expr(MASKED):
                         dead = kv_g >= seqlen_k_i32
@@ -969,6 +1018,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         K: fx.Pointer,
         V: fx.Pointer,
         DO: fx.Pointer,
+        Bias: fx.Pointer,
         DK: fx.Pointer,
         DV: fx.Pointer,
         DQ: fx.Pointer,
@@ -1012,6 +1062,9 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
+        stride_b0: fx.Int64,
+        stride_b1: fx.Int64,
+        stride_b2: fx.Int64,
         sm_scale_arg: fx.Float32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -1027,6 +1080,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             K,
             V,
             DO,
+            Bias,
             DK,
             DV,
             DQ,
@@ -1070,6 +1124,9 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             stride_dq_batch,
             stride_dq_head,
             stride_dq_seq,
+            stride_b0,
+            stride_b1,
+            stride_b2,
             sm_scale_arg,
         )
 
@@ -1139,6 +1196,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         stream=None,
         window=None,
         varlen=None,
+        bias=None,
     ):
         """Dispatch one fused backward pass.
 
@@ -1168,10 +1226,15 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             False, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
         )
         _scale = float(scale) if scale is not None else float(sm_scale)
+        # `with_db=False`: dB is the standalone dQ kernel's, so the DB slot is
+        # discarded rather than being a kernarg this one does not have.
+        _bp, _, _sb0, _sb1, _sb2 = abi.bias_args(BIAS_TYPE, False, bias, None, Q)
         abi.run_compiled(
             _COMPILED,
             launch_bwd_fuse,
-            *[abi.ptr_arg(t) for t in (Q, K, V, DO, DK, DV, DQ, L, Delta)],
+            *[abi.ptr_arg(t) for t in (Q, K, V, DO)],
+            _bp,
+            *[abi.ptr_arg(t) for t in (DK, DV, DQ, L, Delta)],
             _sq0,
             _sq1,
             _sk0,
@@ -1190,6 +1253,9 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             hqk,
             hvo,
             *st,
+            _sb0,
+            _sb1,
+            _sb2,
             _scale,
             stream if stream is not None else fx.Stream(None),
         )

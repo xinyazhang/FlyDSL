@@ -111,18 +111,15 @@ class BwdInputMetadata:
     dropout: bool = False
     philox_width: int | None = None
 
-    # Attention bias. **Rejected rather than ignored**, and not yet supported
-    # here even though the two standalone kernels now take one.
+    # Attention bias, matching the forward's `BIAS_TYPE`: a (B, H, Sq, Sk)
+    # matrix added to the scores after the scale and before the mask.
     #
-    # The forward folds the bias into the score *and* into the logsumexp it
-    # stores, and this kernel recomputes P from that logsumexp -- so without
-    # the bias term every gradient it produces is wrong by `exp(-bias)`,
-    # silently. Carrying the flag is what lets `plan` say so.
+    # An input only. The forward folds the bias into the score *and* into the
+    # logsumexp it stores, and this kernel recomputes P from that logsumexp, so
+    # without the bias term every gradient is wrong by `exp(-bias)`.
     #
-    # Supporting it means the add at *both* P sites, and they want different
-    # loads: the dQ half walks KV tiles for a fixed Q block, so eight adjacent
-    # columns are one v8, while the dK/dV half holds one kv column and eight q
-    # rows and needs eight strided scalars. See the two standalone kernels.
+    # **dB is not emitted here**, as it is not by the standalone dK/dV kernel;
+    # `fmha_bwd_dq_gfx1201_kernel`'s `return_dbias` is where it comes from.
     bias: bool = False
 
 
@@ -276,13 +273,11 @@ def plan(request: BwdInputMetadata, overrides: BwdKnobs | None = None) -> BwdPla
     rather than assertions inside the traced kernel where the message would
     arrive without the knobs that caused it.
     """
-    if request.bias:
+    if request.bias and (request.causal or request.causal_type):
         raise ValueError(
-            "attention bias is not supported by the fused backward kernel. The forward "
-            "folds the bias into both the score and the logsumexp it stores, and this "
-            "kernel recomputes P from that logsumexp without it, so every gradient "
-            "would be wrong by exp(-bias). Use the standalone dQ and dK/dV kernels, "
-            "which do take a bias -- and which is also where dB comes from."
+            "bias and causal masking are mutually exclusive, as in the forward: a bias "
+            "already is an additive mask, so the pair has no defined meaning. Fold the "
+            "causal pattern into the bias tensor, or drop the bias"
         )
     if request.head_dim < 1:
         raise ValueError(f"head_dim must be positive, got {request.head_dim}")

@@ -988,7 +988,7 @@ def _bias_reference(q, k, v, do, bias):
     )
 
 
-def _bias_dq(q, k, v, do, bias, dbias=None, return_dbias=False):
+def _bias_dq(q, k, v, do, bias, dbias=None):
     """dQ (and dB) through a bias build, bypassing the interface as `_bwd_via_kernel` does."""
     batch, heads, seq, head_dim = q.shape
     _, lse, delta, _, _ = _bias_reference(q, k, v, do, bias)
@@ -998,7 +998,6 @@ def _bias_dq(q, k, v, do, bias, dbias=None, return_dbias=False):
         causal=False,
         dtype_str="bf16" if q.dtype == torch.bfloat16 else "f16",
         bias=True,
-        return_dbias=return_dbias,
     )
     pitch = (head_dim + 7) // 8 * 8
     dq = torch.zeros(batch, heads, seq, pitch, dtype=q.dtype, device=q.device)[..., :head_dim]
@@ -1027,7 +1026,7 @@ def test_bias_dq_matches_autograd(head_dim):
     gen = torch.Generator(device=q.device).manual_seed(7)
     bias = torch.randn(1, 2, 128, 128, dtype=q.dtype, device=q.device, generator=gen)
     _, _, _, dq_ref, _ = _bias_reference(q, k, v, do, bias)
-    dq = _bias_dq(q, k, v, do, bias)
+    dq = _bias_dq(q, k, v, do, bias, dbias=torch.zeros_like(bias))
     assert _rel(dq, dq_ref) < _RTOL, f"dQ rel={_rel(dq, dq_ref):.3e}"
 
 
@@ -1040,7 +1039,7 @@ def test_dbias_matches_autograd(head_dim):
     bias = torch.randn(1, 2, 128, 128, dtype=q.dtype, device=q.device, generator=gen)
     _, _, _, _, db_ref = _bias_reference(q, k, v, do, bias)
     dbias = torch.zeros_like(bias)
-    _bias_dq(q, k, v, do, bias, dbias=dbias, return_dbias=True)
+    _bias_dq(q, k, v, do, bias, dbias=dbias)
     assert _rel(dbias, db_ref) < _RTOL, f"dB rel={_rel(dbias, db_ref):.3e}"
 
 
@@ -1056,7 +1055,7 @@ def test_zero_bias_matches_no_bias():
     zeros = torch.zeros(1, 2, 128, 128, dtype=q.dtype, device=q.device)
     _, lse, delta, _, _ = _bias_reference(q, k, v, do, zeros)
     plain = _run(q, k, v, do, lse, delta, causal=False)
-    biased = _bias_dq(q, k, v, do, zeros)
+    biased = _bias_dq(q, k, v, do, zeros, dbias=torch.zeros_like(zeros))
     assert _rel(biased, plain) < 1e-3, f"a zero bias moved dQ by rel={_rel(biased, plain):.3e}"
 
 
@@ -1067,15 +1066,12 @@ def test_nonzero_bias_actually_changes_dq():
     gen = torch.Generator(device=q.device).manual_seed(11)
     bias = torch.randn(1, 2, 128, 128, dtype=q.dtype, device=q.device, generator=gen)
     zeros = torch.zeros_like(bias)
-    assert _rel(_bias_dq(q, k, v, do, bias), _bias_dq(q, k, v, do, zeros)) > 1e-2
+    with_b = _bias_dq(q, k, v, do, bias, dbias=torch.zeros_like(bias))
+    with_z = _bias_dq(q, k, v, do, zeros, dbias=torch.zeros_like(zeros))
+    assert _rel(with_b, with_z) > 1e-2
 
 
 def test_bias_and_causal_are_rejected_together():
     """As in the forward: a bias already is an additive mask."""
     with pytest.raises(ValueError, match="mutually exclusive"):
         bwd_dq_plan(BwdDqInputMetadata(num_heads=2, head_dim=64, causal=True, bias=True))
-
-
-def test_return_dbias_requires_bias():
-    with pytest.raises(ValueError, match="needs bias"):
-        bwd_dq_plan(BwdDqInputMetadata(num_heads=2, head_dim=64, causal=False, return_dbias=True))

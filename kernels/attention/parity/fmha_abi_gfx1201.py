@@ -474,7 +474,7 @@ def dropout_outputs(enable_dropout, seed_output, offset_output):
     )
 
 
-def bias_args(bias_type, with_db, bias, dbias, like):
+def bias_args(bias_type, emit_db, bias, dbias, like):
     """(Bias, DB, stride_b0, stride_b1, stride_b2) in launch order.
 
     The bias is `(B, H, Sq, Sk)`, so its three leading strides are batch, head
@@ -482,10 +482,15 @@ def bias_args(bias_type, with_db, bias, dbias, like):
     the kernel's inner loop walks. That is the forward's layout, unchanged, so
     a caller can hand the backward the very tensor it gave the forward.
 
+    `emit_db` is whether the *kernel* has a DB slot at all -- true for dQ,
+    false for dK/dV and the fused kernel, which take a bias but do not write
+    its gradient. It is a fact about the signature, not a knob: a dQ build with
+    a bias always emits dB, since dB is the `dS` it already forms.
+
     Both pointers are always in the kernarg signature and are `NULL_PTR` when
-    their build axis is off, which is how the dropout arguments behave: a
-    kernel argument that exists unconditionally is one fewer ABI variant to
-    keep in step, and `const_expr` means the null is never dereferenced.
+    the bias axis is off, which is how the dropout arguments behave: a kernel
+    argument that exists unconditionally is one fewer ABI variant to keep in
+    step, and `const_expr` means the null is never dereferenced.
 
     `dbias` is checked against `bias` for shape rather than being inferred,
     because a dB that is silently the wrong shape writes out of bounds.
@@ -505,9 +510,9 @@ def bias_args(bias_type, with_db, bias, dbias, like):
         # one v8, exactly as the forward does; the same check lives there.
         raise ValueError(f"bias must have a contiguous last (Sk) dimension, got stride(3)={bias.stride(3)}")
     db = NULL_PTR
-    if with_db:
+    if emit_db:
         if dbias is None:
-            raise ValueError("this build has return_dbias=True and requires dbias=")
+            raise ValueError("a dQ build with bias=True always writes dB and requires dbias=")
         if tuple(dbias.shape) != tuple(bias.shape):
             raise ValueError(f"dbias shape {tuple(dbias.shape)} must equal bias's {tuple(bias.shape)}")
         if dbias.dtype != bias.dtype:
@@ -516,7 +521,7 @@ def bias_args(bias_type, with_db, bias, dbias, like):
             raise ValueError(f"dbias must have a contiguous last (Sk) dimension, got stride(3)={dbias.stride(3)}")
         db = ptr_arg(dbias)
     elif dbias is not None:
-        raise ValueError("dbias= was passed but this build has return_dbias=False")
+        raise ValueError("dbias= was passed to a kernel that does not write dB; that is the dQ kernel's")
     sb = bias.stride()
     return ptr_arg(bias), db, sb[0], sb[1], sb[2]
 
