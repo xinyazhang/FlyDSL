@@ -501,3 +501,41 @@ head_dim 96 is a normal rung again.
   can, and it is cheaper *and* keeps `-inf` out of arithmetic that runs under
   `fm_fast`'s `ninf` licence. plan1 records that licence deleting a KV tail
   mask on gfx1201.
+- **`LSE` is an output of the forward and an *input* to the backward, and it
+  can legitimately be `-inf`.** A causal row with no live key -- every row
+  below `seqlen_q - seqlen_kv` under bottom-right alignment, which is every
+  `Sq > Sk` varlen sequence -- gives the forward `l_row == 0` and therefore
+  `m_row*ln2 + log(l_row) == -inf`. Two consequences, and the second is the
+  one that cost time:
+  - In the kernel, `-inf` reaching the exponent is survivable only because the
+    causal mask runs *after* the scale-and-subtract and overwrites the row.
+    That rescue leans on `+inf` flowing through an FMA carrying
+    `fastmath<fast>`, whose `ninf` says infinities are absent -- the same
+    licence P5 recorded silently deleting a KV tail mask. Floor the LSE input
+    once instead.
+  - **In the reference.** `torch.softmax` of an all-`-inf` row is NaN, where
+    the forward writes `O = 0` (`safe_l_inv` returns 0 when the denominator
+    is). So `delta = rowsum(dO*O)` is 0, not NaN, and a host reference that
+    skips `nan_to_num` feeds the kernel a NaN and then blames the kernel. The
+    tell is that the NaN appears only in sequences with `Sq > Sk`.
+- **Check what the *fix* costs before concluding what the *feature* costs.**
+  Varlen on the gfx950 dK/dV backward looked like it cost 232 register spills
+  and 3x the runtime at head_dim 224 -- the rung already at 486 of 512 VGPRs --
+  and a second MFMA family looked like the answer. It was not the feature. The
+  logsumexp row pitch stops being 1 under Transformer Engine's `(T, H)` layout,
+  so the workaround was sixteen scalar loads in place of four `dwordx4`, and
+  *that* was what filled the register file. Making the layout a build axis put
+  the same rung back at 486 VGPRs, zero spills, and 720 TFLOP/s, and the
+  override was deleted. The narrow rungs paid most, which was the clue: a
+  row-tensor read is per tile and does not scale with the head dim, so a cost
+  that grows as the head dim *shrinks* is not the head-dim-shaped feature you
+  are looking at.
+- **A predicted bug and a harness bug in the same place look identical.**
+  P4 warns that Q stacked against a batched KV cache (`0x040B`) is the one
+  varlen mode where the two sides' batch indices differ. That mode was also the
+  only one to fail on first run -- and it was the *test*, which sliced the
+  output as packed when dK/dV follow the K layout and are still batched. What
+  separated them in a minute was asking which *other* modes should have failed:
+  a shared batch index also breaks `varlen_padded`, and that one passed. When a
+  failure lands exactly where the lore predicts, check the modes the prediction
+  says should fail *with* it before believing it.

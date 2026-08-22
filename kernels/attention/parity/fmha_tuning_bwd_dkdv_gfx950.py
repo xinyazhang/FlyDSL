@@ -193,13 +193,39 @@ _TIGHT_REGISTERS = {
     512: True,
 }
 
-# **The mask costs about 19 live registers**, which only matters where a build
-# was already at the cap. head_dim 224 at 32 rows is the one: 486 VGPR and no
-# spills dense, 512 and **53 spills** causal, worth 777 TFLOP/s against 1199
-# for the same build with the tight arm. Every other rung's causal build has
-# the same register count as its dense one to within twenty and spills nothing,
-# so this is an override rather than a second table.
-_TIGHT_REGISTERS_CAUSAL = {**_TIGHT_REGISTERS, 224: True}
+# **A feature's register cost lands on whichever rung was already at the cap**,
+# and head_dim 224 at 32 rows is the one -- 486 VGPR of 512 with no spills in a
+# plain dense build. Causal's mask adds about 19 live registers and tips it. At
+# the policy's geometry every other rung spills zero in all four feature
+# combinations, so this is one rung's exception rather than a second table:
+#
+#   head_dim 224                 VGPR  spills   TFLOP/s
+#     dense,         32 loose     486     0       798
+#     causal,        32 loose     512    53       777    <- the mask
+#     causal,        32 tight     512     0      1199    <- override
+#     causal+varlen, 32 tight     512    20       858    <- override
+#     dense+varlen,  32 loose     486     0       720
+#
+# **Varlen itself is free here, but only after the logsumexp layout became a
+# build axis.** Before that the row-tensor read took the sixteen-scalar path in
+# every varlen build, and 224 went to 232 spills and 257 TFLOP/s -- which for a
+# while looked like a second override wanting the 16-row family. The register
+# pressure was the workaround's, not the feature's; see
+# `BwdDkDvInputMetadata.lse_layout_th`.
+_FEATURE_OVERRIDES = {
+    # (head_dim, causal, varlen): (waves, waves_per_eu, shards, rows, block_q, tight)
+    (224, True, False): (4, 1, 1, 32, 64, True),
+    (224, True, True): (4, 1, 1, 32, 64, True),
+}
+
+
+def _geometry_for(block_dmodel, meta):
+    """`(waves, waves_per_eu, shards, rows, block_q, tight)` for a build."""
+    key = (block_dmodel, bool(meta.causal), bool(meta.varlen))
+    if key in _FEATURE_OVERRIDES:
+        return _FEATURE_OVERRIDES[key]
+    return _GEOMETRY[block_dmodel] + (_TIGHT_REGISTERS[block_dmodel],)
+
 
 _GEOMETRY = {
     # head_dim: (waves, waves_per_eu, shards, mfma_rows, block_q)
@@ -355,6 +381,21 @@ class BwdDkDvInputMetadata:
     # requires `causal`; see `_checked_scope`.
     causal: bool = False
     window: bool = False
+    # B5. Whether this build decodes `VarlenBits`. The bits themselves are a
+    # runtime argument -- one build serves all six configurations -- so only
+    # the decision to compile the decode at all is here.
+    varlen: bool = False
+    # B5. Whether the logsumexp and delta tensors use Transformer Engine's
+    # `(T, H)` layout rather than AOTriton's `(H, T)`. **A build axis rather
+    # than a runtime bit**, unlike everything else in `VarlenBits`, and the
+    # reason is measured: `_HT` makes the row pitch 1, so a lane's four
+    # accumulator rows are adjacent and one `dwordx4` fetches them; `_TH` makes
+    # it `num_heads` and the same four rows need four scalar loads. Deciding it
+    # at runtime would cost every build the scalar path, which measured 0.68x
+    # at head_dim 64 -- the row-tensor reads are per q tile and do not scale
+    # with the head dim, so the narrow rungs pay most. `_args` checks the
+    # descriptor's bits against the build.
+    lse_layout_th: bool = False
     # B6.
     dropout: bool = False
     bias: bool = False
@@ -411,7 +452,7 @@ class BwdDkDvKnobs:
             _FALLBACK.merge(self)
             ._checked_scope(meta)
             ._with_widths(meta)
-            ._with_geometry()
+            ._with_geometry(meta)
             ._with_buffers()
             ._with_register_pressure(meta)
             ._with_traits(meta)
@@ -490,7 +531,7 @@ class BwdDkDvKnobs:
             hdim_qk_floor=int(hdim_qk_floor),
         )
 
-    def _with_geometry(self):
+    def _with_geometry(self, meta):
         """Decide waves, `BLOCK_KV`, the granule and the shard count from the tile width.
 
         `_GEOMETRY` is the whole policy and its table is where the measurement
@@ -512,7 +553,7 @@ class BwdDkDvKnobs:
             raise ValueError(
                 f"pin num_waves, block_kv, block_q and head_dim_granule together or not at all, got {pinned}"
             )
-        num_waves, waves_per_eu, table_shards, table_rows, table_bq = _GEOMETRY[self.block_dmodel]
+        num_waves, waves_per_eu, table_shards, table_rows, table_bq, _tight = _geometry_for(self.block_dmodel, meta)
         if shards is None:
             shards = table_shards
         rows = self.mfma_rows if self.mfma_rows is not None else table_rows
@@ -573,8 +614,7 @@ class BwdDkDvKnobs:
         """
         if self.tight_registers is not None:
             return self
-        table = _TIGHT_REGISTERS_CAUSAL if meta.causal else _TIGHT_REGISTERS
-        return replace(self, tight_registers=table[self.block_dmodel])
+        return replace(self, tight_registers=_geometry_for(self.block_dmodel, meta)[5])
 
     def _with_traits(self, meta):
         """Build the traits this configuration implies.
@@ -597,6 +637,14 @@ class BwdDkDvKnobs:
             vo_shards=self.dkv_shards,
             causal=meta.causal,
             window=meta.window,
+            varlen=meta.varlen,
+            # **A causal varlen build has no `cross_seqlen` analogue here**, and
+            # that is a property of the gradient rather than an omission. The
+            # forward needs it because a Q block with no live key must have `O`
+            # *written* as zero; dK/dV accumulate from zero and store whatever
+            # they accumulated, so a KV block with no live query stores zeros
+            # by construction. The flag stays off and nothing reads it.
+            cross_seqlen=False,
             dtype_str=meta.dtype_str,
             waves_per_eu=self.waves_per_eu,
             daz=self.daz,

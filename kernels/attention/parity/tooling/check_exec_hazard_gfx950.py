@@ -32,8 +32,15 @@ a narrowing write puts it in the "narrowed" state until an explicit restore, so
 control flow that rejoins without one is *reported* rather than missed. A false
 positive here costs an investigation; a false negative costs a wrong gradient.
 
+**Varlen (B5) adds a second conditional region** -- the `active` guard around
+the whole body, for a workgroup whose KV block is past this sequence's keys --
+and it is the one that would matter most if it were divergent, because the
+transpose reads are inside it rather than beside it. Its predicate is
+workgroup-uniform, so it is a scalar branch too; that is what these
+configurations check.
+
     python3 check_exec_hazard_gfx950.py            # every configuration
-    python3 check_exec_hazard_gfx950.py 128 --rows 16 --causal 1 --window 1
+    python3 check_exec_hazard_gfx950.py 128 --rows 16 --causal 1 --varlen 1
 """
 
 import argparse
@@ -66,6 +73,7 @@ p.add_argument("head_dim", type=int)
 p.add_argument("--rows", type=int, default=32)
 p.add_argument("--causal", type=int, default=0)
 p.add_argument("--window", type=int, default=0)
+p.add_argument("--varlen", type=int, default=0)
 a = p.parse_args()
 import torch
 import fmha_common_gfx1201 as fmha
@@ -78,16 +86,22 @@ lse = torch.randn(B * H, S, device="cuda", dtype=torch.float32)
 delta = torch.randn_like(lse)
 kw = dict(mfma_rows=a.rows, dkv_shards=1, num_waves=4, block_kv=a.rows * 4, block_q=64,
           head_dim_granule=64 if d % 64 == 0 else 32)
-fn = build(num_heads=H, head_dim=d, num_kv_heads=H, causal=bool(a.causal), window=bool(a.window), **kw)
+fn = build(num_heads=H, head_dim=d, num_kv_heads=H, causal=bool(a.causal), window=bool(a.window),
+           varlen=bool(a.varlen), **kw)
 ka = dict(seqlen_k=S, scale=1.0 / d ** 0.5)
 if a.window:
     ka["window"] = (fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT)
+if a.varlen:
+    import fmha_abi_gfx1201 as _abi
+    cu = torch.tensor([0, S], device="cuda", dtype=torch.int32)
+    ka["varlen"] = _abi.varlen_compact(cu, cu, S, S, lse_tokens=S)
+    ka["num_seqlens"] = 1
 fn(q, k, v, do, dk, dv, lse, delta, B, S, **ka)
 torch.cuda.synchronize()
 """
 
 
-def build_isa(head_dim, rows, causal, window):
+def build_isa(head_dim, rows, causal, window, varlen=0):
     """Compile one configuration in a child process and return its final ISA."""
     out = tempfile.mkdtemp(prefix="exec_hazard_")
     env = dict(os.environ)
@@ -141,10 +155,10 @@ def scan(isa):
     return exec_writes, tr_reads, unsafe
 
 
-def check(head_dim, rows, causal, window):
-    isa = build_isa(head_dim, rows, causal, window)
+def check(head_dim, rows, causal, window, varlen=0):
+    isa = build_isa(head_dim, rows, causal, window, varlen)
     exec_writes, tr_reads, unsafe = scan(isa)
-    tag = f"d{head_dim:<4} rows{rows:<3} causal={int(causal)} window={int(window)}"
+    tag = f"d{head_dim:<4} rows{rows:<3} causal={int(causal)} window={int(window)} varlen={int(varlen)}"
     print(f"  {tag}  tr_reads {tr_reads:>4}  exec_writes {exec_writes:>3}  unsafe {unsafe:>3}")
     if tr_reads == 0:
         raise SystemExit(f"{tag}: no transpose read in the ISA at all -- the scan is not looking at the kernel")
@@ -159,12 +173,12 @@ def main():
     p.add_argument("--window", type=int, default=0)
     a = p.parse_args()
     if a.head_dim is not None:
-        raise SystemExit(1 if check(a.head_dim, a.rows, a.causal, a.window) else 0)
+        raise SystemExit(1 if check(a.head_dim, a.rows, a.causal, a.window, a.varlen) else 0)
     bad = 0
     for head_dim in (64, 128):
         for rows in (32, 16):
-            for causal, window in ((0, 0), (1, 0), (1, 1)):
-                bad += check(head_dim, rows, causal, window)
+            for causal, window, varlen in ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 0, 1), (1, 0, 1)):
+                bad += check(head_dim, rows, causal, window, varlen)
     print("EXEC HAZARD: clean" if not bad else f"EXEC HAZARD: {bad} transpose reads under a narrowed EXEC")
     raise SystemExit(1 if bad else 0)
 

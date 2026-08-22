@@ -1261,8 +1261,12 @@ def test_the_window_tile_cut_is_not_inert(rows):
 
 
 @pytest.mark.parametrize("rows,head_dim", [(32, 128), (16, 512)])
-@pytest.mark.parametrize("window_build", [False, True], ids=["causal", "window"])
-def test_no_transpose_read_under_a_restricted_exec(rows, head_dim, window_build):
+@pytest.mark.parametrize(
+    "window_build,varlen_build",
+    [(False, False), (True, False), (False, True)],
+    ids=["causal", "window", "varlen-causal"],
+)
+def test_no_transpose_read_under_a_restricted_exec(rows, head_dim, window_build, varlen_build):
     """CDNA4 11.4: `ds_read_b64_tr_b16` requires **EXEC all 1s**.
 
     B4 is the first phase where a branch exists to violate it, and the failure
@@ -1277,6 +1281,12 @@ def test_no_transpose_read_under_a_restricted_exec(rows, head_dim, window_build)
     (`s_cbranch`) and never a `saveexec` pair. If a guard ever became lane-
     varying, `s_and_saveexec_b64` would appear and this fails, whether or not
     a transpose read happened to land inside it that day.
+
+    The varlen arm is here because B5 adds a *second* branchy region: the
+    `active` guard, which wraps the whole body and therefore every transpose
+    read in it. It is uniform for the same reason the masks are -- `q_start`
+    is the workgroup's and `seqlen_q` a scalar load -- and this is what says
+    so rather than assuming it.
     """
     import glob
     import os
@@ -1288,14 +1298,24 @@ def test_no_transpose_read_under_a_restricted_exec(rows, head_dim, window_build)
         "import math, torch\n"
         "from fmha_bwd_dq_gfx950 import build_fmha_bwd_dq_gfx950_module as b\n"
         "import fmha_common_gfx1201 as fmha\n"
-        f"d, rows, win = {head_dim}, {rows}, {int(window_build)}\n"
+        f"d, rows, win, vl = {head_dim}, {rows}, {int(window_build)}, {int(varlen_build)}\n"
         "DT=torch.bfloat16; bb,h,s=1,2,256\n"
         "q,k,v,do=(torch.randn(bb,h,s,d,device='cuda',dtype=DT) for _ in range(4))\n"
         "dq=torch.zeros(bb,h,s,d,device='cuda',dtype=DT)\n"
         "l=torch.zeros(bb*h,s,device='cuda',dtype=torch.float32)\n"
-        "fn=b(num_heads=h,head_dim=d,causal=True,window=bool(win),mfma_rows=rows)\n"
+        "import fmha_abi_gfx1201 as abi\n"
+        "fn=b(num_heads=h,head_dim=d,causal=True,window=bool(win),varlen=bool(vl),mfma_rows=rows)\n"
         "w=(fmha.WINDOW_BOTRIGHT,fmha.WINDOW_BOTRIGHT) if win else None\n"
-        "fn(q,k,v,do,dq,l,l,bb,s,seqlen_k=s,scale=1.0/math.sqrt(d),window=w)\n"
+        "if vl:\n"
+        "    cu=torch.tensor([0,64,192,256],device='cuda',dtype=torch.int32)\n"
+        "    sd=abi.VARLEN_COMPACT_SIDE\n"
+        "    lv=torch.zeros(h,256,device='cuda',dtype=torch.float32)\n"
+        "    vk=dict(bits=abi.varlen_bits(sd,sd),max_seqlen_q=128,max_seqlen_k=128,"
+        "seqinfo_q0=cu,seqinfo_k0=cu)\n"
+        "    fn(q,k,v,do,dq,lv,lv,1,128,seqlen_k=128,scale=1.0/math.sqrt(d),window=w,"
+        "varlen=vk,num_seqlens=3)\n"
+        "else:\n"
+        "    fn(q,k,v,do,dq,l,l,bb,s,seqlen_k=s,scale=1.0/math.sqrt(d),window=w)\n"
         "torch.cuda.synchronize()\n"
     )
     with tempfile.TemporaryDirectory() as tmp:
@@ -1315,3 +1335,248 @@ def test_no_transpose_read_under_a_restricted_exec(rows, head_dim, window_build)
         f"the kernel restricts EXEC ({len(saveexec)} saveexec, {len(exec_write)} exec writes), so a "
         "transpose read may execute under a partial mask. Every masking guard must be wave-uniform."
     )
+
+
+# ---------------------------------------------------------------------------
+# B5: varlen
+# ---------------------------------------------------------------------------
+
+_VL_H = 4
+_VL_Q = [128, 377, 64, 500]
+_VL_K = [100, 300, 64, 400]
+_VL_N = len(_VL_Q)
+_VL_MAXQ, _VL_MAXK = max(_VL_Q), max(_VL_K)
+
+
+def _i32(x):
+    return torch.tensor(list(x), device="cuda", dtype=torch.int32)
+
+
+def _cumsum(lens):
+    out, run = [0], 0
+    for value in lens:
+        run += value
+        out.append(run)
+    return out
+
+
+def _vl_stats(q, k, v, do, *, scale, causal):
+    """`(lse, delta)` the way a caller computes them, with the kernel's alignment.
+
+    Two things a naive reference gets wrong here, and both produce NaN rather
+    than a wrong number:
+
+    - **bottom-right**, not `is_causal`. They agree only at `Sq == Sk`, which
+      no varlen sequence here satisfies.
+    - **a row with no live key.** `softmax` of an all-`-inf` row is NaN, where
+      the forward writes `O = 0` -- its `safe_l_inv` returns 0 when the
+      denominator is -- so `delta = rowsum(dO*O)` is 0. Skipping the
+      `nan_to_num` feeds the kernel a NaN delta and then blames the kernel;
+      that cost a debugging round here.
+    """
+    qf, kf, vf, dof = (t.double() for t in (q, k, v, do))
+    scores = (qf @ kf.transpose(-1, -2)) * scale
+    if causal:
+        sq, sk = q.shape[2], k.shape[2]
+        rows = torch.arange(sq, device="cuda")[:, None]
+        cols = torch.arange(sk, device="cuda")[None, :]
+        scores = scores.masked_fill(cols > rows + (sk - sq), float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)
+    p = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)
+    return lse, (dof * (p @ vf)).sum(-1)
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("mode", ["0x150B", "0x040B"])
+def test_varlen_equals_n_dense_calls_bitwise(mode, causal, rows):
+    """**N sequences must equal N separate dense calls, bit for bit.**
+
+    `VarlenBits` overshoots AOTriton -- `0x150B` and `0x040B` have no spelling
+    in its four-`VarlenType` enum -- so there is no external oracle. The one
+    the varlen plan names is this: only the *base address* differs between a
+    varlen workgroup and its dense counterpart, so every bit of arithmetic
+    downstream is identical and a tolerance would be hiding something.
+
+    Two modes, and the second is the one that matters:
+
+    - `0x150B` -- packed Q against packed KV with individual `seqused_k`.
+    - `0x040B` -- packed Q against a **batched** KV cache. The only mode where
+      the two sides disagree about the batch index: Q is stacked (batch 0,
+      large row offset), K is not (batch `z`, no row offset). A kernel letting
+      one index serve both reads batch 0 of the cache for every sequence, and
+      P4 found this was the only mode that noticed.
+    """
+    import fmha_abi_gfx1201 as _abi
+
+    torch.manual_seed(30)
+    d = 64
+    cu, kcu = _cumsum(_VL_Q), _cumsum(_VL_K)
+    scale = _sm_scale(d)
+    q = _rand(1, _VL_H, cu[-1], d)
+    do = _rand(1, _VL_H, cu[-1], d)
+
+    if mode == "0x150B":
+        k, v = (_rand(1, _VL_H, kcu[-1], d) for _ in range(2))
+        bits = _abi.varlen_bits(_abi.VARLEN_COMPACT_SIDE, _abi.VARLEN_SEQUSED_PACKED_SIDE)
+        seqinfo = dict(seqinfo_q0=_i32(cu), seqinfo_k0=_i32(_VL_K), seqinfo_k1=_i32(kcu))
+
+        def kv_of(i):
+            return k[:, :, kcu[i] : kcu[i + 1]].contiguous(), v[:, :, kcu[i] : kcu[i + 1]].contiguous()
+
+    else:
+        k, v = (_rand(_VL_N, _VL_H, _VL_MAXK, d) for _ in range(2))
+        bits = _abi.varlen_bits(_abi.VARLEN_COMPACT_SIDE, _abi.VARLEN_SEQUSED_CACHE_SIDE)
+        seqinfo = dict(seqinfo_q0=_i32(cu), seqinfo_k0=_i32(_VL_K))
+
+        def kv_of(i):
+            return k[i : i + 1, :, : _VL_K[i]].contiguous(), v[i : i + 1, :, : _VL_K[i]].contiguous()
+
+    # LSE and delta in the packed `(H, total_q)` layout the kernel derives from
+    # `lse_token_pitch` -- the batch total for a stacked Q side, *not*
+    # `max_seqlen_q`. Sizing them by the max is the P4 mistake.
+    lse = torch.zeros(_VL_H, cu[-1], device="cuda", dtype=torch.float32)
+    delta = torch.zeros_like(lse)
+    for i in range(_VL_N):
+        a, b = cu[i], cu[i + 1]
+        ki, vi = kv_of(i)
+        li, di = _vl_stats(q[:, :, a:b], ki, vi, do[:, :, a:b], scale=scale, causal=causal)
+        lse[:, a:b], delta[:, a:b] = li[0].float(), di[0].float()
+
+    def build(varlen):
+        return build_dq(num_heads=_VL_H, head_dim=d, causal=causal, num_kv_heads=_VL_H, varlen=varlen, mfma_rows=rows)
+
+    packed = torch.full_like(q, float("nan"))
+    build(True)(
+        q,
+        k,
+        v,
+        do,
+        packed,
+        lse.contiguous(),
+        delta.contiguous(),
+        1,
+        _VL_MAXQ,
+        seqlen_k=_VL_MAXK,
+        scale=scale,
+        varlen=dict(bits=bits, max_seqlen_q=_VL_MAXQ, max_seqlen_k=_VL_MAXK, **seqinfo),
+        num_seqlens=_VL_N,
+    )
+    torch.cuda.synchronize()
+
+    dense = build(False)
+    for i in range(_VL_N):
+        a, b = cu[i], cu[i + 1]
+        ki, vi = kv_of(i)
+        qi, doi = q[:, :, a:b].contiguous(), do[:, :, a:b].contiguous()
+        li, di = _vl_stats(qi, ki, vi, doi, scale=scale, causal=causal)
+        want = torch.full_like(qi, float("nan"))
+        n = b - a
+        dense(
+            qi,
+            ki,
+            vi,
+            doi,
+            want,
+            li.float().reshape(-1, n).contiguous(),
+            di.float().reshape(-1, n).contiguous(),
+            1,
+            n,
+            seqlen_k=ki.shape[2],
+            scale=scale,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(packed[:, :, a:b].contiguous(), want), (
+            f"{mode} sequence {i} (sq={n}, sk={ki.shape[2]}) differs from its dense call. Only the base "
+            "address should differ, so this is bitwise or it is a bug."
+        )
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+def test_db_under_varlen(rows):
+    """dB follows Q's row origin, and must match its dense counterpart bitwise.
+
+    `stride_db_seq_q` is named for exactly the axis that moves: under a packed
+    Q the dB rows are packed too, and the descriptor is rebased at the same
+    `(batch, head, row origin)` dQ uses. A dB indexed from a dense row origin
+    writes sequence `i`'s gradient into sequence 0's rows.
+    """
+    import fmha_abi_gfx1201 as _abi
+
+    torch.manual_seed(31)
+    d = 64
+    cu, kcu = _cumsum(_VL_Q), _cumsum(_VL_K)
+    scale = _sm_scale(d)
+    q, do = (_rand(1, _VL_H, cu[-1], d) for _ in range(2))
+    k, v = (_rand(1, _VL_H, kcu[-1], d) for _ in range(2))
+    lse = torch.zeros(_VL_H, cu[-1], device="cuda", dtype=torch.float32)
+    delta = torch.zeros_like(lse)
+    for i in range(_VL_N):
+        a, b = cu[i], cu[i + 1]
+        c, e = kcu[i], kcu[i + 1]
+        li, di = _vl_stats(q[:, :, a:b], k[:, :, c:e], v[:, :, c:e], do[:, :, a:b], scale=scale, causal=False)
+        lse[:, a:b], delta[:, a:b] = li[0].float(), di[0].float()
+
+    def build(varlen):
+        return build_dq(
+            num_heads=_VL_H,
+            head_dim=d,
+            causal=False,
+            num_kv_heads=_VL_H,
+            varlen=varlen,
+            store_db=True,
+            mfma_rows=rows,
+        )
+
+    dq = torch.empty_like(q)
+    db = torch.full((1, _VL_H, cu[-1], _VL_MAXK), float("nan"), device="cuda", dtype=DT)
+    build(True)(
+        q,
+        k,
+        v,
+        do,
+        dq,
+        lse.contiguous(),
+        delta.contiguous(),
+        1,
+        _VL_MAXQ,
+        seqlen_k=_VL_MAXK,
+        scale=scale,
+        db=db,
+        varlen=dict(
+            bits=_abi.varlen_bits(_abi.VARLEN_COMPACT_SIDE, _abi.VARLEN_SEQUSED_PACKED_SIDE),
+            max_seqlen_q=_VL_MAXQ,
+            max_seqlen_k=_VL_MAXK,
+            seqinfo_q0=_i32(cu),
+            seqinfo_k0=_i32(_VL_K),
+            seqinfo_k1=_i32(kcu),
+        ),
+        num_seqlens=_VL_N,
+    )
+    torch.cuda.synchronize()
+
+    dense = build(False)
+    for i in range(_VL_N):
+        a, b = cu[i], cu[i + 1]
+        c, e = kcu[i], kcu[i + 1]
+        qi, doi = q[:, :, a:b].contiguous(), do[:, :, a:b].contiguous()
+        ki, vi = k[:, :, c:e].contiguous(), v[:, :, c:e].contiguous()
+        li, di = _vl_stats(qi, ki, vi, doi, scale=scale, causal=False)
+        n, m = b - a, e - c
+        want = torch.full((1, _VL_H, n, m), float("nan"), device="cuda", dtype=DT)
+        dense(
+            qi,
+            ki,
+            vi,
+            doi,
+            torch.empty_like(qi),
+            li.float().reshape(-1, n).contiguous(),
+            di.float().reshape(-1, n).contiguous(),
+            1,
+            n,
+            seqlen_k=m,
+            scale=scale,
+            db=want,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(db[:, :, a:b, :m].contiguous(), want), f"dB for sequence {i} is not its dense counterpart"

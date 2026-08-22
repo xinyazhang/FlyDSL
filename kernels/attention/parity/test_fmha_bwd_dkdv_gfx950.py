@@ -46,6 +46,7 @@ import subprocess
 import sys
 import time
 
+import fmha_abi_gfx1201 as abi
 import fmha_common_gfx1201 as fmha
 import pytest
 import torch
@@ -585,6 +586,211 @@ def test_no_transpose_read_under_a_narrowed_exec():
     r = subprocess.run([sys.executable, script], capture_output=True, text=True, timeout=2400)
     assert r.returncode == 0, f"exec-hazard scan failed:\n{r.stdout}\n{r.stderr}"
     assert "EXEC HAZARD: clean" in r.stdout, r.stdout
+
+
+# ---------------------------------------------------------------------------
+# Varlen
+# ---------------------------------------------------------------------------
+#
+# **The oracle here is not AOTriton.** Its varlen is `cu_seqlens` +
+# `num_seqlens` + `seq_strides`, the four-`VarlenType` enum, and two of the
+# five configurations below (`0x150B`, `0x040B`) have no spelling in it at all
+# -- so for those there is nothing to differentially test against. The
+# substitute is the one varlen plan section 7 names and it is sharper than a
+# tolerance: **N sequences must equal N separate dense calls, bitwise.** It
+# holds because a varlen workgroup and its dense counterpart walk the same
+# tiles in the same order over the same values; only the base address differs.
+
+_VARLEN_MODES = ("compact", "padded", "strided", "seqused_packed", "seqused_cache")
+
+
+def _cu(lens):
+    return torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), device="cuda", dtype=torch.int32)
+
+
+def _varlen_case(mode, lq, lk, h, d, lse_layout):
+    """`(descriptor, packed tensors, per-sequence tensors)` for one mode."""
+    n, mq, mk = len(lq), max(lq), max(lk)
+    torch.manual_seed(n * 7 + d + lse_layout)
+    seqs = [
+        (
+            _rand(1, h, a, d),
+            _rand(1, h, b, d),
+            _rand(1, h, b, d),
+            _rand(1, h, a, d),
+        )
+        for a, b in zip(lq, lk)
+    ]
+    packed = lambda i: torch.cat([s[i] for s in seqs], dim=2)  # noqa: E731
+    if mode in ("compact", "strided", "seqused_packed"):
+        Q, K, V, DO = packed(0), packed(1), packed(2), packed(3)
+    elif mode == "padded":
+        Q = torch.zeros(n, h, mq, d, device="cuda", dtype=DT)
+        K = torch.zeros(n, h, mk, d, device="cuda", dtype=DT)
+        V, DO = torch.zeros_like(K), torch.zeros_like(Q)
+        for i, (q, k, v, do) in enumerate(seqs):
+            Q[i, :, : lq[i]], DO[i, :, : lq[i]] = q[0], do[0]
+            K[i, :, : lk[i]], V[i, :, : lk[i]] = k[0], v[0]
+    else:  # seqused_cache: packed Q against a *batched* KV cache
+        Q, DO = packed(0), packed(3)
+        K = torch.zeros(n, h, mk, d, device="cuda", dtype=DT)
+        V = torch.zeros_like(K)
+        for i, (_q, k, v, _do) in enumerate(seqs):
+            K[i, :, : lk[i]], V[i, :, : lk[i]] = k[0], v[0]
+    cuq, cuk, tot = _cu(lq), _cu(lk), int(sum(lq))
+    used = torch.tensor(lk, device="cuda", dtype=torch.int32)
+    desc = {
+        "compact": lambda: abi.varlen_compact(cuq, cuk, mq, mk, lse_tokens=tot, lse_layout=lse_layout),
+        "padded": lambda: abi.varlen_padded(cuq, cuk, mq, mk, lse_layout=lse_layout),
+        "strided": lambda: abi.varlen_strided(cuq, cuk, cuq, cuk, mq, mk, lse_tokens=tot, lse_layout=lse_layout),
+        "seqused_packed": lambda: abi.varlen_seqused_k(cuq, cuk, used, mq, mk, lse_tokens=tot, lse_layout=lse_layout),
+        "seqused_cache": lambda: abi.varlen_seqused_k(
+            cuq, None, used, mq, mk, k_is_cache=True, lse_tokens=tot, lse_layout=lse_layout
+        ),
+    }[mode]()
+    return desc, (Q, K, V, DO), seqs
+
+
+def _varlen_vs_dense(mode, lq, lk, d=64, h=2, causal=False, rows=None, lse_layout=0):
+    """One varlen call against `len(lq)` dense ones. Bitwise."""
+    desc, (Q, K, V, DO), seqs = _varlen_case(mode, lq, lk, h, d, lse_layout)
+    n, mq, mk = len(lq), max(lq), max(lk)
+    q_packed = Q.shape[0] == 1
+    nseq, bsz = (n if q_packed else 0), Q.shape[0]
+    tokens = int(sum(lq)) if q_packed else mq
+    scale = 1.0 / d**0.5
+    if lse_layout:
+        lse = torch.randn((1 if q_packed else bsz) * tokens, h, device="cuda", dtype=torch.float32)
+    else:
+        lse = torch.randn((1 if q_packed else bsz) * h, tokens, device="cuda", dtype=torch.float32)
+    delta = torch.randn_like(lse)
+    dK, dV = torch.full_like(K, float("nan")), torch.full_like(V, float("nan"))
+    knobs = {} if rows is None else _family_knobs(d, rows)
+    fn = build(
+        num_heads=h,
+        head_dim=d,
+        num_kv_heads=h,
+        varlen=True,
+        causal=causal,
+        lse_layout_th=bool(lse_layout),
+        **knobs,
+    )
+    fn(Q, K, V, DO, dK, dV, lse, delta, bsz, mq, seqlen_k=mk, scale=scale, varlen=desc, num_seqlens=nseq)
+    torch.cuda.synchronize()
+
+    # **The reference is pinned to the varlen build's own geometry.** The
+    # tuning policy is feature-aware -- head_dim 224 picks a different MFMA
+    # family once varlen is on -- and two families accumulate in different
+    # orders, so an unpinned reference would compare arithmetic orders rather
+    # than addressing. What this test claims is that only the base address
+    # differs, and that is what pinning makes it test.
+    pin = dict(
+        mfma_rows=fn.traits.MFMA_ROWS,
+        dkv_shards=fn.knobs.dkv_shards,
+        num_waves=fn.knobs.num_waves,
+        block_kv=fn.traits.BLOCK_KV,
+        block_q=fn.knobs.block_q,
+        head_dim_granule=fn.knobs.head_dim_granule,
+        tight_registers=fn.knobs.tight_registers,
+    )
+    ref = build(num_heads=h, head_dim=d, num_kv_heads=h, causal=causal, **pin)
+    off = 0
+    for i, (q, k, v, do) in enumerate(seqs):
+        dk_r, dv_r = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
+        if lse_layout:
+            blk = slice(off, off + lq[i]) if q_packed else slice(i * tokens, i * tokens + lq[i])
+            rows_l, rows_d = lse[blk].T.contiguous(), delta[blk].T.contiguous()
+        elif q_packed:
+            rows_l, rows_d = lse[:, off : off + lq[i]].contiguous(), delta[:, off : off + lq[i]].contiguous()
+        else:
+            rows_l = lse[i * h : (i + 1) * h, : lq[i]].contiguous()
+            rows_d = delta[i * h : (i + 1) * h, : lq[i]].contiguous()
+        ref(q, k, v, do, dk_r, dv_r, rows_l, rows_d, 1, lq[i], seqlen_k=lk[i], scale=scale)
+        torch.cuda.synchronize()
+        # **The output slice follows the K layout, not the Q one.** `0x040B` is
+        # packed Q against a batched cache, so the Q side is packed while dK
+        # and dV are still `(n, h, max_k, d)`. Reading them as packed produced
+        # a mismatch in exactly the mode P4 warns about for the batch index,
+        # and it was this harness rather than the kernel.
+        if K.shape[0] == 1:
+            got_k = dK[:, :, sum(lk[:i]) : sum(lk[: i + 1])]
+            got_v = dV[:, :, sum(lk[:i]) : sum(lk[: i + 1])]
+        else:
+            got_k, got_v = dK[i : i + 1, :, : lk[i]], dV[i : i + 1, :, : lk[i]]
+        assert torch.equal(got_k.reshape(-1), dk_r.reshape(-1)), f"{mode} seq {i}: dK differs from the dense call"
+        assert torch.equal(got_v.reshape(-1), dv_r.reshape(-1)), f"{mode} seq {i}: dV differs from the dense call"
+        off += lq[i]
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+@pytest.mark.parametrize("mode", _VARLEN_MODES)
+def test_varlen_equals_n_dense_calls(mode, rows, causal):
+    """All five `VarlenBits` configurations, both families, both masking modes.
+
+    `Sq != Sk` per sequence, so bottom-right alignment is per-sequence rather
+    than global -- and `torch`'s top-left `is_causal` could not express it even
+    if this test used a tolerance oracle instead of a bitwise one.
+
+    `seqused_cache` (`0x040B`) is the mode that needs **each side's own batch
+    index**: Q is stacked (batch 0, large row offset) against a *batched* cache
+    (batch z, no row offset) in the same call. The other four agree, so it is
+    the only one that exposes a shared index.
+    """
+    _require_rocm_path()
+    _varlen_vs_dense(mode, [96, 200, 41], [160, 200, 300], d=64, rows=rows, causal=causal)
+
+
+@pytest.mark.parametrize("head_dim", LADDER)
+def test_varlen_across_the_ladder(head_dim):
+    """The whole ladder, at the policy's own family and geometry for each rung."""
+    _require_rocm_path()
+    _varlen_vs_dense("compact", [128, 65, 33], [128, 65, 33], d=head_dim)
+    _varlen_vs_dense("seqused_cache", [128, 65, 33], [200, 65, 90], d=head_dim, causal=True)
+
+
+@pytest.mark.parametrize("mode", _VARLEN_MODES)
+def test_varlen_transformer_engine_lse_layout(mode):
+    """`VARLEN_LSE_LAYOUT_TH`: the row pitch stops being 1.
+
+    Bits 17:16 choose `(H, T)` -- AOTriton's, tokens contiguous -- or `(T, H)`,
+    Transformer Engine's, where consecutive tokens of one head are `num_heads`
+    apart. The kernel's row-tensor read is four contiguous f32 per accumulator
+    group in a dense build and **sixteen scalars in a varlen one** precisely
+    because of this, and only this test exercises the second path's reason for
+    existing. It caught the 32-row family still doing the wide load.
+    """
+    _require_rocm_path()
+    _varlen_vs_dense(mode, [96, 200, 41], [96, 200, 41], d=64, lse_layout=abi.VARLEN_LSE_LAYOUT_TH)
+    _varlen_vs_dense(mode, [96, 200, 41], [160, 200, 300], d=128, rows=16, lse_layout=abi.VARLEN_LSE_LAYOUT_TH)
+
+
+def test_varlen_edges():
+    """Single-token sequences, a single sequence, and a badly ragged batch."""
+    _require_rocm_path()
+    _varlen_vs_dense("compact", [1, 2, 3, 4], [1, 2, 3, 4], d=64)
+    _varlen_vs_dense("compact", [512], [512], d=64, causal=True)
+    _varlen_vs_dense("padded", [7, 300, 1], [500, 9, 64], d=64, causal=True)
+
+
+def test_varlen_build_and_descriptor_must_agree():
+    """Neither direction of the mismatch may pass silently.
+
+    A varlen descriptor on a dense build would be ignored, and a dense call on
+    a varlen build decodes `bits == 0` to the right answer -- so both would
+    *work*, and both are a caller who believes something about the layout that
+    is not being honoured.
+    """
+    _require_rocm_path()
+    b, h, s, d = 1, 2, 128, 64
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    dk, dv = torch.empty_like(k), torch.empty_like(v)
+    lse = torch.zeros(b * h, s, device="cuda", dtype=torch.float32)
+    desc = abi.varlen_compact(_cu([s]), _cu([s]), s, s, lse_tokens=s)
+    with pytest.raises(ValueError, match="not compiled for varlen"):
+        build(num_heads=h, head_dim=d)(q, k, v, do, dk, dv, lse, lse, b, s, varlen=desc, num_seqlens=1)
+    with pytest.raises(ValueError, match="requires a varlen= descriptor"):
+        build(num_heads=h, head_dim=d, varlen=True)(q, k, v, do, dk, dv, lse, lse, b, s)
 
 
 # ---------------------------------------------------------------------------

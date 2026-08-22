@@ -2175,3 +2175,234 @@ addresses with. No map crosses between them.
   full region entirely; it is one scalar compare and a branch, so the saving is
   small and the restructure is not.
 - **Dense head_dim 384 at 5.83x** is unchanged and remains the worst rung.
+
+---
+
+## Outcome: B5/dQ — varlen
+
+`VarlenBits` on both MFMA families, the full ladder, causal and dense, with dB.
+228 tests pass with no skips. Nothing outside the four dQ files was edited.
+
+### Wall-clock, varlen
+
+16 sequences of `[4096, 2048, 1024, 512] x 4` packed into one `(1, 8, 30720, D)`
+tensor, `0x0B0B`, idle GPU 6. **Wall-clock** `(t_dQ + t_dKdV) / t_fwd`:
+
+| hdim | mode | fwd | dK/dV | dQ | bwd | bwd/fwd |
+|---|---|---|---|---|---|---|
+| 64 | dense | 247 us | 535 | 375 | 910 | 3.68x |
+| 64 | causal | 176 | 340 | 227 | 567 | **3.22x** |
+| 128 | dense | 387 | 1057 | 822 | 1879 | 4.86x |
+| 128 | causal | 261 | 638 | 476 | 1114 | 4.28x |
+| 512 | dense | 3065 | 7069 | 4835 | 11904 | 3.88x |
+| 512 | causal | 1833 | 3662 | 2535 | 6197 | **3.38x** |
+
+In line with the dense-shape numbers, so packing costs nothing structural.
+
+### Most of it was already there
+
+The parity context this kernel subclasses already decodes `VarlenBits` through
+`fmha.decode_addressing`, derives the LSE token pitch through
+`fmha.lse_token_pitch`, keeps **a batch index per side**, and folds the row
+origins into every descriptor. B2 pinned those at 0 and B5 unpinned them. What
+was actually added: the knob, the grid's `z` extent counting *sequences*
+rather than batches, `abi.varlen_args` on the wire, and the host checks.
+
+`0x040B` -- packed Q against a batched KV cache, the one mode where the two
+sides disagree about the batch index -- passed first run, because
+`kv_batch_idx` was already split out upstream.
+
+### One override, and it replaces a whole mechanism
+
+`compute_active_guard` drops the `causal_end_raw_i32 > 0` term the base adds
+under `CAUSAL and CROSS_SEQLEN`. That term skips a Q block whose causal region
+is empty, which is right for the forward because it then zeroes `O` for those
+rows through `zero_o_block_if_needed`. Inheriting it would leave **dQ
+unwritten** there -- a garbage read rather than a zero.
+
+Dropping it is not a workaround. This loop derives its tile count from the same
+`causal_end_raw_i32`, so an empty causal region walks **zero tiles**, leaves the
+accumulator at its zero seed, and stores zeros. The block does the right thing
+by running rather than by being skipped, and **neither family needs a zeroing
+path**. The `q_start < seqlen_q` term is kept and is the one that saves work.
+
+`CROSS_SEQLEN` is therefore inert in dQ. It is still switched on for a causal
+varlen build, because it is a build axis the traits carry and the two backward
+kernels must agree on it.
+
+### The finding: `LSE` is an input and it can be `-inf`
+
+A causal row with no live key -- every row below `seqlen_q - seqlen_kv`, which
+is every `Sq > Sk` varlen sequence -- gives the forward `l_row == 0` and so
+`LSE == -inf`. Our own forward writes it.
+
+It surfaced as NaN dQ on exactly the sequences with `Sq > Sk`, and **the first
+diagnosis was wrong**: the NaN was in the test harness, not the kernel.
+`torch.softmax` of an all-`-inf` row is NaN where the forward writes `O = 0`,
+so the reference was feeding the kernel a NaN `delta`. With that fixed the
+oracle passed bitwise **with and without** any kernel change.
+
+The kernel still floors `lse2`, and the honest reason is not the NaN:
+unfloored, `scale_and_sub_lse` computes `fma(S, qk_scale, +inf)` and is rescued
+only because the mask runs after it and overwrites the row. That rescue leans
+on an infinity flowing through an FMA carrying `fastmath<fast>`, whose `ninf`
+is a licence to assume infinities are absent -- P5 recorded that licence being
+taken up later by a different pass and deleting a KV tail mask. One `max` per
+kernel removes the case. Both halves are in the lore.
+
+### Gates
+
+**N sequences equal N separate dense calls, bitwise**, at `0x150B` and
+`0x040B`, both families, causal and dense -- the varlen plan's §7 oracle, which
+holds because only the base address differs. dB likewise, per sequence, against
+its dense counterpart. `Sq != Sk` throughout (`[128, 377, 64, 500]` against
+`[100, 300, 64, 400]`), which is also why the bottom-right convention is
+spelled out in the reference rather than taken from `is_causal`.
+
+### Still not done
+
+- Dropout (B6) and bias input, still refused by name.
+- **Three of the five `VarlenBits` modes are not tested here** -- `0x0B0B`,
+  `0x0202` and `0x1313`. They exercise the *decoder*, which is
+  `fmha.decode_addressing` unedited and already covered by the forward's P4
+  suite; the two chosen are the ones whose behaviour is specific to this
+  kernel's addressing. Worth adding if the decode is ever forked.
+- The EXEC scan is still inline in this suite rather than calling
+  `tooling/check_exec_hazard_gfx950.py`; the shared tool should own it. The
+  scan itself now covers varlen: the `active` guard is a *second* branchy
+  region wrapping the whole body, and six builds (both families x
+  causal/window/varlen-causal) report **0 `saveexec` and 0 writes to `exec`**,
+  so every transpose read still runs with EXEC all ones.
+
+---
+
+## Outcome: B5 — dK/dV, varlen
+
+`VarlenBits` decoded in `fmha_bwd_dkdv_gfx950.py`; the row-tensor read split
+across both families; `tooling/check_exec_hazard_gfx950.py` extended with the
+varlen configurations. **301 tests, all passing, no skips** (264 before B5).
+
+### The oracle is N dense calls, and it holds bitwise everywhere
+
+AOTriton's varlen is `cu_seqlens` + `num_seqlens` + `seq_strides`, and two of
+the five configurations here (`0x150B`, `0x040B`) have no spelling in it, so
+for those there is nothing to differentially test against. Varlen plan §7's
+substitute is sharper anyway: **N sequences must equal N separate dense calls,
+bitwise**, because a varlen workgroup and its dense counterpart walk the same
+tiles in the same order over the same values and only the base address differs.
+
+All five configurations × both MFMA families × dense and causal, plus the whole
+ladder, both logsumexp layouts, single-token sequences and a badly ragged
+batch: **bitwise identical, every case**. `Sq != Sk` per sequence throughout,
+so bottom-right alignment is per-sequence -- which `torch`'s top-left
+`is_causal` could not express even if this used a tolerance oracle.
+
+**The reference is pinned to the varlen build's own geometry.** The tuning
+policy is feature-aware, so an unpinned dense reference can resolve to a
+*different MFMA family* and the comparison becomes one of arithmetic orders
+rather than of addressing. That is a way to fail this test that has nothing to
+do with varlen.
+
+### The one bug, and it was in the harness in exactly the predicted mode
+
+`0x040B` -- packed Q against a *batched* KV cache -- failed on the first run
+while the other four passed, which is precisely the signature P4 attaches to a
+shared batch index. It was the **harness**: dK and dV follow the *K* layout, so
+they are still `(n, h, max_k, d)` while the Q side is packed, and reading them
+as packed is wrong in that mode and only that mode. The kernel was right,
+because `_slab_rsrc` and `_slab_view` take the KV batch index and row origin
+rather than parameters, which is what stops Q's reaching them.
+
+Worth recording that the *predicted* bug and a harness bug in the same mode
+look identical from the outside. The thing that separated them in a minute
+rather than an hour was that the other four modes passed: a shared batch index
+would have broken `padded` too, since it also has a real batch axis.
+
+### The real finding: a workaround's register cost, mistaken for a feature's
+
+The row-tensor reads are the one place varlen reaches the hot path.
+`lse_row_addressing` returns a pitch of 1 for AOTriton's `(H, T)` layout and
+`num_heads` for Transformer Engine's `(T, H)`, so **a lane's four accumulator
+rows stop being adjacent** and one `buffer_load_dwordx4` becomes four scalars
+-- sixteen per accumulator in the 32-row family.
+
+Making that a runtime property cost every varlen build the scalar path:
+
+| head_dim | dense | varlen, runtime pitch | varlen, layout as a build axis |
+|---|---|---|---|
+| 64 | 725 | **494** (0.68x) | 723 |
+| 96 | 740 | **518** (0.70x) | 731 |
+| 128 | 766 | 750 | 772 |
+| 256 | 751 | 740 | 768 |
+
+The narrow rungs pay most because the row reads are **per q tile and do not
+scale with the head dim**, so they are a larger share of a small tile.
+
+It also produced a false trail. head_dim 224 -- the rung already at 486 of 512
+VGPRs -- went to **232 spills and 257 TFLOP/s** under varlen, and the 16-row
+family (262 VGPR, 400 TF) looked like the answer, so `_FEATURE_OVERRIDES` grew
+a third entry. Once the layout became a build axis the same 32-row build came
+back at **486 VGPR, zero spills, 720 TF** and the override was deleted. **The
+register pressure belonged to the workaround, not to the feature** -- which is
+the generalisation of my own B4 finding, one level up: check what the *fix*
+costs before concluding what the *feature* costs.
+
+`lse_layout_th` is therefore the one part of `VarlenBits` that is a build axis
+rather than a runtime bit, and `_args` checks the descriptor's bits against the
+build so the two cannot disagree silently.
+
+### `cross_seqlen` has no analogue here, and that is structural
+
+The forward needs it because a Q block with no live key must have `O` *written*
+as zero. dK/dV **accumulate from zero and store whatever they accumulated**, so
+a KV block with no live query stores zeros by construction -- the region math
+returns zero tiles, the loop does not run, and the store still happens. The
+flag is passed as `False` with the reason written down rather than left as an
+unexplained omission.
+
+### The EXEC hazard survives a second conditional region
+
+Varlen adds the `active` guard -- a workgroup whose KV block is past *this*
+sequence's keys -- and unlike the causal mask it wraps the **whole body**, so
+the transpose reads are inside it rather than beside it. Its predicate is
+workgroup-uniform, so it is a scalar branch: the checker now covers 20
+configurations (2 head dims × both families × dense/causal/window/varlen/
+causal+varlen) and reports **zero EXEC-writing instructions of any kind** at
+every one.
+
+The guard is an optimisation rather than a correctness device -- the KV
+descriptors bound at `seqlen_kv` rows, so a dead block reads zeros and its
+stores are dropped -- but a ragged batch dispatches a lot of dead blocks.
+
+### Measured, wall clock
+
+`B=2 H=8 S=4096` bf16, GPU 5 idle, all three kernels in one session; varlen is
+two sequences of 4096 packed into one `1HTD` tensor. `bwd/fwd` is
+`(t_dkdv + t_dq) / t_fwd`.
+
+| hdim | rows | fwd | dK/dV | dQ | bwd eff | t_fwd | t_bwd | bwd/fwd |
+|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | **varlen** |
+| 32 | 32 | 519 | 492 | 570 | 373 | 66 | 230 | 3.47x |
+| 64 | 32 | 753 | 723 | 765 | 529 | 91 | 325 | 3.56x |
+| 96 | 16 | 834 | 731 | 895 | 566 | 124 | 455 | 3.68x |
+| 128 | 16 | 1032 | 772 | 760 | 548 | 133 | 627 | 4.71x |
+| 160 | 32 | 799 | 734 | 730 | 523 | 215 | 821 | 3.82x |
+| 192 | 16 | 810 | 842 | 774 | 580 | 255 | 889 | 3.49x |
+| 224 | 32 | 825 | 792 | 774 | 560 | 292 | 1074 | 3.68x |
+| 256 | 16 | 853 | 768 | 826 | 566 | 322 | 1215 | 3.77x |
+| 384 | 16 | 763 | 424 | 522 | 330 | 541 | 3128 | 5.79x |
+| 512 | 16 | 521 | 427 | 489 | 323 | 1055 | 4260 | 4.04x |
+
+**Varlen is free**: every rung within noise of its dense number (dense
+486/725/740/766/747/848/798/751/422/434 at the same shapes), and `bwd/fwd`
+covers the same 3.5x–5.8x band. Dense head_dim 384 is still the worst rung.
+
+### Not done
+
+- **Dropout (B6), bias input, GQA** -- refused by name.
+- **`lse_layout_th` doubles the build matrix for a caller who needs `(T, H)`.**
+  A runtime fast path (`pitch == 1` chosen at run time) would avoid that at the
+  cost of a branch on the hot path; not attempted, because the layout is
+  something a caller knows at build time.
+- Dense head_dim 384 at 5.8x, unchanged since B3.5.

@@ -354,6 +354,33 @@ class BwdDqKernelContext(ParityKernelContext):
                 ),
             )
 
+    def compute_active_guard(self):
+        """`q_start < seqlen_q`, and **not** the cross-sequence term.
+
+        The base adds `causal_end_raw_i32 > 0` under `CAUSAL and CROSS_SEQLEN`,
+        which skips a Q block whose causal region is empty -- correct for the
+        forward, which then zeroes `O` for those rows through
+        `zero_o_block_if_needed`. Inheriting it here would leave **dQ
+        unwritten** for the same rows, which is a garbage read for the caller
+        rather than a zero.
+
+        Dropping the term is not a workaround: this loop derives its tile count
+        from the same `causal_end_raw_i32`, so an empty causal region walks
+        **zero tiles**, leaves the accumulator at its zero seed and stores
+        zeros. The block does the right thing by running rather than by being
+        skipped, and no second zeroing path is needed in either family.
+
+        The `q_start` term is kept, and it is the one that saves work: under
+        varlen the grid is sized from `max_seqlen_q`, so a short sequence
+        dispatches Q blocks with no real rows at all.
+        """
+        traits = self.traits
+        if const_expr(traits.SPLITK):
+            return self.split_nonempty
+        if const_expr(traits.VARLEN):
+            return self.q_start < self.seqlen_q_v
+        return None
+
     def init_tile_bounds(self, **kwargs):
         """The inherited bounds, re-tightened for a **one-tile** loop.
 
@@ -463,6 +490,29 @@ class BwdDqKernelContext(ParityKernelContext):
         # here rather than per element. AOTriton's `l_i = tl.load(...) *
         # RCP_LN2` is the same fold.
         lse2 = dualwave._fmul(fx.Float32(lse), fx.Float32(dualwave._LOG2E), self.fm_fast)
+        # **Floored, because `LSE` can legitimately be `-inf`** and this is an
+        # *input*. A causal row with no live key -- every row below
+        # `seqlen_q - seqlen_kv` under bottom-right alignment, which is every
+        # `Sq > Sk` varlen sequence -- makes the forward's `l_row` zero and its
+        # `m_row*ln2 + log(l_row)` therefore `-inf`. Our own forward writes it.
+        #
+        # **This is not fixing an observed NaN, and saying so matters.**
+        # Measured with the floor removed, the varlen causal oracle still
+        # passes bitwise: `scale_and_sub_lse` computes `fma(S, qk_scale,
+        # +inf)`, and the KV/causal mask that runs *after* it overwrites every
+        # column of such a row with `-inf` before `exp2` sees it. The rescue is
+        # real and it is why the mask is ordered after the scale.
+        #
+        # The floor is kept because that rescue leans on an infinity flowing
+        # through an FMA carrying `fastmath<fast>`, whose `ninf` is a licence
+        # to assume infinities are absent. P5 recorded exactly that licence
+        # being taken up later by a different pass and silently deleting a KV
+        # tail mask on gfx1201. One `max` per kernel removes the case.
+        #
+        # After the `log2e` conversion, not before: `-3e38 * log2e` overflows
+        # back to `-inf`. Same device `ParitySoftmaxHelper` uses to keep the
+        # forward's running max off `-inf`, applied to an input.
+        lse2 = dualwave._fmax(fx.Float32(lse2), self.c_neg_floor, self.fm_fast)
         return lse2, fx.Float32(delta)
 
 
@@ -1171,7 +1221,10 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
     ):
         # Make the build configuration visible to the JIT cache key.
         _ = _cache_tag
-        bs_idx = fx.Index(batch_size)
+        # **Sequences, not batches.** A packed `(1, H, T, D)` call holding N
+        # sequences is `batch_size=1, num_seqlens=N`; using the batch extent
+        # would launch one program for all N. The forward's expression.
+        bs_idx = fx.Index(num_seqlens if num_seqlens != fx.Int32(0) else batch_size)
         num_q_blocks = (fx.Index(max_seqlen_q) + traits.BLOCK_M - 1) // traits.BLOCK_M
 
         passthrough_entries = (
@@ -1290,6 +1343,8 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         scale=None,
         db=None,
         window=None,
+        varlen=None,
+        num_seqlens=0,
         stream=None,
     ):
         """Every kernel argument but the stream, in launch order.
@@ -1320,6 +1375,19 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
                 "builder so the D-axis masks are emitted."
             )
 
+        # `abi.varlen_args` is gfx1201's, reused unedited: it encodes the same
+        # wire format the forward uses, and it is where the two host-side
+        # checks live that no kernel can make -- `batch_size` must be the
+        # tensor's batch extent whatever the layout, and a packed
+        # `num_seqlens` must agree with the length array. Passing the sequence
+        # count where the batch extent belongs launches N programs over a
+        # 1-batch tensor and every one of them addresses a plausible row.
+        _vl = abi.varlen_args(bool(knobs.strides_constexpr), varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens)
+        if varlen is not None and not traits.VARLEN:
+            raise ValueError("this build was not compiled for varlen; pass varlen=True to the builder")
+        if traits.VARLEN and varlen is None:
+            raise ValueError("this build has varlen=True and requires a varlen= descriptor")
+
         # **`(batch * heads, tokens)`, and the shape is shared with dK/dV.**
         # Both backward kernels take the same two row tensors and read them
         # with the same `fmha.lse_row_addressing`, so the host check is the
@@ -1328,12 +1396,23 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         # seq_len_v + q_row` inside a per-batch slab -- viewed at rank 2; a
         # caller holding `(B, H, S)` passes `lse.view(-1, S)`, which is free
         # on a contiguous tensor.
+        #
+        # **Varlen moves the token pitch**, and this is the one input where
+        # that is invisible from the tensor alone: the kernel derives the
+        # pitch from `lse_token_pitch` -- the batch total for a stacked Q side,
+        # `max_seqlen_q` otherwise -- rather than reading a stride, so a
+        # caller who sized LSE by `max_seqlen_q` under a packed layout gets a
+        # plausible value for the wrong row. `row_tensor_arg` checks the
+        # declared layout against the bits, which is the only place that can
+        # be done. The forward's P4 got this wrong in a way only `_TH`
+        # exposed.
+        rows_expected = int(num_seqlens or batch_size) * num_head_q
         for name, t in (("logsumexp", LSE), ("delta", Delta)):
             if t is None:
                 raise ValueError(f"{name} is required: the backward reads it, it is not recomputed")
-            abi.row_tensor_arg(t, name, num_head_q, seqlen_q, None)
-            if t.shape[0] != int(batch_size) * num_head_q:
-                raise ValueError(f"{name} must be ({int(batch_size) * num_head_q}, {seqlen_q}); got {tuple(t.shape)}")
+            abi.row_tensor_arg(t, name, num_head_q, seqlen_q, varlen)
+            if varlen is None and t.shape[0] != rows_expected:
+                raise ValueError(f"{name} must be ({rows_expected}, {seqlen_q}); got {tuple(t.shape)}")
 
         # A dB build must be handed a tensor and a build without dB must not
         # be: silently ignoring one returns gradients that are the right shape
@@ -1344,10 +1423,17 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         if db is not None and not STORE_DB:
             raise ValueError("this build was not compiled for dB; pass store_db=True to the knobs")
         if db is not None:
-            if tuple(db.shape) != (batch_size, num_head_q, seqlen_q, seqlen_k):
+            # **dB follows Q's batch and row layout, not a dense one.** Its
+            # descriptor is rebased at the same `(batch, head, row origin)` dQ
+            # uses, so under a packed Q the rows are packed too and the batch
+            # extent is Q's. Only the KV axis is sized independently, to
+            # `max_seqlen_k`, because a row's live columns are a per-sequence
+            # prefix of it.
+            want = (int(Q.shape[0]), num_head_q, int(Q.shape[2]), int(seqlen_k))
+            if tuple(db.shape) != want:
                 raise ValueError(
-                    f"dB must be (batch, num_heads_q, seqlen_q, seqlen_k) = "
-                    f"{(batch_size, num_head_q, seqlen_q, seqlen_k)}, got {tuple(db.shape)}"
+                    f"dB must follow Q's batch and row layout with a seqlen_k column axis, {want}; "
+                    f"got {tuple(db.shape)}"
                 )
             if db.stride(3) != 1:
                 raise ValueError(f"dB needs a contiguous seqlen_k axis; strides are {tuple(db.stride())}")
@@ -1367,14 +1453,13 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             LSE,
             Delta,
             int(batch_size),
-            abi.NULL_PTR,
-            abi.NULL_PTR,
-            abi.NULL_PTR,
-            abi.NULL_PTR,
-            0,  # varlen_bits
-            0,  # num_seqlens
-            int(seqlen_q),
-            int(seqlen_k),
+            _vl[1],
+            _vl[2],
+            _vl[3],
+            _vl[4],
+            _vl[0],  # varlen_bits
+            int(num_seqlens),
+            *_vl[5:],  # max_seqlen_q, max_seqlen_k -- the decode's MAX fallback
             *_resolve_window_args(window),
             abi.NULL_PTR,
             abi.NULL_PTR,

@@ -517,13 +517,12 @@ class BwdDqKnobs(Gfx950Knobs):
         for name, value in (
             ("bias", meta.bias),
             ("dropout", meta.dropout),
-            ("varlen", self.varlen),
             ("paged", self.paged),
         ):
             if value:
                 raise NotImplementedError(
-                    f"{name}=True is not implemented by the backward dQ kernel yet; B4 adds causal and "
-                    "windows. See the phase ladder in sdpa-bwd-plan-gfx950.md."
+                    f"{name}=True is not implemented by the backward dQ kernel yet; B5 adds varlen. "
+                    "See the phase ladder in sdpa-bwd-plan-gfx950.md."
                 )
         if meta.window and not meta.causal:
             # `make_traits` says the same thing, and this repeats it only so the
@@ -591,8 +590,22 @@ class BwdDqKnobs(Gfx950Knobs):
             stagger=self.stagger,
             lpt_tile_order=self.lpt_tile_order,
             num_kv_splits=1,
-            varlen=False,
-            cross_seqlen=False,
+            varlen=self.varlen,
+            # **On for a causal varlen build**, by the parent's
+            # `_with_mode_defaults`. The forward defaulted it off and two of
+            # five modes were wrong.
+            #
+            # It reaches less here than there -- see
+            # `BwdDqKernelContext.compute_active_guard`, which drops the
+            # `causal_end_raw_i32 > 0` term because a Q block with an empty
+            # causal region walks zero tiles and stores its zero seed, so this
+            # kernel needs no zeroing path. Kept on because it is cheap and the
+            # traits carry it, not because dK/dV requires it: that kernel
+            # passes `False`, since accumulating from zero and storing the
+            # accumulation gives it the same property structurally. Tuning
+            # policy is per-kernel (contract section 7) and these two differing
+            # is expected rather than a disagreement.
+            cross_seqlen=self.cross_seqlen,
             paged=False,
             kv_cache_layout=self.kv_cache_layout,
             kv_vectorized=False,

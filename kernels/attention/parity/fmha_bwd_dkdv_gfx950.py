@@ -378,6 +378,25 @@ class BwdDkDvKernelContext(ParityKernelContext):
         # the shard comes from `wave_id`; zero and folded away when unsharded.
         self.dkv_col_base = self.dkv_shard_id * fx.Index(traits.D_CHUNKS_PER_SHARD * traits.D_CHUNK)
 
+    def compute_active_guard(self):
+        """Whether this workgroup's KV block exists in *this* sequence.
+
+        The grid is sized from `max_seqlen_k`, so under varlen a short sequence
+        dispatches blocks past its own keys. The base class's guard tests the
+        *Q* extent, which is the right question for the forward and the wrong
+        one here.
+
+        Not needed for correctness -- the KV descriptors bound at
+        `seqlen_kv` rows, so a dead block reads zeros and its stores are
+        dropped -- but it is a lot of wasted work at a ragged batch. The
+        predicate is workgroup-uniform, so the branch is scalar and EXEC stays
+        all 1s across the transpose reads inside it; `check_exec_hazard` is
+        what keeps that true.
+        """
+        if const_expr(not self.traits.VARLEN):
+            return None
+        return self.kv_start < self.seqlen_kv_v
+
     def init_kv_row(self):
         """The KV rows this wave owns: `ROWS_PER_WAVE` of them, at `lane % rows`.
 
@@ -405,8 +424,19 @@ class BwdDkDvKernelContext(ParityKernelContext):
         same trade for the same reason.
         """
         super().init_descriptors(**kwargs)
-        self.q_row_off = fx.Index(0)
-        self.kv_row_off = fx.Index(0)
+        traits = self.traits
+        # **Each side owns its own row origin and its own batch index.** Under
+        # `0x040B` -- packed Q against a *batched* KV cache -- Q is stacked
+        # (batch 0, large row offset) and K is batched (batch z, no row offset)
+        # in the same call. Four of the five modes agree, so reusing Q's index
+        # for K reads batch 0 of the cache for every sequence and only that one
+        # mode exposes it. P4 paid for this once.
+        if const_expr(traits.VARLEN):
+            self.q_row_off = self.varlen_q_row_off
+            self.kv_row_off = self.varlen_kv_row_off
+        else:
+            self.q_row_off = fx.Index(0)
+            self.kv_row_off = fx.Index(0)
         # The staged tiles address from token 0 of the slab; the tile offset
         # rides in the DMA's `soffset`, which is what `_kv_tile_addr` produces.
         self.q_gmem_elem_offset = fx.Index(0)
@@ -419,7 +449,7 @@ class BwdDkDvKernelContext(ParityKernelContext):
             self.stride_q_batch,
             self.stride_q_head,
             self.stride_q_seq,
-            fx.Index(0),
+            self.q_row_off,
             self.q_head_idx,
             self.seqlen_q_v,
         )
@@ -428,7 +458,7 @@ class BwdDkDvKernelContext(ParityKernelContext):
             self.stride_do_batch,
             self.stride_do_head,
             self.stride_do_seq,
-            fx.Index(0),
+            self.q_row_off,
             self.q_head_idx,
             self.seqlen_q_v,
         )
@@ -441,36 +471,40 @@ class BwdDkDvKernelContext(ParityKernelContext):
             self.stride_k_batch,
             self.stride_k_head,
             self.stride_k_seq,
-            fx.Index(0),
+            self.kv_row_off,
             self.kv_head_idx,
             self.seqlen_kv_v,
+            batch_idx=self.kv_batch_idx,
         )
         self.v_res_div = self._slab_view(
             self.V,
             self.stride_v_batch,
             self.stride_v_head,
             self.stride_v_seq,
-            fx.Index(0),
+            self.kv_row_off,
             self.kv_head_idx,
             self.seqlen_kv_v,
+            batch_idx=self.kv_batch_idx,
         )
         self.dk_div = self._slab_view(
             self.DK,
             self.stride_dk_batch,
             self.stride_dk_head,
             self.stride_dk_seq,
-            fx.Index(0),
+            self.kv_row_off,
             self.kv_head_idx,
             self.seqlen_kv_v,
+            batch_idx=self.kv_batch_idx,
         )
         self.dv_div = self._slab_view(
             self.DV,
             self.stride_dv_batch,
             self.stride_dv_head,
             self.stride_dv_seq,
-            fx.Index(0),
+            self.kv_row_off,
             self.kv_head_idx,
             self.seqlen_kv_v,
+            batch_idx=self.kv_batch_idx,
         )
         self.o_div = self.dk_div
 
@@ -480,18 +514,10 @@ class BwdDkDvKernelContext(ParityKernelContext):
         # width per access, and they bound identically -- `rows * stride_seq`
         # elements, so a row past the sequence reads zero and a store to one is
         # dropped.
-        self.k_res_rsrc = self._slab_rsrc(
-            self.K, self.stride_k_batch, self.stride_k_head, self.stride_k_seq, self.kv_head_idx, self.seqlen_kv_v
-        )
-        self.v_res_rsrc = self._slab_rsrc(
-            self.V, self.stride_v_batch, self.stride_v_head, self.stride_v_seq, self.kv_head_idx, self.seqlen_kv_v
-        )
-        self.dk_rsrc = self._slab_rsrc(
-            self.DK, self.stride_dk_batch, self.stride_dk_head, self.stride_dk_seq, self.kv_head_idx, self.seqlen_kv_v
-        )
-        self.dv_rsrc = self._slab_rsrc(
-            self.DV, self.stride_dv_batch, self.stride_dv_head, self.stride_dv_seq, self.kv_head_idx, self.seqlen_kv_v
-        )
+        self.k_res_rsrc = self._slab_rsrc(self.K, self.stride_k_batch, self.stride_k_head, self.stride_k_seq)
+        self.v_res_rsrc = self._slab_rsrc(self.V, self.stride_v_batch, self.stride_v_head, self.stride_v_seq)
+        self.dk_rsrc = self._slab_rsrc(self.DK, self.stride_dk_batch, self.stride_dk_head, self.stride_dk_seq)
+        self.dv_rsrc = self._slab_rsrc(self.DV, self.stride_dv_batch, self.stride_dv_head, self.stride_dv_seq)
 
         self.k_res_elem_base = self.kv_start * self.stride_k_seq_v
         self.v_res_elem_base = self.kv_start * self.stride_v_seq_v
@@ -501,23 +527,48 @@ class BwdDkDvKernelContext(ParityKernelContext):
         self.dk_oob_off = self.seqlen_kv_v * self.stride_dk_seq_v
         self.dv_oob_off = self.seqlen_kv_v * self.stride_dv_seq_v
 
-        # LSE and delta. Compact `(batch * heads, tokens)` f32, the layout the
-        # forward writes LSE in -- `q_head_idx * seq_len_v + q_row` inside a
-        # per-batch slab. Bounding each resource at one head's row means a
-        # token past `seqlen_q` reads zero, which is the value the "nothing is
-        # masked" argument in the module docstring depends on.
-        row_bytes = self.seq_len_v * fx.Index(4)
-        per_batch_bytes = fx.Index(self.num_head_q) * row_bytes
-        head_bytes = self.batch_idx * per_batch_bytes + self.q_head_idx * row_bytes
-        self.lse_rsrc = dualwave._make_ws_rsrc(fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))), head_bytes, row_bytes)
-        self.delta_rsrc = dualwave._make_ws_rsrc(fx.Int64(fx.ptrtoint(fx.get_iter(self.Delta))), head_bytes, row_bytes)
+        # LSE and delta, through **the same function the forward writes LSE
+        # with**. Both are always compact -- their strides are a function of
+        # VarlenBits, the head count and the token pitch rather than a free
+        # variable -- so re-deriving the layout here would be a second source
+        # of truth for one fact (varlen plan section 4.2). `lse_tokens_i32` is
+        # `lse_token_pitch`'s answer, which is `max_seqlen_q` for a batched
+        # layout and the batch total for a stacked one.
+        #
+        # The resource is rebased at that `base` and bounded at this sequence's
+        # own rows, which is what keeps a q row past `seqlen_q` reading **zero**
+        # rather than a neighbouring row's value. That matters more than it
+        # looks: a padding row's `P` is `exp2(-lse * log2e)`, and a neighbour's
+        # very negative LSE would make it `+inf` -- then `inf * 0` from the
+        # zero-staged dO is a NaN in dV, where a zero gives `P = 1` and a clean
+        # zero contribution.
+        lse_base, lse_pitch = fmha.lse_row_addressing(
+            self.varlen_bits_arg,
+            self.batch_idx,
+            self.q_head_idx,
+            fx.Index(self.num_head_q),
+            fx.Index(self.lse_tokens_i32),
+            self.q_row_off,
+        )
+        self.lse_pitch = lse_pitch
+        row_span_bytes = self.seqlen_q_v * lse_pitch * fx.Index(4)
+        base_bytes = lse_base * fx.Index(4)
+        self.lse_rsrc = dualwave._make_ws_rsrc(fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))), base_bytes, row_span_bytes)
+        self.delta_rsrc = dualwave._make_ws_rsrc(
+            fx.Int64(fx.ptrtoint(fx.get_iter(self.Delta))), base_bytes, row_span_bytes
+        )
 
-    def _slab_rsrc(self, tensor, s0, s1, s2, head_idx, rows):
-        """A raw buffer resource over one (batch, head) slab, bounded at `rows`."""
-        span_bytes = rows * fx.Index(s2) * fx.Index(self.traits.BF16_BYTES)
+    def _slab_rsrc(self, tensor, s0, s1, s2):
+        """A raw buffer resource over this workgroup's KV slab, bounded at its rows.
+
+        Only the four KV-side tensors need one, so the head, the row origin and
+        the batch index are the KV ones rather than parameters -- which is also
+        what stops Q's batch index reaching them under `0x040B`.
+        """
+        span_bytes = self.seqlen_kv_v * fx.Index(s2) * fx.Index(self.traits.BF16_BYTES)
         return dualwave._make_ws_rsrc(
             fx.Int64(fx.ptrtoint(fx.get_iter(tensor))),
-            self._slab_byte_base(s0, s1, s2, fx.Index(0), head_idx),
+            self._slab_byte_base(s0, s1, s2, self.kv_row_off, self.kv_head_idx, batch_idx=self.kv_batch_idx),
             span_bytes,
         )
 
@@ -796,23 +847,36 @@ class BwdDkDvSoftmaxHelper(ParitySoftmaxHelper):
     def load_row_values(self, rsrc, tile_base, half, scale):
         """16 f32, one per accumulator element of `half`, times `scale`.
 
-        Four `buffer_load_dwordx4`. The row an element holds is
-        `8 * (r // 4) + 4 * (lane // 32) + (r % 4)`, so the four `r % 4` values
-        of a group are four *contiguous* rows -- which is why this is 4 loads
-        and not 16. `_ROW_RUNS` is where that grouping is stated.
+        The row an element holds is `8 * (r // 4) + 4 * (lane // 32) + (r % 4)`,
+        so the four `r % 4` values of a group are four *contiguous* rows and a
+        dense build covers each group with one `buffer_load_dwordx4`.
+        `_ROW_RUNS` is where that grouping is stated.
+
+        **Under the `_TH` logsumexp layout the four rows are `num_heads`
+        apart**, so the wide load does not apply and it is sixteen scalars
+        instead. That is why the layout is a build axis rather than a runtime
+        bit: making every build take the scalar path measured 0.68x at head_dim
+        64, where the row-tensor reads are the largest share of a tile.
         """
         values = [None] * 16
         row_base = fx.Int32(tile_base + fx.Index(half * 32)) + fx.Int32(self.lane_div_32) * fx.Int32(4)
-        for elem0, col_off, width in _ROW_RUNS:
-            span = buffer_ops.buffer_load(
-                rsrc,
-                as_mlir_value(row_base + fx.Int32(col_off)),
-                vec_width=width,
-                dtype=fx.Float32,
-            )
-            vec = Vec(span, (width,), fx.Float32)
-            for j in range_constexpr(width):
-                values[elem0 + j] = dualwave._fmul(vec[j], scale, self.fm_fast)
+        if const_expr(not self.LSE_TH):
+            for elem0, col_off, width in _ROW_RUNS:
+                span = buffer_ops.buffer_load(
+                    rsrc,
+                    as_mlir_value(row_base + fx.Int32(col_off)),
+                    vec_width=width,
+                    dtype=fx.Float32,
+                )
+                vec = Vec(span, (width,), fx.Float32)
+                for j in range_constexpr(width):
+                    values[elem0 + j] = dualwave._fmul(vec[j], scale, self.fm_fast)
+            return values
+        pitch = self.lse_pitch
+        for r in range_constexpr(16):
+            off = fx.Index(row_base + fx.Int32(_ROW_THRESHOLDS[r])) * pitch
+            one = buffer_ops.buffer_load(rsrc, as_mlir_value(fx.Int32(off)), vec_width=1, dtype=fx.Float32)
+            values[r] = dualwave._fmul(fx.Float32(one), scale, self.fm_fast)
         return values
 
     def probabilities(self, v_s, neg_lse2):
@@ -1123,6 +1187,8 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
     NBUF = traits.NUM_STREAM_BUFFERS
     # Which MFMA family this build is. See `fmha_bwd_dkdv_m16_gfx950`.
     M16 = traits.MFMA_ROWS == 16
+    # `(T, H)` logsumexp/delta. See `BwdDkDvInputMetadata.lse_layout_th`.
+    LSE_TH = bool(meta.lse_layout_th)
     # One knob for the whole register-against-ILP trade; see
     # `BwdDkDvTileBody._row_reader` and `_with_register_pressure`.
     TIGHT_REGISTERS = knobs.tight_registers
@@ -1136,7 +1202,7 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         STRIDES_CONSTEXPR,
         BUILD_SM_SCALE,
         (knobs.num_waves, knobs.block_kv, knobs.block_q, knobs.head_dim_granule),
-        (knobs.dkv_shards, NBUF, knobs.waves_per_eu, TIGHT_REGISTERS, traits.MFMA_ROWS),
+        (knobs.dkv_shards, NBUF, knobs.waves_per_eu, TIGHT_REGISTERS, traits.MFMA_ROWS, LSE_TH),
     )
 
     _lds_elem_dtype = dualwave.dtype_to_elem_type(traits.DTYPE_STR)
@@ -1268,6 +1334,8 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         ctx.init_atoms_and_lds_ptrs()
         ctx.init_dma_thread_offsets()
         ctx.init_tile_bounds()
+        ctx.LSE_TH = LSE_TH
+        ctx.init_active_guard()
         ctx.init_lds_read_bases()
         ctx.init_dma_m0_tables()
         ctx.init_kv_row()
@@ -1372,7 +1440,21 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             store.store_accs(dv, "dv", hdim_vo)
             store.store_accs(dk, "dk", hdim_qk)
 
-        _dkdv_body()
+        # A workgroup whose KV block is past *this* sequence's keys. Scalar
+        # branch (the predicate is workgroup-uniform), so EXEC is untouched
+        # across the transpose reads inside -- which is not optional; see
+        # `tooling/check_exec_hazard_gfx950.py`.
+        if const_expr(ctx.active is None):
+            _dkdv_body()
+        else:
+            active = ctx.active
+
+            @flyc.jit
+            def _run_body_if_active():
+                if active:
+                    _dkdv_body()
+
+            _run_body_if_active()
 
     @flyc.jit
     def launch_fmha_bwd_dkdv_gfx950(
@@ -1431,6 +1513,12 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
     ):
         _ = _cache_tag
         num_kv_blocks = (fx.Index(max_seqlen_k) + fx.Index(traits.BLOCK_KV - 1)) // fx.Index(traits.BLOCK_KV)
+        # The grid's z extent counts **sequences**, which is `num_seqlens` when
+        # a packed tensor holds several in one batch slot and `batch_size`
+        # otherwise. A packed `(1, H, T, D)` call is `batch_size=1,
+        # num_seqlens=N`; using the batch extent there launches one program for
+        # N sequences.
+        bs_idx = fx.Index(num_seqlens if num_seqlens != fx.Int32(0) else batch_size)
         passthrough_entries = (
             [
                 ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
@@ -1506,7 +1594,7 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             # sharing a slab duplicates it across all of them instead of
             # spreading distinct work. Same conclusion as the forward's, for a
             # different reason.
-            grid=(fx.Index(num_head_q), num_kv_blocks, fx.Index(batch_size)),
+            grid=(fx.Index(num_head_q), num_kv_blocks, bs_idx),
             block=(traits.BLOCK_SIZE, 1, 1),
             stream=stream,
         )
@@ -1591,6 +1679,8 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         seqlen_k=None,
         scale=None,
         window=None,
+        varlen=None,
+        num_seqlens=0,
         stream=None,
     ):
         """Every kernel argument but the stream, in launch order.
@@ -1645,14 +1735,32 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         # for the kernel to address them with one offset computation. Its return
         # is discarded: this kernel takes them as tensors, because it builds
         # buffer descriptors rather than dereferencing a raw pointer.
-        abi.row_tensor_arg(LSE, "logsumexp", num_head_q, seqlen_q, None)
-        abi.row_tensor_arg(Delta, "delta", num_head_q, seqlen_q, None)
-        if int(batch_size) != int(Q.shape[0]):
-            raise ValueError(f"batch_size={int(batch_size)} but Q.size(0)={int(Q.shape[0])}")
-        if LSE.shape[0] != int(batch_size) * num_head_q:
-            raise ValueError(f"logsumexp must be ({int(batch_size) * num_head_q}, {seqlen_q}); got {tuple(LSE.shape)}")
+        abi.row_tensor_arg(LSE, "logsumexp", num_head_q, seqlen_q, varlen)
+        abi.row_tensor_arg(Delta, "delta", num_head_q, seqlen_q, varlen)
         if Delta.shape != LSE.shape:
             raise ValueError(f"delta must have logsumexp's shape {tuple(LSE.shape)}, got {tuple(Delta.shape)}")
+        if varlen is None and LSE.shape[0] != int(batch_size) * num_head_q:
+            raise ValueError(f"logsumexp must be ({int(batch_size) * num_head_q}, {seqlen_q}); got {tuple(LSE.shape)}")
+        if varlen is not None and not traits.VARLEN:
+            raise ValueError("this build was not compiled for varlen; pass varlen=True in BwdDkDvInputMetadata")
+        if varlen is not None and bool((int(varlen["bits"]) >> 16) & 3) != LSE_TH:
+            want = "lse_layout_th=True" if not LSE_TH else "lse_layout_th=False"
+            raise ValueError(
+                f"this build is compiled for lse_layout_th={LSE_TH} but the descriptor's bits say "
+                f"otherwise. The logsumexp layout decides whether a lane's four accumulator rows are "
+                f"adjacent, so it is a build axis here rather than a runtime bit; pass {want}."
+            )
+        if varlen is None and traits.VARLEN:
+            # A varlen build with `bits == 0` decodes to the dense answer, so
+            # this would work -- and it would also be a caller who thinks a
+            # ragged batch is being honoured getting a rectangular one.
+            raise ValueError("this build has varlen=True and requires a varlen= descriptor")
+        # `abi.varlen_args` is gfx1201's, reused unedited: it encodes the same
+        # wire format and it is where the two host-side checks live that no
+        # kernel can make -- `batch_size` must be the tensor's batch extent
+        # whatever the layout, and a packed `num_seqlens` must agree with the
+        # length array.
+        _vl = abi.varlen_args(STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens)
 
         return (
             Q,
@@ -1665,14 +1773,13 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             LSE,
             Delta,
             int(batch_size),
-            abi.NULL_PTR,
-            abi.NULL_PTR,
-            abi.NULL_PTR,
-            abi.NULL_PTR,
-            0,  # varlen_bits
-            0,  # num_seqlens
-            int(seqlen_q),
-            int(seqlen_k),
+            _vl[1],
+            _vl[2],
+            _vl[3],
+            _vl[4],
+            _vl[0],
+            int(num_seqlens),
+            *_vl[5:],  # max_seqlen_q, max_seqlen_k -- the decode's MAX fallback
             *_resolve_window_args(window),
             abi.NULL_PTR,
             abi.NULL_PTR,

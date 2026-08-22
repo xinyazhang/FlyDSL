@@ -302,9 +302,20 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
         row0 = fx.Int32(tile_base + fx.Index((sub // 2) * MFMA16_K + (sub % 2) * 4)) + fx.Int32(
             self.lane // fx.Index(MFMA16_M)
         ) * fx.Int32(8)
-        span = buffer_ops.buffer_load(rsrc, as_mlir_value(row0), vec_width=ACC16, dtype=fx.Float32)
-        vec = Vec(span, (ACC16,), fx.Float32)
-        return [dualwave._fmul(vec[i], scale, self.fm_fast) for i in range_constexpr(ACC16)]
+        if const_expr(not self.LSE_TH):
+            span = buffer_ops.buffer_load(rsrc, as_mlir_value(row0), vec_width=ACC16, dtype=fx.Float32)
+            vec = Vec(span, (ACC16,), fx.Float32)
+            return [dualwave._fmul(vec[i], scale, self.fm_fast) for i in range_constexpr(ACC16)]
+        # `_TH`: the four rows are `num_heads` apart, so the vector load does
+        # not apply. A build axis rather than a runtime bit; see
+        # `BwdDkDvInputMetadata.lse_layout_th`.
+        pitch = self.lse_pitch
+        out = []
+        for i in range_constexpr(ACC16):
+            off = fx.Index(row0 + fx.Int32(i)) * pitch
+            one = buffer_ops.buffer_load(rsrc, as_mlir_value(fx.Int32(off)), vec_width=1, dtype=fx.Float32)
+            out.append(dualwave._fmul(fx.Float32(one), scale, self.fm_fast))
+        return out
 
     def probabilities(self, v_s, neg_lse2):
         """`P = exp2(qk_scale * S - log2(e) * LSE)`.
