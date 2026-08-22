@@ -423,3 +423,91 @@ Say so rather than forking if either of you needs to change a shared interface.
   effective, against the forward. Per-kernel numbers at different shapes are
   what hid this in the first place.
 - A perf claim under 10% needs interleaved single-GPU A/B, not a sweep.
+
+---
+
+# Addendum: B4–B6 — the features, on a base that is now fast
+
+B3.5 left both kernels correct and reasonably fast across the ladder with the
+minimum feature set. B4 (causal and windows), B5 (varlen) and B6 (dropout) add
+the rest, **in that order**, because each phase's tests are what make the next
+phase's failures legible.
+
+Four things have changed since the plan wrote these phases, and all four change
+the work.
+
+## 1. Every feature lands on **two** MFMA families, not one
+
+B3.5 added a 16-row family beside the 32-row one, selected per rung by
+measurement. A feature implemented in one and not the other is a wrong answer
+at half the ladder, and `test_both_mfma_families_at_every_rung` exists so that
+coverage does not silently follow the tuning policy. **Extend it with each
+feature** rather than testing the feature only where it is currently selected.
+
+Anything keyed on a lane→(row, col) map has to be derived from the family's
+own map. B3.5's whole discipline was one table per family and no transcription;
+masks are exactly the sort of code that tempts a second copy.
+
+## 2. The EXEC-mask hazard becomes reachable **for the first time** in B4
+
+CDNA4 §11.4: `ds_read_b64_tr_b16` requires **EXEC all 1s**. Both kernels
+reported the same thing at B3 — no `scf.if` anywhere, so the hazard could not
+fire, and both said B4 is where that changes.
+
+Masking introduces real branchy regions around edge tiles, and the transpose
+reads are now the load-bearing path in both families. **A transpose read inside
+a divergent region is undefined**, and the failure mode is the house
+speciality: finite, wrong, no diagnostic.
+
+So: keep every transpose read outside every `scf.if`, and add a test that would
+catch it if one drifted in. This is the first phase where "it works" and "it is
+correct" can differ for this reason.
+
+## 3. The masked region is the transpose of the forward's, for dK/dV
+
+`fmha.decompose_causal_regions` cuts a Q block's KV range; a KV block's Q range
+is **the same function with the axes swapped**, which gfx1201's dK/dV
+established:
+
+    decompose_causal_regions(start_k, k_len, q_len, w_right, w_left,
+                             BLOCK_N, BLOCK_M, alive)
+
+dQ uses it the way the forward does. Neither should re-derive it.
+
+## 4. The forward's findings transfer, and they are enumerable
+
+Do not rediscover these:
+
+- **The bit-identical sentinel oracle.** A window build fed `WINDOW_BOTRIGHT`
+  must reproduce a plain causal build *exactly*. It is the sharpest test in
+  this codebase and it caught four separate bugs in the forward's P3.
+- **A dead tile is a no-op**, so correctness cannot show that the tile cut
+  works. Verify the cut by **timing**. The forward's wide body shipped with its
+  cut inert — right answers, 0.92x — and only a timing assertion found it.
+- **The literal-zero tile base.** P3 found four instances in the forward, in
+  prologues and loop bases that assumed the walk starts at tile 0. Both
+  backward kernels have prologues of the same shape.
+- **`torch`'s `is_causal` is top-left; these kernels are bottom-right.** They
+  agree only at `Sq == Sk`, and no varlen test satisfies that.
+- **A causal varlen build wants `cross_seqlen`** (B5). The forward defaulted it
+  off and two of five modes returned wrong answers.
+- **Each varlen side needs its own batch index** (B5). Q stacked against a
+  batched KV cache is one call where they differ.
+- **Dropout must regenerate the forward's mask bit-identically** (B6). Call the
+  same `grid_plane`/`grid_offset` with the seed and offset the forward
+  *reported*, and make the tiling-independence test **cross-kernel**: forward
+  and backward at different tile geometries must agree.
+
+## Gates, per phase
+
+Everything B3/B3.5 gated, still — full ladder, both families, 8xD, padded
+heads, joint autograd, no regression on either family — plus:
+
+- the sentinel bit-identity oracle (B4),
+- a timing assertion for the tile cut (B4),
+- varlen against *N separate dense calls*, bitwise (B5),
+- cross-kernel dropout mask agreement (B6).
+
+And report performance in the one-shape, one-accounting format with **wall-clock
+bwd/fwd**, not a ratio of rates. B3.5's headline was a rate ratio labelled as a
+time ratio and it flattered by exactly 2.5x.
