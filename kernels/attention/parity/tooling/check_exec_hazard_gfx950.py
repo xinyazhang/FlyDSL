@@ -39,6 +39,14 @@ transpose reads are inside it rather than beside it. Its predicate is
 workgroup-uniform, so it is a scalar branch too; that is what these
 configurations check.
 
+**GQA (B7) adds the first nested runtime region.** The group loop wraps the
+tile loop, so there are now two loop-carried `scf.for`s one inside the other,
+and the accumulators live across both. Nested control flow is where a compiler
+is most likely to materialise a mask rather than a scalar branch, so the
+`kvh=1` arms below are the ones that would catch it. Bias, by contrast, is
+per-element arithmetic with no branch of its own -- it is here because it is
+new, not because it is suspicious.
+
 **Dropout (B6) is the one feature that is genuinely per-lane**, and so the one
 most likely to make the compiler reach for `v_cmpx`: `keep` is a different bit
 in every lane and the kernel selects on it. It is written as `select` rather
@@ -89,26 +97,33 @@ p.add_argument("--causal", type=int, default=0)
 p.add_argument("--window", type=int, default=0)
 p.add_argument("--varlen", type=int, default=0)
 p.add_argument("--dropout", type=int, default=0)
+p.add_argument("--bias", type=int, default=0)
+p.add_argument("--kvheads", type=int, default=0)
 a = p.parse_args()
 import torch
 import fmha_common_gfx1201 as fmha
 from fmha_bwd_dkdv_gfx950 import build_fmha_bwd_dkdv_gfx950_module as build
-d, B, H, S = a.head_dim, 1, 2, 256
+d, B, H, S = a.head_dim, 1, 4, 256
+HK = a.kvheads or H
 q = torch.randn(B, H, S, d, device="cuda", dtype=torch.bfloat16)
-k, v, do = torch.randn_like(q), torch.randn_like(q), torch.randn_like(q)
+do = torch.randn_like(q)
+k = torch.randn(B, HK, S, d, device="cuda", dtype=torch.bfloat16)
+v = torch.randn_like(k)
 dk, dv = torch.empty_like(k), torch.empty_like(v)
 lse = torch.randn(B * H, S, device="cuda", dtype=torch.float32)
 delta = torch.randn_like(lse)
 kw = dict(mfma_rows=a.rows, dkv_shards=1, num_waves=4, block_kv=a.rows * 4, block_q=64,
           head_dim_granule=64 if d % 64 == 0 else 32)
-fn = build(num_heads=H, head_dim=d, num_kv_heads=H, causal=bool(a.causal), window=bool(a.window),
-           varlen=bool(a.varlen), dropout=bool(a.dropout), **kw)
+fn = build(num_heads=H, head_dim=d, num_kv_heads=HK, causal=bool(a.causal), window=bool(a.window),
+           varlen=bool(a.varlen), dropout=bool(a.dropout), bias=bool(a.bias), **kw)
 ka = dict(seqlen_k=S, scale=1.0 / d ** 0.5)
 if a.window:
     ka["window"] = (fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT)
 if a.dropout:
     u64 = lambda x: torch.tensor([x], device="cuda", dtype=torch.int64)  # noqa: E731
     ka.update(dropout_p=0.25, philox_seed=u64(1234), philox_offset1=u64(0), philox_offset2=0)
+if a.bias:
+    ka["bias"] = torch.randn(B, H, S, S, device="cuda", dtype=torch.bfloat16)
 if a.varlen:
     import fmha_abi_gfx1201 as _abi
     cu = torch.tensor([0, S], device="cuda", dtype=torch.int32)
@@ -119,7 +134,7 @@ torch.cuda.synchronize()
 """
 
 
-def build_isa(head_dim, rows, causal, window, varlen=0, dropout=0):
+def build_isa(head_dim, rows, causal, window, varlen=0, dropout=0, bias=0, kvheads=0):
     """Compile one configuration in a child process and return its final ISA."""
     out = tempfile.mkdtemp(prefix="exec_hazard_")
     env = dict(os.environ)
@@ -142,6 +157,10 @@ def build_isa(head_dim, rows, causal, window, varlen=0, dropout=0):
             str(int(varlen)),
             "--dropout",
             str(int(dropout)),
+            "--bias",
+            str(int(bias)),
+            "--kvheads",
+            str(int(kvheads)),
         ],
         env=env,
         capture_output=True,
@@ -177,12 +196,12 @@ def scan(isa):
     return exec_writes, tr_reads, unsafe
 
 
-def check(head_dim, rows, causal, window, varlen=0, dropout=0):
-    isa = build_isa(head_dim, rows, causal, window, varlen, dropout)
+def check(head_dim, rows, causal, window, varlen=0, dropout=0, bias=0, kvheads=0):
+    isa = build_isa(head_dim, rows, causal, window, varlen, dropout, bias, kvheads)
     exec_writes, tr_reads, unsafe = scan(isa)
     tag = (
         f"d{head_dim:<4} rows{rows:<3} causal={int(causal)} window={int(window)} "
-        f"varlen={int(varlen)} dropout={int(dropout)}"
+        f"varlen={int(varlen)} dropout={int(dropout)} bias={int(bias)} kvh={kvheads or '-'}"
     )
     print(f"  {tag}  tr_reads {tr_reads:>4}  exec_writes {exec_writes:>3}  unsafe {unsafe:>3}")
     if tr_reads == 0:
@@ -198,23 +217,39 @@ def main():
     p.add_argument("--window", type=int, default=0)
     p.add_argument("--varlen", type=int, default=0)
     p.add_argument("--dropout", type=int, default=0)
+    p.add_argument("--bias", type=int, default=0)
+    p.add_argument("--kvheads", type=int, default=0)
     a = p.parse_args()
     if a.head_dim is not None:
-        raise SystemExit(1 if check(a.head_dim, a.rows, a.causal, a.window, a.varlen, a.dropout) else 0)
+        raise SystemExit(
+            1 if check(a.head_dim, a.rows, a.causal, a.window, a.varlen, a.dropout, a.bias, a.kvheads) else 0
+        )
     bad = 0
     for head_dim in (64, 128):
         for rows in (32, 16):
-            for causal, window, varlen, dropout in (
-                (0, 0, 0, 0),
-                (1, 0, 0, 0),
-                (1, 1, 0, 0),
-                (0, 0, 1, 0),
-                (1, 0, 1, 0),
-                (0, 0, 0, 1),
-                (1, 0, 0, 1),
-                (0, 0, 1, 1),
+            for causal, window, varlen, dropout, bias, kvh in (
+                (0, 0, 0, 0, 0, 0),
+                (1, 0, 0, 0, 0, 0),
+                (1, 1, 0, 0, 0, 0),
+                (0, 0, 1, 0, 0, 0),
+                (1, 0, 1, 0, 0, 0),
+                (0, 0, 0, 1, 0, 0),
+                (1, 0, 0, 1, 0, 0),
+                (0, 0, 1, 1, 0, 0),
+                # B7. Bias is per-element arithmetic with no branch of its own;
+                # GQA adds the group loop, which is the first *nested* runtime
+                # region in this kernel and therefore the first chance for the
+                # compiler to reach for a mask on the outer one.
+                (0, 0, 0, 0, 1, 0),
+                (0, 0, 1, 0, 1, 0),
+                (0, 0, 0, 1, 1, 0),
+                (0, 0, 0, 0, 0, 1),
+                (1, 0, 0, 0, 0, 1),
+                (0, 0, 1, 0, 0, 1),
+                (0, 0, 0, 1, 0, 1),
+                (1, 0, 1, 1, 0, 1),
             ):
-                bad += check(head_dim, rows, causal, window, varlen, dropout)
+                bad += check(head_dim, rows, causal, window, varlen, dropout, bias, kvh)
     print("EXEC HAZARD: clean" if not bad else f"EXEC HAZARD: {bad} transpose reads under a narrowed EXEC")
     raise SystemExit(1 if bad else 0)
 

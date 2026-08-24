@@ -605,3 +605,97 @@ head_dim 96 is a normal rung again.
   It stays one f32 multiply per element, fused into the `select`. Folding it
   into `dO` before the GEMM instead would round `dO` through bf16 a second
   time.
+- **Inheriting a helper that already does the feature adds it twice, and the
+  backward does not renormalise it away.** B6 hit this with `cast_p`, which is
+  where the *forward* applies dropout; B7 hit it again with
+  `seq_pad_mask_if_needed`, which is where the parity forward adds the *bias*.
+  Adding the bias a second time in the backward's body measured **3.3 relative
+  error**. The reason it is worse here than it would be in the forward is
+  structural: the forward renormalises by its row sum, so a uniform score shift
+  cancels, while the backward computes `P = exp2(S - lse2)` against an `lse`
+  it was *given* and a doubled shift multiplies `P` by `2^shift`. The
+  discriminator that identified it was a **row-constant** bias: shift
+  invariance says that must be a no-op on `P`, and it was not.
+  Before subclassing a softmax helper for the backward, grep it for the feature
+  you are about to add.
+- **A helper that copies a context's `__dict__` does not see the context
+  change.** `DualwaveKernelContext.__init__` does
+  `self.__dict__.update(ctx.__dict__)` when handed another context, so every
+  helper built from it holds a *snapshot*. That is invisible while the context
+  is built once in a prologue, and it becomes a bug the moment anything
+  re-points the context mid-kernel -- a GQA group loop rebinding the query
+  side, say. The failure is finite and plausible: the stream loader keeps
+  staging the first head's Q for the whole group, and the answer is wrong by
+  exactly the group sum. The fix is to read the live `ctx_ref` at the call site
+  for anything the loop rebinds, and to know which of a helper's attributes are
+  snapshots and which are proxies.
+- **A drain you added for a race you reasoned about needs both a control and a
+  price.** A pipeline drain at a GQA group boundary turned out to be
+  bit-identically inert on eight configurations, because the staging is
+  partitioned by wave and one wave's DMAs to the same LDS address retire in
+  issue order. It costs 0.2-0.4%. Keeping it is then a defensible trade -- the
+  ordering property is an inference, not something read off a manual, and a
+  wrong guess costs a silently zeroed tile -- but *only if the comment says the
+  control found it inert*. An unmeasured guard reads as load-bearing to the
+  next person and never gets removed.
+- **An f32 reference compared against a bf16 output measures the dtype, not the
+  algorithm.** Comparing an in-register f32 group sum against a host-side
+  `.float().sum()` of bf16 partials appeared to show the f32 accumulation was
+  no better -- because the reference was never rounded back to the output type.
+  Round both arms to what the kernel would actually write and the ordering
+  reverses. Any A/B between two accumulation strategies has to end in the same
+  type or it is answering a different question.
+- **A feature's measured cost at the policy's geometry can be mostly the
+  geometry.** The bias input read 5.04x at head_dim 64 and 4.05x at 32 --
+  numbers that look like the feature and are not. At head_dim 64 the rung does
+  not spill at all; switching one existing knob took it to 1.41x, which is what
+  the bytes-per-flop law predicts. The tell was that the cost split by **MFMA
+  family** rather than by width: a per-element read costs the 32-row family
+  double, because a lane there holds 32 accumulator elements to the 16-row
+  family's 16. Before reporting a feature's cost, re-tune the rungs it made
+  expensive; otherwise the number is a statement about the old tuning.
+- **Two features can have the same per-element shape and completely different
+  memory behaviour.** Dropout and the bias input both read one value per
+  accumulator element with no per-lane vector available, because the dK/dV
+  accumulator is the forward's transpose. That is where the similarity ends:
+  philox does independent per-lane work and wastes three of every four
+  randoms, while the bias's 32 lanes read 32 *consecutive* columns of one q row
+  along the tensor's contiguous axis, so the wave gets a fully coalesced line
+  even though the lane gets a scalar. "No vector per lane" is not the same
+  claim as "uncoalesced", and the cost models differ by an order of magnitude.
+- **To separate an occupancy effect from an arithmetic one, hold the feature
+  fixed and change only the workgroup count.** A GQA fold at group 8 measured
+  186 TF at `B=2` and 720 TF at `B=8` -- same group size, same code, 4x the
+  workgroups, 3.9x the throughput. That single pair says the cost is the grid
+  and not the fold, and it is worth more than any number of knob sweeps at the
+  slow shape. A recorded "this configuration under-occupies the machine and
+  that is inherent" beats a knob that moved 2%.
+- **Probe an unfamiliar control-flow shape before designing around it.** Nested
+  loop-carried `scf.for` had no precedent anywhere in this repo, and the one
+  other kernel that needed a group loop had explicitly flattened instead --
+  which reads like evidence that nesting does not work, and is not. A 20-line
+  kernel summing over both loops answered it in ten minutes. The alternative
+  was designing a flattened index scheme around a limitation that did not
+  exist.
+- **A build constant and the runtime argument that equals it are not
+  interchangeable as a loop bound.** A GQA group loop bounded by the runtime
+  `num_head_q // num_head_k` cannot be proven to run once, so every MHA caller
+  pays for a loop; bounded by the trait, `[0, 1)` is promoted away and the MHA
+  path is the pre-feature kernel plus a handful of instructions. The runtime
+  values are still checked against the build, so nothing is assumed -- the
+  check is what licenses using the constant.
+- **Do not edit a kernel source file while a test run is in flight, not even a
+  comment.** A 622-test combined run reported 351 failures, every test from
+  #272 to the end; the identical command on the unedited tree passed 622/622.
+  The cause was a five-line docstring insertion I made a few minutes into the
+  run. `compiler/ast_rewriter.py` traces with `inspect.getsource(f)`, which
+  re-reads the file through `linecache` -- invalidated on mtime -- and indexes
+  it with `f.__code__.co_firstlineno` taken from the module imported *before*
+  the edit. Inserting lines above a kernel therefore hands the tracer a window
+  onto the wrong text, and every kernel traced after the save is misaligned.
+  The tell is the shape of the failure: a contiguous block of failures
+  beginning mid-run with everything before it green, and assertion failures
+  rather than the HIP errors a device fault would produce. This is invisible to
+  the disk-cache switch, since `FLYDSL_RUNTIME_ENABLE_CACHE=0` is exactly the
+  setting that forces a re-trace. Suspect the harness before the kernel when a
+  failure boundary is a wall-clock instant rather than a configuration.

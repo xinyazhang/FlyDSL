@@ -511,3 +511,100 @@ heads, joint autograd, no regression on either family — plus:
 And report performance in the one-shape, one-accounting format with **wall-clock
 bwd/fwd**, not a ratio of rates. B3.5's headline was a rate ratio labelled as a
 time ratio and it flattered by exactly 2.5x.
+
+---
+
+# Addendum: B7 — bias input, GQA, and the 384 rung
+
+The last phase. After it the backward's feature surface equals the forward's,
+which equals AOTriton's, and what is left is performance.
+
+## 1. Bias: the *read* arm is not the write arm
+
+dQ already writes `dB`, and that is the part people mistake for done. The bias
+**input** is a separate path: `B` of shape `(b, h, sq, sk)` added to the scores
+before the softmax. Two things follow, and neither is optional.
+
+**The strides are `stride_b_batch / _head / _seq_q`**, already shipped across
+the forward, dQ and dK/dV. `_seq_q` is the query axis; the k axis is contiguous
+by contract and never passed, which is what makes a bare `_seq` ambiguous in a
+way that is easy to miss rather than obviously wrong.
+
+*Corrected in flight.* This entry first said the spelling was `_seq0` and that
+`_seq_q` had been rejected. That reversed the record. The user rejected the
+bare `_seq` and floated `seq0` as a question; the resolution landed in
+`877cf58c` as `_seq_q`, with both alternatives argued rather than skipped —
+`_seqq`'s doubled letter reads as a typo and gets skipped on review, and
+`_seq0` reintroduces the numeric slots the P7 stride rename removed, on the
+grounds that nothing at runtime distinguishes one stride from another so
+spelling the axis out is the only check there is. It also leaves `_seq_k` free.
+The lesson for this document: **a floated suggestion is not a decision, and a
+decision with its reasoning already written into the code outranks a
+second-hand summary of the conversation that produced it.**
+
+**The gradient must be checked against the bias, not only through it.** A bias
+that is read but dropped from the gradient still passes any test that only
+compares `dQ`/`dK`/`dV`, because the forward's bias shifts the scores and the
+softmax normalises most of it away. The autograd comparison must include
+`b.grad`, and — as B6 did for the dropped-vs-undropped `dS` — assert the
+computed `dB` is measurably *not* the value you would get from the other
+plausible choice.
+
+For dK/dV the bias is an input only; there is no `dB` on this side. The gate is
+that `dK`/`dV` change correctly when a bias is present, which means a reference
+built with the bias, not a tolerance widened to absorb it.
+
+**`bias` with `causal` or `window` stays refused, and the refusal is
+semantic.** `fmha_traits_gfx950.py` raises on the pair because a bias *is* an
+attention mask — a large negative entry is how a caller spells "do not attend
+here" — so asking for both asks which wins where they disagree, and there is no
+rule. AOTriton disables the pair, torch's math backend raises, gfx1201 refuses
+in the same words, and the forward asserts the refusal in a test. An earlier
+draft of this addendum listed causal and windows among the compositions to
+test, which is not implementable: lifting the refusal on the backward alone
+would build a configuration no forward can produce, so there would be no LSE to
+consume and the composition would be untestable as well as undefined. Test the
+refusal, the way the forward does.
+
+## 2. GQA: the refusal is in the tuner, and it is load-bearing
+
+dK/dV refuses GQA **by name**, and that refusal is what has kept every dK/dV
+number honest so far. Removing it means the K-head loop is real: several Q
+heads reduce into one KV head, so the accumulators are shared across a head
+group and the reduction is the new thing to get right — not the addressing.
+
+Say up front whether the group reduction happens in registers (one workgroup
+walks the group) or through LDS, and price both. The deterministic requirement
+from B0 stands: **no atomics.** The AITER kernel's atomic `dQ` is why it is a
+clue and not a reference.
+
+The gate is `num_kv_heads < num_heads` against N separate calls at
+`num_kv_heads = num_heads`, summed over each group — the same shape of gate as
+B5's varlen-against-N-dense, and for the same reason: it compares addressing
+against arithmetic that is already trusted.
+
+## 3. The 384 rung is a profile, not a knob
+
+Dense head_dim 384 has been the worst rung since B3.5 and it is **not**
+register-bound: 352 VGPR, 96 AGPR, zero spills. Every knob sweep since has
+moved it by noise. So do not sweep it again — that is the mistake this entry
+exists to prevent.
+
+Find out where the time goes before proposing anything. The candidates worth
+separating are LDS bandwidth against MFMA issue, the `head_dim_granule` split
+at a width that is 6 granules of 64 rather than a power of two, and tail
+effects in the D loop. Report the measurement that distinguishes them, and if
+the answer is "it is bandwidth and the layout is what it is," say that — a
+negative result recorded is worth more than a knob that moved 2%.
+
+## Gates
+
+Everything B4–B6 gated, plus:
+
+- `b.grad` in the autograd comparison, and `dB` asserted distinct from the
+  wrong-but-plausible alternative,
+- bias composing with **varlen and dropout**, and with the KV tail mask, which
+  is not the causal mask and does still order after the bias,
+- GQA against N grouped dense calls (dK/dV),
+- `bias=None` bitwise identical to a build without bias, as `p = 0` was in B6,
+- for 384: a measurement that says *which* resource, not a knob that moved.

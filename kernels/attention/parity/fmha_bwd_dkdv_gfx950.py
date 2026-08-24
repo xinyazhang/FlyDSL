@@ -81,10 +81,25 @@ undefined under a divergent EXEC.
 
 --- Phase status -----------------------------------------------------------
 
-Causal and windows (B4), varlen (B5), dropout and bias (B6) and GQA are **not
-implemented**. The ABI carries their argument slots so the wire format does not
-move when they arrive, and `BwdDkDvKnobs.resolve` refuses a build that would
-need one; there is no half-implemented arm anywhere below.
+Causal and windows (B4), varlen (B5), dropout (B6), the bias *input* and GQA
+(B7) are all implemented. Only `paged` is refused, by name in
+`BwdDkDvKnobs.resolve`; there is no half-implemented arm anywhere below.
+
+GQA is a group *fold*, not a second program: one workgroup owns a KV head and
+walks the query heads of its group, and the dK/dV accumulators -- zeroed once,
+before the loop -- carry the whole group sum in f32. What that costs is grid
+width, `num_head_q` becoming `num_head_k`; see `retarget_q_head` for the
+addressing and the tuning module for the occupancy measurement.
+
+There is no `dB` here and never will be: `dB = dS`, which is materialised per
+`(q, k)` element only in the dQ kernel. The bias is an input on this side.
+
+**Bias and causal/window are mutually exclusive**, and the rule is semantic
+rather than a gap: a bias *is* an attention mask, so pairing it with a
+positional one asks which wins where they disagree and there is no answer.
+`make_traits` raises on the pair, the forward raises on it in the same words,
+AOTriton disables it and torch's math backend raises by name -- so a backward
+that accepted the pair would also have no forward to produce its LSE.
 
 --- Tensor argument order is the ABI ------------------------------------------
 
@@ -100,8 +115,8 @@ L, D, ...)` and `bwd_kernel_dk_dv(Q, K, V, B, sm_scale, DO, DK, DV, L, D, ...)`
 to re-derive the mapping, and neither does anyone eventually dispatching the
 compiled hsaco directly.
 
-`b` sits in the forward-input group even though no build here reads it yet: the
-slot is held so adding bias in B6 does not move the wire format. It was
+`b` sat in the forward-input group for six phases before any build read it, so
+that adding bias would not move the wire format -- and in B7 it did not. It was
 initially placed after `delta`, at the end, which is where an unused argument
 naturally lands and is exactly why the grouping is written down rather than
 left to accrete.
@@ -248,6 +263,62 @@ def philox_keep(ctx, q_rows):
     return out
 
 
+def bias_log2e(ctx, q_rows):
+    """`bias * log2(e)` per accumulator element, given each element's absolute q row.
+
+    **One bias read, two row maps**, the same arrangement `philox_keep` uses and
+    for the same reason: the families differ only in which q row an element
+    holds, so they pass that in and share the rest.
+
+    The `* log2(e)` is here rather than at the use site because the exponent
+    lives in the base-2 domain -- `P = exp2(qk_scale*S - log2e*LSE)` -- and a
+    bias in natural units has to cross into it. This is AOTriton's
+    `qk += bias * 1.44269504089`.
+
+    **`fm_bias`, not `fm_fast`, and it is load-bearing.** `fm_fast` is MLIR's
+    `fast`, which carries `ninf` -- a licence to assume no operand is infinite.
+    A bias entry of `-inf` is precisely how a caller spells "never attend
+    here", so this is the one place in this kernel where a real infinity enters
+    *arithmetic* rather than a select: the causal mask writes zeros through
+    `select` and the KV tail through the descriptor bound, neither of which
+    fastmath touches. The forward records `ninf` silently deleting a KV tail
+    mask on gfx1201; the same licence taken up by a later pass would delete a
+    caller's `-inf` here. The flag rides the whole exponent chain in a bias
+    build (see `probabilities`), which costs a non-bias build nothing because
+    `BIAS_TYPE` is a build axis.
+
+    **The lane gets no vector and the wave gets perfect coalescing**, which is
+    the opposite of the dropout case and worth stating because the two look
+    alike. A lane's 16 elements are 16 q rows, `stride_b_seq_q` apart, so there
+    is no run to draw as a span and it is 16 scalar loads. But the 32 lanes of
+    a row group hold 32 *consecutive* KV columns of the same q row, and the KV
+    axis is the bias's contiguous one -- so each of those 16 loads is one fully
+    coalesced 64-byte line across the group, not 32 scattered dwords. The
+    forward gets its vector per lane instead; both end up reading each bias
+    element exactly once.
+    """
+    rsrc = ctx.bias_rsrc
+    pitch = fx.Index(ctx.stride_b_seq_q)
+    col = fx.Index(ctx.kv_row)
+    log2e = fx.Float32(dualwave._LOG2E)
+    fm_bias = fx.arith.FastMathFlags.contract | fx.arith.FastMathFlags.reassoc
+    out = []
+    for q in q_rows:
+        one = buffer_ops.buffer_load(
+            rsrc,
+            as_mlir_value(fx.Int32(q * pitch + col)),
+            vec_width=1,
+            dtype=ctx.elem_dtype,
+        )
+        # `vec_width=1` returns a **scalar** of the element type, not a
+        # one-lane vector -- so it is wrapped directly rather than through
+        # `Vec(...)[0]`, which is what the forward's width-4 and width-8 reads
+        # use and which raises here.
+        b = ctx.elem_dtype(one).to(fx.Float32)
+        out.append(dualwave._fmul(fx.Float32(b), log2e, fm_bias))
+    return out
+
+
 def _lds_pack_read(traits, lds_ptr, elem_idx, scope_name, pack_type):
     """One 128-bit LDS read of 8 bf16, alias-scoped to the buffer it touches.
 
@@ -389,6 +460,19 @@ class BwdDkDvKernelContext(ParityKernelContext):
         # base class's `q_*` names already hold exactly that arithmetic.
         self.kv_block_idx = self.q_block_idx
         self.kv_start = self.q_start
+        # **`grid.x` enumerates the KV head, not the query head** -- the one
+        # grid change GQA makes. The base class decomposes `h_idx` against
+        # `num_head_k` and recomposes against the group size, so with an extent
+        # of `num_head_k` its `group_id` is always 0 and its `q_head_idx` lands
+        # on the *first* query head of the group. That is the base the loop
+        # walks from, and the base class's own mapping is what supplies it --
+        # no second transcription of the head remap.
+        #
+        # The KV block stays on `grid.y`. gfx1201's fold moves it to the fast
+        # axis for causal load balance; gfx950 measured that exact change at
+        # 12-15% slower at every rung and deleted the knob (eight XCDs with
+        # separate L2s), so the fold does not get to bring it back in.
+        self.gqa_q_head_base = self.q_head_idx
         if const_expr(traits.DKV_SHARDS > 1):
             # With `SHARDS` waves per KV row block, `wave_id` no longer names a
             # row block -- `wave_id // SHARDS` does, and the remainder picks
@@ -434,15 +518,17 @@ class BwdDkDvKernelContext(ParityKernelContext):
         if const_expr(not self.traits.ENABLE_DROPOUT):
             return
         self.philox_rng = Philox.for_arch("gfx950")
-        plane = fx.Int32(self.batch_idx) * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
         self.philox_seed = fmha.philox_seed_value(self.philox_seed_ptr)
-        offset = fmha.philox_offset_base(self.philox_offset1, self.philox_offset2)
-        self.philox_plane_base, self.philox_row_stride = self.philox_rng.grid_plane(
-            offset, plane, self.seq_len_v, self.seq_len_kv_v
-        )
+        self.philox_offset_base_v = fmha.philox_offset_base(self.philox_offset1, self.philox_offset2)
         # A lane owns one KV column for the whole kernel, so which of the
-        # `randoms_per_offset` slots of a philox call it wants is loop-invariant.
+        # `randoms_per_offset` slots of a philox call it wants is loop-invariant
+        # -- and it stays so across a GQA group, since the group moves the
+        # *query* head and the slot is a function of the KV column alone.
         self.philox_slot = fx.Index(self.kv_row) % fx.Index(self.philox_rng.randoms_per_offset)
+        # The plane is `(batch, q head)` and therefore moves with the group, so
+        # it is bound in `bind_q_head` rather than here. This call gives the
+        # prologue a plane for the group's first head; the loop rebinds it.
+        self.bind_q_head()
 
     def compute_active_guard(self):
         """Whether this workgroup's KV block exists in *this* sequence.
@@ -508,27 +594,9 @@ class BwdDkDvKernelContext(ParityKernelContext):
         self.q_gmem_elem_offset = fx.Index(0)
         self.kv_gmem_elem_offset = fx.Index(0)
 
-        # Streamed. Bounded at `seqlen_q` rows, which is what makes the ragged
-        # tail stage as zeros instead of faulting.
-        self.k_div = self._slab_view(
-            self.Q,
-            self.stride_q_batch,
-            self.stride_q_head,
-            self.stride_q_seq,
-            self.q_row_off,
-            self.q_head_idx,
-            self.seqlen_q_v,
-        )
-        self.v_div = self._slab_view(
-            self.DO,
-            self.stride_do_batch,
-            self.stride_do_head,
-            self.stride_do_seq,
-            self.q_row_off,
-            self.q_head_idx,
-            self.seqlen_q_v,
-        )
-        self.q_div = self.k_div
+        # Everything keyed on the *query* head, built once here for the first
+        # head of the group and rebuilt per group iteration under GQA.
+        self.bind_q_head()
 
         # Resident, and the two outputs: all four are (batch, kv head) slabs
         # bounded at `seqlen_kv` rows.
@@ -593,6 +661,43 @@ class BwdDkDvKernelContext(ParityKernelContext):
         self.dk_oob_off = self.seqlen_kv_v * self.stride_dk_seq_v
         self.dv_oob_off = self.seqlen_kv_v * self.stride_dv_seq_v
 
+    def bind_q_head(self):
+        """Every descriptor keyed on `q_head_idx`, in one place.
+
+        **This exists because of GQA**, and it is the whole of the addressing
+        side of that feature: several query heads reduce into one KV head, so a
+        workgroup walks the group and re-points the query side at each head in
+        turn while K, V, dK and dV stay exactly where they are. Collected into
+        one method rather than left inline so that the loop and the prologue
+        cannot drift -- there is one description of what "the query side" is.
+
+        Called once from `init_descriptors` for the first head of the group,
+        and again per group iteration from `retarget_q_head`. At
+        `num_kv_heads == num_heads` the group is one head wide, the loop runs
+        once, and every value here is what it was before B7.
+        """
+        # Streamed. Bounded at `seqlen_q` rows, which is what makes the ragged
+        # tail stage as zeros instead of faulting.
+        self.k_div = self._slab_view(
+            self.Q,
+            self.stride_q_batch,
+            self.stride_q_head,
+            self.stride_q_seq,
+            self.q_row_off,
+            self.q_head_idx,
+            self.seqlen_q_v,
+        )
+        self.v_div = self._slab_view(
+            self.DO,
+            self.stride_do_batch,
+            self.stride_do_head,
+            self.stride_do_seq,
+            self.q_row_off,
+            self.q_head_idx,
+            self.seqlen_q_v,
+        )
+        self.q_div = self.k_div
+
         # LSE and delta, through **the same function the forward writes LSE
         # with**. Both are always compact -- their strides are a function of
         # VarlenBits, the head count and the token pitch rather than a free
@@ -623,6 +728,50 @@ class BwdDkDvKernelContext(ParityKernelContext):
         self.delta_rsrc = dualwave._make_ws_rsrc(
             fx.Int64(fx.ptrtoint(fx.get_iter(self.Delta))), base_bytes, row_span_bytes
         )
+
+        # The bias is `(batch, q head, q row, kv col)`, so it moves with the
+        # query head too. `ParityKernelContext.init_descriptors` built one for
+        # the prologue's head already; this is the binding that survives, and
+        # it is the same expression because `_slab_byte_base` is shared.
+        if const_expr(self.traits.BIAS_TYPE):
+            _bias_span = self.seqlen_q_v * fx.Index(self.stride_b_seq_q)
+            self.bias_rsrc = buffer_ops.create_buffer_resource(
+                self.Bias,
+                max_size=False,
+                num_records_bytes=as_mlir_value(_bias_span * fx.Index(self.traits.BF16_BYTES)),
+                base_byte_offset=as_mlir_value(
+                    self._slab_byte_base(
+                        self.stride_b_batch,
+                        self.stride_b_head,
+                        self.stride_b_seq_q,
+                        self.q_row_off,
+                        self.q_head_idx,
+                    )
+                ),
+            )
+
+        # The philox plane is `(batch, q head)`, so a GQA group draws a
+        # *different* mask per head -- which is the forward's behaviour, since
+        # the forward has one program per query head and this must reproduce it
+        # bit for bit. Guarded on the attribute rather than on the trait
+        # because `init_philox` runs after `init_descriptors`; the prologue
+        # call finds no RNG and the loop's calls do.
+        if const_expr(self.traits.ENABLE_DROPOUT):
+            if getattr(self, "philox_rng", None) is not None:
+                plane = fx.Int32(self.batch_idx) * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
+                self.philox_plane_base, self.philox_row_stride = self.philox_rng.grid_plane(
+                    self.philox_offset_base_v, plane, self.seq_len_v, self.seq_len_kv_v
+                )
+
+    def retarget_q_head(self, g):
+        """Point the query side at head `g` of this KV head's group.
+
+        `g` is a runtime `Index`. The KV side -- K, V, dK, dV, and the
+        accumulators they feed -- is untouched by construction: nothing below
+        `bind_q_head` reads `q_head_idx`.
+        """
+        self.q_head_idx = self.gqa_q_head_base + g
+        self.bind_q_head()
 
     def _slab_rsrc(self, tensor, s0, s1, s2):
         """A raw buffer resource over this workgroup's KV slab, bounded at its rows.
@@ -713,15 +862,27 @@ class BwdDkDvStreamLoader(ParityKvGmemToLdsLoader):
     swap in is not the one the method is named for. Calling the *production*
     method directly keeps one implementation of the DMA sequence and states the
     substitution at the call site instead of hiding it in an attribute.
+
+    **The descriptor is re-read from `ctx_ref` every call, and under GQA that
+    is load-bearing.** `DualwaveKernelContext.__init__` does
+    `self.__dict__.update(ctx.__dict__)`, so a helper holds a *snapshot* of the
+    context taken when it was constructed -- before the group loop exists.
+    `retarget_q_head` rebinds `ctx.k_div` to the next query head's slab, and a
+    loader reading its own `self.k_div` would keep staging the first head's Q
+    for the whole group: finite, plausible, and wrong by exactly the group
+    sum. Everything else the DMA path touches (`k_dma_m0`, the tile start, the
+    lane offsets) is head-independent, so these two lines are the whole fix.
     """
 
     def stage_q_tile(self, tile_idx, buf_id):
         self.stride_kv_n_v = self.ctx_ref.stride_q_seq_v
+        self.k_div = self.ctx_ref.k_div
         self.dma_stage = 0
         dualwave.DualwaveKvGmemToLdsLoader.load_k(self, self.tile_start(tile_idx), buf_id)
 
     def stage_do_tile(self, tile_idx, buf_id):
         self.stride_kv_n_v = self.ctx_ref.stride_do_seq_v
+        self.v_div = self.ctx_ref.v_div
         self.dma_stage = 0
         dualwave.DualwaveKvGmemToLdsLoader.load_v(self, self.tile_start(tile_idx), buf_id)
 
@@ -945,8 +1106,8 @@ class BwdDkDvSoftmaxHelper(ParitySoftmaxHelper):
             values[r] = dualwave._fmul(fx.Float32(one), scale, self.fm_fast)
         return values
 
-    def probabilities(self, v_s, neg_lse2):
-        """`P = exp2(qk_scale * S - log2(e) * LSE)`, element by element.
+    def probabilities(self, v_s, neg_lse2, bias2=None):
+        """`P = exp2(qk_scale * S + bias*log2e - log2(e) * LSE)`, element by element.
 
         Q is **not** pre-scaled, which is the one place this departs from the
         forward, and B2 measured what it costs to get wrong: folding
@@ -955,18 +1116,61 @@ class BwdDkDvSoftmaxHelper(ParitySoftmaxHelper):
         at 1.0. `O` is a normalised average and absorbs it; `dS` is not and does
         not. Here the scale rides the subtraction that had to happen anyway, so
         it is also free.
+
+        **The bias goes after the scale**, which is the forward's rule read in
+        this kernel's terms. There it means "after the pre-scale that already
+        happened upstream"; here Q is unscaled, so it means after the explicit
+        `c_sm_scale_log2e` multiply on this line. Either way the bias is in
+        natural units and the exponent is base-2, so the conversion is the
+        thing that has to line up, not the position in the expression.
+
+        The whole chain drops to `fm_bias` in a bias build so a `-inf` bias
+        survives to `exp2`, which returns an exact zero for it -- and a zero `P`
+        then kills every downstream term, since `dS = P*(...)` and
+        `dV += P.dO`. `BIAS_TYPE` is a build axis, so a build without bias
+        emits the identical `fm_fast` chain it always did.
         """
         values = [Vec(v_s)[r] for r in range_constexpr(16)]
         scale = self.ctx_ref.c_sm_scale_log2e
+        fm = self.fm_fast
+        if const_expr(bias2 is not None):
+            fm = fx.arith.FastMathFlags.contract | fx.arith.FastMathFlags.reassoc
+        scaled = [dualwave._fmul(values[r], scale, fm) for r in range_constexpr(16)]
+        if const_expr(bias2 is not None):
+            scaled = [dualwave._fadd(scaled[r], bias2[r], fm) for r in range_constexpr(16)]
         return [
-            dualwave.rocdl.exp2(
-                T.f32,
-                as_mlir_value(
-                    dualwave._fadd(dualwave._fmul(values[r], scale, self.fm_fast), neg_lse2[r], self.fm_fast)
-                ),
-            )
+            dualwave.rocdl.exp2(T.f32, as_mlir_value(dualwave._fadd(scaled[r], neg_lse2[r], fm)))
             for r in range_constexpr(16)
         ]
+
+    # -- the forward's bias path, shadowed ---------------------------------
+    #
+    # `ParitySoftmaxHelper` carries `_add_bias_inplace`, `bias_to_lists` and a
+    # `seq_pad_mask_if_needed` override, and all three address the bias as
+    # *one q row per lane, 16 KV columns per element* -- the transpose of this
+    # accumulator. Nothing in the dK/dV body calls them today, so inheriting
+    # them is dead code rather than a wrong answer; the hazard is that they are
+    # dead and *plausible*, and the next person to wire a bias site would get
+    # finite garbage from a method that looks like the one to call.
+    #
+    # Shadowed rather than deleted, because deleting them would mean editing
+    # the forward's helper.
+
+    def _add_bias_inplace(self, v_s, tile_idx):
+        raise NotImplementedError(
+            "the forward's bias addressing does not transpose: it assumes one q row per lane and "
+            "contiguous KV columns per element, where this accumulator holds one KV column per lane "
+            "and 16 q rows. Use `bias_log2e(ctx, q_rows)` and `probabilities(..., bias2=)`."
+        )
+
+    def bias_to_lists(self, v_s, tile_idx):
+        raise NotImplementedError("dK/dV applies the bias in `probabilities`; see `_add_bias_inplace`")
+
+    def seq_pad_mask_if_needed(self, v_s, tile_idx):
+        raise NotImplementedError(
+            "dK/dV has no KV tail mask on the scores: the KV extent is a descriptor bound, not a "
+            "select, and the q tail is handled by the same means. See `_add_bias_inplace`."
+        )
 
     def dscores(self, p_list, v_dp, delta, keep=None):
         """`dS = P * (dP - delta)`, with dropout's chain rule folded into `dP`.
@@ -1232,7 +1436,16 @@ class BwdDkDvTileBody(dualwave.DualwaveKernelContext):
             s = {h: self.gemm.contract_d(self._row_reader(q_base, q_scope, h, self.hdim_qk), v_k) for h in group}
             dp = {h: self.gemm.contract_d(self._row_reader(do_base, do_scope, h, self.hdim_vo), v_v) for h in group}
             neg_lse2 = {h: self.softmax.load_row_values(ctx.lse_rsrc, tile_base, h, ctx.c_neg_log2e) for h in group}
-            p_list = {h: self.softmax.probabilities(s[h], neg_lse2[h]) for h in group}
+            # B7. The bias is read per accumulator element and folded into the
+            # exponent, so it lands before `P` exists and therefore before
+            # everything downstream. There is no runtime "does this tile need
+            # one" guard: a bias build reads a bias for every live tile by
+            # definition, and the descriptor bound is what makes a q row past
+            # `seqlen_q` read zero rather than fault.
+            bias2 = {h: None for h in group}
+            if const_expr(traits.BIAS_TYPE):
+                bias2 = {h: bias_log2e(ctx, self.softmax.q_rows(tile_idx, h)) for h in group}
+            p_list = {h: self.softmax.probabilities(s[h], neg_lse2[h], bias2[h]) for h in group}
             if const_expr(traits.CAUSAL):
                 p_list = {h: self.softmax.mask_if_clipped(p_list[h], tile_idx, h) for h in group}
             delta = {h: self.softmax.load_row_values(ctx.delta_rsrc, tile_base, h, ctx.c_one_f) for h in group}
@@ -1471,6 +1684,7 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
                 hdim_qk=hdim_qk,
                 hdim_vo=hdim_vo,
                 keep_fn=philox_keep,
+                bias_fn=bias_log2e,
             )
             n_acc = m16.d_chunks16(traits)
             zero_acc = Vec.filled(m16.ACC16, 0.0, fx.Float32).ir_value()
@@ -1503,47 +1717,114 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
 
         @flyc.jit
         def _dkdv_body():
-            """K/V resident, Q/dO streaming, two tiles per iteration."""
+            """K/V resident, Q/dO streaming, two tiles per iteration.
+
+            **The GQA group is the outer loop and the accumulators live across
+            it**, which is the whole of B7's reduction: several query heads
+            reduce into this KV head, and their partial sums never leave f32
+            registers. It costs no extra accumulator -- the fold lengthens the
+            live range of the ones that were already carried, it does not add a
+            level -- and it is why no scratch tensor, no LDS partials and no
+            atomic appear anywhere here.
+
+            At `num_kv_heads == num_heads` the group is one head wide, the
+            outer loop runs once, and every instruction inside it is what it
+            was before B7.
+            """
             v_k = resident.load_resident("k", hdim_qk)
             v_v = resident.load_resident("v", hdim_vo)
-
-            # Prime every buffer. From here each tile's DMA is issued by the
-            # body `NUM_STREAM_BUFFERS` tiles earlier, so this is the only
-            # staging whose latency is not covered by compute.
-            # `t0`, not a literal 0. Under causal the walk starts at the
-            # window's first live tile, and P3 found four prologues in the
-            # forward that assumed otherwise -- the answer stays right (a dead
-            # tile masks to nothing) while the tile cut goes inert, which only
-            # a timing assertion catches.
-            for b in range_constexpr(NBUF):
-                stream.stage_q_tile(t0 + fx.Index(b), b)
-                stream.stage_do_tile(t0 + fx.Index(b), b)
 
             init_args = []
             for _ in range_constexpr(2 * n_acc):
                 init_args.append(zero_acc)
-            loop_results = init_args
+            group_results = init_args
 
-            for j, loop_args in range(t0, t_end, fx.Index(2), init=init_args):
-                dv = [loop_args[i] for i in range_constexpr(n_acc)]
-                dk = [loop_args[n_acc + i] for i in range_constexpr(n_acc)]
-                # Two tiles per iteration, one LDS buffer each when there are
-                # two. At one buffer both slots use it and the prefetch
-                # distance collapses; the arithmetic below is the same.
-                for slot in range_constexpr(2):
-                    dv, dk = tile.run(
-                        j + fx.Index(slot),
-                        slot % NBUF,
-                        j + fx.Index(slot + NBUF),
-                        v_k,
-                        v_v,
-                        dv,
-                        dk,
-                    )
-                loop_results = yield dv + dk
+            # **The trip count is the build's, not the argument's.** The group
+            # size is a trait, `_args` checks the runtime head counts against
+            # it, and taking it from there is what keeps MHA free: a bound of
+            # `[0, 1)` is a single-iteration `scf.for` that the canonicaliser
+            # promotes away, so an MHA build emits the pre-B7 body with no
+            # outer loop at all. Built from the runtime `num_head_q //
+            # num_head_k` instead, every MHA caller would pay a loop that
+            # cannot be proven to run once.
+            #
+            # Not `range_constexpr`: that would unroll the whole tile loop
+            # `group` times, which is 8 copies of the largest region in the
+            # kernel at MQA and would put the wide rungs through the build cap.
+            for g, group_args in range(fx.Index(0), fx.Index(traits.GQA_GROUP_SIZE), fx.Index(1), init=init_args):
+                # Point the query side at this head. K, V, dK and dV do not
+                # move, and neither do the accumulators.
+                ctx.retarget_q_head(g)
 
-            dv = [loop_results[i] for i in range_constexpr(n_acc)]
-            dk = [loop_results[n_acc + i] for i in range_constexpr(n_acc)]
+                # **Drain the pipeline before re-priming it.** The last tile of
+                # the previous head issued a prefetch into these same LDS
+                # buffers -- unconditionally, because making it conditional
+                # would put an `scf.if` around a DMA -- so the prologue below
+                # writes addresses that head's stale DMAs are still in flight
+                # to, and `vmcnt` is briefly counting two heads' issues at once.
+                #
+                # **Measured inert, and kept anyway.** A control build with
+                # this block removed is bit-identical on eight configurations,
+                # including `s=4096` at group 8 (deep pipeline) and the wide
+                # rungs where `NUM_STREAM_BUFFERS` collapses to 1 and the
+                # prefetch is issued immediately before the wait for it. The
+                # reason it is inert is that the staging is partitioned *by
+                # wave*, so no two waves write the same LDS bytes and a single
+                # wave's DMAs to one address retire in issue order -- the stale
+                # zeros always land before the fresh tile. That is an inference
+                # about hardware ordering rather than something read off a
+                # manual, and the drain is what makes the code not depend on
+                # it: 0.2-0.4% at group 8, once per head against a whole q
+                # walk. A wrong guess here costs a silently zeroed q tile.
+                #
+                # `const_expr`, because at group size 1 there is no previous
+                # head at all -- and that guard is not cosmetic: left
+                # unconditional it measured **1.5% at head_dim 64**, where the
+                # kernel is shortest and a fixed prologue cost shows most.
+                # Every wider rung was within noise, which is exactly the shape
+                # of a constant added to the prologue.
+                if const_expr(traits.GQA_GROUP_SIZE > 1):
+                    dualwave._waitcnt_vm_n(0)
+                    dualwave._sched_barrier(0)
+                    dualwave._s_barrier()
+
+                # Prime every buffer. From here each tile's DMA is issued by
+                # the body `NUM_STREAM_BUFFERS` tiles earlier, so this is the
+                # only staging whose latency is not covered by compute.
+                # `t0`, not a literal 0. Under causal the walk starts at the
+                # window's first live tile, and P3 found four prologues in the
+                # forward that assumed otherwise -- the answer stays right (a
+                # dead tile masks to nothing) while the tile cut goes inert,
+                # which only a timing assertion catches. The walk is the same
+                # for every head of the group: `t0`/`t_end` come from the KV
+                # block and the mask, neither of which the query head moves.
+                for b in range_constexpr(NBUF):
+                    stream.stage_q_tile(t0 + fx.Index(b), b)
+                    stream.stage_do_tile(t0 + fx.Index(b), b)
+
+                loop_results = group_args
+                for j, loop_args in range(t0, t_end, fx.Index(2), init=group_args):
+                    dv = [loop_args[i] for i in range_constexpr(n_acc)]
+                    dk = [loop_args[n_acc + i] for i in range_constexpr(n_acc)]
+                    # Two tiles per iteration, one LDS buffer each when there
+                    # are two. At one buffer both slots use it and the prefetch
+                    # distance collapses; the arithmetic below is the same.
+                    for slot in range_constexpr(2):
+                        dv, dk = tile.run(
+                            j + fx.Index(slot),
+                            slot % NBUF,
+                            j + fx.Index(slot + NBUF),
+                            v_k,
+                            v_v,
+                            dv,
+                            dk,
+                        )
+                    loop_results = yield dv + dk
+
+                group_results = yield [loop_results[i] for i in range_constexpr(2 * n_acc)]
+
+            dv = [group_results[i] for i in range_constexpr(n_acc)]
+            dk = [group_results[n_acc + i] for i in range_constexpr(n_acc)]
 
             # `dS` is the gradient of the *scaled* logits, so `sm_scale` belongs
             # to `dK` and to nothing else. Once at the end rather than per tile:
@@ -1714,7 +1995,13 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             # sharing a slab duplicates it across all of them instead of
             # spreading distinct work. Same conclusion as the forward's, for a
             # different reason.
-            grid=(fx.Index(num_head_q), num_kv_blocks, bs_idx),
+            #
+            # **The head is the KV head, which is what B7 changed.** Under GQA
+            # the workgroup walks the group internally, so the grid shrinks by
+            # the group size and each workgroup does that much more work --
+            # total work unchanged, parallelism divided. At MHA the two counts
+            # are equal and this is the pre-B7 grid exactly.
+            grid=(fx.Index(num_head_k), num_kv_blocks, bs_idx),
             block=(traits.BLOCK_SIZE, 1, 1),
             stream=stream,
         )
@@ -1801,6 +2088,7 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         window=None,
         varlen=None,
         num_seqlens=0,
+        bias=None,
         dropout_p=None,
         philox_seed=None,
         philox_offset1=None,
@@ -1821,11 +2109,17 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         )
         del _ptrs  # gfx950 addresses through buffer descriptors, so it wants the tensors
         num_head_q, num_head_k, hdim_qk, hdim_vo = shape_meta
-        if num_head_q != num_head_k:
+        if num_head_q % num_head_k:
             raise ValueError(
-                f"num_heads_q {num_head_q} != num_heads_k {num_head_k}: dK/dV under GQA must be summed "
-                "over the q heads sharing a kv head, which this kernel does not do. See "
-                "`BwdDkDvKnobs._checked_scope`."
+                f"num_heads_q ({num_head_q}) must be a multiple of num_heads_k ({num_head_k}): each KV "
+                "head owns a whole group of query heads and dK/dV sum over it."
+            )
+        if (num_head_q, num_head_k) != (traits.NUM_HEADS_Q, traits.NUM_HEADS_KV):
+            # The group size sets the trip count of the outer loop and the grid
+            # extent, so a build compiled for one shape cannot serve another.
+            raise ValueError(
+                f"this build is compiled for {traits.NUM_HEADS_Q} query heads over "
+                f"{traits.NUM_HEADS_KV} KV heads; got {num_head_q} over {num_head_k}"
             )
         # dK follows Q's head dim and dV follows V's, which is what makes an
         # asymmetric build meaningful at all.
@@ -1904,11 +2198,60 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         if dropout_p is not None and not traits.ENABLE_DROPOUT:
             raise ValueError("this build was not compiled for dropout; pass dropout=True in BwdDkDvInputMetadata")
 
+        # B7. Checked both ways, because both silent failures return the right
+        # shape: a bias build handed nothing would read whatever tensor filled
+        # the slot, and a plain build handed a bias would return dense
+        # attention's gradient to a caller who believes the bias was applied.
+        if traits.BIAS_TYPE and bias is None:
+            raise ValueError("this build has bias=True and requires a (batch, num_heads, seqlen_q, seqlen_k) tensor")
+        if bias is not None and not traits.BIAS_TYPE:
+            raise ValueError("this build was not compiled for bias; pass bias=True in BwdDkDvInputMetadata")
+        if bias is not None:
+            # **The bias follows Q on the query axis**, which is what the
+            # addressing already does: the descriptor folds in `q_row_off` and
+            # the head exactly as Q's slab does, so the shape rule is "match Q"
+            # rather than a second layout to keep in step. Dense that reads as
+            # `(b, h, seqlen_q, seqlen_k)`; under a packed varlen it reads as
+            # `(1, h, total_q, max_seqlen_k)`, and under `varlen_padded` -- a
+            # real batch axis -- it is the dense shape again. All three fall
+            # out of one check, which is why it is written this way.
+            #
+            # The KV axis is *not* packed: it has no stride of its own (slot 3
+            # is contiguous by contract), so each sequence's row spans
+            # `seqlen_k` columns from 0 and the column index is the
+            # within-sequence KV row the kernel already computes.
+            if bias.shape[0] != Q.shape[0] or bias.shape[2] != Q.shape[2]:
+                raise ValueError(
+                    f"bias must share Q's batch and query-token extents; got {tuple(bias.shape)} "
+                    f"against q {tuple(Q.shape)}. Under a packed varlen that means "
+                    f"(1, num_heads, total_q, max_seqlen_k)."
+                )
+            if bias.shape[3] != seqlen_k:
+                raise ValueError(
+                    f"bias's last axis is the KV column and is not packed: it must be seqlen_k "
+                    f"({seqlen_k}), got {bias.shape[3]}"
+                )
+            if bias.shape[1] != num_head_q:
+                raise ValueError(
+                    f"bias carries the *query* head count ({num_head_q}); got {bias.shape[1]}. The bias "
+                    "shifts the scores, and there is one score matrix per q head even under GQA."
+                )
+            if bias.stride(3) != 1:
+                raise ValueError(f"bias needs a contiguous seqlen_k axis; strides are {tuple(bias.stride())}")
+            if bias.dtype != Q.dtype:
+                raise ValueError(f"bias must have Q's dtype ({Q.dtype}), got {bias.dtype}")
+        # The sentinel is a real tensor whose contents are never read: every
+        # use is behind `const_expr(traits.BIAS_TYPE)`, so a build without bias
+        # emits no load at all. That is what makes `bias=None` bitwise
+        # identical to a build compiled without it.
+        bias_t = bias if bias is not None else DK
+        bias_st = tuple(int(x) for x in bias.stride()[:3]) if bias is not None else (0, 0, 0)
+
         return (
             Q,
             K,
             V,
-            DK,  # Bias: no build here reads it; the slot is held for B6
+            bias_t,
             DO,
             DK,
             DV,
@@ -1936,9 +2279,7 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
                 Q, scale if scale is not None else BUILD_SM_SCALE, PADDED_HEAD, 1.0 / (BLOCK_DMODEL**0.5)
             ),
             *st,
-            0,
-            0,
-            0,  # bias strides
+            *bias_st,
         ), stream
 
     def _launch(*args, **kwargs):

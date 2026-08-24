@@ -332,22 +332,27 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
         )
         return [base + fx.Index(i) for i in range_constexpr(ACC16)]
 
-    def probabilities(self, v_s, neg_lse2):
-        """`P = exp2(qk_scale * S - log2(e) * LSE)`.
+    def probabilities(self, v_s, neg_lse2, bias2=None):
+        """`P = exp2(qk_scale * S + bias*log2e - log2(e) * LSE)`.
 
         Q is not pre-scaled; B2 measured that folding the scale into Q and
         rounding to bf16 puts the error in the exponent, taking the error ratio
         from 1.29 at `sm_scale = 0.05` to 10.9 at 1.0.
+
+        The exponent chain drops to `contract | reassoc` in a bias build so a
+        caller's `-inf` survives `ninf` to reach `exp2`, which returns an exact
+        zero for it. The 32-row family's `probabilities` says why at length.
         """
         values = [Vec(v_s)[r] for r in range_constexpr(ACC16)]
         scale = self.ctx_ref.c_sm_scale_log2e
+        fm = self.fm_fast
+        if const_expr(bias2 is not None):
+            fm = fx.arith.FastMathFlags.contract | fx.arith.FastMathFlags.reassoc
+        scaled = [dualwave._fmul(values[r], scale, fm) for r in range_constexpr(ACC16)]
+        if const_expr(bias2 is not None):
+            scaled = [dualwave._fadd(scaled[r], bias2[r], fm) for r in range_constexpr(ACC16)]
         return [
-            dualwave.rocdl.exp2(
-                T.f32,
-                as_mlir_value(
-                    dualwave._fadd(dualwave._fmul(values[r], scale, self.fm_fast), neg_lse2[r], self.fm_fast)
-                ),
-            )
+            dualwave.rocdl.exp2(T.f32, as_mlir_value(dualwave._fadd(scaled[r], neg_lse2[r], fm)))
             for r in range_constexpr(ACC16)
         ]
 
@@ -484,7 +489,7 @@ class M16TileBody(dualwave.DualwaveKernelContext):
     body, so the kernel's tile loop does not know which family it is driving.
     """
 
-    def __init__(self, ctx, *, stream, reader, gemm, softmax, hdim_qk, hdim_vo, keep_fn=None):
+    def __init__(self, ctx, *, stream, reader, gemm, softmax, hdim_qk, hdim_vo, keep_fn=None, bias_fn=None):
         super().__init__(ctx)
         self.stream = stream
         self.reader = reader
@@ -492,10 +497,12 @@ class M16TileBody(dualwave.DualwaveKernelContext):
         self.softmax = softmax
         self.hdim_qk = hdim_qk
         self.hdim_vo = hdim_vo
-        # `philox_keep`, injected rather than imported: it is family-neutral and
-        # lives in the module that owns the builder, which already imports this
-        # one. Passing it keeps the dependency one-way.
+        # `philox_keep` and `bias_log2e`, injected rather than imported: both are
+        # family-neutral and live in the module that owns the builder, which
+        # already imports this one. Passing them keeps the dependency one-way.
+        # Each takes this family's own `q_rows`, which is the whole difference.
         self.keep_fn = keep_fn
+        self.bias_fn = bias_fn
 
     def run(self, tile_idx, buf_id, prefetch_idx, v_k, v_v, dv, dk):
         traits = self.traits
@@ -526,7 +533,11 @@ class M16TileBody(dualwave.DualwaveKernelContext):
                 s = self.gemm.contract_d(self._reader_for(q_base, q_scope, sub, self.hdim_qk), v_k)
                 dp = self.gemm.contract_d(self._reader_for(do_base, do_scope, sub, self.hdim_vo), v_v)
                 neg_lse2 = self.softmax.load_row_values(ctx.lse_rsrc, tile_base, sub, ctx.c_neg_log2e)
-                p_list = self.softmax.probabilities(s, neg_lse2)
+                # B7. Folded into the exponent, so it lands before `P` exists.
+                bias2 = None
+                if const_expr(traits.BIAS_TYPE):
+                    bias2 = self.bias_fn(ctx, self.softmax.q_rows(tile_idx, sub))
+                p_list = self.softmax.probabilities(s, neg_lse2, bias2)
                 if const_expr(traits.CAUSAL):
                     p_list = self.softmax.mask_if_clipped(p_list, tile_idx, sub)
                 delta = self.softmax.load_row_values(ctx.delta_rsrc, tile_base, sub, ctx.c_one_f)

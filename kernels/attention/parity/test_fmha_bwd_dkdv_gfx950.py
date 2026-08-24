@@ -833,14 +833,27 @@ def _u64(x):
     return torch.tensor([int(x)], device="cuda", dtype=torch.int64)
 
 
-def _dropout_case(d=64, b=1, h=2, s=256, p=0.25, rows=None, causal=False, seed=1234, mask_tile=(64, 32)):
-    """Forward -> reported (seed, offset) -> mask tensor -> fp64 reference -> backward."""
+def _dropout_case(
+    d=64, b=1, h=2, s=256, p=0.25, rows=None, causal=False, seed=1234, mask_tile=(64, 32), bias_scale=None, hk=None
+):
+    """Forward -> reported (seed, offset) -> mask tensor -> fp64 reference -> backward.
+
+    `bias_scale` and `hk` extend the same three-party oracle to B7's two
+    features, which is the point of doing it here rather than in a second
+    harness: the forward draws its mask over the *biased* scores and per
+    *query* head, so both compositions are claims about what the forward did,
+    and this is the only place that can read that back.
+    """
     from dropout_mask_gfx1201 import dropout_mask
     from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module as build_fwd
     from philox import dropout_threshold
 
     torch.manual_seed(7)
-    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    hk = h if hk is None else hk
+    g = h // hk
+    q, do = _rand(b, h, s, d), _rand(b, h, s, d)
+    k, v = _rand(b, hk, s, d), _rand(b, hk, s, d)
+    bias = None if bias_scale is None else _rand(b, h, s, s) * bias_scale
     scale = 1.0 / d**0.5
 
     o = torch.empty_like(q)
@@ -849,7 +862,14 @@ def _dropout_case(d=64, b=1, h=2, s=256, p=0.25, rows=None, causal=False, seed=1
         1, device="cuda", dtype=torch.int64
     )
     fwd = build_fwd(
-        num_heads=h, head_dim=d, num_kv_heads=h, causal=causal, dtype_str="bf16", return_lse=True, dropout=True
+        num_heads=h,
+        head_dim=d,
+        num_kv_heads=hk,
+        causal=causal,
+        dtype_str="bf16",
+        return_lse=True,
+        dropout=True,
+        bias=bias is not None,
     )
     fwd(
         q,
@@ -862,6 +882,7 @@ def _dropout_case(d=64, b=1, h=2, s=256, p=0.25, rows=None, causal=False, seed=1
         scale=scale,
         lse=lse,
         dropout_p=p,
+        **({} if bias is None else {"bias": bias}),
         philox_seed=_u64(seed),
         philox_offset1=_u64(0),
         philox_offset2=0,
@@ -877,16 +898,18 @@ def _dropout_case(d=64, b=1, h=2, s=256, p=0.25, rows=None, causal=False, seed=1
     keep = raw > dropout_threshold(p)
 
     qf, kf, vf = (t.float().detach().requires_grad_() for t in (q, k, v))
-    sc = (qf @ kf.transpose(-1, -2)) * scale
+    sc = (qf @ kf.repeat_interleave(g, dim=1).transpose(-1, -2)) * scale
+    if bias is not None:
+        sc = sc + bias.float()
     if causal:
         sc = sc.masked_fill(~_band(s, s, (s, 0)), float("-inf"))
     pd = torch.where(keep, torch.softmax(sc, -1) * (1.0 / (1.0 - p)), torch.zeros_like(sc))
-    o_ref = pd @ vf
+    o_ref = pd @ vf.repeat_interleave(g, dim=1)
     dk_ref, dv_ref = torch.autograd.grad(o_ref, (kf, vf), do.float())
 
     knobs = {} if rows is None else _family_knobs(d, rows)
     dk, dv = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
-    fn = build(num_heads=h, head_dim=d, num_kv_heads=h, dropout=True, causal=causal, **knobs)
+    fn = build(num_heads=h, head_dim=d, num_kv_heads=hk, dropout=True, causal=causal, bias=bias is not None, **knobs)
     fn(
         q,
         k,
@@ -904,6 +927,7 @@ def _dropout_case(d=64, b=1, h=2, s=256, p=0.25, rows=None, causal=False, seed=1
         philox_seed=seed_out,
         philox_offset1=off_out,
         philox_offset2=0,
+        **({} if bias is None else {"bias": bias}),
     )
     torch.cuda.synchronize()
     return o, o_ref.detach(), dk, dk_ref, dv, dv_ref, float(keep.float().mean())
@@ -1236,10 +1260,8 @@ def test_refuses_what_it_does_not_compute():
     """Every one of these would otherwise be a plausible, finite, wrong gradient."""
     with pytest.raises(ValueError, match="window=True requires causal=True"):
         build(num_heads=8, head_dim=64, window=True)
-    with pytest.raises(NotImplementedError, match="bias"):
-        build(num_heads=8, head_dim=64, bias=True)
-    with pytest.raises(NotImplementedError, match="GQA"):
-        build(num_heads=8, head_dim=64, num_kv_heads=2)
+    with pytest.raises(ValueError, match="must be a multiple of"):
+        build(num_heads=8, head_dim=64, num_kv_heads=3)
     with pytest.raises(ValueError, match="exceeds the widest tile"):
         build(num_heads=8, head_dim=513)
     with pytest.raises(NotImplementedError, match="bf16"):
@@ -1260,3 +1282,489 @@ def test_rejects_a_mismatched_row_tensor():
         fn(q, k, v, do, dk, dv, torch.zeros(b * h, s + 1, device="cuda"), good, b, s)
     with pytest.raises(ValueError, match="delta"):
         fn(q, k, v, do, dk, dv, good, good[:, :-1].contiguous(), b, s)
+
+
+# ---------------------------------------------------------------------------
+# B7: the bias input
+# ---------------------------------------------------------------------------
+
+
+def _bias_ref(q, k, v, do, scale, bias):
+    """`(lse, delta, dk, dv)` in fp64, with the bias inside the softmax.
+
+    The bias shifts the scores and the softmax normalises most of it away, so a
+    kernel that *reads* a bias and drops it still produces a plausible
+    gradient. That is why this reference is built with the bias rather than a
+    tolerance widened to absorb one -- and why
+    `test_bias_changes_the_gradient_correctly` also checks the distance to the
+    bias-free answer.
+    """
+    qq, kk, vv = (t.double().detach().requires_grad_() for t in (q, k, v))
+    s = (qq @ kk.transpose(-1, -2)) * scale
+    if bias is not None:
+        s = s + bias.double()
+    o = torch.softmax(s, -1) @ vv
+    dk, dv = torch.autograd.grad(o, (kk, vv), do.double())
+    lse = torch.logsumexp(s.detach(), -1)
+    delta = (do.double() * o.detach()).sum(-1)
+    return lse, delta, dk, dv
+
+
+def _bias_run(
+    q, k, v, do, lse, delta, *, scale, bias, knobs=None, varlen=None, num_seqlens=0, batch=None, seqlens=None
+):
+    """Build and dispatch. `seqlens` is `(seqlen_q, seqlen_k)`, needed under varlen.
+
+    A packed batch's tensors carry `total_tokens` on the sequence axis while
+    the kernel wants `max_seqlen_*`, so deriving the lengths from the tensor
+    shapes -- which is right for every dense call -- is wrong for exactly the
+    varlen ones.
+    """
+    b, hq, sq, d = q.shape
+    sq, sk = (sq, k.shape[2]) if seqlens is None else seqlens
+    fn = build(
+        num_heads=hq,
+        head_dim=d,
+        num_kv_heads=k.shape[1],
+        bias=bias is not None,
+        varlen=varlen is not None,
+        **(knobs or {}),
+    )
+    dk, dv = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
+    extra = {} if bias is None else {"bias": bias}
+    if varlen is not None:
+        extra.update(varlen=varlen, num_seqlens=num_seqlens)
+    fn(q, k, v, do, dk, dv, lse, delta, b if batch is None else batch, sq, seqlen_k=sk, scale=scale, **extra)
+    return dk, dv
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_bias_changes_the_gradient_correctly(head_dim, rows):
+    """Against a reference *with* the bias, and far from one without it.
+
+    The second assertion is the one that matters. A build that read the bias
+    into the wrong lane, scaled it by the wrong constant, or dropped it after
+    loading would still return a finite gradient of the right shape, and the
+    softmax's normalisation makes the magnitude plausible too. Measured: 2.3e-3
+    against the bias reference and **2.2 / 3.0** against the bias-free one, so
+    the two are three orders of magnitude apart and no tolerance sits between
+    them by accident.
+    """
+    _require_rocm_path()
+    knobs = _family_knobs(head_dim, rows)
+    if knobs is None:
+        pytest.skip(f"no legal {rows}-row geometry at head_dim {head_dim}")
+    b, h, s = 2, 4, 256
+    torch.manual_seed(head_dim + rows)
+    q, k, v, do = (_rand(b, h, s, head_dim) for _ in range(4))
+    # Scaled up, so the bias is not a perturbation the softmax can shrug off.
+    bias = _rand(b, h, s, s) * 2.0
+    scale = 1.0 / head_dim**0.5
+    lse, delta, dk_ref, dv_ref = _bias_ref(q, k, v, do, scale, bias)
+    _lse0, _d0, dk_nobias, dv_nobias = _bias_ref(q, k, v, do, scale, None)
+    dk, dv = _bias_run(
+        q,
+        k,
+        v,
+        do,
+        lse.float().reshape(b * h, s).contiguous(),
+        delta.float().reshape(b * h, s).contiguous(),
+        scale=scale,
+        bias=bias,
+        knobs=knobs,
+    )
+    for name, got, ref, off in (("dk", dk, dk_ref, dk_nobias), ("dv", dv, dv_ref, dv_nobias)):
+        e = _rel(got, ref)
+        assert e < 1e-2, f"{name}: {e:.3e} against the bias reference"
+        e_off = _rel(got, off)
+        assert e_off > 0.1, (
+            f"{name}: {e_off:.3e} against the *bias-free* reference -- this build is not applying the "
+            "bias, and every other assertion here would still pass"
+        )
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+def test_bias_zero_is_bitwise_a_build_without_it(rows):
+    """`bias=0` must be bitwise identical, as `p = 0` was in B6.
+
+    A zero bias adds exactly `0.0 * log2e` to every exponent, so the arithmetic
+    is unchanged and any difference is a bug. A tolerance would not notice the
+    bias being applied on the wrong side of the LSE subtraction, or in the
+    wrong fastmath domain, which are the two mistakes the placement invites.
+    """
+    _require_rocm_path()
+    knobs = _family_knobs(64, rows)
+    b, h, s, d = 1, 2, 256, 64
+    torch.manual_seed(3)
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    scale = 1.0 / d**0.5
+    lse, delta, _dk, _dv = _bias_ref(q, k, v, do, scale, None)
+    lse_a = lse.float().reshape(b * h, s).contiguous()
+    del_a = delta.float().reshape(b * h, s).contiguous()
+    with_zero = _bias_run(
+        q, k, v, do, lse_a, del_a, scale=scale, bias=torch.zeros_like(q[..., :1] * 0).new_zeros(b, h, s, s), knobs=knobs
+    )
+    without = _bias_run(q, k, v, do, lse_a, del_a, scale=scale, bias=None, knobs=knobs)
+    assert torch.equal(with_zero[0], without[0]), "dK differs between bias=0 and a build without bias"
+    assert torch.equal(with_zero[1], without[1]), "dV differs between bias=0 and a build without bias"
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+def test_bias_minus_inf_never_produces_nan(rows):
+    """`-inf` is how a caller spells "never attend here", and it is arithmetic here.
+
+    Everywhere else in this kernel a mask is a `select` or a descriptor bound,
+    neither of which fast-math touches. The bias puts a real infinity into an
+    `fmul` and an `fadd`, and `fm_fast` carries `ninf` -- a licence to assume
+    that cannot happen. The forward records `ninf` silently deleting a KV tail
+    mask on gfx1201, so this is the test that says the flag was narrowed.
+    """
+    _require_rocm_path()
+    knobs = _family_knobs(64, rows)
+    b, h, s, d = 1, 2, 256, 64
+    torch.manual_seed(5)
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    bias = _rand(b, h, s, s)
+    bias[:, :, :, 64:128] = float("-inf")
+    scale = 1.0 / d**0.5
+    lse, delta, dk_ref, dv_ref = _bias_ref(q, k, v, do, scale, bias)
+    dk, dv = _bias_run(
+        q,
+        k,
+        v,
+        do,
+        lse.float().reshape(b * h, s).contiguous(),
+        delta.float().reshape(b * h, s).contiguous(),
+        scale=scale,
+        bias=bias,
+        knobs=knobs,
+    )
+    assert not dk.isnan().any(), "dK carries a NaN from a -inf bias"
+    assert not dv.isnan().any(), "dV carries a NaN from a -inf bias"
+    # A key nobody may attend to receives no gradient at all, exactly.
+    assert dk[:, :, 64:128, :].count_nonzero() == 0, "a fully masked key has a nonzero dK"
+    assert dv[:, :, 64:128, :].count_nonzero() == 0, "a fully masked key has a nonzero dV"
+    assert _rel(dk, dk_ref) < 1e-2 and _rel(dv, dv_ref) < 1e-2
+
+
+def test_bias_and_causal_are_rejected():
+    """Undefined, not unimplemented -- and the forward cannot build the pair either.
+
+    A bias *is* an attention mask: a large negative entry is how a caller
+    spells "do not attend here". Pairing it with a positional mask asks which
+    wins where they disagree and there is no answer. AOTriton disables the
+    combination, torch's math backend raises by name, and the forward refuses
+    it in these words -- so a backward that accepted it would have no forward
+    to produce the LSE it consumes. Untestable as well as undefined.
+    """
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        build(num_heads=8, head_dim=64, bias=True, causal=True)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        build(num_heads=8, head_dim=64, bias=True, causal=True, window=True)
+
+
+def test_bias_tensor_presence_is_checked_both_ways():
+    """Both silent failures return the right shape."""
+    _require_rocm_path()
+    b, h, s, d = 1, 2, 128, 64
+    torch.manual_seed(9)
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    row = torch.zeros(b * h, s, device="cuda", dtype=torch.float32)
+    dk, dv = torch.empty_like(k), torch.empty_like(v)
+    bias = _rand(b, h, s, s)
+    with pytest.raises(ValueError, match="requires a"):
+        build(num_heads=h, head_dim=d, bias=True)(q, k, v, do, dk, dv, row, row, b, s)
+    with pytest.raises(ValueError, match="not compiled for bias"):
+        build(num_heads=h, head_dim=d)(q, k, v, do, dk, dv, row, row, b, s, bias=bias)
+    with pytest.raises(ValueError, match="contiguous seqlen_k"):
+        build(num_heads=h, head_dim=d, bias=True)(q, k, v, do, dk, dv, row, row, b, s, bias=bias.transpose(2, 3))
+
+
+def test_bias_composes_with_varlen():
+    """Bias under varlen must equal N dense calls, bitwise.
+
+    The bias follows Q on the query axis -- the descriptor folds in the varlen
+    row origin and the head exactly as Q's slab does -- so a packed batch reads
+    it as `(1, h, total_q, max_seqlen_k)`. The KV axis is *not* packed: slot 3
+    has no stride of its own, so each sequence's row spans `seqlen_k` columns
+    from zero. That is a contract rather than an accident, and this is where it
+    is pinned down.
+    """
+    _require_rocm_path()
+    import fmha_abi_gfx1201 as abi
+
+    h, d = 4, 64
+    lens = [192, 256]
+    smax, total = max(lens), sum(lens)
+    scale = 1.0 / d**0.5
+    knobs = _family_knobs(d, 32)
+    torch.manual_seed(11)
+    qs = [_rand(1, h, n, d) for n in lens]
+    ks = [_rand(1, h, n, d) for n in lens]
+    vs = [_rand(1, h, n, d) for n in lens]
+    dos = [_rand(1, h, n, d) for n in lens]
+    bs = [_rand(1, h, n, smax) for n in lens]
+
+    dense = []
+    for i, n in enumerate(lens):
+        bias_i = bs[i][..., :n].contiguous()
+        lse, delta, _dk, _dv = _bias_ref(qs[i], ks[i], vs[i], dos[i], scale, bias_i)
+        dense.append(
+            _bias_run(
+                qs[i],
+                ks[i],
+                vs[i],
+                dos[i],
+                lse.float().reshape(h, n).contiguous(),
+                delta.float().reshape(h, n).contiguous(),
+                scale=scale,
+                bias=bias_i,
+                knobs=knobs,
+            )
+        )
+
+    qp, kp, vp, dop = (torch.cat(t, dim=2) for t in (qs, ks, vs, dos))
+    bp = torch.cat(bs, dim=2).contiguous()
+    lse_p = torch.zeros(h, total, device="cuda", dtype=torch.float32)
+    del_p = torch.zeros_like(lse_p)
+    off = 0
+    for i, n in enumerate(lens):
+        lse, delta, _dk, _dv = _bias_ref(qs[i], ks[i], vs[i], dos[i], scale, bs[i][..., :n].contiguous())
+        lse_p[:, off : off + n] = lse.float().reshape(h, n)
+        del_p[:, off : off + n] = delta.float().reshape(h, n)
+        off += n
+    cu = _cu(lens)
+    got = _bias_run(
+        qp,
+        kp,
+        vp,
+        dop,
+        lse_p,
+        del_p,
+        scale=scale,
+        bias=bp,
+        knobs=knobs,
+        varlen=abi.varlen_compact(cu, cu, smax, smax, lse_tokens=total),
+        num_seqlens=len(lens),
+        batch=1,
+        seqlens=(smax, smax),
+    )
+    off = 0
+    for i, n in enumerate(lens):
+        for j, name in ((0, "dK"), (1, "dV")):
+            assert torch.equal(got[j][:, :, off : off + n, :], dense[i][j]), (
+                f"{name} for sequence {i} differs from the dense call; bias under varlen is not "
+                "following Q's query axis"
+            )
+        off += n
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+def test_bias_composes_with_dropout(rows):
+    """Both touch the scores, and they touch it at different points.
+
+    The bias goes into the exponent, so it lands before `P` exists; dropout
+    goes on `P` after the row sum. Composition is therefore a claim about
+    ordering, and the way to check it is the B6 oracle with a bias added to
+    every arm: the forward draws the mask over the biased scores, and this
+    kernel must reproduce both.
+    """
+    _require_rocm_path()
+    o, o_ref, dk, dk_ref, dv, dv_ref, keep = _dropout_case(d=64, rows=rows, bias_scale=2.0)
+    assert _rel(o, o_ref.double()) < 1e-2, "the forward and the mask kernel disagree; the reference is invalid"
+    assert _rel(dk, dk_ref.double()) < 1e-2, "dK: bias and dropout do not compose"
+    assert _rel(dv, dv_ref.double()) < 1e-2, "dV: bias and dropout do not compose"
+    assert abs(keep - 0.75) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# B7: GQA
+# ---------------------------------------------------------------------------
+
+
+def _gqa_ref(q, k, v, do, scale, causal=False):
+    """fp64 truth with K/V expanded over the group, and `dK`/`dV` summed by autograd.
+
+    `repeat_interleave` on the *differentiable* tensor is what makes the sum
+    happen: autograd accumulates the gradient of every expanded copy back onto
+    the one KV head, which is exactly the reduction the kernel performs in
+    registers. Expanding first and differentiating the expanded tensor would
+    return one q head's contribution per copy and hide a missing group sum.
+    """
+    g = q.shape[1] // k.shape[1]
+    qq, kk, vv = (t.double().detach().requires_grad_() for t in (q, k, v))
+    s = (qq @ kk.repeat_interleave(g, dim=1).transpose(-1, -2)) * scale
+    if causal:
+        s = s.masked_fill(~_band(q.shape[2], k.shape[2], (q.shape[2], k.shape[2] - q.shape[2])), float("-inf"))
+    o = torch.softmax(s, -1) @ vv.repeat_interleave(g, dim=1)
+    dk, dv = torch.autograd.grad(o, (kk, vv), do.double())
+    lse = torch.logsumexp(s.detach(), -1)
+    delta = (do.double() * o.detach()).sum(-1)
+    return lse, delta, dk, dv
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+@pytest.mark.parametrize("hq,hk", [(8, 8), (8, 4), (8, 2), (8, 1), (6, 3)], ids=["mha", "g2", "g4", "mqa", "g2odd"])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_gqa_matches_the_grouped_reference(hq, hk, rows, causal):
+    """Several query heads reduce into one KV head, and the sum is the feature.
+
+    `hq=6, hk=3` is the case a broadcast hides: with `hk=1` a plain
+    `expand`-style reference happens to be right whatever the grouping, so a
+    wrong `q_head_idx -> kv_head_idx` mapping survives it. A group that is
+    neither 1 nor the whole head count is what pins the mapping down.
+    """
+    _require_rocm_path()
+    d = 64
+    knobs = _family_knobs(d, rows)
+    b, s = 2, 256
+    torch.manual_seed(hq * 31 + hk)
+    q = _rand(b, hq, s, d)
+    k, v = _rand(b, hk, s, d), _rand(b, hk, s, d)
+    do = _rand(b, hq, s, d)
+    scale = 1.0 / d**0.5
+    lse, delta, dk_ref, dv_ref = _gqa_ref(q, k, v, do, scale, causal)
+    dk, dv = _run(
+        q,
+        k,
+        v,
+        do,
+        lse.float().reshape(b * hq, s).contiguous(),
+        delta.float().reshape(b * hq, s).contiguous(),
+        scale=scale,
+        knobs=knobs,
+        causal=causal,
+    )
+    for name, got, ref in (("dk", dk, dk_ref), ("dv", dv, dv_ref)):
+        e = _rel(got, ref)
+        assert e < 1e-2, f"{name}: {e:.3e} -- the group sum is wrong at hq={hq} hk={hk}"
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+@pytest.mark.parametrize("hk", [4, 2, 1], ids=["g2", "g4", "mqa"])
+def test_gqa_matches_n_grouped_dense_calls(hk, rows):
+    """The B5-shaped gate: new addressing against arithmetic already trusted.
+
+    An MHA build over the *expanded* K/V is code that has passed every phase
+    since B1. Summing its per-head outputs over each group is what the GQA
+    build must produce, so this compares the fold's addressing against a
+    result whose arithmetic is not in question.
+
+    **Not bitwise, and the reason is the point of the design.** The MHA path
+    rounds each query head's partial to bf16 before anything can sum them; the
+    fold keeps the group sum in f32 registers and rounds once. So the two agree
+    to within one bf16 quantisation of the output and no closer -- which is
+    exactly the difference that ruled out writing per-head partials to a
+    scratch tensor. An addressing error is O(1) and nowhere near this band.
+    """
+    _require_rocm_path()
+    d, hq = 64, 8
+    g = hq // hk
+    knobs = _family_knobs(d, rows)
+    b, s = 2, 256
+    torch.manual_seed(hk * 17 + rows)
+    q = _rand(b, hq, s, d)
+    k, v = _rand(b, hk, s, d), _rand(b, hk, s, d)
+    do = _rand(b, hq, s, d)
+    scale = 1.0 / d**0.5
+    lse, delta, dk64, dv64 = _gqa_ref(q, k, v, do, scale)
+    lse_a = lse.float().reshape(b * hq, s).contiguous()
+    del_a = delta.float().reshape(b * hq, s).contiguous()
+
+    got = _run(q, k, v, do, lse_a, del_a, scale=scale, knobs=knobs)
+    ke = k.repeat_interleave(g, dim=1).contiguous()
+    ve = v.repeat_interleave(g, dim=1).contiguous()
+    per_head = _run(q, ke, ve, do, lse_a, del_a, scale=scale, knobs=knobs)
+    summed = [t.float().reshape(b, hk, g, s, d).sum(2) for t in per_head]
+
+    for name, a, ref, truth in (("dk", got[0], summed[0], dk64), ("dv", got[1], summed[1], dv64)):
+        e = _rel(a, ref.double())
+        assert e < 1e-2, f"{name}: {e:.3e} against N grouped dense calls -- the fold addresses a head wrong"
+        # And the fold is no less accurate than the per-head route it replaces.
+        assert _rel(a, truth) < 3.0 * _rel(ref, truth) + 1e-6, (
+            f"{name}: the in-register group sum is materially worse than summing bf16 partials, which "
+            "is the opposite of the reason it was chosen"
+        )
+
+
+def test_gqa_composes_with_varlen_and_dropout():
+    """A GQA group under varlen must still equal N dense calls, bitwise.
+
+    Dropout is the interesting half: the philox plane is `(batch, query head)`,
+    so every head of a group draws a *different* mask -- which is the forward's
+    behaviour, since the forward has one program per query head. A fold that
+    hoisted the plane out of the group loop would give the whole group one
+    mask, and the error would be a plausible fraction of the right answer.
+    """
+    _require_rocm_path()
+    import fmha_abi_gfx1201 as abi
+
+    hq, hk, d = 8, 2, 64
+    lens = [128, 192]
+    smax, total = max(lens), sum(lens)
+    scale = 1.0 / d**0.5
+    knobs = _family_knobs(d, 32)
+    torch.manual_seed(21)
+    qs = [_rand(1, hq, n, d) for n in lens]
+    ks = [_rand(1, hk, n, d) for n in lens]
+    vs = [_rand(1, hk, n, d) for n in lens]
+    dos = [_rand(1, hq, n, d) for n in lens]
+
+    dense = []
+    rows = []
+    for i, n in enumerate(lens):
+        lse, delta, _a, _b = _gqa_ref(qs[i], ks[i], vs[i], dos[i], scale)
+        rows.append((lse.float().reshape(hq, n).contiguous(), delta.float().reshape(hq, n).contiguous()))
+        dense.append(_run(qs[i], ks[i], vs[i], dos[i], rows[i][0], rows[i][1], scale=scale, knobs=knobs, batch=1))
+
+    qp, kp, vp, dop = (torch.cat(t, dim=2) for t in (qs, ks, vs, dos))
+    lse_p = torch.zeros(hq, total, device="cuda", dtype=torch.float32)
+    del_p = torch.zeros_like(lse_p)
+    off = 0
+    for i, n in enumerate(lens):
+        lse_p[:, off : off + n] = rows[i][0]
+        del_p[:, off : off + n] = rows[i][1]
+        off += n
+    cu = _cu(lens)
+    fn = build(num_heads=hq, head_dim=d, num_kv_heads=hk, varlen=True, **knobs)
+    dk, dv = torch.full_like(kp, float("nan")), torch.full_like(vp, float("nan"))
+    fn(
+        qp,
+        kp,
+        vp,
+        dop,
+        dk,
+        dv,
+        lse_p,
+        del_p,
+        1,
+        smax,
+        seqlen_k=smax,
+        scale=scale,
+        varlen=abi.varlen_compact(cu, cu, smax, smax, lse_tokens=total),
+        num_seqlens=len(lens),
+    )
+    off = 0
+    for i, n in enumerate(lens):
+        assert torch.equal(dk[:, :, off : off + n, :], dense[i][0]), f"dK sequence {i} under GQA+varlen"
+        assert torch.equal(dv[:, :, off : off + n, :], dense[i][1]), f"dV sequence {i} under GQA+varlen"
+        off += n
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+def test_gqa_draws_a_mask_per_query_head(rows):
+    """Dropout under GQA, against the mask the forward actually drew.
+
+    The forward runs one program per query head and draws a plane per
+    `(batch, query head)`. The fold walks the group inside one workgroup, so
+    the plane has to move with the group -- and it is the one piece of
+    per-head state that is neither a descriptor nor an address, which is
+    exactly the kind that gets hoisted by accident.
+    """
+    _require_rocm_path()
+    o, o_ref, dk, dk_ref, dv, dv_ref, keep = _dropout_case(d=64, rows=rows, hk=2)
+    assert _rel(o, o_ref.double()) < 1e-2, "the forward and the mask kernel disagree; the reference is invalid"
+    assert _rel(dk, dk_ref.double()) < 1e-2, "dK: the GQA fold is not drawing a mask per query head"
+    assert _rel(dv, dv_ref.double()) < 1e-2, "dV: the GQA fold is not drawing a mask per query head"
+    assert abs(keep - 0.75) < 0.01

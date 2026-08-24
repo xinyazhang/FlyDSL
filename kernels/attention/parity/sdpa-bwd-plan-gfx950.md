@@ -2757,3 +2757,453 @@ The no-dropout rungs measured in the same session are within noise of B5's
   counter walked rather than the mask re-tiled.
 - head_dim 224 at 32 rows carries 6 spills with dropout on.
 - Dense head_dim 384 at 5.8x, unchanged since B3.5 and untouched by this phase.
+
+---
+
+## Outcome: B7/dQ — the bias input, and the 384 profile
+
+255 tests pass with no skips. dQ's feature surface now equals the forward's:
+causal, windows, varlen, dropout, **bias input**, padded heads, asymmetric
+hdim and dB, on the full ladder in both MFMA families. Only `paged` is refused.
+
+### 1. Bias: the read arm
+
+`B` of shape `(b, h, sq, sk)` added to the scores before the softmax, strides
+`stride_b_batch / _head / _seq_q` -- matching `stride_db_seq_q` and the 24
+other occurrences the rename settled on.
+
+The 32-row family needed **no new code at all**: the parity forward already
+folds `_add_bias_inplace` into `seq_pad_mask_if_needed`, ahead of the tail
+mask, which is exactly the order wanted. The 16-row family needed its own read,
+off its own column map -- a lane's four elements are four contiguous KV
+columns, so each half is a single 4-wide `buffer_load` where the 32-row path
+needs `_score_column_runs`' four scattered spans.
+
+**The bug this phase found is B6's, in a second costume.** Adding the bias
+explicitly in the body *as well* -- not noticing the inherited helper already
+did -- measured **3.3 relative error**. Worse in the backward than it would be
+in the forward, and structurally so: the forward renormalises by its row sum,
+so a uniform score shift cancels, while the backward computes
+`P = exp2(S - lse2)` against an `lse` it was *given*, and a doubled shift
+multiplies `P` by `2^shift`.
+
+What identified it was a **row-constant** bias: shift invariance says that must
+be a no-op on `P`, and it was not -- which ruled out the column map and the
+`log2e` factor in one measurement. Both the rule and the discriminator are in
+the lore.
+
+`b.grad` is in the comparison, and `dB` is asserted measurably **not** the `dS`
+a build that read the bias and dropped it from the gradient would produce
+(0.49 relative, against a 5e-3 bound on the correct value). That second
+assertion is what would have caught the double-add as a *gradient* bug rather
+than as a tolerance complaint.
+
+**Bias does not compose with causal or windows, and that is refused rather than
+unimplemented.** `fmha_traits_gfx950.make_traits` raises on
+`bias and (causal or window)` for four kernels at once: a bias *is* an
+attention mask, so the pair has no defined meaning. Lifting it on the backward
+alone would build a configuration no forward can produce, so there would be no
+LSE to consume. `test_bias_with_causal_is_refused_upstream` pins the refusal so
+the gate cannot be read as satisfied by silence. Bias **does** compose with
+varlen, dropout and the KV tail mask, all tested.
+
+### 2. The 384 rung: a profile, and a negative result
+
+**First, whose loss it is.** Dense `B=2 H=8 S=4096`, min of 5:
+
+| | fwd | dK/dV | dQ |
+|---|---|---|---|
+| head_dim 384 | 597 us | **1971** | 1217 |
+
+dK/dV is 62% of the backward's time at 384 and the worse of the two by rate
+(419 TF against dQ's 508). So the rung's loss is **mostly dK/dV's**. What
+follows is dQ's share only.
+
+**It is not KV re-read bandwidth, and that is the useful negative.** The
+obvious story -- `BLOCK_M` is 64, so each workgroup re-streams the whole K and
+V for only 64 query rows -- predicts that doubling `BLOCK_M` halves the traffic
+and the time. Measured on the 32-row family, where `BLOCK_M` can be varied:
+
+| head_dim | BLOCK_M | KV traffic | TFLOP/s | apparent KV rate |
+|---|---|---|---|---|
+| 128 | 64 | 2.15 GB | 724 | 7.5 TB/s |
+| 128 | 128 | 1.07 GB | 970 | 5.1 TB/s |
+| 256 | 64 | 4.29 GB | 848 | 8.8 TB/s |
+| 256 | 128 | 2.15 GB | 820 | 4.3 TB/s |
+
+At head_dim 256, **halving the traffic changed the time by 3%**. And the
+apparent KV rates -- 8.8 TB/s -- are *above* HBM peak, which says the re-reads
+are being absorbed by L2 rather than crossing the memory bus. `BLOCK_M` is not
+the lever and the traffic figure is not the cost.
+
+**It is partly LDS, and that is measurable.** The decisive experiment is the
+lore's "incorrect but decisive" kind: hoist the per-tile LDS reads out of the
+KV loop so the MFMA count is unchanged and the LDS reads collapse to one set.
+The answers are wrong; the instruction mix is the point.
+
+| head_dim (16-row) | baseline | LDS reads hoisted | gain |
+|---|---|---|---|
+| 256 | 763-848 TF | 799 TF | **1.00x** |
+| 384 | 526 TF | 699 TF | **1.33x** |
+| 512 | 488 TF | *(invalid)* | — |
+
+So the LDS reads are **fully hidden at 256 and cost at least 25% at 384**. The
+512 arm is not a measurement: hoisting keeps every A operand live across the
+loop, which at that width spills, and the result (110 TF) reports register
+pressure rather than LDS.
+
+**Why 384 and not 256 is structural.** The 16-row family moves **twice the LDS
+bytes per flop** of the 32-row family:
+
+    32 rows: 6d bytes per 192d flops per lane  = 1 byte / 32 flops
+    16 rows: 3d bytes per  48d flops per lane  = 1 byte / 16 flops
+
+because a 16-row operand is read by half as many lanes for the same data. That
+is inherent to the shape, not to the addressing, and 384 is the narrowest rung
+where the 16-row family is selected -- so it is the first place the halved LDS
+intensity is exposed without spills masking it.
+
+**Residual.** Even with the LDS reads removed, 384 reaches 699 TF against
+256's 799. ~12% is unaccounted for and I did not isolate it.
+
+**What this does not license.** No knob was moved and none is proposed. If
+anything is worth trying it is reducing LDS *traffic* at 16 rows -- reusing one
+staged K read across GEMM1 and GEMM3 rather than reading it twice -- which is a
+layout change, not a tuning parameter, and it should be measured against the
+1.33x ceiling this profile establishes.
+
+### 3. A methodological repair
+
+This file's own tile-cut timing assertion **failed spuriously** during B7: it
+reported a working causal cut as 2.6x *slower* than dense (703 us against 271),
+because a co-tenant's burst landed on the causal arm. The dense arm was stable
+to 1%.
+
+Fixed by measuring the two arms **interleaved, minimum over rounds** --
+the interleaved single-GPU A/B the lore prescribes for any perf claim, which
+had been applied to hand measurements but not to the assertion in the suite. A
+shared GPU is the normal case here and a timing test has to assume it.
+
+### Still not done
+
+- `paged`, the only refused mode.
+- The ~12% residual at 384.
+- The EXEC scan is still inline rather than calling
+  `tooling/check_exec_hazard_gfx950.py`.
+
+---
+
+## Outcome: B7 — dK/dV, the bias input and GQA
+
+The bias *read* and the GQA group reduction, on the full ladder in both MFMA
+families. **367 tests, all passing, no skips** (323 before B7). The dK/dV
+feature surface is now causal, windows, varlen, dropout, bias, GQA, padded
+heads and asymmetric head dims. Nothing is refused that is defined.
+
+### 1. Bias
+
+#### Where it goes, and why that is not where the forward puts it
+
+Into the **exponent**: `P = exp2(qk_scale*S + bias*log2e - log2e*LSE)`. The
+forward's rule is "after the scale, before the mask", and both halves read
+differently here. *After the scale*: the forward pre-scales Q, so for it that
+means "upstream"; this kernel does not pre-scale Q (B2 measured 10.9x error
+ratio for doing so), so it means after the explicit `c_sm_scale_log2e` multiply
+on that line. *Before the mask*: there is no `-inf`-writing mask on this side
+at all -- the causal mask goes on `P` and the KV extent is a descriptor bound
+-- so the ordering constraint the forward states does not bind, and the bias
+simply lands before `P` exists and therefore before everything.
+
+`dK` and `dV` need no other change. An additive shift to the scores changes
+`P`, and `P` is already an input to both, so the chain rule is unaltered in
+form: `sm_scale` still belongs to `dK` alone.
+
+#### The transposed read: no vector per lane, and full coalescing per wave
+
+A lane holds one KV column and 16 q rows, which are `stride_b_seq_q` apart, so
+there is no run to draw as a span and it is **16 scalar loads**. That looks
+exactly like B6's philox 4x and it is not the same thing: the 32 lanes of a row
+group hold 32 *consecutive* KV columns of the same q row, and the KV axis is
+the bias's contiguous one, so each of those 16 loads is **one fully coalesced
+64-byte line across the group**. The forward gets its vector per lane instead;
+both read each bias element exactly once. The gfx1201 bias plan's 50%-of-peak
+cache-line ceiling does not transfer, because that argument is about eight-wide
+column loads and this side has none.
+
+#### The fast-math narrowing, and the three methods that had to be shadowed
+
+`-inf` is how a caller spells "never attend here", so bias is the first thing
+in this kernel to put a real infinity into *arithmetic* rather than a select.
+`fm_fast` carries `ninf`. The exponent chain drops to `contract | reassoc` in a
+bias build -- a build axis, so a non-bias build emits the identical `fm_fast`
+chain it always did.
+
+`ParitySoftmaxHelper` carries `_add_bias_inplace`, `bias_to_lists` and a
+`seq_pad_mask_if_needed` override, and all three address the bias as *one q row
+per lane, contiguous KV columns per element* -- the transpose of this
+accumulator. Nothing in the dK/dV body called them, so they were dead rather
+than wrong; the hazard is that they were dead and **plausible**, and the next
+person wiring a bias site would have got finite garbage from the method that
+looks like the one to call. All three now raise, with the reason.
+
+#### Bias and causal are refused, and the refusal is semantic
+
+`make_traits` raises on `bias and (causal or window)`. A bias *is* an attention
+mask, so pairing it with a positional one asks which wins where they disagree
+and there is no answer. The B7 brief originally asked for the composition; the
+argument that settled it is that the **forward cannot build the pair either**,
+so a backward that accepted it would have no forward to produce its LSE --
+untestable as well as undefined. The KV tail mask is a different thing, is not
+refused, and still orders after the bias.
+
+Under varlen the bias follows **Q on the query axis** -- the descriptor folds
+in the varlen row origin and the head exactly as Q's slab does -- so a packed
+batch reads it as `(1, h, total_q, max_seqlen_k)` and `varlen_padded` reads it
+as the dense shape. The KV axis is not packed: slot 3 has no stride of its own.
+One host check covers all three, and varlen+bias is bitwise N dense calls.
+
+#### The cost, and how much of it was the geometry rather than the feature
+
+First measurement, at the policy's geometry, `B=2 H=8 S=4096`:
+
+| head_dim | 32 | 64 | 96 | 128 | 160 | 192 | 224 | 256 | 384 | 512 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| family | 32 | 32 | 16 | 16 | 32 | 16 | 32 | 16 | 16 | 16 |
+| bias cost | 4.05x | 5.04x | 1.33x | 1.26x | 2.77x | 1.17x | 6.09x | 2.13x | 1.78x | 1.79x |
+
+**The split is by family, not by width**, which is the tell: the 32-row family
+holds 32 accumulator elements per tile to the 16-row family's 16, and issues
+that many dependent scalar loads in one place. Only 224 spilled (512 VGPR, 229
+of them). So three of the four bad rungs were an issue-rate problem wearing
+register pressure's clothes, and the fix is a different geometry:
+
+| head_dim | policy | override | |
+|---|---|---|---|
+| 64 | 149 TF (32 loose, **0 spills**) | **520 TF** (32 tight) | 3.5x |
+| 160 | 277 TF (32 loose) | **487 TF** (16-row) | 1.76x |
+| 224 | 136 TF (229 spills) | **227 TF** (32 tight) | 1.67x |
+| 32 | 125 TF (32 loose) | **182 TF** (16-row) | 1.46x |
+
+After the overrides: 2.79 / **1.41** / 1.34 / 1.26 / 1.58 / 1.15 / 3.67 / 2.11
+/ 1.79 / 1.79x. So "bias costs 5x at head_dim 64" was a geometry mismatch; the
+feature costs **1.41x** there, which is what the bytes-per-flop law predicts
+(`BLOCK_KV / 4d` extra streamed bytes, 0.5 at that rung). 224 stays worst at
+3.67x and stays the known-marginal rung.
+
+### 2. GQA: the register fold
+
+#### Priced before written, as the contract asked
+
+**Registers, group folded into the loop.** It costs **zero extra
+accumulators** -- the fold lengthens the live range of the ones already carried
+rather than adding a level -- needs no scratch tensor, no ABI change and no
+atomic, and K/V stay resident across the whole group.
+
+**LDS was rejected on two independent grounds**, and the second is decisive.
+Measured: `ds_add_f32` for a cross-wave reduction costs 1055 WMMA-equivalents
+against 54 for explicit partials, so an atomic form is out on evidence and on
+B0's determinism rule. Structural: explicit LDS partials mean splitting the
+group across *waves*, and the Q/dO staging is shared across waves precisely
+because they share the query head. Give wave `w` head `w` and each wave needs
+its own Q tile -- 4x the staging or 4x the streamed traffic, on the axis that
+is already the traffic lever -- and LDS cannot reduce across workgroups, so the
+grid does not come back either.
+
+**Per-head scratch + host reduction was also rejected**, which is what
+`fmha_bwd_fuse_gfx1201` ships and what gfx950's grid was *already* shaped for.
+It keeps full parallelism and has no atomics, but it changes the output ABI to
+`(B, Hq, S, D)`, needs that buffer zero-filled and round-tripped, and rounds
+each partial to bf16 before anything can sum them. Measured, both arms in bf16
+so the comparison is about the accumulation and not the dtype:
+
+| | fold (f32 sum) | scratch, f32 host sum | scratch, bf16 sum |
+|---|---|---|---|
+| group 4, randn | 2.34e-3 | 2.89e-3 | 3.56e-3 |
+| group 8, randn | 2.36e-3 | 2.90e-3 | 4.39e-3 |
+| group 8, same-signed | 1.65e-3 | 1.77e-3 | 3.09e-3 |
+
+The fold is best everywhere, by **1.1-1.2x** against a carefully implemented
+scratch design and 1.5-1.9x against a naive one. I had told the coordinator the
+f32 argument "settles it"; 1.2x is real but it is not a landslide, and the ABI
+and the round-trip are the larger part of the case. An earlier reading that
+suggested the two were a wash was a harness error -- an f32 reference compared
+against a bf16 output measures the dtype, not the accumulation.
+
+#### How it is built
+
+`grid.x` enumerates the **KV head** instead of the query head; everything else
+about the grid is unchanged, because gfx950 measured the KV-block-on-the-fast-
+axis variant at 12-15% slower and deleted the knob, and gfx1201's fold does not
+get to bring it back in with it. The base class's head remap already decomposes
+`h_idx` against `num_head_k`, so with that extent its `q_head_idx` lands on the
+group's first query head and the loop walks from there -- no second
+transcription of the mapping.
+
+An outer `scf.for` wraps the tile loop, with the accumulators carried through
+both. **Nested loop-carried `scf.for` had no precedent in this repo** and the
+gfx1201 fold explicitly flattened instead, so it was probed before anything was
+designed around it: a 20-line kernel summing `g*T + t` over both loops returns
+the right answer.
+
+The trip count is `traits.GQA_GROUP_SIZE`, a **build** constant, not the
+runtime `num_head_q // num_head_k`. That is what keeps MHA free: a `[0, 1)`
+loop is promoted away, and the emitted ISA at MHA is the pre-B7 kernel plus
+seven instructions. Built from the runtime quotient instead, every MHA caller
+would have paid for a loop that cannot be proven to run once. `range_constexpr`
+would also have worked and would have unrolled the largest region in the kernel
+eight times at MQA.
+
+#### The snapshot trap
+
+`DualwaveKernelContext.__init__` does `self.__dict__.update(ctx.__dict__)`, so
+every helper holds a **copy** of the context taken when it was constructed --
+before the group loop exists. `retarget_q_head` rebinds `ctx.k_div`, and the
+stream loader was reading its own `self.k_div`: it would have staged the first
+head's Q for the whole group, which is wrong by exactly the group sum and
+finite and plausible. Two lines, in the idiom the class already uses for the
+per-tensor stride swap. Everything else the DMA path touches is
+head-independent, and the softmax reads its resources through the live `ctx`.
+
+#### The philox plane moves with the group
+
+The plane is `(batch, query head)`, so each head of a group draws a *different*
+mask -- which is the forward's behaviour, since the forward runs one program
+per query head. It is the one piece of per-head state that is neither a
+descriptor nor an address, so it is the one most likely to be hoisted by
+accident, and it has its own test against the mask the forward actually drew.
+
+#### The group-boundary drain: measured inert, kept anyway
+
+The last tile of a head issues a prefetch into the same LDS buffers the next
+head's prologue re-primes, so the two writes are briefly in flight together. A
+control build with the drain removed is **bit-identical on eight
+configurations**, including `s=4096` at group 8 and the wide rungs where
+`NUM_STREAM_BUFFERS` collapses to 1. It is inert because the staging is
+partitioned by *wave*, so no two waves write the same LDS bytes and one wave's
+DMAs to one address retire in issue order.
+
+That is an inference about hardware ordering rather than something read off a
+manual, and the drain costs **0.2-0.4%** at group 8 -- once per head against a
+whole q walk. Kept as a backstop, with the control's result written next to it
+so nobody later reads it as load-bearing. It is `const_expr`-gated on the group
+being wider than one: left unconditional it cost **1.5% at head_dim 64**, where
+the kernel is shortest and a fixed prologue cost shows most.
+
+#### What it costs: the grid, and only the grid
+
+`B=2 S=4096 head_dim 64`, nominal TFLOP/s on the **query** head count:
+
+| B | Hq | Hk | workgroups | us | TF |
+|---|---|---|---|---|---|
+| 2 | 8 | 8 | 512 | 180 | 764 |
+| 2 | 8 | 4 | 256 | 214 | 642 |
+| 2 | 8 | 2 | 128 | 374 | 368 |
+| 2 | 8 | 1 | 64 | 739 | 186 |
+| 2 | 32 | 8 | 512 | 685 | **802** |
+| 8 | 8 | 1 | 256 | 763 | **720** |
+| 1 | 8 | 1 | 32 | 738 | 93 |
+
+**The last two rows are the control and they settle it.** `B=2 Hk=1` and
+`B=8 Hk=1` have the *same* group size and the same fold; the second has 4x the
+workgroups and is 3.9x faster. So the cost is the workgroup count, not the
+fold's arithmetic, and throughput tracks it almost linearly below about 256
+workgroups and is flat above. A realistic GQA shape -- Llama-3-8B's 32 query
+heads over 8 KV heads -- dispatches 512 workgroups and measures 802 TF, above
+the MHA rung. **MQA at small batch is the case that bites and it is inherent to
+the fold**, which is the honest answer rather than a knob.
+
+head_dim 224 at group 4 spills (512 VGPR, 160), and the 16-row family is 1.29x
+faster there -- but `32 tight`, which removes the spills, is only 1.02x. The
+registers are not what binds: the 16-row family wins because its `BLOCK_KV` is
+half as wide and it dispatches twice the workgroups. That makes the right
+geometry a function of the group size, the batch and the sequence length rather
+than of the head dim, so **no override was added** and the measurement is
+recorded instead.
+
+### MHA did not regress
+
+Interleaved single-GPU A/B against the committed B6, two passes:
+
+| head_dim | B7 | B6 |
+|---|---|---|
+| 64 | 751.8 / 754.7 | 751.5 / 756.3 |
+| 128 | 820.7 / 822.1 | 815.5 / 821.4 |
+| 224 | 827.5 / 827.8 | 824.0 / 826.1 |
+| 512 | 424.9 / 423.4 | 429.6 / 437.2 |
+
+Indistinguishable. The between-session drift on this machine is about 2% --
+B6's own d64 reads 751 and 772 in two different sessions -- which is why the
+interleaving is not optional at this margin.
+
+### Gates
+
+- `dK`/`dV` correct against a reference **built with** the bias, and 2.2/3.0
+  away from the bias-free one, so no tolerance sits between them.
+- `bias=None` **bitwise** identical to a build compiled without bias.
+- `-inf` bias: no NaN, and a fully masked key receives exactly zero gradient.
+- bias x varlen bitwise equal to N dense calls; bias x dropout through the B6
+  three-party oracle; bias x causal refused, and the refusal tested.
+- GQA correct at groups 1, 2, 4 and 8 and at `hq=6, hk=3` -- the case a
+  broadcast hides, because at `hk=1` a plain expansion is right whatever the
+  grouping.
+- GQA equal to **N grouped dense calls** at every group size and both families.
+- GQA x varlen bitwise equal to N dense calls; GQA x dropout against the mask
+  the forward drew.
+- EXEC scan extended to 32 configurations including the nested group loop.
+
+### Measured, wall clock
+
+`B=2 H=8 S=4096` bf16, GPU 5 idle, all three kernels in one session.
+`bwd/fwd` is `(t_dkdv + t_dq) / t_fwd`, microseconds; rates are nominal
+TFLOP/s on 2/4/3 `S*S*d` GEMM-equivalents and on the **query** head count.
+GQA is `num_kv_heads = 2`, a group of four.
+
+| hdim | rows | fwd | dK/dV | dQ | bwd eff | t_fwd | t_bwd | bwd/fwd |
+|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | **bias** |
+| 32 | 16 | 184 | 182 | 245 | 146 | 186 | 589 | 3.16x |
+| 64 | 32 | 274 | 514 | 373 | 316 | 250 | 544 | 2.17x |
+| 96 | 16 | 398 | 571 | 555 | 403 | 259 | 640 | 2.47x |
+| 128 | 16 | 478 | 647 | 412 | 371 | 288 | 925 | 3.22x |
+| 160 | 16 | 440 | 487 | 426 | 327 | 390 | 1311 | 3.36x |
+| 192 | 16 | 499 | 750 | 633 | 496 | 413 | 1038 | 2.51x |
+| 224 | 32 | 524 | 227 | 642 | 224 | 459 | 2685 | 5.85x |
+| 256 | 16 | 572 | 365 | 684 | 326 | 480 | 2109 | 4.39x |
+| 384 | 16 | 594 | 238 | 468 | 215 | 694 | 4787 | 6.90x |
+| 512 | 16 | 423 | 243 | 499 | 223 | 1299 | 6167 | 4.75x |
+| | | | | | | | | **GQA, group 4** |
+| 32 | 32 | 521 | 209 | 622 | 209 | 66 | 411 | 6.23x |
+| 64 | 32 | 823 | 364 | 815 | 341 | 84 | 504 | 6.03x |
+| 96 | 16 | 877 | 587 | 901 | 493 | 118 | 523 | 4.45x |
+| 128 | 16 | 1050 | 703 | 800 | 530 | 131 | 649 | 4.96x |
+| 160 | 32 | 846 | 405 | 763 | 362 | 203 | 1186 | 5.84x |
+| 192 | 16 | 884 | 747 | 826 | 556 | 233 | 926 | 3.97x |
+| 224 | 32 | 889 | 324 | 807 | 311 | 270 | 1931 | 7.14x |
+| 256 | 16 | 898 | 416 | 857 | 381 | 306 | 1802 | 5.89x |
+| 384 | 16 | 807 | 430 | 527 | 334 | 511 | 3089 | 6.05x |
+| 512 | 16 | 527 | 442 | 492 | 330 | 1043 | 4160 | 3.99x |
+
+**Bias improves `bwd/fwd`** (2.17x-6.90x against dense's 3.20x-5.81x at the
+same shapes) for the reason dropout did in B6: the forward pays the feature
+too, on a smaller denominator. The wall clock is what moved.
+
+**GQA makes `bwd/fwd` worse, and that is the fold's signature.** The forward
+keeps one program per *query* head under GQA, so its grid does not shrink at
+all; dK/dV's shrinks by the group size. So the ratio degrades by roughly the
+group size divided by whatever headroom the machine had -- 3.97x-7.14x here.
+It is the same fact as the workgroup table above seen from the other end, and
+it is the price of not writing a per-head scratch tensor.
+
+### Not done
+
+- **The bias tile is not staged through LDS.** 16 scalar loads per lane per
+  tile is the cost, and the 32-row family pays double. Staging the bias tile
+  and reading it with the transpose would make it a handful of `ds_read`s, at
+  the price of `BLOCK_Q x BLOCK_KV x 2` bytes of LDS on exactly the rungs that
+  are already LDS-bound. Not attempted.
+- **head_dim 224 with bias, at 3.67x**, is the worst remaining feature cost,
+  and it is the one rung that genuinely spills.
+- **MQA at small batch under-occupies the machine**, inherently. Recovering it
+  needs the grid back, which needs a reduction, which is the design that was
+  priced and rejected.
+- The 384 rung is dQ's to profile.

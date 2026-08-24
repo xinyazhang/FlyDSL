@@ -704,16 +704,16 @@ def test_run_to_run_deterministic():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("field,value", [("bias", True)])
-def test_unimplemented_modes_are_refused(field, value):
-    """Refused by name, not ignored.
+def test_paged_is_refused_by_name():
+    """The one mode still refused, and refused by name rather than ignored.
 
-    Every one of these would build, run and return a correctly-shaped wrong
-    answer, which is the failure mode the whole backward plan is written
-    against. B4-B6 turn them on one at a time.
+    It would otherwise build, run and return a correctly-shaped wrong answer,
+    which is the failure mode the whole backward plan is written against.
+    Everything else on the surface -- causal, windows, varlen, dropout, bias,
+    padded heads, asymmetric hdim, dB -- is implemented.
     """
-    with pytest.raises(NotImplementedError, match=field):
-        build_dq(num_heads=4, head_dim=64, **{field: value})
+    with pytest.raises(NotImplementedError, match="paged"):
+        build_dq(num_heads=4, head_dim=64, causal=False, paged=True)
 
 
 def test_head_dim_past_the_widest_rung_is_refused():
@@ -1185,6 +1185,23 @@ def _time_us(fn, iters=20, warm=5):
     return (time.perf_counter() - t0) / iters * 1e6
 
 
+def _time_ab(a, b, rounds=5):
+    """`(min a, min b)`, measured **interleaved**, one round each at a time.
+
+    A shared GPU is the normal case here, and a co-tenant's burst lands on
+    whichever arm happens to be running -- which turned this file's own
+    tile-cut assertion into a flaky test reporting a *working* cut as 2.6x
+    slower than dense. The lore prescribes interleaved single-GPU A/B for any
+    perf claim; the minimum over rounds is the estimator that survives a
+    neighbour, and interleaving is what stops a slow patch biasing one arm.
+    """
+    best_a = best_b = float("inf")
+    for _ in range(rounds):
+        best_a = min(best_a, _time_us(a, iters=10, warm=2))
+        best_b = min(best_b, _time_us(b, iters=10, warm=2))
+    return best_a, best_b
+
+
 @pytest.mark.parametrize("rows", _FAMILIES)
 def test_the_causal_tile_cut_is_not_inert(rows):
     """**A dead tile is a no-op, so only timing can show the cut works.**
@@ -1221,8 +1238,7 @@ def test_the_causal_tile_cut_is_not_inert(rows):
         fn = build_dq(num_heads=h, head_dim=d, causal=causal, mfma_rows=rows)
         return lambda: fn(q, k, v, do, dq, lse, lse, b, s, seqlen_k=s, scale=scale)
 
-    dense = _time_us(build(False))
-    causal = _time_us(build(True))
+    dense, causal = _time_ab(build(False), build(True))
     assert causal < 0.80 * dense, (
         f"causal {causal:.0f} us against dense {dense:.0f} us at {rows} rows: the tile cut is inert. "
         "A dead tile changes no output bit, so no correctness test can see this."
@@ -1249,8 +1265,7 @@ def test_the_window_tile_cut_is_not_inert(rows):
     def at(window):
         return lambda: fn(q, k, v, do, dq, lse, lse, b, s, seqlen_k=s, scale=scale, window=window)
 
-    unbounded = _time_us(at((fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT)))
-    narrow = _time_us(at((128, 0)))
+    unbounded, narrow = _time_ab(at((fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT)), at((128, 0)))
     assert narrow < 0.5 * unbounded, (
         f"a 128-wide left band takes {narrow:.0f} us against {unbounded:.0f} for an unbounded one at "
         f"{rows} rows: the left bound is masking but not cutting."
@@ -1954,3 +1969,199 @@ def test_the_forwards_mask_does_not_depend_on_its_tiling():
     a = mask_at({})
     c = mask_at(dict(num_waves=4, block_m=128, block_n=64, head_dim_granule=64))
     assert torch.equal(a, c), "the forward's dropout mask moved with its tile geometry"
+
+
+# ---------------------------------------------------------------------------
+# B7: the bias *input* -- a different path from the dB output
+# ---------------------------------------------------------------------------
+
+
+def _bias_ref(q, k, v, do, bias, *, scale, dtype=torch.float64):
+    """`(lse, delta, dq, ds)` for `softmax(scale*QK^T + B)`.
+
+    The bias is added to the **scaled** score, which is AOTriton's convention
+    (`qk += bias / sm_scale` before multiplying by `sm_scale * log2e`) and the
+    forward's. Verified against the forward's own bias path before being used
+    here, because a reference that gets the convention wrong makes a correct
+    kernel look broken.
+    """
+    qf, kf, vf, dof, bf = (t.to(dtype) for t in (q, k, v, do, bias))
+    scores = (qf @ kf.transpose(-1, -2)) * scale + bf
+    lse = torch.logsumexp(scores, dim=-1)
+    p = torch.softmax(scores, dim=-1)
+    delta = (dof * (p @ vf)).sum(-1)
+    ds = p * ((dof @ vf.transpose(-1, -2)) - delta.unsqueeze(-1))
+    n = lse.shape[-1]
+    return (
+        lse.float().reshape(-1, n).contiguous(),
+        delta.float().reshape(-1, n).contiguous(),
+        ((ds @ kf) * scale).double(),
+        ds.double(),
+    )
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+@pytest.mark.parametrize("head_dim", [64, 512])
+def test_bias_input_and_its_gradient(head_dim, rows):
+    """**The gradient checked against the bias, not only through it.**
+
+    A bias that is read but dropped from the gradient passes any test that
+    compares only `dQ`: the forward's bias shifts the scores and the softmax
+    normalises most of it away. So `dB` is compared too -- and, as B6 did for
+    dropped-vs-undropped `dS`, asserted to be measurably *not* the other
+    plausible value, which here is the `dS` a build with no bias at all would
+    produce.
+
+    That second assertion is what would have caught the bug this test found:
+    the bias was being added **twice** (see the kernel's comment at
+    `seq_pad_mask_if_needed`), which `dQ` alone reports as 3.3 relative error
+    but which a reader could mistake for a tolerance problem.
+    """
+    torch.manual_seed(50)
+    b, h, s = 1, 4, 256
+    q, k, v, do = (_rand(b, h, s, head_dim) for _ in range(4))
+    bias = _rand(b, h, s, s) * 0.5
+    scale = _sm_scale(head_dim)
+
+    lse, delta, ref_dq, ref_db = _bias_ref(q, k, v, do, bias, scale=scale)
+    _, _, lo_dq, _ = _bias_ref(q, k, v, do, bias, scale=scale, dtype=DT)
+
+    dq = torch.full_like(q, float("nan"))
+    db = torch.full((b, h, s, s), float("nan"), device="cuda", dtype=DT)
+    build_dq(num_heads=h, head_dim=head_dim, causal=False, bias=True, store_db=True, mfma_rows=rows)(
+        q, k, v, do, dq, lse, delta, b, s, seqlen_k=s, scale=scale, bias=bias, db=db
+    )
+    torch.cuda.synchronize()
+
+    assert _max_err(dq, ref_dq) <= DQ_FUDGE * _max_err(lo_dq, ref_dq)
+    assert _max_err(db, ref_db) / max(ref_db.abs().max().item(), 1.0) < 5.0e-3
+
+    # The wrong-but-plausible alternative: the `dS` of a build that read the
+    # bias and left it out of the gradient.
+    zero = torch.zeros_like(bias)
+    _, _, _, no_bias_ds = _bias_ref(q, k, v, do, zero, scale=scale)
+    assert _max_err(db, no_bias_ds) / max(ref_db.abs().max().item(), 1.0) > 0.1
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+def test_bias_none_is_bitwise_a_no_bias_build(rows):
+    """A zero bias must reproduce a build compiled without one, bit for bit.
+
+    The same shape of check as `p = 0` in B6: everything cancels, so the two
+    differ only in emitted code.
+    """
+    torch.manual_seed(51)
+    b, h, s, d = 1, 4, 256, 64
+    q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
+    scale = _sm_scale(d)
+    lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
+
+    plain = _run_dq(q, k, v, do, lse, delta, scale=scale, mfma_rows=rows)
+    with_bias = torch.full_like(q, float("nan"))
+    build_dq(num_heads=h, head_dim=d, causal=False, bias=True, mfma_rows=rows)(
+        q,
+        k,
+        v,
+        do,
+        with_bias,
+        lse,
+        delta,
+        b,
+        s,
+        seqlen_k=s,
+        scale=scale,
+        bias=torch.zeros(b, h, s, s, device="cuda", dtype=DT),
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(plain, with_bias)
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+def test_bias_composes_with_dropout(rows):
+    """Bias and dropout both touch the scores, so they are tested together.
+
+    The bias goes onto the score before the softmax; the dropout mask goes onto
+    `dP` after it. They commute only because they act on different quantities,
+    which is worth an assertion rather than an argument.
+    """
+    torch.manual_seed(52)
+    b, h, s = 1, 4, 128
+    d = s
+    p = 0.3
+    q, k, do = (_rand(b, h, s, d) for _ in range(3))
+    v = _identity_v(b, h, s)
+    bias = _rand(b, h, s, s) * 0.5
+    scale = _sm_scale(d)
+
+    # The forward, with both, so the mask is the one the backward must match.
+    from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module as build_fwd
+
+    o = torch.empty_like(q)
+    lse = torch.empty(b, h, s, device="cuda", dtype=torch.float32)
+    seed = torch.tensor([77], device="cuda", dtype=torch.int64)
+    seed_out = torch.zeros(1, device="cuda", dtype=torch.int64)
+    off_out = torch.zeros(1, device="cuda", dtype=torch.int64)
+    build_fwd(num_heads=h, head_dim=d, causal=False, dtype_str="bf16", bias=True, dropout=True, return_lse=True)(
+        q,
+        k,
+        v,
+        o,
+        b,
+        s,
+        seqlen_k=s,
+        scale=scale,
+        lse=lse,
+        bias=bias,
+        dropout_p=p,
+        philox_seed=seed,
+        philox_offset2=0,
+        philox_seed_out=seed_out,
+        philox_offset_out=off_out,
+    )
+    torch.cuda.synchronize()
+    keep = o.float() != 0.0
+    delta = (do.float() * o.float()).sum(-1)
+
+    got = torch.full_like(q, float("nan"))
+    build_dq(num_heads=h, head_dim=d, causal=False, bias=True, dropout=True, mfma_rows=rows)(
+        q,
+        k,
+        v,
+        do,
+        got,
+        lse.reshape(-1, s).contiguous(),
+        delta.reshape(-1, s).contiguous(),
+        b,
+        s,
+        seqlen_k=s,
+        scale=scale,
+        bias=bias,
+        dropout_p=p,
+        philox_seed=seed_out,
+        philox_offset1=off_out,
+        philox_offset2=0,
+    )
+    torch.cuda.synchronize()
+
+    qd, kd, vd, dod, bf = (t.double() for t in (q, k, v, do, bias))
+    prob = torch.softmax((qd @ kd.transpose(-1, -2)) * scale + bf, dim=-1)
+    dp = (dod @ vd.transpose(-1, -2)) * keep.double() / (1.0 - p)
+    ref = ((prob * (dp - delta.double().unsqueeze(-1))) @ kd) * scale
+    assert _max_err(got, ref) / max(ref.abs().max().item(), 1.0) < 5.0e-3
+
+
+def test_bias_with_causal_is_refused_upstream():
+    """`make_traits` rejects bias together with causal, and that is deliberate.
+
+    Not this kernel's rule: `fmha_traits_gfx950.make_traits` refuses the
+    combination for four kernels at once, on the grounds that a bias *is* an
+    attention mask supplied directly, so asking for both asks which wins where
+    they disagree. AOTriton disables it and PyTorch's math backend raises on
+    it.
+
+    Pinned here so that the B7 gate "bias composes with causal and windows"
+    is not silently read as satisfied: it is **refused**, and changing that is
+    a decision about a shared file rather than about this kernel.
+    """
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        build_dq(num_heads=4, head_dim=64, causal=True, bias=True)

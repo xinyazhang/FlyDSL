@@ -514,10 +514,7 @@ class BwdDqKnobs(Gfx950Knobs):
         # Refused rather than ignored. Each of these would build and run and
         # return the right *shape*, which is the failure mode the whole
         # backward plan is written to avoid.
-        for name, value in (
-            ("bias", meta.bias),
-            ("paged", self.paged),
-        ):
+        for name, value in (("paged", self.paged),):
             if value:
                 raise NotImplementedError(
                     f"{name}=True is not implemented by the backward dQ kernel yet; B6 adds dropout "
@@ -587,6 +584,7 @@ class BwdDqKnobs(Gfx950Knobs):
             lazy_rescale=self.lazy_rescale,
             setprio=self.setprio,
             stagger=self.stagger,
+            bias=meta.bias,
             dropout=meta.dropout,
             lpt_tile_order=self.lpt_tile_order,
             num_kv_splits=1,

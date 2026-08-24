@@ -212,16 +212,68 @@ _TIGHT_REGISTERS = {
 # while looked like a second override wanting the 16-row family. The register
 # pressure was the workaround's, not the feature's; see
 # `BwdDkDvInputMetadata.lse_layout_th`.
+#
+# **B7's bias needed four more, and the reason is not register pressure at
+# three of them.** A bias read is one scalar `buffer_load` per accumulator
+# element -- a lane holds one KV column and 16 q rows, `stride_b_seq_q` apart,
+# so there is no run to vectorise. The 32-row family holds *32* such elements
+# per tile to the 16-row family's 16, and issues them in one place, which is
+# why the two families pay so differently at the policy's geometry:
+#
+#   bias, B=2 H=8 S=4096            dense    bias   ratio
+#     head_dim  96 / 128 / 192      (16-row)         1.33 / 1.26 / 1.17x
+#     head_dim 256 / 384 / 512      (16-row)         2.13 / 1.78 / 1.79x
+#     head_dim  32 /  64 / 160      (32-row)         4.05 / 5.04 / 2.77x
+#     head_dim 224                  (32-row)         6.09x
+#
+# Only 224 spills (512 VGPR, 229 of them). The other three are the issue cost
+# of 32 dependent scalar loads landing in a tile whose MFMA work is small, and
+# the fix is a different geometry rather than more registers:
+#
+#   head_dim 64, bias      policy (32 loose)  149 TF
+#                          32 tight           520 TF   <- 3.5x, and no spills
+#                                                         either way
+#   head_dim 160, bias     policy (32 loose)  277 TF
+#                          16-row bq64        487 TF   <- 1.76x
+#   head_dim 224, bias     policy (32 loose)  136 TF   (229 spills)
+#                          32 tight           227 TF   <- 1.67x
+#   head_dim 32, bias      policy (32 loose)  125 TF
+#                          16-row bq64        182 TF   <- 1.46x
+#
+# So the "5x cost of bias at head_dim 64" was a geometry mismatch, not the
+# feature: with the right arm it is 1.44x, which is what the bytes-per-flop
+# law predicts (`BLOCK_KV / 4d` extra streamed bytes, 0.5 at that rung).
+# 256/384/512 are already best at the policy's geometry and get no entry.
+#
+# **GQA gets no entry, and that is a measurement rather than an omission.**
+# head_dim 224 at group 4 spills too (512 VGPR, 160 spills) and the 16-row
+# family is 1.29x faster there -- but `32 tight`, which removes the spills, is
+# only 1.02x, so the registers are not what binds. The 16-row family wins
+# because its `BLOCK_KV` is half as wide and it therefore dispatches twice the
+# workgroups, and under GQA the grid has already shrunk by the group size. That
+# makes the right geometry a function of the group size, the batch *and* the
+# sequence length rather than of the head dim, which is not something this
+# table can express. See the B7 outcome section.
 _FEATURE_OVERRIDES = {
-    # (head_dim, causal, varlen): (waves, waves_per_eu, shards, rows, block_q, tight)
-    (224, True, False): (4, 1, 1, 32, 64, True),
-    (224, True, True): (4, 1, 1, 32, 64, True),
+    # (head_dim, causal, varlen, bias): (waves, waves_per_eu, shards, rows, block_q, tight)
+    (224, True, False, False): (4, 1, 1, 32, 64, True),
+    (224, True, True, False): (4, 1, 1, 32, 64, True),
+    # Bias excludes causal by construction, so these can never collide with the
+    # two above; the varlen axis is free because bias measured the same on both.
+    (32, False, False, True): (4, 2, 1, 16, 64, False),
+    (32, False, True, True): (4, 2, 1, 16, 64, False),
+    (64, False, False, True): (4, 1, 1, 32, 64, True),
+    (64, False, True, True): (4, 1, 1, 32, 64, True),
+    (160, False, False, True): (4, 2, 1, 16, 64, False),
+    (160, False, True, True): (4, 2, 1, 16, 64, False),
+    (224, False, False, True): (4, 1, 1, 32, 64, True),
+    (224, False, True, True): (4, 1, 1, 32, 64, True),
 }
 
 
 def _geometry_for(block_dmodel, meta):
     """`(waves, waves_per_eu, shards, rows, block_q, tight)` for a build."""
-    key = (block_dmodel, bool(meta.causal), bool(meta.varlen))
+    key = (block_dmodel, bool(meta.causal), bool(meta.varlen), bool(meta.bias))
     if key in _FEATURE_OVERRIDES:
         return _FEATURE_OVERRIDES[key]
     return _GEOMETRY[block_dmodel] + (_TIGHT_REGISTERS[block_dmodel],)
@@ -401,6 +453,16 @@ class BwdDkDvInputMetadata:
     # compile the PRNG at all is here, because a build without dropout must
     # emit none of it.
     dropout: bool = False
+    # B7. AOTriton's `BIAS_TYPE`: a `(b, h, sq, sk)` matrix added to the scores
+    # before the softmax. A *read* here and nothing more -- `dB` belongs to the
+    # dQ kernel, which is where `dS` is materialised per `(q, k)` element.
+    #
+    # A build axis for the reason the forward gives: the loop is latency-bound
+    # and a bias that cost anything when unused would be paid by every caller
+    # who does not want one. It also makes `bias=None` bitwise identical to a
+    # build compiled without bias, since there is nothing to be identical to
+    # otherwise. **Mutually exclusive with `causal`/`window`**, which
+    # `make_traits` enforces; see `_with_traits`.
     bias: bool = False
 
 
@@ -465,15 +527,11 @@ class BwdDkDvKnobs:
         """Refuse what this phase does not compute, at the decision rather than at an address.
 
         Every one of these would otherwise produce a plausible, finite, wrong
-        gradient: a dropped causal mask returns dense attention's gradient, and
-        a GQA call returns one q head's contribution where the sum over the
-        group belongs. Both are the right shape.
+        gradient -- a dropped causal mask returns dense attention's, which is
+        the right shape. What is left after B7 is one arithmetic precondition
+        and one semantic exclusion, not a scope boundary; the feature refusals
+        this docstring was written for are all implemented now.
         """
-        if meta.bias:
-            raise NotImplementedError(
-                "bias=True is not implemented; see sdpa-bwd-plan-gfx950.md. dB belongs to the dQ kernel, "
-                "which is where dS is materialised per (q, k) element."
-            )
         if meta.window and not meta.causal:
             # A window without the causal machinery has no masked region to
             # apply itself to, and silently dropping it would return dense
@@ -484,11 +542,13 @@ class BwdDkDvKnobs:
         if meta.dtype_str != "bf16":
             raise NotImplementedError(f"this kernel builds bf16 only, got {meta.dtype_str!r}")
         num_kv_heads = meta.num_heads if meta.num_kv_heads is None else meta.num_kv_heads
-        if num_kv_heads != meta.num_heads:
-            raise NotImplementedError(
-                f"GQA (num_heads {meta.num_heads}, num_kv_heads {num_kv_heads}) needs dK/dV summed "
-                "over every q head sharing a kv head, which this kernel does not do: one workgroup "
-                "owns one (q head, kv block) and would write, not accumulate. MHA only."
+        if meta.num_heads % num_kv_heads:
+            # B7 made GQA real; this is the one part of the old refusal that
+            # survives, because a group that does not divide evenly has no
+            # meaning rather than no implementation.
+            raise ValueError(
+                f"num_heads ({meta.num_heads}) must be a multiple of num_kv_heads ({num_kv_heads}): "
+                "each KV head owns a whole group of query heads and dK/dV sum over it"
             )
         return self
 
@@ -641,6 +701,14 @@ class BwdDkDvKnobs:
             window=meta.window,
             varlen=meta.varlen,
             dropout=meta.dropout,
+            # B7. `make_traits` is also where `bias and (causal or window)` is
+            # refused, and taking that from there rather than restating it is
+            # the point: the rule is semantic (a bias *is* an attention mask,
+            # so pairing it with a positional one asks which wins where they
+            # disagree) and it must read identically on both sides of the
+            # gradient. The forward cannot build the pair either, so a backward
+            # that accepted it would have no forward to produce its LSE.
+            bias=meta.bias,
             # **A causal varlen build has no `cross_seqlen` analogue here**, and
             # that is a property of the gradient rather than an omission. The
             # forward needs it because a Q block with no live key must have `O`

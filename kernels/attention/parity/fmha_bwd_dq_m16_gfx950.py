@@ -71,7 +71,7 @@ from gfx950_standalone import buffer_ops, dualwave
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -431,6 +431,46 @@ class M16DqSoftmax:
             + fx.Int32(4 * (lane // fx.Index(MFMA16_M)))
         )
 
+    def add_bias(self, v_s, tile_idx, lane, q_row):
+        """`S += bias * log2e`, from this family's own column map.
+
+        A lane's four accumulator elements are four **contiguous** KV columns
+        at `4 * (lane // 16)`, so each half is a single 4-wide `buffer_load`.
+        The 32-row path needs `_score_column_runs` because its sixteen are four
+        scattered spans; reusing that table here would be a transcription.
+
+        **Not `fm_fast`.** That carries `ninf`, a licence to assume no
+        infinities reach the operation -- and a bias entry of `-inf` is how a
+        caller spells "never attend here", so this is the first thing in the
+        kernel that puts a real infinity into *arithmetic* rather than into a
+        select. Two operations per element, one by a constant, so getting the
+        flag right costs nothing measurable.
+
+        The descriptor is bounded at the (batch, head) slab, so a read past the
+        last row returns zero rather than faulting -- which is also the right
+        bias for a padded row -- and a column past `seqlen_kv` picks up the
+        next row's entry, which the KV tail mask below then overwrites with
+        `-inf`. That is the forward's argument, unchanged.
+        """
+        ctx = self.ctx
+        fm = arith.FastMathFlags.contract | arith.FastMathFlags.reassoc
+        log2e = fx.Float32(dualwave._LOG2E)
+        row_base = q_row * fx.Index(ctx.stride_b_seq_q)
+        lists = self.to_lists(v_s)
+        for step in range_constexpr(2):
+            col0 = self.kv_col(tile_idx, lane, step, 0)
+            span = buffer_ops.buffer_load(
+                ctx.bias_rsrc,
+                as_mlir_value(fx.Int32(row_base + fx.Index(col0))),
+                vec_width=self.n,
+                dtype=ctx.elem_dtype,
+            )
+            vec = Vec(span, (self.n,), ctx.elem_dtype)
+            for i in range_constexpr(self.n):
+                b = fx.Float32(vec[i].to(fx.Float32))
+                lists[step][i] = dualwave._fadd(lists[step][i], dualwave._fmul(b, log2e, fm), fm)
+        return self.to_vecs(lists)
+
     def seq_pad_mask(self, v_s, tile_idx, lane):
         """`-inf` past `seqlen_kv`, on the tiles that need it.
 
@@ -680,6 +720,8 @@ def make_m16_dq_body(
 
             v_s = gemm.qk(k_reader.load_a_all(lane), q_packs)
             v_s = softmax.scale_and_sub_lse(v_s, ctx.c_sm_scale_log2e, lse2)
+            if const_expr(traits.BIAS_TYPE):
+                v_s = softmax.add_bias(v_s, j, lane, q_row)
             v_s = softmax.seq_pad_mask(v_s, j, lane)
             if const_expr(traits.CAUSAL):
                 # Same placement argument as the 32-row body's: this touches

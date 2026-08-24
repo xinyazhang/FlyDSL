@@ -1028,6 +1028,9 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
+        stride_b_batch: fx.Int64,
+        stride_b_head: fx.Int64,
+        stride_b_seq_q: fx.Int64,
         stride_db_batch: fx.Int64,
         stride_db_head: fx.Int64,
         stride_db_seq_q: fx.Int64,
@@ -1076,7 +1079,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             CuSeqKv=Q,
             BlockTable=Q,
             Bias=Bias,
-            bias_strides=(0, 0, 0),
+            bias_strides=(stride_b_batch, stride_b_head, stride_b_seq_q),
             philox=(philox_seed_ptr, philox_offset1, philox_offset2, None, None),
             idropout_p=idropout_p,
             dropout_scale=dropout_scale,
@@ -1148,6 +1151,19 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
                 # -- GEMM1. S, raw. The scale and the LSE subtract follow.
                 v_s = gemm_helper.qk(k_reader.load_k(0), q_all_bf16)
                 v_s = softmax_helper.scale_and_sub_lse(v_s, ctx.c_sm_scale_log2e, lse2)
+                # **This also adds the bias**, on the 32-row family:
+                # `ParitySoftmaxHelper.seq_pad_mask_if_needed` folds
+                # `_add_bias_inplace` in ahead of the tail mask, which is
+                # exactly the order wanted -- `bias * log2e` onto the scaled
+                # score, then `-inf` for the columns that do not exist. Adding
+                # it again here is the B6 `cast_p` mistake in a second costume,
+                # and it is *not* benign: the backward has no softmax
+                # renormalisation, so `P = exp2(S - lse2)` does not absorb a
+                # uniform shift the way the forward's does. Measured at 3.3
+                # relative error, and even a row-*constant* bias failed --
+                # which is what identified it, since shift invariance would
+                # have hidden a double add in the forward.
+                #
                 # Columns past `seqlen_kv` read zero from the buffer bound,
                 # which is a *score of zero*, not an absent key: without the
                 # mask `exp2(0 - lse2)` contributes a spurious P. After the
@@ -1322,6 +1338,9 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
+        stride_b_batch: fx.Int64,
+        stride_b_head: fx.Int64,
+        stride_b_seq_q: fx.Int64,
         stride_db_batch: fx.Int64,
         stride_db_head: fx.Int64,
         stride_db_seq_q: fx.Int64,
@@ -1392,6 +1411,9 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             stride_dq_batch,
             stride_dq_head,
             stride_dq_seq,
+            stride_b_batch,
+            stride_b_head,
+            stride_b_seq_q,
             stride_db_batch,
             stride_db_head,
             stride_db_seq_q,
@@ -1450,6 +1472,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         seqlen_k=None,
         scale=None,
         db=None,
+        bias=None,
         window=None,
         varlen=None,
         num_seqlens=0,
@@ -1571,6 +1594,32 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         if dropout_p is not None and not traits.ENABLE_DROPOUT:
             raise ValueError("this build was not compiled for dropout; pass dropout=True to the builder")
 
+        # **The bias *input* is a different path from the dB *output***, and
+        # having written dB is the part that gets mistaken for done. `B` is
+        # added to the scores before the softmax; `dB` is the gradient with
+        # respect to it. A build can read one, write the other, both or
+        # neither.
+        if traits.BIAS_TYPE and bias is None:
+            raise ValueError("this build has bias=True and requires a (batch, num_heads_q, seqlen_q, seqlen_k) tensor")
+        if bias is not None and not traits.BIAS_TYPE:
+            # Silently ignoring it returns dense attention's gradient: right
+            # shape, finite, wrong. It is only ever passed by a caller who
+            # believes it is being applied.
+            raise ValueError("this build was not compiled for bias; pass bias=True to the builder")
+        if bias is not None:
+            want = (int(Q.shape[0]), num_head_q, int(Q.shape[2]), int(seqlen_k))
+            if tuple(bias.shape) != want:
+                raise ValueError(f"bias must follow Q's batch and row layout, {want}; got {tuple(bias.shape)}")
+            if bias.stride(3) != 1:
+                raise ValueError(f"bias needs a contiguous seqlen_k axis; strides are {tuple(bias.stride())}")
+        bias_t = bias if bias is not None else DQ
+        # `_seq_q` is the *query* axis, matching `stride_db_seq_q` two lines
+        # down and the 24 other occurrences the rename settled on. `_seq`
+        # alone does not say which sequence; `_seq0` would reintroduce the
+        # numeric slots the stride rename removed, and leaves `_seq_k` with
+        # nothing to be called if the k axis ever stops being contiguous.
+        bias_st = tuple(int(x) for x in bias.stride()[:3]) if bias is not None else (0, 0, 0)
+
         db_t = db if db is not None else DQ
         db_st = tuple(int(x) for x in db.stride()[:3]) if db is not None else (0, 0, 0)
 
@@ -1578,7 +1627,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             Q,
             K,
             V,
-            DQ,  # Bias: no build here reads it; the slot is held for B6
+            bias_t,
             DO,
             DQ,
             db_t,
@@ -1606,6 +1655,7 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
                 Q, scale if scale is not None else BUILD_SM_SCALE, PADDED_HEAD, 1.0 / (BLOCK_DMODEL**0.5)
             ),
             *st,
+            *bias_st,
             *db_st,
         ), stream
 
