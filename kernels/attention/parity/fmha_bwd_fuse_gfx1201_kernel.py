@@ -1232,6 +1232,8 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         abi.run_compiled(
             _COMPILED,
             launch_bwd_fuse,
+            # Q, K, V, Bias, DO, <outputs>, LSE, Delta -- the shared backward
+            # block, with `<outputs>` = (DK, DV, DQ) for the fused kernel.
             *[abi.ptr_arg(t) for t in (Q, K, V)],
             _bp,
             *[abi.ptr_arg(t) for t in (DO, DK, DV, DQ, L, Delta)],

@@ -1396,8 +1396,12 @@ def build_bwd_dq_module_primary(meta, knobs):
         _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(ENABLE_DROPOUT, dropout_p, seed, off1, off2, Q.device)
         _bp, _dbp, _sb0, _sb1, _sb2 = abi.bias_args(BIAS_TYPE, True, bias, dbias, Q)
         return (
-            # `ptrs` is (Q, K, V, DO, DQ); Bias goes in front of DQ and DB
-            # behind it, so the pointer block stays inputs-then-outputs.
+            # The shared backward pointer block is
+            #     Q, K, V, Bias, DO, <outputs>, LSE, Delta
+            # and `<outputs>` is what differs between the split kernels: here
+            # it is (DQ, DB), in dK/dV (DK, DV). `ptrs` arrives as
+            # (Q, K, V, DO, DQ), so Bias splices in ahead of DO and DB joins
+            # DQ as the second output.
             *ptrs[:3],
             _bp,
             ptrs[3],

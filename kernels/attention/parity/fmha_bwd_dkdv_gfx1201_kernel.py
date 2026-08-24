@@ -1355,7 +1355,10 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         abi.run_compiled(
             _COMPILED,
             launch_bwd_dkdv,
-            # `ptrs` is (Q, K, V, DO, DK, DV); Bias joins the inputs.
+            # The shared backward pointer block is
+            #     Q, K, V, Bias, DO, <outputs>, LSE, Delta
+            # with `<outputs>` = (DK, DV) here; the dQ kernel's is (DQ, DB),
+            # dB being one of its outputs rather than an extra slot.
             *ptrs[:3],
             _bp,
             *ptrs[3:],
