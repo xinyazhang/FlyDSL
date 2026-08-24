@@ -402,11 +402,11 @@ def build_bwd_dq_module_primary(meta, knobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        DO: fx.Pointer,
         Bias: fx.Pointer,
+        DO: fx.Pointer,
         DQ: fx.Pointer,
         DB: fx.Pointer,
-        L: fx.Pointer,
+        LSE: fx.Pointer,
         Delta: fx.Pointer,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
@@ -428,6 +428,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
+        sm_scale: fx.Float32,
         stride_q_batch: fx.Int64,
         stride_q_head: fx.Int64,
         stride_q_seq: fx.Int64,
@@ -443,10 +444,9 @@ def build_bwd_dq_module_primary(meta, knobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
-        stride_b0: fx.Int64,
-        stride_b1: fx.Int64,
-        stride_b2: fx.Int64,
-        sm_scale_arg: fx.Float32,
+        stride_db_batch: fx.Int64,
+        stride_db_head: fx.Int64,
+        stride_db_seq_q: fx.Int64,
     ):
         elem_type = elem_numeric_cls.ir_type
         elem_dtype = elem_numeric_cls
@@ -549,7 +549,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         v_st = (fx.Index(stride_v_batch), fx.Index(stride_v_head), fx.Index(stride_v_seq))
         do_st = (fx.Index(stride_do_batch), fx.Index(stride_do_head), fx.Index(stride_do_seq))
         dq_st = (fx.Index(stride_dq_batch), fx.Index(stride_dq_head), fx.Index(stride_dq_seq))
-        sm_log2e = fastmath.mul(sm_scale_arg, fx.Float32(_LOG2E))
+        sm_log2e = fastmath.mul(sm_scale, fx.Float32(_LOG2E))
 
         _q_batch_v = fx.Index(q_batch)
         _k_batch_v = fx.Index(k_batch)
@@ -662,7 +662,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         q_row_in_tile = wave_q_offset + lane16
 
         # Bias is (B, H, Sq, Sk): its last axis is the KV column, so its "row"
-        # stride is stride_b2 and the contiguous axis is the one the KV loop
+        # stride is stride_db_seq_q and the contiguous axis is the one the KV loop
         # walks. Indexed with the same (batch, q_row_off) the varlen decode
         # produced, so it inherits every layout for free -- the forward's
         # `sdpa-bias-plan.md` 3 argument, unchanged. One row per lane, since a
@@ -670,9 +670,9 @@ def build_bwd_dq_module_primary(meta, knobs):
         if const_expr(BIAS_TYPE):
             _b_ptr = fmha.pointer_to_llvm_ptr(Bias)
             _b_row = (
-                _q_batch_v * fx.Index(stride_b0)
-                + head_q * fx.Index(stride_b1)
-                + (_q_row_off_v + q_row) * fx.Index(stride_b2)
+                _q_batch_v * fx.Index(stride_db_batch)
+                + head_q * fx.Index(stride_db_head)
+                + (_q_row_off_v + q_row) * fx.Index(stride_db_seq_q)
             )
             _db_ptr = fmha.pointer_to_llvm_ptr(DB)
 
@@ -740,7 +740,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         # l_i = 0 and delta = 0 the row's Q and dO packs are already zero, so
         # dS comes out exactly 0 and the row contributes nothing -- and its
         # store is guarded anyway.
-        _lse_nat = fx.Float32(fx.Float32(_load_row_f32(L)) if _q_in else fx.Float32(0.0))
+        _lse_nat = fx.Float32(fx.Float32(_load_row_f32(LSE)) if _q_in else fx.Float32(0.0))
         delta_i = fx.Float32(fx.Float32(_load_row_f32(Delta)) if _q_in else fx.Float32(0.0))
         # The forward writes LSE in natural units; the exponent here is base 2,
         # so this is AOTriton's `l_i = tl.load(...) * RCP_LN2` exactly.
@@ -767,7 +767,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         # takes a row max, it reads the forward's logsumexp instead.
         c_neg_inf = fx.Float32(float("-inf"))
         c_zero_v8f32 = Vec.filled(8, 0.0, fx.Float32)
-        sm_scale_vec = Vec.from_elements([sm_scale_arg], fx.Float32).broadcast_to(8).ir_value()
+        sm_scale_vec = Vec.from_elements([sm_scale], fx.Float32).broadcast_to(8).ir_value()
 
         # ---- The visible band ----
         if const_expr(CAUSAL):
@@ -1189,11 +1189,11 @@ def build_bwd_dq_module_primary(meta, knobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        DO: fx.Pointer,
         Bias: fx.Pointer,
+        DO: fx.Pointer,
         DQ: fx.Pointer,
         DB: fx.Pointer,
-        L: fx.Pointer,
+        LSE: fx.Pointer,
         Delta: fx.Pointer,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
@@ -1215,6 +1215,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
+        sm_scale: fx.Float32,
         stride_q_batch: fx.Int64,
         stride_q_head: fx.Int64,
         stride_q_seq: fx.Int64,
@@ -1230,10 +1231,9 @@ def build_bwd_dq_module_primary(meta, knobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
-        stride_b0: fx.Int64,
-        stride_b1: fx.Int64,
-        stride_b2: fx.Int64,
-        sm_scale_arg: fx.Float32,
+        stride_db_batch: fx.Int64,
+        stride_db_head: fx.Int64,
+        stride_db_seq_q: fx.Int64,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -1248,11 +1248,11 @@ def build_bwd_dq_module_primary(meta, knobs):
             Q,
             K,
             V,
-            DO,
             Bias,
+            DO,
             DQ,
             DB,
-            L,
+            LSE,
             Delta,
             seqinfo_q0,
             seqinfo_q1,
@@ -1274,6 +1274,7 @@ def build_bwd_dq_module_primary(meta, knobs):
             num_head_k,
             hdim_qk,
             hdim_vo,
+            sm_scale,
             stride_q_batch,
             stride_q_head,
             stride_q_seq,
@@ -1289,10 +1290,9 @@ def build_bwd_dq_module_primary(meta, knobs):
             stride_dq_batch,
             stride_dq_head,
             stride_dq_seq,
-            stride_b0,
-            stride_b1,
-            stride_b2,
-            sm_scale_arg,
+            stride_db_batch,
+            stride_db_head,
+            stride_db_seq_q,
         )
 
         if const_expr(WAVES_PER_EU is not None):
@@ -1398,8 +1398,9 @@ def build_bwd_dq_module_primary(meta, knobs):
         return (
             # `ptrs` is (Q, K, V, DO, DQ); Bias goes in front of DQ and DB
             # behind it, so the pointer block stays inputs-then-outputs.
-            *ptrs[:4],
+            *ptrs[:3],
             _bp,
+            ptrs[3],
             ptrs[4],
             _dbp,
             _lp,
@@ -1421,11 +1422,11 @@ def build_bwd_dq_module_primary(meta, knobs):
             _ip,
             _dsc,
             *meta_t,
+            abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
             *st,
             _sb0,
             _sb1,
             _sb2,
-            abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
         )
 
     def _launch(

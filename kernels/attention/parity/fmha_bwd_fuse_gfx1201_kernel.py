@@ -374,13 +374,13 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        DO: fx.Pointer,
         Bias: fx.Pointer,
+        DO: fx.Pointer,
         DK: fx.Pointer,
         DV: fx.Pointer,
         DQ: fx.Pointer,
-        L: fx.Pointer,
-        Dlt: fx.Pointer,
+        LSE: fx.Pointer,
+        Delta: fx.Pointer,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
@@ -398,6 +398,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
+        sm_scale: fx.Float32,
         stride_q_batch: fx.Int64,
         stride_q_head: fx.Int64,
         stride_q_seq: fx.Int64,
@@ -419,10 +420,9 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
-        stride_b0: fx.Int64,
-        stride_b1: fx.Int64,
-        stride_b2: fx.Int64,
-        sm_scale_arg: fx.Float32,
+        stride_b_batch: fx.Int64,
+        stride_b_head: fx.Int64,
+        stride_b_seq_q: fx.Int64,
     ):
         elem_type = elem_numeric_cls.ir_type
         elem_dtype = elem_numeric_cls
@@ -436,8 +436,8 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         dk_ptr = fmha.pointer_to_llvm_ptr(DK)
         dv_ptr = fmha.pointer_to_llvm_ptr(DV)
         dq_ptr = fmha.pointer_to_llvm_ptr(DQ)
-        l_ptr = fmha.pointer_to_llvm_ptr(L)
-        dlt_ptr = fmha.pointer_to_llvm_ptr(Dlt)
+        l_ptr = fmha.pointer_to_llvm_ptr(LSE)
+        dlt_ptr = fmha.pointer_to_llvm_ptr(Delta)
         q_ptr_i64 = fx.as_ir_value(fx.Int64(fx.ptrtoint(Q)))
         k_ptr_i64 = fx.as_ir_value(fx.Int64(fx.ptrtoint(K)))
         do_ptr_i64 = fx.as_ir_value(fx.Int64(fx.ptrtoint(DO)))
@@ -476,7 +476,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         head_q = fx.Index(gpu.block_idx.y)
         head_k = head_q // (fx.Index(num_head_q) // fx.Index(num_head_k))
 
-        sm_log2e = fastmath.mul(sm_scale_arg, fx.Float32(_LOG2E))
+        sm_log2e = fastmath.mul(sm_scale, fx.Float32(_LOG2E))
 
         q_st = (fx.Index(stride_q_batch), fx.Index(stride_q_head), fx.Index(stride_q_seq))
         k_st = (fx.Index(stride_k_batch), fx.Index(stride_k_head), fx.Index(stride_k_seq))
@@ -495,7 +495,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         # once.
         if const_expr(BIAS_TYPE):
             bias_ptr = fmha.pointer_to_llvm_ptr(Bias)
-            _b_head = _q_batch_v * fx.Index(stride_b0) + head_q * fx.Index(stride_b1)
+            _b_head = _q_batch_v * fx.Index(stride_b_batch) + head_q * fx.Index(stride_b_head)
         _k_row_off_v = fx.Index(k_row_off)
 
         # `max(seqlen - 1, 0)`: `fx.Index` is unsigned, so a bare `seqlen - 1`
@@ -741,12 +741,12 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                     s = fastmath.mul(fx.Float32(Vec(s_acc)[e]), sm_log2e)
                     if const_expr(BIAS_TYPE):
                         # This half holds one kv column and eight q rows, so
-                        # the eight bias entries are `stride_b2` apart and each
+                        # the eight bias entries are `stride_b_seq_q` apart and each
                         # is its own load -- the standalone dK/dV kernel pays
                         # exactly this. Clamped, since a dead row still issues
                         # the load and `dead` below is what removes it.
                         _bq = fx.Index(q_g) if (q_g < seqlen_q_i32) else fx.Index(0)
-                        _bo = _b_head + (_q_row_off_v + _bq) * fx.Index(stride_b2) + fx.Index(kv_row_i32)
+                        _bo = _b_head + (_q_row_off_v + _bq) * fx.Index(stride_b_seq_q) + fx.Index(kv_row_i32)
                         _bv = fx.Float32(fx.as_dsl_value(load_bias_1(_bo)).to(fx.Float32))
                         s = fastmath.add(s, fastmath.mul(_bv, fx.Float32(_LOG2E)))
                     s = fastmath.sub(s, fastmath.mul(fx.Float32(lse), fx.Float32(_LOG2E)))
@@ -822,7 +822,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             # dq by sm_scale and leaves dv alone).
             dk_ap = fmha.Aperture(qk_cols)
             dv_ap = fmha.Aperture(vo_cols)
-            scale_vec = Vec.from_elements([sm_scale_arg], fx.Float32).broadcast_to(8).ir_value()
+            scale_vec = Vec.from_elements([sm_scale], fx.Float32).broadcast_to(8).ir_value()
             row_in_tile = wave_id * fx.Index(WMMA_N) + lane16
 
             def write_dk(row, col, val):
@@ -926,7 +926,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                     _bq = fx.Index(q_row_i32) if (q_row_i32 < seqlen_q_i32) else fx.Index(0)
                     _bo = (
                         _b_head
-                        + (_q_row_off_v + _bq) * fx.Index(stride_b2)
+                        + (_q_row_off_v + _bq) * fx.Index(stride_b_seq_q)
                         + fx.Index(start_k_i)
                         + klane * fx.Index(WMMA_LANE_K)
                     )
@@ -988,7 +988,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             results = listify(results, ND)
 
             dq_ap = fmha.Aperture(qk_cols)
-            scale_vec = Vec.from_elements([sm_scale_arg], fx.Float32).broadcast_to(8).ir_value()
+            scale_vec = Vec.from_elements([sm_scale], fx.Float32).broadcast_to(8).ir_value()
 
             def write_dq(row, col, val):
                 store_global_v8(dq_ptr, dq_tbase(q_start_safe), dq_toff(row, col), val)
@@ -1017,13 +1017,13 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        DO: fx.Pointer,
         Bias: fx.Pointer,
+        DO: fx.Pointer,
         DK: fx.Pointer,
         DV: fx.Pointer,
         DQ: fx.Pointer,
-        L: fx.Pointer,
-        Dlt: fx.Pointer,
+        LSE: fx.Pointer,
+        Delta: fx.Pointer,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
@@ -1041,6 +1041,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
+        sm_scale: fx.Float32,
         stride_q_batch: fx.Int64,
         stride_q_head: fx.Int64,
         stride_q_seq: fx.Int64,
@@ -1062,10 +1063,9 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
-        stride_b0: fx.Int64,
-        stride_b1: fx.Int64,
-        stride_b2: fx.Int64,
-        sm_scale_arg: fx.Float32,
+        stride_b_batch: fx.Int64,
+        stride_b_head: fx.Int64,
+        stride_b_seq_q: fx.Int64,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -1079,13 +1079,13 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             Q,
             K,
             V,
-            DO,
             Bias,
+            DO,
             DK,
             DV,
             DQ,
-            L,
-            Dlt,
+            LSE,
+            Delta,
             seqinfo_q0,
             seqinfo_q1,
             seqinfo_k0,
@@ -1103,6 +1103,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             num_head_k,
             hdim_qk,
             hdim_vo,
+            sm_scale,
             stride_q_batch,
             stride_q_head,
             stride_q_seq,
@@ -1124,10 +1125,9 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             stride_dq_batch,
             stride_dq_head,
             stride_dq_seq,
-            stride_b0,
-            stride_b1,
-            stride_b2,
-            sm_scale_arg,
+            stride_b_batch,
+            stride_b_head,
+            stride_b_seq_q,
         )
 
         if const_expr(WAVES_PER_EU is not None):
@@ -1232,9 +1232,9 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         abi.run_compiled(
             _COMPILED,
             launch_bwd_fuse,
-            *[abi.ptr_arg(t) for t in (Q, K, V, DO)],
+            *[abi.ptr_arg(t) for t in (Q, K, V)],
             _bp,
-            *[abi.ptr_arg(t) for t in (DK, DV, DQ, L, Delta)],
+            *[abi.ptr_arg(t) for t in (DO, DK, DV, DQ, L, Delta)],
             _sq0,
             _sq1,
             _sk0,
@@ -1252,11 +1252,11 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             nhk,
             hqk,
             hvo,
+            _scale,
             *st,
             _sb0,
             _sb1,
             _sb2,
-            _scale,
             stream if stream is not None else fx.Stream(None),
         )
 

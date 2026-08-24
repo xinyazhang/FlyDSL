@@ -406,11 +406,11 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        DO: fx.Pointer,
         Bias: fx.Pointer,
+        DO: fx.Pointer,
         DK: fx.Pointer,
         DV: fx.Pointer,
-        L: fx.Pointer,
+        LSE: fx.Pointer,
         Delta: fx.Pointer,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
@@ -432,6 +432,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
+        sm_scale: fx.Float32,
         stride_q_batch: fx.Int64,
         stride_q_head: fx.Int64,
         stride_q_seq: fx.Int64,
@@ -450,10 +451,9 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         stride_dv_batch: fx.Int64,
         stride_dv_head: fx.Int64,
         stride_dv_seq: fx.Int64,
-        stride_b0: fx.Int64,
-        stride_b1: fx.Int64,
-        stride_b2: fx.Int64,
-        sm_scale_arg: fx.Float32,
+        stride_b_batch: fx.Int64,
+        stride_b_head: fx.Int64,
+        stride_b_seq_q: fx.Int64,
     ):
         elem_type = elem_numeric_cls.ir_type
         elem_dtype = elem_numeric_cls
@@ -472,7 +472,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             bias_ptr = fmha.pointer_to_llvm_ptr(Bias)
         dk_ptr = fmha.pointer_to_llvm_ptr(DK)
         dv_ptr = fmha.pointer_to_llvm_ptr(DV)
-        l_ptr = fmha.pointer_to_llvm_ptr(L)
+        l_ptr = fmha.pointer_to_llvm_ptr(LSE)
         delta_ptr = fmha.pointer_to_llvm_ptr(Delta)
 
         v8f16_type = Vec.make_type(8, elem_dtype)
@@ -553,7 +553,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         _q_row_off_v = fx.Index(q_row_off)
         _k_row_off_v = fx.Index(k_row_off)
 
-        sm_log2e = fastmath.mul(sm_scale_arg, fx.Float32(_LOG2E))
+        sm_log2e = fastmath.mul(sm_scale, fx.Float32(_LOG2E))
 
         # ---- Column masking, PADDED_HEAD ----
         # One rule, exactly as the forward: an element is valid iff its column
@@ -577,7 +577,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
 
             Scalar, and unavoidably so: this kernel runs the loop transposed,
             so a lane holds one kv column and eight q *rows*, and those eight
-            bias entries are `stride_b2` apart rather than adjacent. The dQ
+            bias entries are `stride_b_seq_q` apart rather than adjacent. The dQ
             kernel, walking the other axis, gets all eight in one v8. It is the
             same layout cost the dropout path here already pays, and the reason
             dB is emitted from dQ rather than from this kernel.
@@ -846,7 +846,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                 # Rebuilt per iteration because `head_q` moves with the GQA
                 # fold, exactly as the Q/dO addressing above is. Uniform
                 # scalars, so this is SGPR arithmetic.
-                _b_head = _q_batch_v * fx.Index(stride_b0) + head_q * fx.Index(stride_b1)
+                _b_head = _q_batch_v * fx.Index(stride_b_batch) + head_q * fx.Index(stride_b_head)
 
             _fetch_q = fmha.reader(q_addr, lambda b, o: load_global_f16xN(q_ptr, b, o))(_q_row_start)
             _fetch_do = fmha.reader(do_addr, lambda b, o: load_global_f16xN(do_ptr, b, o))(_q_row_start)
@@ -1018,7 +1018,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                         # staging has with its clamped rows.
                         _bq = fx.Index(_q_row_i32) if _q_ok else fx.Index(0)
                         _bk = kv_row_abs if (kv_row_abs_i32 < seqlen_k_i32) else fx.Index(0)
-                        _boff = _b_head + (_q_row_off_v + _bq) * fx.Index(stride_b2) + _bk
+                        _boff = _b_head + (_q_row_off_v + _bq) * fx.Index(stride_b_seq_q) + _bk
                         _bv = fx.Float32(fx.as_dsl_value(load_global_f16(bias_ptr, _boff)).to(fx.Float32))
                         _s = fastmath.add(_s, fastmath.mul(_bv, fx.Float32(_LOG2E)))
                     _e = fastmath.sub(_s, fastmath.mul(fx.Float32(_lse), fx.Float32(_LOG2E)))
@@ -1139,7 +1139,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             # dK carries the sm_scale AOTriton applies once at the end: the
             # accumulator is dS^T Q with dS taken against the *unscaled* score,
             # so the chain rule's factor lands here rather than per element.
-            _scale_vec = Vec.from_elements([fx.Float32(sm_scale_arg)], fx.Float32).broadcast_to(8).ir_value()
+            _scale_vec = Vec.from_elements([fx.Float32(sm_scale)], fx.Float32).broadcast_to(8).ir_value()
             # Under the split each wave stores only the head-dim half it
             # accumulated; the pair writes disjoint columns, hence no reduction.
             for dc in range_constexpr(D_STEPS_OWN):
@@ -1157,11 +1157,11 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        DO: fx.Pointer,
         Bias: fx.Pointer,
+        DO: fx.Pointer,
         DK: fx.Pointer,
         DV: fx.Pointer,
-        L: fx.Pointer,
+        LSE: fx.Pointer,
         Delta: fx.Pointer,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
@@ -1183,6 +1183,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
+        sm_scale: fx.Float32,
         stride_q_batch: fx.Int64,
         stride_q_head: fx.Int64,
         stride_q_seq: fx.Int64,
@@ -1201,10 +1202,9 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         stride_dv_batch: fx.Int64,
         stride_dv_head: fx.Int64,
         stride_dv_seq: fx.Int64,
-        stride_b0: fx.Int64,
-        stride_b1: fx.Int64,
-        stride_b2: fx.Int64,
-        sm_scale_arg: fx.Float32,
+        stride_b_batch: fx.Int64,
+        stride_b_head: fx.Int64,
+        stride_b_seq_q: fx.Int64,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -1219,11 +1219,11 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             Q,
             K,
             V,
-            DO,
             Bias,
+            DO,
             DK,
             DV,
-            L,
+            LSE,
             Delta,
             seqinfo_q0,
             seqinfo_q1,
@@ -1245,6 +1245,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             num_head_k,
             hdim_qk,
             hdim_vo,
+            sm_scale,
             stride_q_batch,
             stride_q_head,
             stride_q_seq,
@@ -1263,10 +1264,9 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             stride_dv_batch,
             stride_dv_head,
             stride_dv_seq,
-            stride_b0,
-            stride_b1,
-            stride_b2,
-            sm_scale_arg,
+            stride_b_batch,
+            stride_b_head,
+            stride_b_seq_q,
         )
 
         if const_expr(WAVES_PER_EU is not None):
@@ -1356,9 +1356,9 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             _COMPILED,
             launch_bwd_dkdv,
             # `ptrs` is (Q, K, V, DO, DK, DV); Bias joins the inputs.
-            *ptrs[:4],
+            *ptrs[:3],
             _bp,
-            *ptrs[4:],
+            *ptrs[3:],
             _lp,
             _dp,
             _sq0,
@@ -1378,11 +1378,11 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             _ip,
             _dsc,
             *meta_t,
+            abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
             *st,
             _sb0,
             _sb1,
             _sb2,
-            abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
             stream if stream is not None else fx.Stream(None),
         )
 
