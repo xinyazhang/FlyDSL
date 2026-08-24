@@ -374,7 +374,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        Bias: fx.Pointer,
+        B: fx.Pointer,
         DO: fx.Pointer,
         DK: fx.Pointer,
         DV: fx.Pointer,
@@ -494,7 +494,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         # variable, so unlike the standalone dK/dV kernel the base is built
         # once.
         if const_expr(BIAS_TYPE):
-            bias_ptr = fmha.pointer_to_llvm_ptr(Bias)
+            bias_ptr = fmha.pointer_to_llvm_ptr(B)
             _b_head = _q_batch_v * fx.Index(stride_b_batch) + head_q * fx.Index(stride_b_head)
         _k_row_off_v = fx.Index(k_row_off)
 
@@ -1017,7 +1017,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        Bias: fx.Pointer,
+        B: fx.Pointer,
         DO: fx.Pointer,
         DK: fx.Pointer,
         DV: fx.Pointer,
@@ -1079,7 +1079,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             Q,
             K,
             V,
-            Bias,
+            B,
             DO,
             DK,
             DV,
@@ -1228,11 +1228,11 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         _scale = float(scale) if scale is not None else float(sm_scale)
         # `with_db=False`: dB is the standalone dQ kernel's, so the DB slot is
         # discarded rather than being a kernarg this one does not have.
-        _bp, _, _sb0, _sb1, _sb2 = abi.bias_args(BIAS_TYPE, False, bias, None, Q)
+        _bp, _, _bs, _ = abi.bias_args(BIAS_TYPE, False, bias, None, Q)
         abi.run_compiled(
             _COMPILED,
             launch_bwd_fuse,
-            # Q, K, V, Bias, DO, <outputs>, LSE, Delta -- the shared backward
+            # Q, K, V, B, DO, <outputs>, LSE, Delta -- the shared backward
             # block, with `<outputs>` = (DK, DV, DQ) for the fused kernel.
             *[abi.ptr_arg(t) for t in (Q, K, V)],
             _bp,
@@ -1256,9 +1256,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             hvo,
             _scale,
             *st,
-            _sb0,
-            _sb1,
-            _sb2,
+            *_bs,
             stream if stream is not None else fx.Stream(None),
         )
 

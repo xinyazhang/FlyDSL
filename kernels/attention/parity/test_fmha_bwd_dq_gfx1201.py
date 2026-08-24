@@ -1075,3 +1075,27 @@ def test_bias_and_causal_are_rejected_together():
     """As in the forward: a bias already is an additive mask."""
     with pytest.raises(ValueError, match="mutually exclusive"):
         bwd_dq_plan(BwdDqInputMetadata(num_heads=2, head_dim=64, causal=True, bias=True))
+
+
+def test_dbias_with_a_different_layout_from_bias():
+    """B and DB carry separate strides, so DB need not be laid out like B.
+
+    The kernel briefly derived one from the other, which is invisible while
+    both are contiguous and writes to the wrong addresses the moment either is
+    a view. `dbias` here is a column slice of a wider buffer: its last axis is
+    still contiguous, as the ABI requires, but its row pitch is twice B's.
+    """
+    _require_env()
+    q, k, v, do = _qkv(1, 2, 2, 128, 128, 64, torch.float16)
+    gen = torch.Generator(device=q.device).manual_seed(31)
+    bias = torch.randn(1, 2, 128, 128, dtype=q.dtype, device=q.device, generator=gen)
+    _, _, _, _, db_ref = _bias_reference(q, k, v, do, bias)
+
+    wide = torch.zeros(1, 2, 128, 256, dtype=q.dtype, device=q.device)
+    dbias = wide[..., :128]
+    assert dbias.stride(3) == 1 and dbias.stride(2) != bias.stride(2)
+    _bias_dq(q, k, v, do, bias, dbias=dbias)
+
+    assert _rel(dbias, db_ref) < _RTOL, f"dB rel={_rel(dbias, db_ref):.3e}"
+    # Nothing may have landed outside the slice.
+    assert wide[..., 128:].abs().max().item() == 0.0, "dB wrote past its own columns"

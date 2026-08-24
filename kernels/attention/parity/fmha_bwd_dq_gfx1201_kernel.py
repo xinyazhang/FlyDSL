@@ -402,7 +402,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        Bias: fx.Pointer,
+        B: fx.Pointer,
         DO: fx.Pointer,
         DQ: fx.Pointer,
         DB: fx.Pointer,
@@ -444,6 +444,9 @@ def build_bwd_dq_module_primary(meta, knobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
+        stride_b_batch: fx.Int64,
+        stride_b_head: fx.Int64,
+        stride_b_seq_q: fx.Int64,
         stride_db_batch: fx.Int64,
         stride_db_head: fx.Int64,
         stride_db_seq_q: fx.Int64,
@@ -668,8 +671,15 @@ def build_bwd_dq_module_primary(meta, knobs):
         # `sdpa-bias-plan.md` 3 argument, unchanged. One row per lane, since a
         # lane owns one Q row for the whole KV loop.
         if const_expr(BIAS_TYPE):
-            _b_ptr = fmha.pointer_to_llvm_ptr(Bias)
+            _b_ptr = fmha.pointer_to_llvm_ptr(B)
             _b_row = (
+                _q_batch_v * fx.Index(stride_b_batch)
+                + head_q * fx.Index(stride_b_head)
+                + (_q_row_off_v + q_row) * fx.Index(stride_b_seq_q)
+            )
+            # DB is a different tensor and may be laid out differently, so it
+            # gets its own row rather than reusing B's.
+            _db_row = (
                 _q_batch_v * fx.Index(stride_db_batch)
                 + head_q * fx.Index(stride_db_head)
                 + (_q_row_off_v + q_row) * fx.Index(stride_db_seq_q)
@@ -1063,7 +1073,7 @@ def build_bwd_dq_module_primary(meta, knobs):
                     ).ir_value()
                     store_global_v8(
                         _db_ptr,
-                        _b_row + fx.Index(kv_block_start) + fx.Index(_st * WMMA_N) + klane * fx.Index(8),
+                        _db_row + fx.Index(kv_block_start) + fx.Index(_st * WMMA_N) + klane * fx.Index(8),
                         fx.Index(0),
                         _dbv,
                     )
@@ -1189,7 +1199,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        Bias: fx.Pointer,
+        B: fx.Pointer,
         DO: fx.Pointer,
         DQ: fx.Pointer,
         DB: fx.Pointer,
@@ -1231,6 +1241,9 @@ def build_bwd_dq_module_primary(meta, knobs):
         stride_dq_batch: fx.Int64,
         stride_dq_head: fx.Int64,
         stride_dq_seq: fx.Int64,
+        stride_b_batch: fx.Int64,
+        stride_b_head: fx.Int64,
+        stride_b_seq_q: fx.Int64,
         stride_db_batch: fx.Int64,
         stride_db_head: fx.Int64,
         stride_db_seq_q: fx.Int64,
@@ -1248,7 +1261,7 @@ def build_bwd_dq_module_primary(meta, knobs):
             Q,
             K,
             V,
-            Bias,
+            B,
             DO,
             DQ,
             DB,
@@ -1290,6 +1303,9 @@ def build_bwd_dq_module_primary(meta, knobs):
             stride_dq_batch,
             stride_dq_head,
             stride_dq_seq,
+            stride_b_batch,
+            stride_b_head,
+            stride_b_seq_q,
             stride_db_batch,
             stride_db_head,
             stride_db_seq_q,
@@ -1394,10 +1410,10 @@ def build_bwd_dq_module_primary(meta, knobs):
             False, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
         )
         _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(ENABLE_DROPOUT, dropout_p, seed, off1, off2, Q.device)
-        _bp, _dbp, _sb0, _sb1, _sb2 = abi.bias_args(BIAS_TYPE, True, bias, dbias, Q)
+        _bp, _dbp, _bs, _dbs = abi.bias_args(BIAS_TYPE, True, bias, dbias, Q)
         return (
             # The shared backward pointer block is
-            #     Q, K, V, Bias, DO, <outputs>, LSE, Delta
+            #     Q, K, V, B, DO, <outputs>, LSE, Delta
             # and `<outputs>` is what differs between the split kernels: here
             # it is (DQ, DB), in dK/dV (DK, DV). `ptrs` arrives as
             # (Q, K, V, DO, DQ), so Bias splices in ahead of DO and DB joins
@@ -1428,9 +1444,8 @@ def build_bwd_dq_module_primary(meta, knobs):
             *meta_t,
             abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
             *st,
-            _sb0,
-            _sb1,
-            _sb2,
+            *_bs,
+            *_dbs,
         )
 
     def _launch(

@@ -406,7 +406,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        Bias: fx.Pointer,
+        B: fx.Pointer,
         DO: fx.Pointer,
         DK: fx.Pointer,
         DV: fx.Pointer,
@@ -469,7 +469,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         do_ptr = fmha.pointer_to_llvm_ptr(DO)
         do_ptr_i64 = _to_global_ptr_i64(DO)
         if const_expr(BIAS_TYPE):
-            bias_ptr = fmha.pointer_to_llvm_ptr(Bias)
+            bias_ptr = fmha.pointer_to_llvm_ptr(B)
         dk_ptr = fmha.pointer_to_llvm_ptr(DK)
         dv_ptr = fmha.pointer_to_llvm_ptr(DV)
         l_ptr = fmha.pointer_to_llvm_ptr(LSE)
@@ -1157,7 +1157,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        Bias: fx.Pointer,
+        B: fx.Pointer,
         DO: fx.Pointer,
         DK: fx.Pointer,
         DV: fx.Pointer,
@@ -1219,7 +1219,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             Q,
             K,
             V,
-            Bias,
+            B,
             DO,
             DK,
             DV,
@@ -1351,12 +1351,12 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         )
         # `with_db=False`: dB is the dQ kernel's, so the DB slot is discarded
         # rather than being a kernarg this kernel does not have.
-        _bp, _, _sb0, _sb1, _sb2 = abi.bias_args(BIAS_TYPE, False, bias, None, Q)
+        _bp, _, _bs, _ = abi.bias_args(BIAS_TYPE, False, bias, None, Q)
         abi.run_compiled(
             _COMPILED,
             launch_bwd_dkdv,
             # The shared backward pointer block is
-            #     Q, K, V, Bias, DO, <outputs>, LSE, Delta
+            #     Q, K, V, B, DO, <outputs>, LSE, Delta
             # with `<outputs>` = (DK, DV) here; the dQ kernel's is (DQ, DB),
             # dB being one of its outputs rather than an extra slot.
             *ptrs[:3],
@@ -1383,9 +1383,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             *meta_t,
             abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
             *st,
-            _sb0,
-            _sb1,
-            _sb2,
+            *_bs,
             stream if stream is not None else fx.Stream(None),
         )
 

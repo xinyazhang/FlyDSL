@@ -475,7 +475,14 @@ def dropout_outputs(enable_dropout, seed_output, offset_output):
 
 
 def bias_args(bias_type, emit_db, bias, dbias, like):
-    """(Bias, DB, stride_b0, stride_b1, stride_b2) in launch order.
+    """`(B, DB, b_strides, db_strides)`, each stride set a `(batch, head, seq_q)`
+    triple in launch order.
+
+    **Two triples, not one.** B and DB are separate tensors and may be laid out
+    differently -- `dbias` is the caller's buffer, and nothing obliges it to
+    match the bias it is the gradient of. Deriving one from the other happens
+    to work whenever both are contiguous, which is why it survived a first
+    pass, and writes to the wrong addresses the moment either is a view.
 
     The bias is `(B, H, Sq, Sk)`, so its three leading strides are batch, head
     and *query row* -- the last axis is the KV column and is the contiguous one
@@ -498,7 +505,7 @@ def bias_args(bias_type, emit_db, bias, dbias, like):
     if not bias_type:
         if bias is not None:
             raise ValueError("bias= was passed but this build has bias=False; rebuild with bias=True")
-        return NULL_PTR, NULL_PTR, 0, 0, 0
+        return NULL_PTR, NULL_PTR, (0, 0, 0), (0, 0, 0)
     if bias is None:
         raise ValueError("this build has bias=True and requires bias=")
     if bias.dim() != 4:
@@ -522,8 +529,9 @@ def bias_args(bias_type, emit_db, bias, dbias, like):
         db = ptr_arg(dbias)
     elif dbias is not None:
         raise ValueError("dbias= was passed to a kernel that does not write dB; that is the dQ kernel's")
-    sb = bias.stride()
-    return ptr_arg(bias), db, sb[0], sb[1], sb[2]
+    sb = bias.stride()[:3]
+    sdb = dbias.stride()[:3] if emit_db else (0, 0, 0)
+    return ptr_arg(bias), db, sb, sdb
 
 
 def dropout_args(enable_dropout, dropout_p, seed, offset1, offset2, device=None, stream=None):
