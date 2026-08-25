@@ -746,7 +746,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         philox_offset_output: fx.Pointer,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
-        num_head: fx.Int32,
+        num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
@@ -888,7 +888,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # MQA/GQA: Num_head_q / Num_head_k query heads share each KV head.
         # The ratio is uniform and computed once, so the scalar divide is
         # immaterial; the per-head division below is by that ratio.
-        head_k = head_q // (fx.Index(num_head) // fx.Index(num_head_k))
+        head_k = head_q // (fx.Index(num_head_q) // fx.Index(num_head_k))
 
         load_row_in_batch = tid // K_TPR_LOAD
         load_lane_in_row = tid % K_TPR_LOAD
@@ -949,7 +949,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             sm_log2e = fastmath.mul(sm_scale, fx.Float32(_LOG2E))
 
         # Q and O are indexed by the query head; K and V by the KV head they
-        # share. At num_head == num_head_k these coincide.
+        # share. At num_head_q == num_head_k these coincide.
         _q_batch_v = fx.Index(q_batch)
         _k_batch_v = fx.Index(k_batch)
         _q_row_off_v = fx.Index(q_row_off)
@@ -984,7 +984,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # The offset scheme itself is `Philox.grid_plane`/`grid_offset`,
             # shared with the debug mask kernel -- see the comment there. This
             # kernel supplies only which plane a workgroup is on.
-            _off_zh = fx.Int32(z_i32) * fx.Int32(num_head) + fx.Int32(head_q)
+            _off_zh = fx.Int32(z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
             _ph_seed = fmha.philox_seed_value(philox_seed_ptr)
             _ph_off = fmha.philox_offset_base(philox_offset1, philox_offset2)
             fmha.philox_report(philox_seed_output, philox_offset_output, _ph_seed, _ph_off)
@@ -1901,9 +1901,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 #   _HT  (H, T)   AOTriton's, and the default: T contiguous
                 #   _TH  (T, H)   Transformer Engine's:         H contiguous
                 # Compact in both layouts, so the head pitch is exactly
-                # num_head and the token pitch is the decode's `tokens`.
+                # num_head_q and the token pitch is the decode's `tokens`.
                 _row = _q_row_off_v + q_rows[qt]
-                _lse_off, _ = fmha.lse_row_addressing(varlen_bits, _q_batch_v, head_q, num_head, lse_tokens, _row)
+                _lse_off, _ = fmha.lse_row_addressing(varlen_bits, _q_batch_v, head_q, num_head_q, lse_tokens, _row)
                 _pointer_store(
                     _lse,
                     buffer_ops.get_element_ptr(
@@ -1982,7 +1982,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         philox_offset_output: fx.Pointer,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
-        num_head: fx.Int32,
+        num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
@@ -2043,7 +2043,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             philox_offset_output,
             idropout_p,
             dropout_scale,
-            num_head,
+            num_head_q,
             num_head_k,
             hdim_qk,
             hdim_vo,
@@ -2115,7 +2115,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
 
         launcher.launch(
-            grid=(fx.Index(num_head), num_q_tiles, nseq_idx),
+            grid=(fx.Index(num_head_q), num_q_tiles, nseq_idx),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
         )

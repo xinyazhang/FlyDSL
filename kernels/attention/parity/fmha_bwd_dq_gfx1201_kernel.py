@@ -98,7 +98,7 @@ See ``fmha_tuning_bwd_dq_gfx1201.py`` for what is worth measuring first.
 Shape:  Q/K/V/dO/dQ are BHSD (batch, num_heads, seq_len, head_dim); the memory
         layout is free so long as D is innermost. Strides arrive as
         (batch, head, seq) -- axis 3 is never passed.
-Grid:   (num_head, num_q_tiles, batch)
+Grid:   (num_head_q, num_q_tiles, batch)
 """
 
 import math as host_math
@@ -423,7 +423,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         philox_offset2: fx.Int64,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
-        num_head: fx.Int32,
+        num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
@@ -528,8 +528,8 @@ def build_bwd_dq_module_primary(meta, knobs):
         # past this sequence.
         _q_start_addr = fx.Index(start_q if _alive else fx.Index(0))
 
-        # MQA/GQA: num_head / num_head_k query heads share each KV head.
-        head_k = head_q // (fx.Index(num_head) // fx.Index(num_head_k))
+        # MQA/GQA: num_head_q / num_head_k query heads share each KV head.
+        head_k = head_q // (fx.Index(num_head_q) // fx.Index(num_head_k))
 
         load_row_in_batch = tid // K_TPR_LOAD
         load_col_base = (tid % K_TPR_LOAD) * VEC_WIDTH
@@ -725,12 +725,12 @@ def build_bwd_dq_module_primary(meta, knobs):
         # discarded by the select below.
         _tok_i32 = lse_tokens
         _lse_tok = common_utils.smin(q_row_off + q_row_i32, _tok_i32 - fx.Int32(1))
-        _nhq_v = fx.Index(num_head)
+        _nhq_v = fx.Index(num_head_q)
         _tok_v = fx.Index(_tok_i32)
         _tok_row = fx.Index(common_utils.smax(_lse_tok, fx.Int32(0)))
         #   _HT  (H, T)   AOTriton's, and the default: T contiguous
         #   _TH  (T, H)   Transformer Engine's:         H contiguous
-        _lse_base, _lse_pitch = fmha.lse_row_addressing(varlen_bits, _q_batch_v, head_q, num_head, _tok_i32, _tok_row)
+        _lse_base, _lse_pitch = fmha.lse_row_addressing(varlen_bits, _q_batch_v, head_q, num_head_q, _tok_i32, _tok_row)
         # `_tok_row` is already the clamped absolute row, so the offset is the
         # base itself -- this caller wants one row, not a range.
         _lse_off = _lse_base
@@ -765,7 +765,7 @@ def build_bwd_dq_module_primary(meta, knobs):
             # regenerated mask differs and the gradient is silently wrong,
             # which is why both call `Philox.grid_plane` / `grid_offset`
             # rather than transcribing the formula.
-            _off_zh = fx.Int32(z_i32) * fx.Int32(num_head) + fx.Int32(head_q)
+            _off_zh = fx.Int32(z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
             _ph_seed = fmha.philox_seed_value(philox_seed_ptr)
             _ph_off = fmha.philox_offset_base(philox_offset1, philox_offset2)
             _ph_base, _ph_stride = PHILOX.grid_plane(_ph_off, _off_zh, max_seqlen_q, max_seqlen_k)
@@ -1220,7 +1220,7 @@ def build_bwd_dq_module_primary(meta, knobs):
         philox_offset2: fx.Int64,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
-        num_head: fx.Int32,
+        num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
@@ -1281,7 +1281,7 @@ def build_bwd_dq_module_primary(meta, knobs):
             philox_offset2,
             idropout_p,
             dropout_scale,
-            num_head,
+            num_head_q,
             num_head_k,
             hdim_qk,
             hdim_vo,
@@ -1352,7 +1352,7 @@ def build_bwd_dq_module_primary(meta, knobs):
                 op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
 
         launcher.launch(
-            grid=(fx.Index(num_head), num_q_tiles, nseq_idx),
+            grid=(fx.Index(num_head_q), num_q_tiles, nseq_idx),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
         )
