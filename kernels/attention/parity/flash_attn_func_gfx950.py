@@ -222,6 +222,38 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         class SharedStorage:
             kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
 
+    # `Workspace`, `BlockTable` and `block_table_stride` are the three kernargs
+    # gfx950 carries and gfx1201 does not -- split-K and paged, neither of which
+    # exists over there. Every one of their consumers already sits behind a
+    # compile-time guard (`const_expr(traits.SPLITK)` in `init_workspace` and
+    # `init_workspace_io`, `const_expr(traits.PAGED)` in `GenericPageIdLoader`
+    # and `init_descriptors`, `DUALWAVE_SWP_DEBUG_LAZY_COUNTS` for the lazy
+    # counts), so in a build with those off nothing reads them.
+    #
+    # **Annotating them `Constexpr` in that case removes the kernarg entirely**,
+    # rather than passing a null pointer in a slot that still exists:
+    # `compiler/kernel_function.py` sorts constexpr-annotated parameters into
+    # `constexpr_values` and never adds them to `kernel_arg_types`. That matters
+    # because the slots sit *between* `LSE` and `seqinfo_q0`, so leaving them
+    # occupied would shift every later argument two positions away from
+    # gfx1201's layout -- a consumer that hardcodes the kernarg block reads the
+    # wrong slots no matter what the pointers contain. With them gone the
+    # forward's kernarg is byte-identical to `flash_attn_func_aiw_kernel`'s.
+    #
+    # The annotation can be a per-build choice because this `def` executes on
+    # every build and the module has no `from __future__ import annotations`,
+    # so the expression is evaluated here rather than kept as a string.
+    #
+    # The stand-in value is `0` and not `None` because a constexpr value becomes
+    # part of the JIT cache key through `Constexpr.value_signature`, which
+    # accepts int/bool/float/str/tuple/lambda and raises on anything else. It is
+    # never read; the guards above see to that.
+    _WS_RUNTIME = bool(traits.SPLITK or traits.DUALWAVE_SWP_DEBUG_LAZY_COUNTS)
+    _BT_RUNTIME = bool(traits.PAGED)
+    _WS_ANN = fx.Tensor if _WS_RUNTIME else fx.Constexpr
+    _BT_ANN = fx.Tensor if _BT_RUNTIME else fx.Constexpr
+    _BTS_ANN = fx.Int32 if _BT_RUNTIME else fx.Constexpr
+
     @flyc.kernel(known_block_size=[traits.BLOCK_SIZE, 1, 1])
     def flash_attn_func_gfx950_kernel(
         Q: fx.Tensor,
@@ -230,8 +262,8 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         B: fx.Tensor,
         O: fx.Tensor,  # noqa: E741
         LSE: fx.Tensor,
-        Workspace: fx.Tensor,
-        BlockTable: fx.Tensor,
+        Workspace: _WS_ANN,
+        BlockTable: _BT_ANN,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
@@ -249,7 +281,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         philox_offset_output: fx.Pointer,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
-        num_head: fx.Int32,
+        num_head_q: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
@@ -269,7 +301,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         stride_b_batch: fx.Int64,
         stride_b_head: fx.Int64,
         stride_b_seq_q: fx.Int64,
-        block_table_stride: fx.Int32,
+        block_table_stride: _BTS_ANN,
     ):
         ctx = (WideKernelContext if WIDE else ParityKernelContext)(
             traits,
@@ -288,7 +320,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
                 stride_o_seq,
             ),
             sm_scale=sm_scale,
-            num_head_q=num_head,
+            num_head_q=num_head_q,
             num_head_k=num_head_k,
             hdim_qk=hdim_qk,
             hdim_vo=hdim_vo,
@@ -937,8 +969,8 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         O: fx.Tensor,  # noqa: E741
         LSE: fx.Tensor,
         Bias: fx.Tensor,
-        Workspace: fx.Tensor,
-        BlockTable: fx.Tensor,
+        Workspace: _WS_ANN,
+        BlockTable: _BT_ANN,
         batch_size: fx.Int32,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
@@ -977,7 +1009,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         stride_b_batch: fx.Int64,
         stride_b_head: fx.Int64,
         stride_b_seq_q: fx.Int64,
-        block_table_stride: fx.Int32,
+        block_table_stride: _BTS_ANN,
         stream: fx.Stream = fx.Stream(None),
     ):
         # Make the build configuration visible to the JIT cache key.
@@ -1257,8 +1289,13 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         )
 
         lse_out = lse if lse is not None else O
-        ws = workspace if workspace is not None else O
-        bt = block_table if block_table is not None else O
+        # When the build folds these away (see `_WS_ANN` at the kernel), the
+        # slot still has to be *filled* -- the launcher's parameter is still
+        # positional, it is just constexpr, so the value is consumed at trace
+        # time instead of becoming a kernarg. `0` rather than the old `O`
+        # stand-in, so the JIT cache key does not vary with an unused tensor.
+        ws = (workspace if workspace is not None else O) if _WS_RUNTIME else 0
+        bt = (block_table if block_table is not None else O) if _BT_RUNTIME else 0
 
         # `abi.varlen_args` is gfx1201's, reused unedited: it encodes the same
         # wire format, and it is where the two host-side checks live that no

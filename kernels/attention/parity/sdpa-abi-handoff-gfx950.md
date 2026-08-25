@@ -118,6 +118,12 @@ One name was contested and gfx950 keeps it: `num_head_q`, not `num_head`.
 mapping and a rename would move away from AOTriton, not toward it. gfx1201
 briefly renamed it and reverted.
 
+> **The reasoning in this paragraph is wrong; the conclusion still stands.**
+> `wires_to='Num_head_q'` names the attribute ATI reads off its *context
+> object*, not the kernel argument it feeds, so it says nothing about what the
+> kernarg should be called. See the outcome section: gfx950 keeps `num_head_q`
+> as a decision, and gfx1201 currently spells it `num_head`.
+
 ## Two traps, both of which cost us a cycle
 
 **Moving a kernarg is two edits, not one.** The signature and the host tuple
@@ -187,27 +193,71 @@ Where it was stale, for the next person:
   separate arguments, which is the shape the item asks for and the bug it warns
   about is not present. The gfx1201 regression test it recommends copying is
   still worth copying and is **not** yet ported.
-- **`num_head_q` went the other way.** This document says gfx950 keeps
-  `num_head_q` and that gfx1201 "briefly renamed it and reverted", citing
-  `flyc_attn_fwd.py:231` wiring to `Num_head_q`. `1b58fb93` then renamed it to
-  `num_head` in all four gfx1201 kernels, on the grounds that AOTriton's pair is
-  `num_head`/`num_head_k`. gfx950 has followed gfx1201, because aligning with
-  gfx1201 was the instruction. **The two claims about what AOTriton wires to
-  cannot both be right, and `flyati/` is not checked out here, so this was not
-  verified from the ATI side.** If `Num_head_q` is what it actually wires to,
-  this rename is the wrong direction for all eight kernels and is one `sed` to
-  undo in either family.
+- **`num_head_q` is the one place gfx950 does *not* follow gfx1201, and the
+  argument both sides used was void.** This document argued for `num_head_q`
+  from `flyc_attn_fwd.py:231` wiring to `Num_head_q`; `1b58fb93` argued for
+  `num_head` from AOTriton's `num_head`/`num_head_k` pair and renamed all four
+  gfx1201 kernels. **`wires_to='Num_head_q'` names the attribute ATI reads off
+  its *context object* — the input side — not the kernel argument it feeds.**
+  So that line constrains neither spelling, and the "1:1 mapping" reasoning in
+  the section above is wrong even though its conclusion is the one adopted.
+  gfx950 keeps `num_head_q` by decision, not by inference.
 
-What changed on gfx950: `Bias` -> `B` in all three kernels; `B` moved ahead of
-`O` in the forward; `num_head_q` -> `num_head` in all three kernarg lists. The
-context keyword stays `num_head_q=` — the shared `flash_attn_utils.py` context
-attribute is not part of this ABI and renaming it would reach into production
-code four kernels depend on.
+  The consequence to state plainly: gfx950 and gfx1201 **disagree** on this one
+  kernarg name until gfx1201 reverts `1b58fb93`'s rename. Nothing breaks —
+  kernarg names are not part of the binary layout, and the slot is in the same
+  position in both families — but the two signatures are no longer textually
+  identical, and anything comparing them by name needs to know that.
 
-`Workspace`, `BlockTable` and `block_table_stride` are gfx950-only (split-K and
-paged) and sit after `LSE`, which is what item 2 prescribes. The three
-signatures are otherwise identical to gfx1201's, argument for argument, and the
-backward pair is now *exactly* equal.
+What changed on gfx950: `Bias` -> `B` in all three kernels, and `B` moved ahead
+of `O` in the forward. `num_head_q` is unchanged, and so is the context keyword
+`num_head_q=` — that attribute lives in the shared `flash_attn_utils.py`
+context and is not part of this ABI in any case.
+
+## The three gfx950-only kernargs are gone, not nulled
+
+`Workspace`, `BlockTable` and `block_table_stride` — split-K and paged, neither
+of which exists on gfx1201 — **leave the kernarg entirely in builds that do not
+use them.** The forward's kernarg segment goes 636 -> 536 bytes for the same
+configuration, so the ATI-dispatched build now matches
+`flash_attn_func_aiw_kernel` argument for argument.
+
+Baking them as null pointers would *not* have been enough, and the reason is
+worth stating because it is the same reason the whole exercise exists: the two
+pointers sat **between `LSE` and `seqinfo_q0`**, so an occupied-but-null slot
+still shifts every later argument two positions away from gfx1201's layout. A
+consumer that hardcodes the block reads the wrong slots whatever the pointers
+contain. Position is the ABI; content is not.
+
+The mechanism is a `Constexpr` annotation.
+`compiler/kernel_function.py` sorts constexpr-annotated parameters into
+`constexpr_values` and never adds them to `kernel_arg_types`, so the parameter
+is folded at trace time and no slot is emitted. Two properties make it a
+*per-build* choice: the `def` runs inside the builder on every build, and this
+module has no `from __future__ import annotations`, so the annotation
+expression is evaluated there rather than kept as a string. Hence
+`_WS_ANN = fx.Tensor if _WS_RUNTIME else fx.Constexpr`, with `_WS_RUNTIME =
+SPLITK or DUALWAVE_SWP_DEBUG_LAZY_COUNTS` and `_BT_RUNTIME = PAGED`.
+
+Two things to know before copying this:
+
+- **The stand-in value must be an `int`, not `None`.** A constexpr value goes
+  into the JIT cache key through `Constexpr.value_signature`, which accepts
+  int/bool/float/str/tuple/lambda and *raises* on anything else. `0` is passed
+  and never read; every consumer is behind a `const_expr` guard.
+- **The launcher takes the same annotations as the kernel.** Doing it that way
+  means the folded value arrives as a Python constant and forwards to the
+  kernel unchanged, so there is no build-time conditional inside traced code at
+  all — the alternative was a ternary in a `@flyc.jit` body, which the AST
+  rewriter would have had to be trusted to leave alone.
+
+Coverage, stated honestly: the split-K tests build with `_WS_RUNTIME` true and
+pass, so both `Workspace` branches are exercised. **No paged forward kernel is
+built anywhere in the parity suite, before or after this change** — the paged
+coverage in `test_traits_constructor_matches_production_exactly` is traits-only.
+The `_BT_RUNTIME` true branch is therefore unexercised, and it is a no-op by
+construction: when `PAGED` is on the annotation is `fx.Tensor`, textually what
+it was.
 
 Both traps in this document are real and both were hit in the reading rather
 than the writing: the identical `Q, K, V, O, LSE, Bias, ...` block appears in
