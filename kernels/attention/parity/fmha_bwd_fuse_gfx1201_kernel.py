@@ -393,7 +393,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         num_q_blocks: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
-        num_head_q: fx.Int32,
+        num_head: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
@@ -464,7 +464,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         load_row_in_batch = tid // TPR
         load_col_base = (tid % TPR) * VEC_WIDTH
 
-        # Grid: (num_kv_blocks + num_q_blocks, num_head_q, batch).
+        # Grid: (num_kv_blocks + num_q_blocks, num_head, batch).
         #
         # grid.y is the **query** head in both roles. AOTriton uses the KV head
         # and loops the GQA group inside the dK/dV branch, holding K and V
@@ -473,7 +473,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         # at the cost of re-reading K/V per query head -- see the docstring.
         pid = fx.Int32(gpu.block_idx.x)
         head_q = fx.Index(gpu.block_idx.y)
-        head_k = head_q // (fx.Index(num_head_q) // fx.Index(num_head_k))
+        head_k = head_q // (fx.Index(num_head) // fx.Index(num_head_k))
 
         sm_log2e = fastmath.mul(sm_scale, fx.Float32(_LOG2E))
 
@@ -549,7 +549,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         # by the same caller, and giving it its own would double the decode for
         # no expressiveness.
         row_base, row_pitch = fmha.lse_row_addressing(
-            varlen_bits, _q_batch_v, head_q, num_head_q, lse_tokens, _q_row_off_v
+            varlen_bits, _q_batch_v, head_q, num_head, lse_tokens, _q_row_off_v
         )
 
         def load_bias_1(off64):
@@ -1036,7 +1036,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         num_q_blocks: fx.Int32,
         window_left: fx.Int32,
         window_right: fx.Int32,
-        num_head_q: fx.Int32,
+        num_head: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
@@ -1097,7 +1097,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             num_q_blocks,
             window_left,
             window_right,
-            num_head_q,
+            num_head,
             num_head_k,
             hdim_qk,
             hdim_vo,
@@ -1163,7 +1163,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
         launcher.launch(
             grid=(
                 fx.Index(num_kv_blocks) + fx.Index(num_q_blocks),
-                fx.Index(num_head_q),
+                fx.Index(num_head),
                 fx.Index(num_seqlens if num_seqlens != fx.Int32(0) else batch_size),
             ),
             block=(BLOCK_SIZE, 1, 1),
@@ -1198,7 +1198,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
     ):
         """Dispatch one fused backward pass.
 
-        `DK` and `DV` carry **num_head_q** heads, not num_head_k: this kernel
+        `DK` and `DV` carry **num_head** heads, not num_head_k: this kernel
         gives GQA one program per query head and leaves the reduction to the
         caller. `L` and `Delta` are compact f32 with the layout VarlenBits
         names.
@@ -1213,7 +1213,7 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
             raise ValueError(f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})")
         if DK.shape[1] != nhq or DV.shape[1] != nhq:
             raise ValueError(
-                f"DK/DV must carry num_head_q ({nhq}) heads -- GQA is reduced by the "
+                f"DK/DV must carry num_head ({nhq}) heads -- GQA is reduced by the "
                 f"caller, not in the kernel. Got {DK.shape[1]} and {DV.shape[1]}"
             )
         # This kernel has no separate device-side causal type; like dkdv and dq

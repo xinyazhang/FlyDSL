@@ -18,7 +18,8 @@ The rule is subsequence rather than equality because a launcher legitimately
 takes arguments its kernel does not. `stream` is the obvious one. `batch_size` is the other kind: it
 sizes the grid's third axis, and every kernel recovers its plane from
 `block_idx.z` instead, so passing it down would be a dead kernarg. The mask
-kernel established that; the three backward kernels now do the same.
+kernel established that; the forward and the three backward kernels now
+do the same.
 Both are listed per module below, which is the point -- a new
 divergence has to be written down here to pass, and writing it down is where
 someone asks whether it should exist.
@@ -34,7 +35,7 @@ import pytest
 # Arguments the launcher may carry that its kernel does not. Anything else is a
 # failure, including a *reordering*, which subsequence matching also catches.
 _JIT_ONLY = {
-    "flash_attn_func_gfx1201_aiw.py": {"stream"},
+    "flash_attn_func_gfx1201_aiw.py": {"stream", "batch_size"},
     "fmha_bwd_dq_gfx1201_kernel.py": {"stream", "batch_size"},
     "fmha_bwd_dkdv_gfx1201_kernel.py": {"stream", "batch_size"},
     "fmha_bwd_fuse_gfx1201_kernel.py": {"stream", "batch_size"},

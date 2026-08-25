@@ -427,7 +427,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         philox_offset2: fx.Int64,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
-        num_head_q: fx.Int32,
+        num_head: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
@@ -537,7 +537,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         # MQA/GQA: this KV head is shared by `group` query heads, and dK/dV sum
         # over all of them. AOTriton loops `off_h_q` in the group; so does this
         # kernel, folded into the Q-block loop below.
-        group_i32 = num_head_q // num_head_k
+        group_i32 = num_head // num_head_k
 
         # ---- Strides ----
         q_st = (fx.Index(stride_q_batch), fx.Index(stride_q_head), fx.Index(stride_q_seq))
@@ -878,7 +878,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             # global loads *per lane per iteration*, and with them the 64-bit
             # address chain that dominated this loop.
             _rowq_base, _rowq_pitch = fmha.lse_row_addressing(
-                varlen_bits, _q_batch_v, head_q, num_head_q, lse_tokens, _q_row_off_v
+                varlen_bits, _q_batch_v, head_q, num_head, lse_tokens, _q_row_off_v
             )
             for _rb in range_constexpr(_ROWQ_BATCHES):
                 _r = fx.Int32(tid) + fx.Int32(_rb * BLOCK_SIZE)
@@ -1053,7 +1053,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                         # the loop transposed and it is the reason dropout is
                         # off by default; see the module docstring.
                         _ph_base = _ph_off + fx.Int64(
-                            fx.Int32(z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
+                            fx.Int32(z_i32) * fx.Int32(num_head) + fx.Int32(head_q)
                         ) * fx.Int64(max_seqlen_q) * fx.Int64(_ph_stride_all)
                         _rn = PHILOX.randoms_per_offset
                         _poff = PHILOX.grid_offset(_ph_base, _ph_stride_all, _q_row_i32, kv_row_abs_i32)
@@ -1178,7 +1178,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
         philox_offset2: fx.Int64,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
-        num_head_q: fx.Int32,
+        num_head: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
@@ -1239,7 +1239,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             philox_offset2,
             idropout_p,
             dropout_scale,
-            num_head_q,
+            num_head,
             num_head_k,
             hdim_qk,
             hdim_vo,

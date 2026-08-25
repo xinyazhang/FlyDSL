@@ -460,7 +460,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # that swaps them gets finite garbage rather than an error; spelling the
     # axis out is the only check there is.
     #
-    # Bias already used this order (`stride_b0/1/2` are batch, head, Sq), so
+    # Bias already used this order (`stride_b_batch/1/2` are batch, head, Sq), so
     # this makes the five tensors agree rather than introducing a convention.
     #
     # Longest-processing-time-first dispatch for causal. Under causal masking
@@ -726,15 +726,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
+        B: fx.Pointer,
         O: fx.Pointer,  # noqa: E741
-        L: fx.Pointer,
-        Bias: fx.Pointer,
+        LSE: fx.Pointer,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
         varlen_bits: fx.Int32,
-        batch_size: fx.Int32,
         num_seqlens: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
@@ -747,10 +746,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         philox_offset_output: fx.Pointer,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
-        num_head_q: fx.Int32,
+        num_head: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
+        sm_scale: fx.Float32,
         stride_q_batch: fx.Int64,
         stride_q_head: fx.Int64,
         stride_q_seq: fx.Int64,
@@ -763,10 +763,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         stride_o_batch: fx.Int64,
         stride_o_head: fx.Int64,
         stride_o_seq: fx.Int64,
-        stride_b0: fx.Int64,
-        stride_b1: fx.Int64,
-        stride_b2: fx.Int64,
-        sm_scale_arg: fx.Float32,
+        stride_b_batch: fx.Int64,
+        stride_b_head: fx.Int64,
+        stride_b_seq_q: fx.Int64,
     ):
         elem_type = elem_numeric_cls.ir_type
         elem_dtype = elem_numeric_cls
@@ -889,7 +888,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # MQA/GQA: Num_head_q / Num_head_k query heads share each KV head.
         # The ratio is uniform and computed once, so the scalar divide is
         # immaterial; the per-head division below is by that ratio.
-        head_k = head_q // (fx.Index(num_head_q) // fx.Index(num_head_k))
+        head_k = head_q // (fx.Index(num_head) // fx.Index(num_head_k))
 
         load_row_in_batch = tid // K_TPR_LOAD
         load_lane_in_row = tid % K_TPR_LOAD
@@ -947,23 +946,25 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             k_st = (fx.Index(stride_k_batch), fx.Index(stride_k_head), fx.Index(stride_k_seq))
             v_st = (fx.Index(stride_v_batch), fx.Index(stride_v_head), fx.Index(stride_v_seq))
             o_st = (fx.Index(stride_o_batch), fx.Index(stride_o_head), fx.Index(stride_o_seq))
-            sm_log2e = fastmath.mul(sm_scale_arg, fx.Float32(_LOG2E))
+            sm_log2e = fastmath.mul(sm_scale, fx.Float32(_LOG2E))
 
         # Q and O are indexed by the query head; K and V by the KV head they
-        # share. At num_head_q == num_head_k these coincide.
+        # share. At num_head == num_head_k these coincide.
         _q_batch_v = fx.Index(q_batch)
         _k_batch_v = fx.Index(k_batch)
         _q_row_off_v = fx.Index(q_row_off)
         _k_row_off_v = fx.Index(k_row_off)
         # Bias is (B, H, Sq, Sk): the last axis is the KV column, so unlike
-        # Q/K/V/O its "row" stride is stride_b2 and the contiguous axis is the
+        # Q/K/V/O its "row" stride is stride_b_seq_q and the contiguous axis is the
         # one the KV tile walks. Indexed with the *same* (batch_index,
         # q_row_off) the varlen decode produced, so it inherits every layout
         # for free rather than needing its own -- sdpa-bias-plan.md 3.
         if const_expr(BIAS_TYPE):
-            _b_ptr = fmha.pointer_to_llvm_ptr(Bias)
+            _b_ptr = fmha.pointer_to_llvm_ptr(B)
             _b_base = (
-                _q_batch_v * fx.Index(stride_b0) + head_q * fx.Index(stride_b1) + _q_row_off_v * fx.Index(stride_b2)
+                _q_batch_v * fx.Index(stride_b_batch)
+                + head_q * fx.Index(stride_b_head)
+                + _q_row_off_v * fx.Index(stride_b_seq_q)
             )
 
         if const_expr(ENABLE_DROPOUT):
@@ -983,7 +984,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             # The offset scheme itself is `Philox.grid_plane`/`grid_offset`,
             # shared with the debug mask kernel -- see the comment there. This
             # kernel supplies only which plane a workgroup is on.
-            _off_zh = fx.Int32(z_i32) * fx.Int32(num_head_q) + fx.Int32(head_q)
+            _off_zh = fx.Int32(z_i32) * fx.Int32(num_head) + fx.Int32(head_q)
             _ph_seed = fmha.philox_seed_value(philox_seed_ptr)
             _ph_off = fmha.philox_offset_base(philox_offset1, philox_offset2)
             fmha.philox_report(philox_seed_output, philox_offset_output, _ph_seed, _ph_off)
@@ -1563,7 +1564,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     # are eight *contiguous* columns starting at klane*8, and
                     # one v8 load covers them -- the same shape as the K and V
                     # loads.
-                    _b_row = _b_base + q_rows[qt] * fx.Index(stride_b2)
+                    _b_row = _b_base + q_rows[qt] * fx.Index(stride_b_seq_q)
                     for _st in range_constexpr(NUM_S_ACCS):
                         _c0 = (_st // 2) * 32 + (_st % 2) * 16
                         _bv = load_global_v8f16(
@@ -1873,7 +1874,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # `&` on an `fx.Boolean` is the bitwise op and evaluates neither side
         # at trace time.
         _f32_ty = ir.F32Type.get()
-        _l_valid = fx.Int64(fx.ptrtoint(L)) != fx.Int64(0)
+        _l_valid = fx.Int64(fx.ptrtoint(LSE)) != fx.Int64(0)
         _lse_writer = _l_valid & (klane == fx.Index(0)) & (shard_id == fx.Index(0))
         # Everything -- the log2, the scale, the address -- lives inside the
         # guard. Hoisting it out cost 8% at BLOCK_DMODEL 256 non-causal even though
@@ -1900,13 +1901,13 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 #   _HT  (H, T)   AOTriton's, and the default: T contiguous
                 #   _TH  (T, H)   Transformer Engine's:         H contiguous
                 # Compact in both layouts, so the head pitch is exactly
-                # num_head_q and the token pitch is the decode's `tokens`.
+                # num_head and the token pitch is the decode's `tokens`.
                 _row = _q_row_off_v + q_rows[qt]
-                _lse_off, _ = fmha.lse_row_addressing(varlen_bits, _q_batch_v, head_q, num_head_q, lse_tokens, _row)
+                _lse_off, _ = fmha.lse_row_addressing(varlen_bits, _q_batch_v, head_q, num_head, lse_tokens, _row)
                 _pointer_store(
                     _lse,
                     buffer_ops.get_element_ptr(
-                        fmha.pointer_to_llvm_ptr(L),
+                        fmha.pointer_to_llvm_ptr(LSE),
                         fx.Int64(_lse_off),
                         elem_type=_f32_ty,
                     ),
@@ -1960,9 +1961,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
+        B: fx.Pointer,
         O: fx.Pointer,  # noqa: E741
-        L: fx.Pointer,
-        Bias: fx.Pointer,
+        LSE: fx.Pointer,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
@@ -1981,10 +1982,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         philox_offset_output: fx.Pointer,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
-        num_head_q: fx.Int32,
+        num_head: fx.Int32,
         num_head_k: fx.Int32,
         hdim_qk: fx.Int32,
         hdim_vo: fx.Int32,
+        sm_scale: fx.Float32,
         stride_q_batch: fx.Int64,
         stride_q_head: fx.Int64,
         stride_q_seq: fx.Int64,
@@ -1997,10 +1999,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         stride_o_batch: fx.Int64,
         stride_o_head: fx.Int64,
         stride_o_seq: fx.Int64,
-        stride_b0: fx.Int64,
-        stride_b1: fx.Int64,
-        stride_b2: fx.Int64,
-        sm_scale_arg: fx.Float32,
+        stride_b_batch: fx.Int64,
+        stride_b_head: fx.Int64,
+        stride_b_seq_q: fx.Int64,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -2022,15 +2023,14 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             Q,
             K,
             V,
+            B,
             O,
-            L,
-            Bias,
+            LSE,
             seqinfo_q0,
             seqinfo_q1,
             seqinfo_k0,
             seqinfo_k1,
             varlen_bits,
-            batch_size,
             num_seqlens,
             max_seqlen_q,
             max_seqlen_k,
@@ -2043,10 +2043,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             philox_offset_output,
             idropout_p,
             dropout_scale,
-            num_head_q,
+            num_head,
             num_head_k,
             hdim_qk,
             hdim_vo,
+            sm_scale,
             stride_q_batch,
             stride_q_head,
             stride_q_seq,
@@ -2059,10 +2060,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             stride_o_batch,
             stride_o_head,
             stride_o_seq,
-            stride_b0,
-            stride_b1,
-            stride_b2,
-            sm_scale_arg,
+            stride_b_batch,
+            stride_b_head,
+            stride_b_seq_q,
         )
 
         if const_expr(WAVES_PER_EU is not None):
@@ -2115,7 +2115,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
 
         launcher.launch(
-            grid=(fx.Index(num_head_q), num_q_tiles, nseq_idx),
+            grid=(fx.Index(num_head), num_q_tiles, nseq_idx),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
         )
@@ -2152,7 +2152,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # 0x02
 
     def _bias_args(bias):
-        """(pointer, stride_b0, stride_b1, stride_b2) for a (B, H, Sq, Sk) bias.
+        """(pointer, stride_b_batch, stride_b_head, stride_b_seq_q) for a (B, H, Sq, Sk) bias.
 
         The last axis is the KV column and must be contiguous, exactly as the
         D axis is for Q/K/V/O -- the kernel loads eight adjacent columns per
@@ -2214,9 +2214,13 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         _so, _oo = abi.dropout_outputs(ENABLE_DROPOUT, philox_seed_output, philox_offset_output)
         return (
             (
-                *ptrs,
-                _lse_p,
+                # Q, K, V, B, <outputs> -- `ptrs` is (Q, K, V, O), so the
+                # bias splices in ahead of O and the lse follows it as the
+                # second output.
+                *ptrs[:3],
                 _bp,
+                ptrs[3],
+                _lse_p,
                 _sq0,
                 _sq1,
                 _sk0,
@@ -2236,11 +2240,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 _ip,
                 _dsc,
                 *meta,
+                abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
                 *st,
                 _sb0,
                 _sb1,
                 _sb2,
-                abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
             ),
             _hold,
             stream,
