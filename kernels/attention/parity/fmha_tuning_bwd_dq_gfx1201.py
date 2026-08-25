@@ -308,6 +308,15 @@ class BwdDqInputMetadata:
 
     num_heads: int
     head_dim: int
+    # The V/O extent, when it differs from the QK one. `None` means "same".
+    #
+    # There is only ONE compiled tile here, unlike dK/dV which carries a second
+    # `block_dmodel_v`, so the tile must cover the *wider* of the two and the
+    # narrower axis rides as a masked runtime extent. That is what
+    # `padded_head` has to reflect: the kernel's `vo_cols` is
+    # `MaskedAxis(hdim_vo, active=PADDED_HEAD)`, so with the flag off the V/O
+    # axis is not bounded at all and a narrower V is walked to the full tile.
+    head_dim_v: int | None = None
     causal: bool = True
     dtype_str: str = "bf16"
     sm_scale: float | None = None
@@ -450,11 +459,19 @@ def plan(request: BwdDqInputMetadata, overrides: BwdDqKnobs | None = None) -> Bw
             "causal pattern into the bias tensor, or drop the bias"
         )
     head_dim = request.head_dim
-    if head_dim < 1 or head_dim > MAX_HEAD_DIM:
-        raise ValueError(f"kernel requires 1 <= head_dim <= {MAX_HEAD_DIM}, got {head_dim}")
-    block_dmodel = _round_to_ladder(head_dim)
+    head_dim_v = request.head_dim_v if request.head_dim_v is not None else head_dim
+    # One tile serves both axes, so it has to cover the wider one; whichever
+    # axis is narrower than the tile is then a masked runtime extent.
+    wide = max(head_dim, head_dim_v)
+    if wide < 1 or wide > MAX_HEAD_DIM:
+        raise ValueError(f"kernel requires 1 <= head_dim <= {MAX_HEAD_DIM}, got ({head_dim}, {head_dim_v})")
+    block_dmodel = _round_to_ladder(wide)
     knobs = replace(
         resolve_knobs(request, (overrides or BwdDqKnobs()).merge(BwdDqKnobs(block_dmodel=block_dmodel))),
-        padded_head=block_dmodel != head_dim,
+        # EITHER axis short of the tile turns the masking on, because one flag
+        # gates both `qk_cols` and `vo_cols` in the kernel. Deriving it from
+        # `head_dim` alone left `hdim_qk != hdim_vo` walking the narrower
+        # tensor to the full tile width.
+        padded_head=(block_dmodel != head_dim) or (block_dmodel != head_dim_v),
     )
     return BwdDqPlan(request, knobs)

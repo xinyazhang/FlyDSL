@@ -1099,3 +1099,163 @@ def test_dbias_with_a_different_layout_from_bias():
     assert _rel(dbias, db_ref) < _RTOL, f"dB rel={_rel(dbias, db_ref):.3e}"
     # Nothing may have landed outside the slice.
     assert wide[..., 128:].abs().max().item() == 0.0, "dB wrote past its own columns"
+
+
+# --------------------------------------------------------------------------
+# Regressions found by static reading of an AOTriton pass-1 failure log
+# (`flyati/flyc_pass1.out`, 1334 FAILED). The log carried no tracebacks, so
+# these were derived from the failing parametrizations plus the resolved tile
+# sizes, and each one names the mechanism it is meant to catch.
+#
+# The tiles are the reason the shapes look arbitrary: at every failing head_dim
+# `plan()` resolves BLOCK_M=256 and BLOCK_N=32, so seqlen_q 13 or 16 leaves
+# 240+ padding Q rows and seqlen_k 8 or 11 leaves 21+ padding KV columns.
+# --------------------------------------------------------------------------
+
+
+def _ne_reference(q, k, v, do):
+    """fp32 autograd with hdim_vo != hdim_qk."""
+    qf, kf, vf = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    s = (qf @ kf.transpose(-1, -2)) * (1.0 / (q.shape[3] ** 0.5))
+    o = torch.softmax(s, -1) @ vf
+    o.backward(do.float())
+    return torch.logsumexp(s, -1).detach(), (do.float() * o.detach()).sum(-1), qf.grad.detach()
+
+
+@pytest.mark.parametrize("hdim_qk,hdim_vo", [(192, 128), (128, 192), (64, 32), (32, 64), (256, 64)])
+def test_hdim_qk_ne_vo(hdim_qk, hdim_vo):
+    """dQ when the QK and V/O head dims differ.
+
+    One compiled tile serves both axes, so it must cover the wider one and the
+    narrower rides as a masked runtime extent. The kernel's `vo_cols` is
+    `MaskedAxis(hdim_vo, active=PADDED_HEAD)`, so if `PADDED_HEAD` is derived
+    from `head_dim` alone -- as it was -- an equal-to-tile `hdim_qk` turns the
+    masking off and the narrower tensor is walked to the full tile width.
+    """
+    _require_env()
+    b, h, n = 1, 2, 128
+    gen = torch.Generator(device="cuda").manual_seed(17)
+
+    def _t(d):
+        return torch.randn(b, h, n, d, dtype=torch.float16, device="cuda", generator=gen)
+
+    q, k = _t(hdim_qk), _t(hdim_qk)
+    v, do = _t(hdim_vo), _t(hdim_vo)
+    lse, delta, dq_ref = _ne_reference(q, k, v, do)
+    exe = build_bwd_dq_module(num_heads=h, head_dim=hdim_qk, head_dim_v=hdim_vo, causal=False, dtype_str="f16")
+    dq = torch.zeros_like(q)
+    exe(q, k, v, do, dq, lse.reshape(b * h, n).contiguous(), delta.reshape(b * h, n).contiguous(), b, n, seqlen_k=n)
+    assert _rel(dq, dq_ref) < _RTOL, f"qk={hdim_qk} vo={hdim_vo} rel={_rel(dq, dq_ref):.3e}"
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(13, 11), (16, 64), (64, 8), (2048, 8), (71, 37)])
+def test_bias_with_ragged_seqlens(seqlen_q, seqlen_k):
+    """Bias and dB where neither extent fills its tile.
+
+    Both the bias load and the dB store index by absolute Q row and KV column.
+    With BLOCK_M 256 and BLOCK_N 32 these shapes leave most of the tile out of
+    bounds on both axes, and dB's KV pitch is exactly `seqlen_k` -- so an
+    unbounded store lands in the *next row* rather than in padding.
+    """
+    _require_env()
+    b, h, d = 1, 2, 64
+    gen = torch.Generator(device="cuda").manual_seed(19)
+
+    def _t(n):
+        return torch.randn(b, h, n, d, dtype=torch.float16, device="cuda", generator=gen)
+
+    q, do = _t(seqlen_q), _t(seqlen_q)
+    k, v = _t(seqlen_k), _t(seqlen_k)
+    bias = torch.randn(b, h, seqlen_q, seqlen_k, dtype=torch.float16, device="cuda", generator=gen)
+
+    qf, kf, vf = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    bf = bias.detach().float().requires_grad_(True)
+    s = (qf @ kf.transpose(-1, -2)) * (1.0 / d**0.5) + bf
+    o = torch.softmax(s, -1) @ vf
+    o.backward(do.float())
+    lse = torch.logsumexp(s, -1).detach()
+    delta = (do.float() * o.detach()).sum(-1)
+
+    exe = build_bwd_dq_module(num_heads=h, head_dim=d, causal=False, dtype_str="f16", bias=True)
+    dq = torch.zeros_like(q)
+    dbias = torch.zeros_like(bias)
+    exe(
+        q,
+        k,
+        v,
+        do,
+        dq,
+        lse.reshape(b * h, seqlen_q).contiguous(),
+        delta.reshape(b * h, seqlen_q).contiguous(),
+        b,
+        seqlen_q,
+        seqlen_k=seqlen_k,
+        bias=bias,
+        dbias=dbias,
+    )
+    assert _rel(dq, qf.grad.detach()) < _RTOL, f"dQ rel={_rel(dq, qf.grad.detach()):.3e}"
+    assert _rel(dbias, bf.grad.detach()) < _RTOL, f"dB rel={_rel(dbias, bf.grad.detach()):.3e}"
+
+
+def test_dbias_does_not_write_past_its_own_extent():
+    """The direct out-of-bounds detector, rather than an indirect wrong answer.
+
+    dB is a `(seqlen_q, seqlen_k)` window of a buffer padded on both axes and
+    pre-filled with a sentinel. Anything the kernel writes outside its extent
+    lands in the padding and is visible; with a tightly-sized dB the same
+    overflow silently lands on a neighbouring row's real gradient, which is
+    what made the original bug read as a plain accuracy failure.
+    """
+    _require_env()
+    b, h, d, sq, sk = 1, 2, 64, 13, 11
+    gen = torch.Generator(device="cuda").manual_seed(23)
+
+    def _t(n):
+        return torch.randn(b, h, n, d, dtype=torch.float16, device="cuda", generator=gen)
+
+    q, do = _t(sq), _t(sq)
+    k, v = _t(sk), _t(sk)
+    bias = torch.randn(b, h, sq, sk, dtype=torch.float16, device="cuda", generator=gen)
+
+    qf, kf, vf = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    s = (qf @ kf.transpose(-1, -2)) * (1.0 / d**0.5) + bias.float()
+    o = torch.softmax(s, -1) @ vf
+    o.backward(do.float())
+    lse = torch.logsumexp(s, -1).detach()
+    delta = (do.float() * o.detach()).sum(-1)
+
+    SENTINEL = 7.0
+    padded = torch.full((b, h, sq + 64, sk + 64), SENTINEL, dtype=torch.float16, device="cuda")
+    dbias = padded[:, :, :sq, :sk]
+
+    exe = build_bwd_dq_module(num_heads=h, head_dim=d, causal=False, dtype_str="f16", bias=True)
+    exe(
+        q,
+        k,
+        v,
+        do,
+        torch.zeros_like(q),
+        lse.reshape(b * h, sq).contiguous(),
+        delta.reshape(b * h, sq).contiguous(),
+        b,
+        sq,
+        seqlen_k=sk,
+        bias=bias,
+        dbias=dbias,
+    )
+
+    assert (padded[:, :, :, sk:] == SENTINEL).all(), "dB wrote past seqlen_k"
+    assert (padded[:, :, sq:, :] == SENTINEL).all(), "dB wrote past seqlen_q"
+
+
+def test_hdim_qk_ne_vo_sets_padded_head():
+    """The policy half of `test_hdim_qk_ne_vo`, without a GPU.
+
+    One flag gates both column axes, so it has to be on when *either* is short
+    of the tile. Deriving it from `head_dim` alone is what left the V/O axis
+    unmasked whenever the QK axis happened to land exactly on a ladder rung.
+    """
+    for qk, vo, want in ((192, 192, False), (192, 128, True), (128, 192, True), (64, 32, True)):
+        knobs = bwd_dq_plan(BwdDqInputMetadata(num_heads=2, head_dim=qk, head_dim_v=vo, causal=False)).knobs
+        assert knobs.padded_head is want, f"qk={qk} vo={vo}: padded_head={knobs.padded_head}"
+        assert knobs.block_dmodel >= max(qk, vo), "the single tile must cover the wider axis"

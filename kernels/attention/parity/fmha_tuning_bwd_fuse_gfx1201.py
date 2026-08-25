@@ -102,6 +102,11 @@ class BwdInputMetadata:
     num_head_q: int
     num_head_k: int
     head_dim: int
+    # The V/O extent, when it differs from the QK one. `None` means "same".
+    # One compiled tile serves both axes, so it must cover the wider, and
+    # `padded_head` has to be on whenever *either* is short of it -- that one
+    # flag gates both `qk_cols` and `vo_cols` in the kernel.
+    head_dim_v: int | None = None
     causal: bool = False
     dtype_str: str = "f16"
     sm_scale: float | None = None
@@ -209,8 +214,15 @@ def resolve_knobs(meta: BwdInputMetadata, overrides: BwdKnobs | None = None) -> 
     """
     k = BwdKnobs().merge(overrides or BwdKnobs())
 
-    block_dmodel = k.block_dmodel if k.block_dmodel is not None else _round_to_ladder(meta.head_dim)
-    padded_head = block_dmodel != meta.head_dim
+    # The wider of the two axes: one tile serves both, so it has to cover
+    # whichever is larger and the other rides as a masked runtime extent.
+    _hdv = meta.head_dim_v if meta.head_dim_v is not None else meta.head_dim
+    _wide = max(meta.head_dim, _hdv)
+    block_dmodel = k.block_dmodel if k.block_dmodel is not None else _round_to_ladder(_wide)
+    # EITHER axis short of the tile turns the masking on: one flag gates both
+    # `qk_cols` and `vo_cols` in the kernel, so deriving it from `head_dim`
+    # alone leaves a narrower V/O walked to the full tile width.
+    padded_head = (block_dmodel != meta.head_dim) or (block_dmodel != _hdv)
 
     num_waves = k.num_waves if k.num_waves is not None else _DEFAULT_NUM_WAVES
     q_step = k.q_step if k.q_step is not None else 16
@@ -309,4 +321,11 @@ def plan(request: BwdInputMetadata, overrides: BwdKnobs | None = None) -> BwdPla
             f"{LDS_BYTES_LIMIT} B workgroup limit. Lower num_waves "
             f"({knobs.num_waves}) or q_step ({knobs.q_step})"
         )
-    return BwdPlan(request, replace(knobs, padded_head=knobs.block_dmodel != request.head_dim))
+    _hdv = request.head_dim_v if request.head_dim_v is not None else request.head_dim
+    return BwdPlan(
+        request,
+        replace(
+            knobs,
+            padded_head=(knobs.block_dmodel != request.head_dim) or (knobs.block_dmodel != _hdv),
+        ),
+    )
