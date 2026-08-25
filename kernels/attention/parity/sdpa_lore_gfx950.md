@@ -699,3 +699,57 @@ head_dim 96 is a normal rung again.
   the disk-cache switch, since `FLYDSL_RUNTIME_ENABLE_CACHE=0` is exactly the
   setting that forces a re-trace. Suspect the harness before the kernel when a
   failure boundary is a wall-clock instant rather than a configuration.
+- **Two element types of the same width are the perfect silent failure.** bf16
+  and f16 are both two bytes, so every descriptor, stride, LDS offset, tile
+  geometry and register count is identical and *nothing downstream can notice*
+  a mismatch -- only the bit interpretation and the MFMA opcode differ. The
+  consequence for testing is sharp: **feeding f16 tensors is not evidence that
+  f16 was built.** If `dtype_str` fails to reach the traits, the kernel reads
+  the operands as bf16, and the result is finite, wrong by a factor near
+  2^112, and green against any tolerance. Two cheap gates fix it: assert on the
+  emitted ISA (`v_mfma_f32_32x32x16_f16` present, `..._bf16` absent -- the
+  *absence* half is what catches a dtype that reached one GEMM and not the
+  rest), and assert the error moves in the direction only the new type can
+  produce (f16 has three more mantissa bits, so ~8x smaller against fp64; a
+  ratio near 1 means it silently ran bf16).
+- **A `bitcast` after a conversion is a cast that cannot fail loudly.** The one
+  dtype-specific site in the 16-row store emitted `cvt_pk_bf16_f32` and then
+  bitcast the result to `elem_dtype`. Under bf16 that is correct; under f16 it
+  reinterprets bf16 patterns as f16 and every value is silently wrong. Convert,
+  do not reinterpret -- and when a helper is named for one type
+  (`_bf16_trunc_pack_v8`) check whether it *branches* internally before
+  assuming it is the hardcoded one. Two of the three sites in this kernel
+  already handled both types; the name was the only thing that looked wrong.
+- **`hash()` on a string is salted per process.** A cross-process bitwise
+  comparison that seeds `torch.manual_seed(hash(name))` feeds the two builds
+  *different random inputs*, and every case differs. Use `zlib.crc32` or an
+  explicit counter. The tell was diagnostic and worth keeping: **46 of 46
+  differed, including configurations the change could not reach** -- a real
+  regression from a localised edit hits a subset, so "everything differs"
+  points at the harness before it points at the kernel.
+- **A comparison harness that produces zero cases passes its own diff.** The
+  first bf16-regression run crashed inside the loop, wrote two empty files, and
+  `diff` reported them identical -- which printed as "BITWISE IDENTICAL". Any
+  script whose output is consumed by a comparison needs an assertion on the
+  *number of results*, not just on their contents. Same failure family as a
+  checker that only ever reports "clean".
+- **Range constants chosen under one dtype do not carry to another.** The
+  test harness substituted `1e30` for a dead row's `-inf` logsumexp, which is
+  fine in bf16 and fp64 and does not exist in f16. That one failed loudly only
+  because torch *raises* on an overflowing scalar conversion rather than
+  saturating; the same constant inside kernel arithmetic would have become an
+  infinity in silence. When adding a dtype, grep the harness for magnitudes as
+  carefully as the kernel.
+- **A range test whose safety margin is a random variable is not a range
+  test.** An f16 overflow test picked an input scale a probe had measured
+  clean, and a different seed's tail put the maximum over the line. Compute the
+  quantity the test is claiming is in range -- here `max|dS|` in fp64 -- and
+  assert *that* against the limit before asserting the kernel is finite. The
+  test then states its own precondition instead of inheriting one from a run
+  nobody will repeat.
+- **Parametrise by dtype; do not add a parallel suite.** A second file drifts:
+  the next feature gets added to one and not the other, which is how bf16
+  became the only tested type in the first place. One module-level setting that
+  every helper reads, driven by a fixture, means the ladder, both MFMA
+  families, causal, windows, varlen, dropout, bias and GQA all gain the new
+  type at once -- and so do tests that do not exist yet.

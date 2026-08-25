@@ -2149,6 +2149,21 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         for name, t in (("DK", DK), ("DV", DV)):
             if t.dtype != Q.dtype:
                 raise ValueError(f"{name} must have Q's dtype ({Q.dtype}), got {t.dtype}")
+        # **B8: the tensors must match what the build was compiled for.** Both
+        # dtypes are two bytes, so every descriptor, stride and LDS offset is
+        # identical between them and a mismatch changes nothing about the
+        # addressing -- it is only the *bit interpretation* of the operands and
+        # the MFMA opcode that differ. That is precisely why it has to be
+        # checked here: handing f16 tensors to a bf16 build reads them as bf16,
+        # which is finite, wrong by a factor near 2^112, and silent.
+        # Compared by name rather than against a `torch` dtype object, because
+        # this module does not import torch and should not start.
+        want = {"bf16": "torch.bfloat16", "f16": "torch.float16"}[traits.DTYPE_STR]
+        if str(Q.dtype) != want:
+            raise ValueError(
+                f"this build is compiled for dtype_str={traits.DTYPE_STR!r} ({want}); got {Q.dtype}. "
+                "The two are the same width, so nothing downstream would notice."
+            )
         # `row_tensor_arg` checks both the same way, which is what makes it safe
         # for the kernel to address them with one offset computation. Its return
         # is discarded: this kernel takes them as tensors, because it builds

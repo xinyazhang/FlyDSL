@@ -81,6 +81,22 @@ def _rand(*shape, dtype=DT):
     return torch.randn(*shape, device="cuda", dtype=dtype)
 
 
+# The two operand dtypes the kernel is built for. bf16 first so an unordered
+# failure report still reads in the historical order.
+DTYPES = (torch.bfloat16, torch.float16)
+_DTYPE_IDS = {torch.bfloat16: "bf16", torch.float16: "f16"}
+
+
+def _dtype_str(t):
+    """The build's `dtype_str` for a tensor. **One derivation, shared.**
+
+    `_run_dq` uses it and so does `test_fp16_really_builds_fp16`, which is what
+    makes the ISA check evidence about the path the numeric tests take rather
+    than about a string spelled twice.
+    """
+    return _DTYPE_IDS[t.dtype]
+
+
 def _max_err(got, ref):
     return (got.double() - ref.double()).abs().max().item()
 
@@ -161,7 +177,7 @@ def _run_dq(
         head_dim_v=v.shape[3],
         causal=causal,
         window=window_build,
-        dtype_str="bf16" if q.dtype is torch.bfloat16 else "f16",
+        dtype_str=_dtype_str(q),
         num_kv_heads=k.shape[1],
         store_db=db is not None,
         **({} if mfma_rows is None else {"mfma_rows": mfma_rows}),
@@ -213,9 +229,10 @@ SHAPES = [
 WORKHORSE = (64, 128)
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=_DTYPE_IDS.get)
 @pytest.mark.parametrize("head_dim", WORKHORSE)
 @pytest.mark.parametrize("b,h,sq,sk", SHAPES, ids=lambda x: str(x))
-def test_error_ratio_vs_math_backend(b, h, sq, sk, head_dim):
+def test_error_ratio_vs_math_backend(b, h, sq, sk, head_dim, dtype):
     """`err(ours, fp64) <= fudge * err(math-in-bf16, fp64)`, on dQ.
 
     The bound is the precision the problem inherently has. `lse` and `delta`
@@ -224,15 +241,15 @@ def test_error_ratio_vs_math_backend(b, h, sq, sk, head_dim):
     `test_agrees_with_our_forwards_own_lse`.
     """
     torch.manual_seed(0)
-    q, do = (_rand(b, h, sq, head_dim) for _ in range(2))
-    k, v = (_rand(b, h, sk, head_dim) for _ in range(2))
+    q, do = (_rand(b, h, sq, head_dim, dtype=dtype) for _ in range(2))
+    k, v = (_rand(b, h, sk, head_dim, dtype=dtype) for _ in range(2))
     scale = _sm_scale(head_dim)
 
     lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
     got = _run_dq(q, k, v, do, lse, delta, scale=scale)
 
     hi = _math_grads(q, k, v, do, torch.float64, scale=scale, gqa=False)[0]
-    lo = _math_grads(q, k, v, do, DT, scale=scale, gqa=False)[0]
+    lo = _math_grads(q, k, v, do, dtype, scale=scale, gqa=False)[0]
 
     ours_err = _max_err(got, hi)
     ref_err = _max_err(lo, hi)
@@ -243,9 +260,10 @@ def test_error_ratio_vs_math_backend(b, h, sq, sk, head_dim):
     )
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=_DTYPE_IDS.get)
 @pytest.mark.parametrize("head_dim", BWD_DQ_LADDER)
 @pytest.mark.parametrize("sq,sk", [(512, 512), (300, 411)], ids=["square", "ragged"])
-def test_ladder_error_ratio(head_dim, sq, sk):
+def test_ladder_error_ratio(head_dim, sq, sk, dtype):
     """Every rung of the ladder, square and ragged.
 
     The ladder is where the *geometry* changes -- wave count, staging granule,
@@ -256,15 +274,15 @@ def test_ladder_error_ratio(head_dim, sq, sk):
     """
     torch.manual_seed(13)
     b, h = 1, 4
-    q, do = (_rand(b, h, sq, head_dim) for _ in range(2))
-    k, v = (_rand(b, h, sk, head_dim) for _ in range(2))
+    q, do = (_rand(b, h, sq, head_dim, dtype=dtype) for _ in range(2))
+    k, v = (_rand(b, h, sk, head_dim, dtype=dtype) for _ in range(2))
     scale = _sm_scale(head_dim)
 
     lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
     got = _run_dq(q, k, v, do, lse, delta, scale=scale)
 
     hi = _math_grads(q, k, v, do, torch.float64, scale=scale, gqa=False)[0]
-    lo = _math_grads(q, k, v, do, DT, scale=scale, gqa=False)[0]
+    lo = _math_grads(q, k, v, do, dtype, scale=scale, gqa=False)[0]
     ours, honest = _max_err(got, hi), _max_err(lo, hi)
     assert torch.isfinite(got.float()).all()
     assert ours <= DQ_FUDGE * honest, (
@@ -1095,9 +1113,10 @@ def _causal_ref(q, k, v, do, *, scale, window=None, dtype=torch.float64):
     )
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=_DTYPE_IDS.get)
 @pytest.mark.parametrize("rows", _FAMILIES)
 @pytest.mark.parametrize("head_dim", [d for d in BWD_DQ_LADDER if d % 64 == 0])
-def test_causal_error_ratio(head_dim, rows):
+def test_causal_error_ratio(head_dim, rows, dtype):
     """Causal, every rung that both families serve, against the error-ratio gate.
 
     `Sq == Sk` throughout, and that is not a convenience: these kernels are
@@ -1106,10 +1125,10 @@ def test_causal_error_ratio(head_dim, rows):
     """
     torch.manual_seed(20)
     b, h, s = 1, 4, 512
-    q, k, v, do = (_rand(b, h, s, head_dim) for _ in range(4))
+    q, k, v, do = (_rand(b, h, s, head_dim, dtype=dtype) for _ in range(4))
     scale = _sm_scale(head_dim)
     lse, delta, hi = _causal_ref(q, k, v, do, scale=scale)
-    _, _, lo = _causal_ref(q, k, v, do, scale=scale, dtype=DT)
+    _, _, lo = _causal_ref(q, k, v, do, scale=scale, dtype=dtype)
     got = _run_dq(q, k, v, do, lse, delta, scale=scale, causal=True, mfma_rows=rows)
     assert torch.isfinite(got.float()).all()
     assert _max_err(got, hi) <= DQ_FUDGE * _max_err(lo, hi)
@@ -2165,3 +2184,185 @@ def test_bias_with_causal_is_refused_upstream():
     """
     with pytest.raises(ValueError, match="mutually exclusive"):
         build_dq(num_heads=4, head_dim=64, causal=True, bias=True)
+
+
+# ---------------------------------------------------------------------------
+# fp16: two checks that a silent bf16 build could not pass
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("rows,head_dim", [(32, 128), (16, 512)])
+@pytest.mark.parametrize("dtype", DTYPES, ids=_DTYPE_IDS.get)
+def test_fp16_really_builds_fp16(rows, head_dim, dtype):
+    """The dtype must reach the **MFMA opcode**, not merely the tensor.
+
+    Every other dtype test here is numeric, and a numeric test passes just as
+    well if `dtype_str` never reaches the traits and the kernel quietly builds
+    bf16: the answers stay plausible and every tolerance goes green. The
+    mapping *is* the thing under test, so it cannot also be the evidence.
+
+    Two independent discriminators out of one ISA dump:
+
+    - the MFMA mnemonic. `v_mfma_f32_..._bf16` and `v_mfma_f32_..._f16` are
+      different instructions, and `bf16` contains `f16` as a substring -- which
+      is why the check is written as "the bf16 form is absent" rather than as a
+      substring search that would match both.
+    - `v_cvt_pk_bf16_f32`, which `_bf16_trunc_pack_v8` emits for the `dS` pack
+      on the bf16 arm and not at all on the f16 arm.
+
+    The dtype string comes from `_dtype_str`, the same derivation `_run_dq`
+    uses, so this is evidence about the path the numeric tests take.
+    """
+    import glob
+    import os
+    import re
+    import subprocess
+    import tempfile
+
+    want = _dtype_str(torch.zeros(1, dtype=dtype))
+    script = (
+        "import math, torch\n"
+        "from fmha_bwd_dq_gfx950 import build_fmha_bwd_dq_gfx950_module as b\n"
+        f"ds, rows, d = {want!r}, {rows}, {head_dim}\n"
+        "DT = torch.float16 if ds == 'f16' else torch.bfloat16\n"
+        "bb,h,s=1,2,128\n"
+        "q,k,v,do=(torch.randn(bb,h,s,d,device='cuda',dtype=DT) for _ in range(4))\n"
+        "dq=torch.zeros(bb,h,s,d,device='cuda',dtype=DT)\n"
+        "l=torch.zeros(bb*h,s,device='cuda',dtype=torch.float32)\n"
+        "b(num_heads=h,head_dim=d,causal=False,dtype_str=ds,mfma_rows=rows)("
+        "q,k,v,do,dq,l,l,bb,s,seqlen_k=s,scale=1.0/math.sqrt(d))\n"
+        "torch.cuda.synchronize()\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "build.py")
+        open(src, "w").write(script)
+        env = dict(os.environ, FLYDSL_DUMP_IR="1", FLYDSL_DUMP_DIR=tmp, FLYDSL_RUNTIME_ENABLE_CACHE="0")
+        env["PYTHONPATH"] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + env.get("PYTHONPATH", "")
+        subprocess.run([sys.executable, src], env=env, cwd=tmp, capture_output=True, timeout=900)
+        dumps = glob.glob(os.path.join(tmp, "*", "*final_isa.s"))
+        assert dumps, "no ISA dump; the build did not get far enough for this test to mean anything"
+        isa = open(dumps[0]).read()
+
+    bf16_mfma = len(re.findall(r"\bv_mfma_f32_\d+x\d+x\d+_bf16\b", isa))
+    f16_mfma = len(re.findall(r"\bv_mfma_f32_\d+x\d+x\d+_f16\b", isa))
+    cvt_bf16 = isa.count("v_cvt_pk_bf16_f32")
+    if want == "bf16":
+        assert bf16_mfma > 0 and f16_mfma == 0, f"bf16 build emitted {f16_mfma} f16 MFMAs"
+        assert cvt_bf16 > 0, "bf16 build emitted no bf16 pack"
+    else:
+        assert f16_mfma > 0 and bf16_mfma == 0, f"f16 build emitted {bf16_mfma} bf16 MFMAs -- it is bf16"
+        assert cvt_bf16 == 0, f"f16 build emitted {cvt_bf16} bf16 packs -- it is bf16"
+
+
+@pytest.mark.parametrize("rows,head_dim", [(32, 64), (32, 128), (16, 384), (16, 512)])
+def test_fp16_is_measurably_more_accurate_than_bf16(rows, head_dim):
+    """fp16 has 10 mantissa bits to bf16's 7, so its error must be **smaller**.
+
+    The numeric counterpart of the ISA check, and the same move as B6's
+    dropped-vs-undropped `dS` and the `V = I` mask oracle: do not compare
+    against a tolerance when you can compare against the wrong answer. A silent
+    bf16 build makes the two errors *equal*; the assertion is that fp16 is at
+    least twice as accurate, and it measures ~10x.
+
+    Each dtype is scored against an fp64 reference built from **its own**
+    rounded inputs, so what is compared is the precision of the arithmetic
+    rather than of the inputs.
+    """
+    b, h, s = 1, 4, 256
+    scale = _sm_scale(head_dim)
+    errs = {}
+    for dtype in DTYPES:
+        torch.manual_seed(60)
+        q, k, v, do = (_rand(b, h, s, head_dim, dtype=dtype) for _ in range(4))
+        lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
+        got = _run_dq(q, k, v, do, lse, delta, scale=scale, mfma_rows=rows)
+        ref = _math_grads(q, k, v, do, torch.float64, scale=scale, gqa=False)[0]
+        errs[dtype] = _max_err(got, ref) / max(ref.abs().max().item(), 1.0)
+    assert errs[torch.float16] < 0.5 * errs[torch.bfloat16], (
+        f"fp16 error {errs[torch.float16]:.2e} is not measurably below bf16's "
+        f"{errs[torch.bfloat16]:.2e}: the fp16 build is probably bf16."
+    )
+
+
+def test_an_unknown_dtype_is_refused():
+    """f16 and bf16, and nothing silently falls through to one of them."""
+    with pytest.raises(NotImplementedError, match="f16/bf16"):
+        build_dq(num_heads=4, head_dim=64, causal=False, dtype_str="fp8")
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+def test_fp16_composes_with_the_features(rows):
+    """One fp16 arm over causal + dropout + bias, where the range risk is.
+
+    The feature paths are deliberately **not** fully cross-producted with the
+    dtype -- see the report -- because they exercise addressing and ordering,
+    which the operand width does not change. What it *can* change is range:
+    f16 overflows at 65504 where bf16 carries fp32's exponent. So the one arm
+    that is worth running is the one where the most f32 intermediates are
+    narrowed to the operand type.
+    """
+    torch.manual_seed(61)
+    b, h, s = 1, 4, 128
+    d = s
+    p = 0.3
+    dtype = torch.float16
+    q, k, do = (_rand(b, h, s, d, dtype=dtype) for _ in range(3))
+    v = torch.eye(s, device="cuda", dtype=dtype).expand(b, h, s, s).contiguous()
+    bias = _rand(b, h, s, s, dtype=dtype) * 0.5
+    scale = _sm_scale(d)
+
+    from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module as build_fwd
+
+    o = torch.empty_like(q)
+    lse = torch.empty(b, h, s, device="cuda", dtype=torch.float32)
+    seed = torch.tensor([88], device="cuda", dtype=torch.int64)
+    seed_out = torch.zeros(1, device="cuda", dtype=torch.int64)
+    off_out = torch.zeros(1, device="cuda", dtype=torch.int64)
+    build_fwd(num_heads=h, head_dim=d, causal=False, dtype_str="f16", bias=True, dropout=True, return_lse=True)(
+        q,
+        k,
+        v,
+        o,
+        b,
+        s,
+        seqlen_k=s,
+        scale=scale,
+        lse=lse,
+        bias=bias,
+        dropout_p=p,
+        philox_seed=seed,
+        philox_offset2=0,
+        philox_seed_out=seed_out,
+        philox_offset_out=off_out,
+    )
+    torch.cuda.synchronize()
+    keep = o.float() != 0.0
+    delta = (do.float() * o.float()).sum(-1)
+
+    got = torch.full_like(q, float("nan"))
+    build_dq(num_heads=h, head_dim=d, causal=False, dtype_str="f16", bias=True, dropout=True, mfma_rows=rows)(
+        q,
+        k,
+        v,
+        do,
+        got,
+        lse.reshape(-1, s).contiguous(),
+        delta.reshape(-1, s).contiguous(),
+        b,
+        s,
+        seqlen_k=s,
+        scale=scale,
+        bias=bias,
+        dropout_p=p,
+        philox_seed=seed_out,
+        philox_offset1=off_out,
+        philox_offset2=0,
+    )
+    torch.cuda.synchronize()
+
+    qd, kd, vd, dod, bf = (t.double() for t in (q, k, v, do, bias))
+    prob = torch.softmax((qd @ kd.transpose(-1, -2)) * scale + bf, dim=-1)
+    dp = (dod @ vd.transpose(-1, -2)) * keep.double() / (1.0 - p)
+    ref = ((prob * (dp - delta.double().unsqueeze(-1))) @ kd) * scale
+    assert torch.isfinite(got.float()).all(), "f16 overflowed somewhere the bf16 path does not"
+    assert _max_err(got, ref) / max(ref.abs().max().item(), 1.0) < 5.0e-3

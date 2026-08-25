@@ -424,6 +424,21 @@ class BwdDkDvInputMetadata:
 
     num_heads: int
     head_dim: int
+    # B8. `"bf16"` or `"f16"`. Everything the tuner decides is dtype-independent
+    # -- both are two bytes, so the LDS budget, the staging granule, the tile
+    # geometry and the register pressure are identical, and the tables are
+    # shared rather than duplicated. Measured, not assumed; see the B8 outcome.
+    #
+    # **The two differ in range, not in size, and only three things in this
+    # kernel care.** `P = exp2(qk*scale + bias*log2e - lse*log2e)` is bounded
+    # by 1 by construction (`lse` is the log-sum-exp of the row, so no score
+    # exceeds it), which f16 holds exactly as well as bf16. `LSE` and `delta`
+    # are f32 row tensors whatever this says, so the padding-row argument --
+    # a zero row gives `P = exp2(0) = 1` and contributes zero -- is f32
+    # arithmetic and carries unchanged. **`dS` is the one exposure**: it is
+    # packed to this dtype for GEMM4 and is unbounded, so an f16 build
+    # overflows at 65504 where bf16 would not. That is inherent to f16 and is
+    # the same exposure the forward and every other f16 attention kernel has.
     dtype_str: str = "bf16"
     num_kv_heads: int | None = None
     head_dim_v: int | None = None
@@ -539,8 +554,8 @@ class BwdDkDvKnobs:
             # `window_right` expresses a pure left-band, so nothing is lost.
             # `make_traits` says the same; this says it before the ladder runs.
             raise ValueError("window=True requires causal=True; it is a left bound on top of the causal one")
-        if meta.dtype_str != "bf16":
-            raise NotImplementedError(f"this kernel builds bf16 only, got {meta.dtype_str!r}")
+        if meta.dtype_str not in ("bf16", "f16"):
+            raise NotImplementedError(f"this kernel builds bf16 and f16, got {meta.dtype_str!r}")
         num_kv_heads = meta.num_heads if meta.num_kv_heads is None else meta.num_kv_heads
         if meta.num_heads % num_kv_heads:
             # B7 made GQA real; this is the one part of the old refusal that

@@ -500,6 +500,13 @@ class BwdDqKnobs(Gfx950Knobs):
                 f"the backward dQ kernel is built for head_dim tiles {BWD_DQ_LADDER}, not "
                 f"{self.block_dmodel}. head_dim {meta.head_dim} rounds to {tile_width_for(meta.head_dim)}."
             )
+        if meta.dtype_str not in ("f16", "bf16"):
+            # Same assertion and the same two values as gfx1201's `bwd_dq`, so
+            # the two ports refuse the same set. It is a *build* axis: the
+            # operand width reaches the MFMA opcode, the `dS` pack and the
+            # store, so an unrecognised string would otherwise pick a dtype by
+            # falling through a comparison.
+            raise NotImplementedError(f"the backward dQ kernel supports f16/bf16, got {meta.dtype_str!r}")
         if (self.mfma_rows or 32) == 16 and self.block_dmodel % 64:
             # Before `make_traits`, which would otherwise raise first with a
             # message about the granule and leave the caller to work out that

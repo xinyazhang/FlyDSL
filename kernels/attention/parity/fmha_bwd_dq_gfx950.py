@@ -162,6 +162,36 @@ What still has to be re-derived, in dependency order:
 Items 2-4 live in `flash_attn_utils.py`, which is imported and never edited, so
 each becomes an override here.
 
+--- f16 and bf16, and where the operand dtype actually reaches ----------------
+
+Both are supported; `BwdDqKnobs._with_traits` refuses anything else by name,
+matching gfx1201's `assert dtype_str in ("f16", "bf16")`.
+
+**The operand dtype reaches only two places**, and knowing that is what makes
+f16 cheap here: the `dS` pack that feeds GEMM3's B operand
+(`_bf16_trunc_pack_v8`, which already branches on `DTYPE_STR`) and the dQ
+store. Everything with an exponent in it -- the score, `lse2`, `delta`, the
+softmax, `dP`, the dropout survivor scale, the bias add -- is **f32 in both
+builds**. So f16's narrower range (65504 against bf16's fp32 range) is exposed
+at those two narrowings and nowhere else.
+
+Two consequences worth stating rather than rediscovering:
+
+- The `lse2` floor and the dropout ordering were both derived under bf16, and
+  both carry, for the same reason: they are about f32 intermediates. See
+  `BwdDqKernelContext.load_row_scalars`.
+- **The dropout survivor scale is applied to the f32 `dP`, not folded into
+  `dO`.** B6 chose that on precision grounds -- folding would round `dO`
+  through the operand type a second time -- and it is also the f16-safe
+  choice, because `1/(1-p)` on an f16 operand is a multiply into a 65504
+  ceiling where on f32 it is not.
+
+What is *not* guarded, deliberately and in line with AOTriton and gfx1201: a
+`dS` or `dQ` magnitude beyond 65504 saturates in an f16 build where a bf16
+build would carry it. That needs inputs far outside anything these tests or a
+trained model produce, and clamping it would cost a per-element `min` on the
+hot path to change one implausible case into a different wrong answer.
+
 --- Not implemented, deliberately ---------------------------------------------
 
 Causal, windows, varlen, dropout, bias *input*, split-K, paged, `D_STAGES`,
@@ -547,6 +577,15 @@ class BwdDqKernelContext(ParityKernelContext):
         # After the `log2e` conversion, not before: `-3e38 * log2e` overflows
         # back to `-inf`. Same device `ParitySoftmaxHelper` uses to keep the
         # forward's running max off `-inf`, applied to an input.
+        #
+        # **Re-derived for f16 rather than assumed to carry.** The floor is
+        # `-3.0e38`, which is an f32 magnitude and would be `-inf` in f16 --
+        # but nothing here is f16. `lse` arrives f32, `log2e` is f32, the `max`
+        # is f32, and the FMA it protects in `scale_and_sub_lse` is f32. The
+        # operand dtype reaches this kernel at exactly two places, the `dS`
+        # pack and the dQ store, and neither is upstream of this. So the
+        # argument is about `fastmath<fast>`'s `ninf` on an f32 FMA and is
+        # dtype-independent.
         lse2 = dualwave._fmax(fx.Float32(lse2), self.c_neg_floor, self.fm_fast)
         return lse2, fx.Float32(delta)
 

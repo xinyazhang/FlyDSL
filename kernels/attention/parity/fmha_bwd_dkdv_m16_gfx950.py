@@ -458,6 +458,33 @@ class M16StoreHelper(dualwave.DualwaveKernelContext):
     apart and has to be assembled into 128 bits through `permlane32_swap`.
     """
 
+    def _pack_out(self, vals):
+        """Four f32 accumulator values as four output elements, in either dtype.
+
+        **The one place in this family that was dtype-specific**, and the way
+        it was wrong under f16 is the reason it is a method now: it emitted
+        `cvt_pk_bf16_f32` and then *bitcast* the result to `elem_dtype`, so an
+        f16 build would have written bf16 bit patterns reinterpreted as f16 --
+        finite, wrongly scaled by about 2^112, and with no diagnostic. A cast
+        that reinterprets rather than converts cannot fail loudly.
+
+        `_o_pack_2dw` and `_bf16_trunc_pack_v8` in the production helpers
+        already branch this way; this is the same branch, on the same trait,
+        for the accumulator shape this family has. bf16 keeps the packed
+        two-at-a-time instruction, so its emitted code is unchanged.
+        """
+        if const_expr(self.traits.DTYPE_STR == "bf16"):
+            return Vec.from_elements(
+                [dualwave.rocdl.cvt_pk_bf16_f32(vals[2 * j], vals[2 * j + 1]) for j in range_constexpr(ACC16 // 2)],
+                fx.Int32,
+            ).bitcast(self.elem_dtype)
+        # f16: convert each value (round-to-nearest-even) and build the vector
+        # directly. There is no `cvt_pk_f16_f32` pair form to use here.
+        return Vec.from_elements(
+            [fx.Float32(vals[i]).to(self.elem_dtype) for i in range_constexpr(ACC16)],
+            self.elem_dtype,
+        )
+
     def store_accs(self, accs, which, hdim):
         rsrc = self.dk_rsrc if which == "dk" else self.dv_rsrc
         stride_seq = self.stride_dk_seq_v if which == "dk" else self.stride_dv_seq_v
@@ -468,10 +495,7 @@ class M16StoreHelper(dualwave.DualwaveKernelContext):
         for c in range_constexpr(len(accs)):
             col = fx.Index(c * MFMA16_M) + lane_d
             vals = [Vec(accs[c])[i] for i in range_constexpr(ACC16)]
-            packed = Vec.from_elements(
-                [dualwave.rocdl.cvt_pk_bf16_f32(vals[2 * j], vals[2 * j + 1]) for j in range_constexpr(ACC16 // 2)],
-                fx.Int32,
-            ).bitcast(self.elem_dtype)
+            packed = self._pack_out(vals)
             off = base + col
             if const_expr(self.PADDED_HEAD):
                 # Four columns, all-or-nothing. A run starting at or past the

@@ -99,15 +99,17 @@ p.add_argument("--varlen", type=int, default=0)
 p.add_argument("--dropout", type=int, default=0)
 p.add_argument("--bias", type=int, default=0)
 p.add_argument("--kvheads", type=int, default=0)
+p.add_argument("--dt", default="bf16")
 a = p.parse_args()
 import torch
 import fmha_common_gfx1201 as fmha
 from fmha_bwd_dkdv_gfx950 import build_fmha_bwd_dkdv_gfx950_module as build
 d, B, H, S = a.head_dim, 1, 4, 256
 HK = a.kvheads or H
-q = torch.randn(B, H, S, d, device="cuda", dtype=torch.bfloat16)
+_DT = torch.bfloat16 if a.dt == "bf16" else torch.float16
+q = torch.randn(B, H, S, d, device="cuda", dtype=_DT)
 do = torch.randn_like(q)
-k = torch.randn(B, HK, S, d, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(B, HK, S, d, device="cuda", dtype=_DT)
 v = torch.randn_like(k)
 dk, dv = torch.empty_like(k), torch.empty_like(v)
 lse = torch.randn(B * H, S, device="cuda", dtype=torch.float32)
@@ -115,7 +117,8 @@ delta = torch.randn_like(lse)
 kw = dict(mfma_rows=a.rows, dkv_shards=1, num_waves=4, block_kv=a.rows * 4, block_q=64,
           head_dim_granule=64 if d % 64 == 0 else 32)
 fn = build(num_heads=H, head_dim=d, num_kv_heads=HK, causal=bool(a.causal), window=bool(a.window),
-           varlen=bool(a.varlen), dropout=bool(a.dropout), bias=bool(a.bias), **kw)
+           varlen=bool(a.varlen), dropout=bool(a.dropout), bias=bool(a.bias),
+           dtype_str=a.dt, **kw)
 ka = dict(seqlen_k=S, scale=1.0 / d ** 0.5)
 if a.window:
     ka["window"] = (fmha.WINDOW_BOTRIGHT, fmha.WINDOW_BOTRIGHT)
@@ -123,7 +126,7 @@ if a.dropout:
     u64 = lambda x: torch.tensor([x], device="cuda", dtype=torch.int64)  # noqa: E731
     ka.update(dropout_p=0.25, philox_seed=u64(1234), philox_offset1=u64(0), philox_offset2=0)
 if a.bias:
-    ka["bias"] = torch.randn(B, H, S, S, device="cuda", dtype=torch.bfloat16)
+    ka["bias"] = torch.randn(B, H, S, S, device="cuda", dtype=_DT)
 if a.varlen:
     import fmha_abi_gfx1201 as _abi
     cu = torch.tensor([0, S], device="cuda", dtype=torch.int32)
@@ -134,7 +137,7 @@ torch.cuda.synchronize()
 """
 
 
-def build_isa(head_dim, rows, causal, window, varlen=0, dropout=0, bias=0, kvheads=0):
+def build_isa(head_dim, rows, causal, window, varlen=0, dropout=0, bias=0, kvheads=0, dt="bf16"):
     """Compile one configuration in a child process and return its final ISA."""
     out = tempfile.mkdtemp(prefix="exec_hazard_")
     env = dict(os.environ)
@@ -161,6 +164,8 @@ def build_isa(head_dim, rows, causal, window, varlen=0, dropout=0, bias=0, kvhea
             str(int(bias)),
             "--kvheads",
             str(int(kvheads)),
+            "--dt",
+            str(dt),
         ],
         env=env,
         capture_output=True,
@@ -196,12 +201,12 @@ def scan(isa):
     return exec_writes, tr_reads, unsafe
 
 
-def check(head_dim, rows, causal, window, varlen=0, dropout=0, bias=0, kvheads=0):
-    isa = build_isa(head_dim, rows, causal, window, varlen, dropout, bias, kvheads)
+def check(head_dim, rows, causal, window, varlen=0, dropout=0, bias=0, kvheads=0, dt="bf16"):
+    isa = build_isa(head_dim, rows, causal, window, varlen, dropout, bias, kvheads, dt)
     exec_writes, tr_reads, unsafe = scan(isa)
     tag = (
         f"d{head_dim:<4} rows{rows:<3} causal={int(causal)} window={int(window)} "
-        f"varlen={int(varlen)} dropout={int(dropout)} bias={int(bias)} kvh={kvheads or '-'}"
+        f"varlen={int(varlen)} dropout={int(dropout)} bias={int(bias)} kvh={kvheads or '-'} {dt}"
     )
     print(f"  {tag}  tr_reads {tr_reads:>4}  exec_writes {exec_writes:>3}  unsafe {unsafe:>3}")
     if tr_reads == 0:
@@ -250,6 +255,17 @@ def main():
                 (1, 0, 1, 1, 0, 1),
             ):
                 bad += check(head_dim, rows, causal, window, varlen, dropout, bias, kvh)
+            # B8. f16 changes the output pack and the MFMA opcode, so "no EXEC
+            # write anywhere" is a claim about a different instruction stream.
+            # One arm per family rather than the full cross product: the dtype
+            # does not touch control flow, so this is a check that it did not
+            # start to, not a matrix.
+            for causal, window, varlen, dropout, bias, kvh in (
+                (0, 0, 0, 0, 0, 0),
+                (1, 0, 1, 1, 0, 1),
+                (0, 0, 0, 0, 1, 0),
+            ):
+                bad += check(head_dim, rows, causal, window, varlen, dropout, bias, kvh, "f16")
     print("EXEC HAZARD: clean" if not bad else f"EXEC HAZARD: {bad} transpose reads under a narrowed EXEC")
     raise SystemExit(1 if bad else 0)
 

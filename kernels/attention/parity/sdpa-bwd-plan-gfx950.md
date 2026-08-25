@@ -3207,3 +3207,369 @@ it is the price of not writing a per-head scratch tensor.
   needs the grid back, which needs a reduction, which is the design that was
   priced and rejected.
 - The 384 rung is dQ's to profile.
+
+---
+
+## Outcome: fp16 for dQ — it already worked, and now that is a fact
+
+**fp16 worked out of the box.** No kernel change was needed: the operand dtype
+was already threaded from `meta.dtype_str` into the traits, the MFMA atom and
+`_bf16_trunc_pack_v8`'s existing dtype branch. What was missing was the
+*assertion* and the *coverage*, and "supports fp16" was an untested inference.
+
+Measured against an fp64 reference, `B=1 H=4 S=256`:
+
+| build | rel err |
+|---|---|
+| bf16 | 3.3e-3 |
+| f16 | 3.2e-4 |
+
+The change is one refusal in the tuner (`dtype_str in ("f16","bf16")`, the same
+assertion and the same two values as gfx1201's `bwd_dq`) plus tests.
+
+### The trap in testing this, and the two checks that avoid it
+
+A numeric fp16 test **passes just as well if `dtype_str` never reaches the
+traits and the kernel quietly builds bf16**: the answers stay plausible and
+every tolerance goes green. The mapping is the thing under test, so it cannot
+also be the evidence. Two checks that a silent bf16 build could not pass:
+
+- **The ISA.** `v_mfma_f32_*_bf16` and `v_mfma_f32_*_f16` are different
+  instructions, and `v_cvt_pk_bf16_f32` appears only on the bf16 arm. An f16
+  build must have zero of both bf16 forms. Written as "the bf16 form is
+  absent" rather than a substring search, because `bf16` contains `f16`.
+  Measured: 48 bf16 MFMAs + 48 packs on the bf16 arm, 48 f16 MFMAs + **0**
+  packs on the f16 arm.
+- **The error direction.** fp16 has 10 mantissa bits to bf16's 7, so on
+  identical inputs its error must be measurably *smaller*. A silent bf16 build
+  makes them equal. Asserted at 2x, measures ~10x.
+
+Both go through `_dtype_str`, the one derivation `_run_dq` also uses, so the
+ISA check is evidence about the path the numeric tests take.
+
+### Range: re-derived, not assumed
+
+f16 overflows at 65504 where bf16 carries fp32's range, so the two pieces of
+reasoning derived under bf16 were re-checked rather than inherited.
+
+**The operand dtype reaches exactly two places**: the `dS` pack feeding GEMM3's
+B operand, and the dQ store. Everything with an exponent in it -- the score,
+`lse2`, `delta`, the softmax, `dP`, the dropout survivor scale, the bias add --
+is **f32 in both builds**. So:
+
+- the **`lse2` floor** carries unchanged. `-3.0e38` would be `-inf` in f16, but
+  nothing on that path is f16: `lse` arrives f32, the `max` is f32, and the FMA
+  it protects is f32. The argument is about `ninf` on an f32 FMA and is
+  dtype-independent.
+- the **dropout ordering** carries, and B6's choice turns out to be the
+  f16-safe one for a second reason: the survivor scale multiplies the f32 `dP`
+  rather than being folded into `dO`, so `1/(1-p)` never multiplies into a
+  65504 ceiling.
+
+Not guarded, deliberately and in line with AOTriton and gfx1201: a `dS` or `dQ`
+magnitude past 65504 saturates in an f16 build. That needs inputs far outside
+anything these tests or a trained model produce, and a per-element clamp on the
+hot path would turn one implausible case into a different wrong answer.
+
+### What is parametrized, and what is not
+
+Parametrized by dtype (no parallel fp16 suite -- a second suite drifts, and
+that drift is how bf16 became the only tested dtype):
+
+| arm | cases | of which f16 |
+|---|---|---|
+| `test_error_ratio_vs_math_backend` | 16 | 8 |
+| `test_ladder_error_ratio` | 40 | 20 |
+| `test_causal_error_ratio` | 24 | 12 |
+| `test_fp16_really_builds_fp16` | 4 | 2 |
+| `test_fp16_is_measurably_more_accurate_than_bf16` | 4 | both, internally |
+| `test_fp16_composes_with_the_features` | 2 | 2 |
+
+**Deliberately left bf16-only**, and named: the 8xD grid (64 builds -- doubling
+it costs more than it proves), padded and asymmetric heads, all varlen modes,
+the dropout and bias suites except the composed arm, windows, the sentinel
+oracle, and every timing, EXEC, structural and register-model test. The
+argument is that those exercise *addressing and ordering*, which the operand
+width does not change; what it can change is *range*, and
+`test_fp16_composes_with_the_features` runs causal + dropout + bias in f16
+because that is the arm with the most f32 values narrowed to the operand type.
+
+### The bf16 path did not move
+
+The risk here was never fp16 -- it was that making fp16 official perturbs bf16,
+which fails quietly where fp16 would fail loudly. dQ output hashed over four
+(family, head_dim) points before and after: **byte-identical**.
+
+Suite: 255 -> 306 tests, no skips.
+
+---
+
+## Outcome: B9 — the 384 fix attempt. **Negative: the layout is what it is.**
+
+The ceiling from B7's profile was **1.33x** (hoisting all per-tile LDS reads out
+of the KV loop). **Nothing was captured, and no code changed** -- the kernel is
+byte-identical to where B7 left it. Four candidates were priced and all four
+are dead, three of them for reasons that are structural rather than measured.
+
+Machine state was asserted before every number below: the forward at 384 is
+compute-bound and stable, so it is the canary, and every round required it
+above 600 TF (it measured 721-724 throughout). A co-tenant produced a *stable*
+wrong number earlier in this work, so repeatability alone was not treated as
+evidence.
+
+### 1. Reuse one staged K read across GEMM1 and GEMM3 — **not available**
+
+The named lever, and it does not exist. K is already staged once (B3 fixed the
+double staging); what happens twice is the LDS→register read, and the two reads
+are of **different orientations**:
+
+    GEMM1 wants A[m = token][k = d]
+    GEMM3 wants A[m = d][k = token]
+
+MFMA's A and B operands have the same per-lane shape, so swapping which operand
+is which does not help, and computing `S` transposed puts K in the same layout
+it already has. Counting the bytes settles it: each read covers the 32-token
+tile **exactly once** (64 lanes x d bytes = the tile), so the traffic is K
+twice plus V once = 3x the tile, and 3x is the floor for this three-GEMM
+decomposition rather than an artefact of how it is written.
+
+Staging K in both orientations would not help either: staging is a write, and
+the reads are unchanged.
+
+### 2. Wider LDS reads — **dead by ISA, not by measurement**
+
+gfx950 has `DS_READ_B64_TR_B4`, `_B8`, `_B16` and `DS_READ_B96_TR_B6`
+(`DSInstructions.td`). **`b64` is the only 16-bit transpose width** -- there is
+no `b128_tr_b16` form. The instruction count is forced, so the "same bytes in
+half the instructions" idea has nothing to spend.
+
+### 3. The family at 384 — **B3.5's conclusion survived its own follow-on work**
+
+Worth checking rather than assuming, and the answer is that it holds. Measured
+at `B=2 H=8 S=4096`, interleaved, min of 6 rounds:
+
+| build at head_dim 384 | TFLOP/s |
+|---|---|
+| 16 rows, `BLOCK_N` 32, 4 waves *(current)* | **527** |
+| 32 rows, `BLOCK_N` 64, 4 waves | 305 |
+| 32 rows, `BLOCK_N` 64, 2 waves | 121 |
+
+The 32-row family has the better LDS arithmetic intensity (1 byte per 32 flops
+against 16 rows' 1 per 16) and still loses by 1.7x, because at 384 it spills
+where the 16-row family does not. The trade is real and it is not close.
+
+`BLOCK_N` 32 for the 32-row family -- which the register model says would nearly
+fit -- is not available: it makes `BLOCK_N / MFMA_M` equal 1, and the softmax
+path in `flash_attn_utils` is an `(s_lo, s_hi)` *pair*, not a list.
+
+### 4. Reordering the transpose reads within the tile — **measured, 0.94x**
+
+The one hypothesis the profile actually pointed at: if the LDS cost is exposed
+*latency* rather than issue or bandwidth, issuing GEMM3's transpose reads right
+after the barrier -- so they overlap GEMM1 and GEMM2's MFMAs instead of being
+consumed immediately -- should recover some of it without moving a byte.
+
+It costs 6%: **527 -> 494 TF**, same machine state. The ISA says why, and it is
+not spills:
+
+| | VGPR | AGPR | spills |
+|---|---|---|---|
+| baseline | 318 | 62 | 0 |
+| reads hoisted into the tile | 358 | 102 | 0 |
+
+40 more live registers, no spilling, and slower. So the LDS cost at 384 is
+**issue or bandwidth, not exposed latency** -- which is consistent with the
+B7 hoist-out-of-loop result being 1.33x, since that removed the instructions
+and not merely their position.
+
+### What this means
+
+At 384 the LDS read traffic is at its floor for this decomposition, the
+instruction width is fixed by the ISA, the family with the better bytes-per-flop
+ratio loses more to registers than it gains, and the cost is not latency that
+scheduling can hide. **The layout is what it is.**
+
+The two things that would change the answer are both larger than a fix:
+
+- a decomposition that does not need K in two orientations, which is a
+  different algorithm rather than a different layout;
+- an MFMA shape with 16 rows *and* 32-row LDS intensity, which does not exist
+  on gfx950 -- 16 rows costs 2x the bytes per flop because a 16-row operand is
+  read by half as many lanes for the same data.
+
+The ~12% residual B7 measured (699 TF at 384 even with the LDS reads removed,
+against 799 at 256) is still unexplained and was not investigated here.
+
+**No knob was swept.** Each of the four candidates was a structural hypothesis
+with a stated mechanism, and three were settled without running anything.
+
+---
+
+## Outcome: B8 — dK/dV in fp16 as well as bf16
+
+Both element types on the full feature surface, in both MFMA families.
+**732 tests, all passing, no skips** (367 before B8, of which the f16 arms are
+270 and the rest are dtype-agnostic or bf16-only by choice).
+
+### The plumbing was almost all already there
+
+`dtype_to_elem_type` threads `DTYPE_STR` to the LDS array type, the MMA atom,
+the masked-axis helpers and the buffer reads, and two of the three pack sites
+already branched internally -- `_o_pack_2dw` and `_bf16_trunc_pack_v8` both
+test `traits.DTYPE_STR` and emit the f16 form. **The name was the only thing
+that looked hardcoded about them.**
+
+**One site was genuinely wrong, and it is the interesting one.** The 16-row
+family's `store_accs` emitted `cvt_pk_bf16_f32` and then *bitcast* the result
+to `elem_dtype`:
+
+```python
+Vec.from_elements([cvt_pk_bf16_f32(...) ...], fx.Int32).bitcast(self.elem_dtype)
+```
+
+Under bf16 that is correct. Under f16 it writes bf16 bit patterns reinterpreted
+as f16 -- every value silently wrong by a factor near 2^112, with no
+diagnostic, because **a cast that reinterprets rather than converts cannot fail
+loudly**. It is now a `_pack_out` method that branches on the trait, and bf16
+keeps the packed two-at-a-time instruction so its emitted code is unchanged.
+
+`traits.BF16_BYTES` stays as it is: a misleading name whose value (2) is right
+for both, and it is shared with production.
+
+### The range questions, re-derived rather than assumed
+
+f16 overflows at 65504 where bf16 carries f32's range, and three arguments in
+this kernel were reasoned under bf16 specifically.
+
+- **The padding-row argument carries.** "A zero row gives `P = exp2(0) = 1` and
+  contributes zero" is a statement about f32: `LSE` and `delta` are f32 row
+  tensors whatever the element type, `exp2` is f32, and the accumulators are
+  f32. Nothing in it moves.
+- **B7's `-inf` bias case carries.** f16 has an infinity; the read converts to
+  f32 before any arithmetic; `exp2(-inf)` is an exact zero. A caller spelling
+  the mask as a large finite negative saturates to `-inf` on the way into an
+  f16 tensor, which still masks.
+- **`P` cannot overflow in either type**, and that is by construction rather
+  than by luck: `lse` is the log-sum-exp of its own row, so no score exceeds it
+  and `P <= 1`.
+- **`dS` is the one exposure.** It is the only unbounded value packed to the
+  element type, for GEMM4. Measured boundary at `B1 H2 S256 D64` with `dO`
+  scaled: `|dS|` reaches 22390 at `|dO|` 15000 and f16 is clean; at 30000
+  `|dS|` is 69482, past 65504, and f16 returns NaN where bf16 does not. Not
+  worked around -- clamping `dS` would change the gradient -- and it is the
+  same exposure every f16 attention backward has.
+
+### The regression gate: bf16 bitwise, 46 configurations
+
+The realistic failure was never f16 being wrong -- that fails loudly -- but
+bf16 drifting a bit and nobody noticing. So bf16 was compared against the
+committed build (`75553a16`) by SHA over the raw output bytes, over the whole
+ladder x both families x causal, windows, varlen, varlen+causal, dropout,
+dropout+causal, bias, bias+varlen, GQA, MQA, GQA+causal, GQA+dropout and a
+padded head: **46 of 46 identical.**
+
+Two harness bugs surfaced on the way, and both are the shape this project keeps
+meeting:
+
+- **The first run produced zero cases and the diff passed.** The loop crashed
+  on `numpy()` of a bf16 tensor, both files came out empty, and `diff` reported
+  them identical -- which printed as "BITWISE IDENTICAL". A comparison script
+  needs an assertion on the *number* of results, not only on their contents.
+- **Then all 46 differed**, which looked like a catastrophic regression and was
+  `torch.manual_seed(hash(name))`: `hash()` on a string is salted per process,
+  so the two builds were fed different inputs. The tell was that **cases the
+  change could not reach differed too** -- a localised edit produces a subset,
+  so "everything differs" points at the harness first.
+
+### Coverage that could only pass if the build is genuinely f16
+
+bf16 and f16 are the same width, so every descriptor, stride, LDS offset, tile
+geometry and register count is identical and nothing downstream can notice a
+mismatch. **Feeding f16 tensors is therefore not evidence that f16 was built**
+-- it is the dtype-shaped twin of the checker that parsed `--varlen` and never
+passed it on. Three gates:
+
+- **The ISA.** An `f16` build must contain `v_mfma_f32_{32x32x16,16x16x32}_f16`
+  and **must not contain** the `_bf16` opcode, and the converse for bf16, plus
+  the same for `v_cvt_pk_*_f32` at the store. The absence half is what catches
+  a dtype that reached one GEMM and not the other three.
+- **The error, in the direction only f16 can produce.** f16 has three more
+  mantissa bits, so on identical inputs its error against fp64 must be about 8x
+  smaller. Measured 2.9e-4 against bf16's 2.35e-3 -- almost exactly 8x. A build
+  that claimed f16 and ran bf16 would score 1x.
+- **A host check that the tensor dtype matches the build**, because there is
+  nowhere further down that could catch it.
+
+### The dtype is a test axis, not a second suite
+
+Parametrised through a `dtype` fixture that drives one module-level setting
+which every harness entry point reads, so the ladder, both families, causal,
+windows, varlen, dropout, bias and GQA all gained f16 at once -- and so will
+anything added later. A parallel f16 file would drift, which is how bf16 became
+the only tested type in the first place.
+
+**What is bf16-only, deliberately**, and why:
+
+| test | reason |
+|---|---|
+| `causal_tile_cut_is_not_inert` | a timing test; the cut is dtype-independent and this is the slowest test in the file |
+| `dropout_keep_rate` | the mask is drawn from integers; the element type cannot reach it |
+| `bias_and_causal_are_rejected`, `bias_tensor_presence...`, `refuses_what_it_does_not_compute`, `rejects_a_mismatched_row_tensor`, `varlen_build_and_descriptor_must_agree`, `tight_odd_hdim...`, `odd_hdim_bshd...` | build-time refusals and ABI validation, all dtype-independent |
+| `no_transpose_read_under_a_narrowed_exec` | delegates to the checker, which now runs its own f16 arms |
+| `f16_is_measurably_more_accurate_than_bf16`, `the_tensor_dtype_must_match_the_build`, `the_build_uses_the_mfma_opcode_for_its_dtype` | build both types internally |
+
+The EXEC checker gained three f16 arms per family rather than a full cross
+product: the dtype does not touch control flow, so these confirm it did not
+start to. 76 configurations, still zero EXEC writes.
+
+### The one place bf16 and f16 genuinely diverge
+
+`test_dropout_p_zero_is_bitwise_a_build_without_it` **fails in f16 at 32 rows**,
+and the finding is worth more than the test was.
+
+A dropout build at `p = 0` and a build compiled without dropout are genuinely
+different instruction streams -- one carries a `select` and a multiply by
+exactly 1.0 that the other does not -- so bit-for-bit agreement was never
+guaranteed by construction. It needs the compiler not to reassociate around the
+extra operations, and `fm_fast` licenses it to. Measured: **0.12% of elements
+differ, up to 19 ulps of the f16 encoding**, and the differing elements are the
+*small* ones (median `|dK|` 1.4e-2 against 6.1e-2 overall) -- the signature of a
+fixed absolute f32 residue becoming visible once the mantissa is fine enough.
+bf16's 7 bits absorb it; f16's 10 sometimes do not. The 16-row family holds
+bitwise in both.
+
+Both builds are **equally accurate**: 2.9842e-04 against 2.9844e-04 versus
+fp64, agreeing to four significant figures, and the dropout build is
+deterministic across runs. So the bitwise claim was a bf16 accident, and the
+f16 arm now asserts what still carries and what a misplaced survivor scale
+would still break -- determinism, a bounded ulp distance, and equal accuracy.
+
+### The tuning tables transfer unchanged
+
+Checked rather than asserted. Identical geometry at every rung, and VGPR counts
+within +-16 (mostly +-4):
+
+| head_dim | 32 | 64 | 96 | 128 | 160 | 192 | 224 | 256 | 384 | 512 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| bf16 VGPR | 148 | 236 | 144 | 202 | 354 | 220 | 486 | 238 | 352 | 470 |
+| f16 VGPR | 156 | 234 | 144 | 194 | 356 | 220 | 486 | 254 | 356 | 464 |
+
+No f16-specific entries are warranted, and one rung argues actively against
+them: **`head_dim 512` with bias spills 174 in bf16 and zero in f16** (512 VGPR
+against 470), so f16 is the better-behaved type exactly where B7 left a known
+spill. Adding f16 rows to `_FEATURE_OVERRIDES` would be a gratuitous
+divergence.
+
+Throughput, `B=2 H=8 S=4096`, f16 against bf16: 0.96 / 0.95 / 0.89 / 0.95 /
+0.98 / 0.95 / 0.97 / 1.09 / 1.06 / 1.08x across the ladder -- within +-10%,
+slightly behind at the narrow rungs and slightly ahead at the wide ones. Same
+MFMA rate; nothing that would justify separate tuning.
+
+### Not done
+
+- **`dS` overflow in f16** is recorded, not handled.
+- The f16 arms of `_ratio_check` use the f16 math backend as the low-precision
+  reference, so the fudge factor is unchanged and still 2.0 -- but the absolute
+  errors it gates are ~8x smaller, which is a tighter gate rather than a looser
+  one.
+- fp8 remains out of scope and is refused by name.

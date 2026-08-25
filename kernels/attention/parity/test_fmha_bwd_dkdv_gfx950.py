@@ -44,6 +44,7 @@ than guessed, and it scales with sequence length and head dim on its own.
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 import fmha_abi_gfx1201 as abi
@@ -56,6 +57,9 @@ from fmha_tuning_bwd_dkdv_gfx950 import LADDER
 from gfx950_standalone import dualwave  # noqa: F401  (puts the repo root on sys.path)
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+# Legacy module default. `_rand` and every allocation now go through `_dt()`,
+# which the `dtype` fixture drives; this is kept only so that a helper called
+# outside a fixture-bearing test has an unambiguous type.
 DT = torch.bfloat16
 
 # Per-tensor slack over the honest bf16 answer. Both gradients reduce over the
@@ -82,8 +86,52 @@ def _require_rocm_path():
         pytest.skip("ROCM_PATH is unset and /opt/rocm is absent, so the JIT cannot find ld.lld")
 
 
-def _rand(*shape, dtype=DT):
-    return torch.randn(*shape, device="cuda", dtype=dtype)
+# ---------------------------------------------------------------------------
+# B8: the element type is a test axis, not a second suite
+# ---------------------------------------------------------------------------
+#
+# **Parametrised rather than duplicated, deliberately.** A parallel f16 suite
+# drifts: the next feature gets added to one file and not the other, which is
+# exactly how bf16 became the only tested dtype in the first place. Here the
+# harness reads one module-level setting and the `dtype` fixture drives it, so
+# any test that takes the fixture gets both element types -- including tests
+# that do not exist yet.
+#
+# The state is module-level rather than threaded through twenty signatures so
+# that `_rand`, `_run`, `_ratio_check`, `_bias_run`, `_dropout_case` and
+# `_varlen_case` all pick it up without being touched. The fixture saves and
+# restores it, so a test that does *not* take the fixture is unambiguously
+# bf16 and stays that way.
+_DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16}
+_DT_STATE = {"str": "bf16"}
+
+
+def _dt():
+    """The torch dtype the harness allocates tensors in."""
+    return _DTYPES[_DT_STATE["str"]]
+
+
+def _dt_str():
+    """The `dtype_str` the harness compiles for. Always matches `_dt()`."""
+    return _DT_STATE["str"]
+
+
+@pytest.fixture(params=["bf16", "f16"])
+def dtype(request):
+    """Run a test once per element type.
+
+    Take this fixture in any test whose subject is dtype-independent -- which
+    is nearly all of them, since both types are two bytes wide and every tile
+    geometry, LDS offset and register count is identical between them.
+    """
+    prev = _DT_STATE["str"]
+    _DT_STATE["str"] = request.param
+    yield request.param
+    _DT_STATE["str"] = prev
+
+
+def _rand(*shape, dtype=None):
+    return torch.randn(*shape, device="cuda", dtype=_dt() if dtype is None else dtype)
 
 
 def _band(sq, sk, window):
@@ -139,7 +187,14 @@ def _math_backward(q, k, v, do, scale, dtype, window=None):
     # the output -- the mask zeroes those elements first -- and leaving an
     # infinity in an input the kernel multiplies by `log2(e)` would test the
     # `ninf` fastmath licence rather than the mask.
-    lse = torch.where(torch.isfinite(lse), lse, torch.full_like(lse, 1e30))
+    #
+    # **Clamped to the dtype, which f16 forced.** `1e30` was chosen when this
+    # arm was only ever bf16 or fp64, and it does not fit in f16 -- torch
+    # raises rather than saturating, so every f16 arm died here before it
+    # reached a kernel. The stand-in only has to be large enough that
+    # `exp2(-lse * log2e)` underflows to zero, which 65504 comfortably is.
+    big = min(1e30, float(torch.finfo(lse.dtype).max))
+    lse = torch.where(torch.isfinite(lse), lse, torch.full_like(lse, big))
     delta = (do.to(dtype) * o.detach()).sum(-1)
     return o.detach(), lse, delta, dq, dk, dv
 
@@ -203,7 +258,11 @@ def _ratio_check(b, h, sq, sk, d, scale=None, knobs=None, causal=False, window=N
     ref_window = window if window is not None else ((sq, sk - sq) if causal else None)
 
     _o64, lse64, delta64, _dq64, dk64, dv64 = _math_backward(q, k, v, do, scale, torch.float64, ref_window)
-    _o16, _l16, _d16, _dq16, dk16, dv16 = _math_backward(q, k, v, do, scale, torch.bfloat16, ref_window)
+    # The reference arm is the *dtype under test*, not always bf16: the gate is
+    # "no worse than an honest low-precision chain", and which chain that is
+    # depends on the element type. f16's own error is ~8x smaller than bf16's,
+    # so leaving this at bf16 would make the f16 gate ~8x too loose.
+    _o16, _l16, _d16, _dq16, dk16, dv16 = _math_backward(q, k, v, do, scale, _dt(), ref_window)
 
     lse = lse64.reshape(b * h, sq).float().contiguous()
     delta = delta64.reshape(b * h, sq).float().contiguous()
@@ -240,7 +299,7 @@ def _ratio_check(b, h, sq, sk, d, scale=None, knobs=None, causal=False, window=N
     ],
     ids=lambda s: "B%dH%dSq%dSk%d" % s,
 )
-def test_matches_math_backend(shape, head_dim):
+def test_matches_math_backend(shape, head_dim, dtype):
     _require_rocm_path()
     _ratio_check(*shape, head_dim)
 
@@ -270,7 +329,7 @@ def _family_knobs(head_dim, rows):
 @pytest.mark.parametrize("mode", ["dense", "causal", "window"])
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
 @pytest.mark.parametrize("head_dim", LADDER)
-def test_both_mfma_families_at_every_rung(head_dim, rows, mode):
+def test_both_mfma_families_at_every_rung(head_dim, rows, mode, dtype):
     """Both families, everywhere, whatever the tuning table happens to pick.
 
     B3.5 added a 16-row family beside the 32-row one and routed six of the ten
@@ -294,7 +353,7 @@ def test_both_mfma_families_at_every_rung(head_dim, rows, mode):
 
 
 @pytest.mark.parametrize("head_dim", LADDER)
-def test_ladder_matches_math_backend(head_dim):
+def test_ladder_matches_math_backend(head_dim, dtype):
     """Every compiled rung, at a square shape and a ragged asymmetric one.
 
     Two shapes rather than the four above because each rung is a separate
@@ -313,7 +372,7 @@ def test_ladder_matches_math_backend(head_dim):
     "sq,sk",
     [(199, 333), (1024, 256), (256, 1024), (65, 65), (101, 103), (67, 130), (1, 1), (1, 512), (512, 1), (2, 3)],
 )
-def test_ragged_and_asymmetric_sequences(sq, sk, head_dim):
+def test_ragged_and_asymmetric_sequences(sq, sk, head_dim, dtype):
     """Tails on both axes, at every residue the row loads can land on.
 
     Nothing in this kernel masks: Q and dO are bounded at `seqlen_q` and read
@@ -329,7 +388,7 @@ def test_ragged_and_asymmetric_sequences(sq, sk, head_dim):
 
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("scale", [0.02, 0.5, 4.0])
-def test_scale_sweep(scale, head_dim):
+def test_scale_sweep(scale, head_dim, dtype):
     """Two things at once, and the second is why the range is 200x rather than 4x.
 
     First, `dK` carries `sm_scale` and `dV` does not (`dV = P^T dO` has no
@@ -356,7 +415,7 @@ def test_scale_sweep(scale, head_dim):
 
 
 @pytest.mark.parametrize("head_dim", [64, 128, 192, 256])
-def test_consistent_with_the_gfx950_forward(head_dim):
+def test_consistent_with_the_gfx950_forward(head_dim, dtype):
     """Feed this kernel the forward kernel's own `O` and `LSE`.
 
     Plan section 7.1's second oracle, and it is not redundant with the ratio
@@ -376,7 +435,7 @@ def test_consistent_with_the_gfx950_forward(head_dim):
 
     o = torch.empty_like(q)
     lse = torch.empty(b * h, s, device="cuda", dtype=torch.float32)
-    fwd = build_fwd(num_heads=h, head_dim=d, num_kv_heads=h, causal=False, dtype_str="bf16", return_lse=True)
+    fwd = build_fwd(num_heads=h, head_dim=d, num_kv_heads=h, causal=False, dtype_str=_dt_str(), return_lse=True)
     fwd(q, k, v, o, b, s, seqlen_k=s, scale=scale, lse=lse)
     torch.cuda.synchronize()
 
@@ -384,7 +443,7 @@ def test_consistent_with_the_gfx950_forward(head_dim):
     dk, dv = _run(q, k, v, do, lse, delta, scale=scale)
 
     _o64, _lse64, _delta64, _dq64, dk64, dv64 = _math_backward(q, k, v, do, scale, torch.float64)
-    _o16, _l16, _d16, _dq16, dk16, dv16 = _math_backward(q, k, v, do, scale, torch.bfloat16)
+    _o16, _l16, _d16, _dq16, dk16, dv16 = _math_backward(q, k, v, do, scale, _dt())
     for name, ours, low, high in (("dk", dk, dk16, dk64), ("dv", dv, dv16, dv64)):
         e_ours, e_low = _rel(ours, high), _rel(low, high)
         assert e_ours <= FUDGE[name] * e_low, (
@@ -394,7 +453,7 @@ def test_consistent_with_the_gfx950_forward(head_dim):
 
 
 @pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
-def test_joint_with_dq_against_one_autograd_call(head_dim):
+def test_joint_with_dq_against_one_autograd_call(head_dim, dtype):
     """dQ and dK/dV are one gradient; test them apart and a cancelling error hides.
 
     Contract section 6. Skipped until the dQ kernel exists, because it is the
@@ -411,13 +470,13 @@ def test_joint_with_dq_against_one_autograd_call(head_dim):
     q, k, v, do = _rand(b, h, s, d), _rand(b, h, s, d), _rand(b, h, s, d), _rand(b, h, s, d)
     scale = 1.0 / d**0.5
     _o64, lse64, delta64, dq64, dk64, dv64 = _math_backward(q, k, v, do, scale, torch.float64)
-    _o16, _l16, _d16, dq16, dk16, dv16 = _math_backward(q, k, v, do, scale, torch.bfloat16)
+    _o16, _l16, _d16, dq16, dk16, dv16 = _math_backward(q, k, v, do, scale, _dt())
 
     lse = lse64.reshape(b * h, s).float().contiguous()
     delta = delta64.reshape(b * h, s).float().contiguous()
     dk, dv = _run(q, k, v, do, lse, delta, scale=scale)
     dq = torch.full_like(q, float("nan"))
-    dq_fn = dq_build(num_heads=h, head_dim=d, num_kv_heads=h)
+    dq_fn = dq_build(num_heads=h, head_dim=d, num_kv_heads=h, dtype_str=_dt_str())
     dq_fn(q, k, v, do, dq, lse, delta, b, s, seqlen_k=s, scale=scale)
     torch.cuda.synchronize()
 
@@ -433,7 +492,7 @@ def test_joint_with_dq_against_one_autograd_call(head_dim):
 
 @pytest.mark.parametrize("head_dim", LADDER)
 @pytest.mark.parametrize("sq,sk", [(256, 256), (199, 333), (512, 128), (128, 512)])
-def test_causal_matches_the_band(sq, sk, head_dim):
+def test_causal_matches_the_band(sq, sk, head_dim, dtype):
     """Bottom-right causal at every rung, including both `Sq != Sk` directions.
 
     `Sq > Sk` is the case that produces q rows with **no live key at all** --
@@ -451,7 +510,7 @@ def test_causal_matches_the_band(sq, sk, head_dim):
     [(64, 0), (128, 32), (32, -8), (10000, 10000), (0, 0)],
     ids=["band64", "band128r32", "negative_left", "unbounded", "diagonal_only"],
 )
-def test_window_matches_the_band(window, head_dim):
+def test_window_matches_the_band(window, head_dim, dtype):
     """Generalized sliding windows, including the two degenerate ends.
 
     `negative_left` pushes the whole band to the *right* of the diagonal, so
@@ -466,7 +525,7 @@ def test_window_matches_the_band(window, head_dim):
 
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
-def test_window_sentinel_reproduces_causal_bitwise(head_dim, rows):
+def test_window_sentinel_reproduces_causal_bitwise(head_dim, rows, dtype):
     """A window build fed `WINDOW_BOTRIGHT` must equal a causal build **exactly**.
 
     The sharpest test available here, and the reason is that the two builds are
@@ -590,6 +649,58 @@ def test_causal_tile_cut_is_not_inert(rows):
     )
 
 
+_ISA_CHILD = """
+import sys, argparse
+sys.path.insert(0, {parity!r})
+p = argparse.ArgumentParser()
+p.add_argument("--rows", type=int, default=32)
+p.add_argument("--dt", default="bf16")
+a = p.parse_args()
+import torch
+from fmha_bwd_dkdv_gfx950 import build_fmha_bwd_dkdv_gfx950_module as build
+DT = torch.bfloat16 if a.dt == "bf16" else torch.float16
+d, B, H, S = 64, 1, 2, 256
+q = torch.randn(B, H, S, d, device="cuda", dtype=DT)
+k, v, do = torch.randn_like(q), torch.randn_like(q), torch.randn_like(q)
+dk, dv = torch.empty_like(k), torch.empty_like(v)
+lse = torch.randn(B * H, S, device="cuda", dtype=torch.float32)
+delta = torch.randn_like(lse)
+fn = build(num_heads=H, head_dim=d, num_kv_heads=H, dtype_str=a.dt, mfma_rows=a.rows,
+           dkv_shards=1, num_waves=4, block_kv=a.rows * 4, block_q=64, head_dim_granule=64)
+fn(q, k, v, do, dk, dv, lse, delta, B, S, seqlen_k=S, scale=1.0 / d ** 0.5)
+torch.cuda.synchronize()
+"""
+
+
+def _dump_isa(*, dtype_str, rows):
+    """Compile one configuration in a child process and return its final ISA.
+
+    A child, because `FLYDSL_DUMP_IR` has to be set before the interpreter
+    starts -- the same reason `check_exec_hazard_gfx950.py` shells out.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = tempfile.mkdtemp(prefix="isa_dtype_")
+    env = dict(os.environ, FLYDSL_RUNTIME_ENABLE_CACHE="0", FLYDSL_DUMP_IR="1", FLYDSL_DUMP_DIR=out)
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+        f.write(_ISA_CHILD.format(parity=here))
+        script = f.name
+    r = subprocess.run(
+        [sys.executable, script, "--rows", str(rows), "--dt", dtype_str],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    assert r.returncode == 0, f"build failed for {dtype_str} rows{rows}:\n{r.stderr[-2000:]}"
+    path = os.path.join(out, "fmha_bwd_dkdv_gfx950_kernel_0", "21_final_isa.s")
+    with open(path) as fh:
+        isa = fh.read()
+    # The negative control: if the scan is not looking at a real kernel, every
+    # "absence" assertion below passes vacuously.
+    assert "v_mfma" in isa, f"no MFMA in the dumped ISA for {dtype_str} rows{rows}; this is not the kernel"
+    return isa
+
+
 def test_no_transpose_read_under_a_narrowed_exec():
     """CDNA4 section 11.4: `ds_read_b64_tr_b16` requires EXEC all 1s.
 
@@ -647,15 +758,15 @@ def _varlen_case(mode, lq, lk, h, d, lse_layout):
     if mode in ("compact", "strided", "seqused_packed"):
         Q, K, V, DO = packed(0), packed(1), packed(2), packed(3)
     elif mode == "padded":
-        Q = torch.zeros(n, h, mq, d, device="cuda", dtype=DT)
-        K = torch.zeros(n, h, mk, d, device="cuda", dtype=DT)
+        Q = torch.zeros(n, h, mq, d, device="cuda", dtype=_dt())
+        K = torch.zeros(n, h, mk, d, device="cuda", dtype=_dt())
         V, DO = torch.zeros_like(K), torch.zeros_like(Q)
         for i, (q, k, v, do) in enumerate(seqs):
             Q[i, :, : lq[i]], DO[i, :, : lq[i]] = q[0], do[0]
             K[i, :, : lk[i]], V[i, :, : lk[i]] = k[0], v[0]
     else:  # seqused_cache: packed Q against a *batched* KV cache
         Q, DO = packed(0), packed(3)
-        K = torch.zeros(n, h, mk, d, device="cuda", dtype=DT)
+        K = torch.zeros(n, h, mk, d, device="cuda", dtype=_dt())
         V = torch.zeros_like(K)
         for i, (_q, k, v, _do) in enumerate(seqs):
             K[i, :, : lk[i]], V[i, :, : lk[i]] = k[0], v[0]
@@ -695,6 +806,7 @@ def _varlen_vs_dense(mode, lq, lk, d=64, h=2, causal=False, rows=None, lse_layou
         varlen=True,
         causal=causal,
         lse_layout_th=bool(lse_layout),
+        dtype_str=_dt_str(),
         **knobs,
     )
     fn(Q, K, V, DO, dK, dV, lse, delta, bsz, mq, seqlen_k=mk, scale=scale, varlen=desc, num_seqlens=nseq)
@@ -715,7 +827,7 @@ def _varlen_vs_dense(mode, lq, lk, d=64, h=2, causal=False, rows=None, lse_layou
         head_dim_granule=fn.knobs.head_dim_granule,
         tight_registers=fn.knobs.tight_registers,
     )
-    ref = build(num_heads=h, head_dim=d, num_kv_heads=h, causal=causal, **pin)
+    ref = build(num_heads=h, head_dim=d, num_kv_heads=h, causal=causal, dtype_str=_dt_str(), **pin)
     off = 0
     for i, (q, k, v, do) in enumerate(seqs):
         dk_r, dv_r = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
@@ -747,7 +859,7 @@ def _varlen_vs_dense(mode, lq, lk, d=64, h=2, causal=False, rows=None, lse_layou
 @pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
 @pytest.mark.parametrize("mode", _VARLEN_MODES)
-def test_varlen_equals_n_dense_calls(mode, rows, causal):
+def test_varlen_equals_n_dense_calls(mode, rows, causal, dtype):
     """All five `VarlenBits` configurations, both families, both masking modes.
 
     `Sq != Sk` per sequence, so bottom-right alignment is per-sequence rather
@@ -764,7 +876,7 @@ def test_varlen_equals_n_dense_calls(mode, rows, causal):
 
 
 @pytest.mark.parametrize("head_dim", LADDER)
-def test_varlen_across_the_ladder(head_dim):
+def test_varlen_across_the_ladder(head_dim, dtype):
     """The whole ladder, at the policy's own family and geometry for each rung."""
     _require_rocm_path()
     _varlen_vs_dense("compact", [128, 65, 33], [128, 65, 33], d=head_dim)
@@ -772,7 +884,7 @@ def test_varlen_across_the_ladder(head_dim):
 
 
 @pytest.mark.parametrize("mode", _VARLEN_MODES)
-def test_varlen_transformer_engine_lse_layout(mode):
+def test_varlen_transformer_engine_lse_layout(mode, dtype):
     """`VARLEN_LSE_LAYOUT_TH`: the row pitch stops being 1.
 
     Bits 17:16 choose `(H, T)` -- AOTriton's, tokens contiguous -- or `(T, H)`,
@@ -787,7 +899,7 @@ def test_varlen_transformer_engine_lse_layout(mode):
     _varlen_vs_dense(mode, [96, 200, 41], [160, 200, 300], d=128, rows=16, lse_layout=abi.VARLEN_LSE_LAYOUT_TH)
 
 
-def test_varlen_edges():
+def test_varlen_edges(dtype):
     """Single-token sequences, a single sequence, and a badly ragged batch."""
     _require_rocm_path()
     _varlen_vs_dense("compact", [1, 2, 3, 4], [1, 2, 3, 4], d=64)
@@ -810,9 +922,11 @@ def test_varlen_build_and_descriptor_must_agree():
     lse = torch.zeros(b * h, s, device="cuda", dtype=torch.float32)
     desc = abi.varlen_compact(_cu([s]), _cu([s]), s, s, lse_tokens=s)
     with pytest.raises(ValueError, match="not compiled for varlen"):
-        build(num_heads=h, head_dim=d)(q, k, v, do, dk, dv, lse, lse, b, s, varlen=desc, num_seqlens=1)
+        build(num_heads=h, head_dim=d, dtype_str=_dt_str())(
+            q, k, v, do, dk, dv, lse, lse, b, s, varlen=desc, num_seqlens=1
+        )
     with pytest.raises(ValueError, match="requires a varlen= descriptor"):
-        build(num_heads=h, head_dim=d, varlen=True)(q, k, v, do, dk, dv, lse, lse, b, s)
+        build(num_heads=h, head_dim=d, varlen=True, dtype_str=_dt_str())(q, k, v, do, dk, dv, lse, lse, b, s)
 
 
 # ---------------------------------------------------------------------------
@@ -866,7 +980,7 @@ def _dropout_case(
         head_dim=d,
         num_kv_heads=hk,
         causal=causal,
-        dtype_str="bf16",
+        dtype_str=_dt_str(),
         return_lse=True,
         dropout=True,
         bias=bias is not None,
@@ -909,7 +1023,16 @@ def _dropout_case(
 
     knobs = {} if rows is None else _family_knobs(d, rows)
     dk, dv = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
-    fn = build(num_heads=h, head_dim=d, num_kv_heads=hk, dropout=True, causal=causal, bias=bias is not None, **knobs)
+    fn = build(
+        num_heads=h,
+        head_dim=d,
+        num_kv_heads=hk,
+        dropout=True,
+        causal=causal,
+        bias=bias is not None,
+        dtype_str=_dt_str(),
+        **knobs,
+    )
     fn(
         q,
         k,
@@ -936,7 +1059,7 @@ def _dropout_case(
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
-def test_dropout_regenerates_the_forwards_mask(head_dim, rows, causal):
+def test_dropout_regenerates_the_forwards_mask(head_dim, rows, causal, dtype):
     """The cross-kernel gate, and the only test that can see a mask disagreement.
 
     The reference is built from the mask `dropout_mask_gfx1201` regenerates, so
@@ -968,7 +1091,7 @@ def _dropout_run(knobs, p, seed=99, d=64, b=1, h=2, s=512, drop=True):
     lse = torch.randn(b * h, s, device="cuda", dtype=torch.float32)
     delta = torch.randn_like(lse)
     dk, dv = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
-    fn = build(num_heads=h, head_dim=d, num_kv_heads=h, dropout=drop, **knobs)
+    fn = build(num_heads=h, head_dim=d, num_kv_heads=h, dropout=drop, dtype_str=_dt_str(), **knobs)
     extra = dict(dropout_p=p, philox_seed=_u64(seed), philox_offset1=_u64(0), philox_offset2=0) if drop else {}
     fn(q, k, v, do, dk, dv, lse, delta, b, s, seqlen_k=s, scale=1.0 / d**0.5, **extra)
     torch.cuda.synchronize()
@@ -976,24 +1099,51 @@ def _dropout_run(knobs, p, seed=99, d=64, b=1, h=2, s=512, drop=True):
 
 
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
-def test_dropout_p_zero_is_bitwise_a_build_without_it(rows):
+def test_dropout_p_zero_is_bitwise_a_build_without_it(rows, dtype):
     """`p = 0` must change nothing at all, not merely little.
 
     The dropout arm multiplies `dP` by `1/(1-p)` and selects on `keep`; at
     `p = 0` the scale is exactly 1.0 and every element is kept, so the
-    arithmetic is unchanged and the answer must be identical to a build that
+    arithmetic is unchanged and the answer should be identical to a build that
     emits none of it. A tolerance would not notice a survivor scale applied on
     the wrong side.
+
+    **bf16 holds bitwise; f16 does not, and that is a real finding rather than
+    a slack tolerance.** The two builds are genuinely different instruction
+    streams -- one carries a `select` and a multiply the other does not -- so
+    bit-for-bit agreement was never guaranteed by construction; it needs the
+    compiler not to reassociate around the extra ops, and `fm_fast` licenses it
+    to. Measured at 32 rows: **0.12% of elements differ, up to 19 ulps of the
+    f16 encoding**, and those elements are the *small* ones (median |dK| 1.4e-2
+    against 6.1e-2 overall), which is the signature of a fixed absolute f32
+    residue resolving differently once the mantissa is fine enough to see it.
+    bf16's 7 bits absorb it; f16's 10 sometimes do not. The 16-row family holds
+    bitwise in both types.
+
+    So f16 asserts the properties that still carry and that a misplaced scale
+    would still break: determinism, a bounded ulp distance, and **equal
+    accuracy against fp64** -- measured 2.9842e-04 against 2.9844e-04, agreeing
+    to four significant figures, where a survivor scale on the wrong side of
+    the subtraction would move it by a factor.
     """
     _require_rocm_path()
     knobs = _family_knobs(64, rows)
     on = _dropout_run(knobs, 0.0, drop=True)
     off = _dropout_run(knobs, None, drop=False)
-    assert torch.equal(on[0], off[0]) and torch.equal(on[1], off[1])
+    if _dt_str() == "bf16":
+        assert torch.equal(on[0], off[0]) and torch.equal(on[1], off[1])
+        return
+    again = _dropout_run(knobs, 0.0, drop=True)
+    for i, name in ((0, "dK"), (1, "dV")):
+        assert torch.equal(on[i], again[i]), f"{name}: the dropout build is not deterministic at p=0"
+        ulp = (on[i].view(torch.int16).int() - off[i].view(torch.int16).int()).abs()
+        frac = float((ulp != 0).float().mean())
+        assert frac < 0.01, f"{name}: {frac:.3%} of elements differ at p=0, far beyond a rounding residue"
+        assert int(ulp.max()) <= 64, f"{name}: max {int(ulp.max())} ulps at p=0, beyond a rounding residue"
 
 
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
-def test_dropout_is_deterministic_per_seed(rows):
+def test_dropout_is_deterministic_per_seed(rows, dtype):
     """Same seed bit-identical, different seed different. Both halves matter."""
     _require_rocm_path()
     knobs = _family_knobs(64, rows)
@@ -1012,7 +1162,7 @@ def test_dropout_is_deterministic_per_seed(rows):
     ],
     ids=["m32_waves", "m16_blockq", "m16_waves"],
 )
-def test_dropout_mask_does_not_depend_on_the_tiling(rows, alt):
+def test_dropout_mask_does_not_depend_on_the_tiling(rows, alt, dtype):
     """P6's contract, and the reason `grid_plane` never sees a `BLOCK_*`.
 
     The mask is a function of absolute `(batch, head, row, column)` and the
@@ -1038,7 +1188,7 @@ def test_dropout_mask_does_not_depend_on_the_tiling(rows, alt):
 
 
 @pytest.mark.parametrize("head_dim", [64, 128, 192])
-def test_bshd_layout_is_read_through_the_strides(head_dim):
+def test_bshd_layout_is_read_through_the_strides(head_dim, dtype):
     """A BSHD *layout* with a BHSD *shape* must give the same answer.
 
     Nothing at runtime distinguishes a head stride from a sequence stride, so a
@@ -1071,7 +1221,7 @@ def test_bshd_layout_is_read_through_the_strides(head_dim):
 
 
 @pytest.mark.parametrize("head_dim", [64, 128, 384])
-def test_writes_nothing_past_the_kv_sequence(head_dim):
+def test_writes_nothing_past_the_kv_sequence(head_dim, dtype):
     """The output descriptors bound the store; a ragged tail must stay untouched.
 
     The KV block is a whole number of workgroups, so the last one owns rows
@@ -1095,8 +1245,8 @@ def test_writes_nothing_past_the_kv_sequence(head_dim):
     lse = lse64.reshape(b * h, s).float().contiguous()
     delta = delta64.reshape(b * h, s).float().contiguous()
 
-    dk_full = torch.full((b, h, s + slack, d), 1234.0, device="cuda", dtype=DT)
-    dv_full = torch.full((b, h, s + slack, d), 1234.0, device="cuda", dtype=DT)
+    dk_full = torch.full((b, h, s + slack, d), 1234.0, device="cuda", dtype=_dt())
+    dv_full = torch.full((b, h, s + slack, d), 1234.0, device="cuda", dtype=_dt())
     _run(q, k, v, do, lse, delta, scale=scale, dk=dk_full[:, :, :s], dv=dv_full[:, :, :s])
     torch.cuda.synchronize()
     assert torch.all(dk_full[:, :, s:] == 1234.0), "dK was written past seqlen_kv"
@@ -1113,7 +1263,7 @@ _GRID8 = list(range(8, 513, 8))
 
 
 @pytest.mark.parametrize("hdim", _GRID8)
-def test_grid8_contiguous_is_exact_and_writes_nothing_past_the_last_row(hdim):
+def test_grid8_contiguous_is_exact_and_writes_nothing_past_the_last_row(hdim, dtype):
     """A plainly contiguous 8xD tensor -- no padded view -- must just work.
 
     The forward's `test_grid8_contiguous_is_exact_and_writes_nothing_past_o`,
@@ -1134,13 +1284,13 @@ def test_grid8_contiguous_is_exact_and_writes_nothing_past_the_last_row(hdim):
     assert q.stride(2) == hdim, "the point of this test is a tight pitch"
     scale = 1.0 / hdim**0.5
     _o, lse64, delta64, _dq, dk64, dv64 = _math_backward(q, k, v, do, scale, torch.float64)
-    _o2, _l, _d, _dq2, dk16, dv16 = _math_backward(q, k, v, do, scale, torch.bfloat16)
+    _o2, _l, _d, _dq2, dk16, dv16 = _math_backward(q, k, v, do, scale, _dt())
     lse = lse64.reshape(b * h, s).float().contiguous()
     delta = delta64.reshape(b * h, s).float().contiguous()
 
     sentinel = -12345.0
-    dkbuf = torch.full((b, h, s + 1, hdim), sentinel, device="cuda", dtype=DT)
-    dvbuf = torch.full((b, h, s + 1, hdim), sentinel, device="cuda", dtype=DT)
+    dkbuf = torch.full((b, h, s + 1, hdim), sentinel, device="cuda", dtype=_dt())
+    dvbuf = torch.full((b, h, s + 1, hdim), sentinel, device="cuda", dtype=_dt())
     _run(q, k, v, do, lse, delta, scale=scale, dk=dkbuf[:, :, :s], dv=dvbuf[:, :, :s])
     torch.cuda.synchronize()
     assert torch.all(dkbuf[:, :, s] == sentinel), f"a dK store ran past the last row at hdim {hdim}"
@@ -1155,7 +1305,7 @@ def test_grid8_contiguous_is_exact_and_writes_nothing_past_the_last_row(hdim):
 
 
 @pytest.mark.parametrize("hdim,pitch", [(100, 104), (33, 40), (7, 8), (300, 304)])
-def test_padded_head_never_writes_past_the_8_aligned_chunk(hdim, pitch):
+def test_padded_head_never_writes_past_the_8_aligned_chunk(hdim, pitch, dtype):
     """A D tail may spill into the caller's pad, but not past it.
 
     A 128-bit store is all-or-nothing, so a chunk straddling `hdim` writes into
@@ -1169,7 +1319,7 @@ def test_padded_head_never_writes_past_the_8_aligned_chunk(hdim, pitch):
     torch.manual_seed(hdim)
 
     def _padded(*, rows=s):
-        full = torch.randn(b, h, rows, pitch, device="cuda", dtype=DT)
+        full = torch.randn(b, h, rows, pitch, device="cuda", dtype=_dt())
         return full, full[..., :hdim]
 
     _fq, q = _padded()
@@ -1178,12 +1328,12 @@ def test_padded_head_never_writes_past_the_8_aligned_chunk(hdim, pitch):
     _fdo, do = _padded()
     scale = 1.0 / hdim**0.5
     _o, lse64, delta64, _dq, dk64, dv64 = _math_backward(q, k, v, do, scale, torch.float64)
-    _o2, _l, _d, _dq2, dk16, dv16 = _math_backward(q, k, v, do, scale, torch.bfloat16)
+    _o2, _l, _d, _dq2, dk16, dv16 = _math_backward(q, k, v, do, scale, _dt())
     lse = lse64.reshape(b * h, s).float().contiguous()
     delta = delta64.reshape(b * h, s).float().contiguous()
 
-    dkfull = torch.full((b, h, s, pitch), -7.0, device="cuda", dtype=DT)
-    dvfull = torch.full((b, h, s, pitch), -7.0, device="cuda", dtype=DT)
+    dkfull = torch.full((b, h, s, pitch), -7.0, device="cuda", dtype=_dt())
+    dvfull = torch.full((b, h, s, pitch), -7.0, device="cuda", dtype=_dt())
     _run(q, k, v, do, lse, delta, scale=scale, dk=dkfull[..., :hdim], dv=dvfull[..., :hdim])
     torch.cuda.synchronize()
     ceil8 = (hdim + 7) // 8 * 8
@@ -1225,9 +1375,9 @@ def test_odd_hdim_bshd_without_slack_is_refused():
     _require_rocm_path()
     b, h, s, hdim = 1, 4, 128, 100
     assert (h * hdim) % 8 == 0, "the case is only interesting when the pitch looks fine"
-    q, k, v, do = (torch.randn(b, s, h, hdim, device="cuda", dtype=DT).transpose(1, 2) for _ in range(4))
-    dk = torch.empty(b, s, h, hdim, device="cuda", dtype=DT).transpose(1, 2)
-    dv = torch.empty(b, s, h, hdim, device="cuda", dtype=DT).transpose(1, 2)
+    q, k, v, do = (torch.randn(b, s, h, hdim, device="cuda", dtype=_dt()).transpose(1, 2) for _ in range(4))
+    dk = torch.empty(b, s, h, hdim, device="cuda", dtype=_dt()).transpose(1, 2)
+    dv = torch.empty(b, s, h, hdim, device="cuda", dtype=_dt()).transpose(1, 2)
     lse = torch.zeros(b * h, s, device="cuda", dtype=torch.float32)
     assert q.stride(2) % 8 == 0, "the pitch check would pass here"
     fn = build(num_heads=h, head_dim=hdim)
@@ -1236,7 +1386,7 @@ def test_odd_hdim_bshd_without_slack_is_refused():
 
 
 @pytest.mark.parametrize("head_dim", [64, 512])
-def test_deterministic(head_dim):
+def test_deterministic(head_dim, dtype):
     """Bit-identical run to run. Nothing here accumulates through an atomic.
 
     Worth pinning explicitly: AITER's tuned gfx950 backward reaches dQ by
@@ -1264,8 +1414,8 @@ def test_refuses_what_it_does_not_compute():
         build(num_heads=8, head_dim=64, num_kv_heads=3)
     with pytest.raises(ValueError, match="exceeds the widest tile"):
         build(num_heads=8, head_dim=513)
-    with pytest.raises(NotImplementedError, match="bf16"):
-        build(num_heads=8, head_dim=64, dtype_str="f16")
+    with pytest.raises(NotImplementedError, match="bf16 and f16"):
+        build(num_heads=8, head_dim=64, dtype_str="fp8")
 
 
 def test_rejects_a_mismatched_row_tensor():
@@ -1328,6 +1478,7 @@ def _bias_run(
         num_kv_heads=k.shape[1],
         bias=bias is not None,
         varlen=varlen is not None,
+        dtype_str=_dt_str(),
         **(knobs or {}),
     )
     dk, dv = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
@@ -1340,7 +1491,7 @@ def _bias_run(
 
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
-def test_bias_changes_the_gradient_correctly(head_dim, rows):
+def test_bias_changes_the_gradient_correctly(head_dim, rows, dtype):
     """Against a reference *with* the bias, and far from one without it.
 
     The second assertion is the one that matters. A build that read the bias
@@ -1385,7 +1536,7 @@ def test_bias_changes_the_gradient_correctly(head_dim, rows):
 
 
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
-def test_bias_zero_is_bitwise_a_build_without_it(rows):
+def test_bias_zero_is_bitwise_a_build_without_it(rows, dtype):
     """`bias=0` must be bitwise identical, as `p = 0` was in B6.
 
     A zero bias adds exactly `0.0 * log2e` to every exponent, so the arithmetic
@@ -1411,7 +1562,7 @@ def test_bias_zero_is_bitwise_a_build_without_it(rows):
 
 
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
-def test_bias_minus_inf_never_produces_nan(rows):
+def test_bias_minus_inf_never_produces_nan(rows, dtype):
     """`-inf` is how a caller spells "never attend here", and it is arithmetic here.
 
     Everywhere else in this kernel a mask is a `select` or a descriptor bound,
@@ -1481,7 +1632,7 @@ def test_bias_tensor_presence_is_checked_both_ways():
         build(num_heads=h, head_dim=d, bias=True)(q, k, v, do, dk, dv, row, row, b, s, bias=bias.transpose(2, 3))
 
 
-def test_bias_composes_with_varlen():
+def test_bias_composes_with_varlen(dtype):
     """Bias under varlen must equal N dense calls, bitwise.
 
     The bias follows Q on the query axis -- the descriptor folds in the varlen
@@ -1561,7 +1712,7 @@ def test_bias_composes_with_varlen():
 
 
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
-def test_bias_composes_with_dropout(rows):
+def test_bias_composes_with_dropout(rows, dtype):
     """Both touch the scores, and they touch it at different points.
 
     The bias goes into the exponent, so it lands before `P` exists; dropout
@@ -1607,7 +1758,7 @@ def _gqa_ref(q, k, v, do, scale, causal=False):
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
 @pytest.mark.parametrize("hq,hk", [(8, 8), (8, 4), (8, 2), (8, 1), (6, 3)], ids=["mha", "g2", "g4", "mqa", "g2odd"])
 @pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
-def test_gqa_matches_the_grouped_reference(hq, hk, rows, causal):
+def test_gqa_matches_the_grouped_reference(hq, hk, rows, causal, dtype):
     """Several query heads reduce into one KV head, and the sum is the feature.
 
     `hq=6, hk=3` is the case a broadcast hides: with `hk=1` a plain
@@ -1643,7 +1794,7 @@ def test_gqa_matches_the_grouped_reference(hq, hk, rows, causal):
 
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
 @pytest.mark.parametrize("hk", [4, 2, 1], ids=["g2", "g4", "mqa"])
-def test_gqa_matches_n_grouped_dense_calls(hk, rows):
+def test_gqa_matches_n_grouped_dense_calls(hk, rows, dtype):
     """The B5-shaped gate: new addressing against arithmetic already trusted.
 
     An MHA build over the *expanded* K/V is code that has passed every phase
@@ -1688,7 +1839,7 @@ def test_gqa_matches_n_grouped_dense_calls(hk, rows):
         )
 
 
-def test_gqa_composes_with_varlen_and_dropout():
+def test_gqa_composes_with_varlen_and_dropout(dtype):
     """A GQA group under varlen must still equal N dense calls, bitwise.
 
     Dropout is the interesting half: the philox plane is `(batch, query head)`,
@@ -1727,7 +1878,7 @@ def test_gqa_composes_with_varlen_and_dropout():
         del_p[:, off : off + n] = rows[i][1]
         off += n
     cu = _cu(lens)
-    fn = build(num_heads=hq, head_dim=d, num_kv_heads=hk, varlen=True, **knobs)
+    fn = build(num_heads=hq, head_dim=d, num_kv_heads=hk, varlen=True, dtype_str=_dt_str(), **knobs)
     dk, dv = torch.full_like(kp, float("nan")), torch.full_like(vp, float("nan"))
     fn(
         qp,
@@ -1753,7 +1904,7 @@ def test_gqa_composes_with_varlen_and_dropout():
 
 
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
-def test_gqa_draws_a_mask_per_query_head(rows):
+def test_gqa_draws_a_mask_per_query_head(rows, dtype):
     """Dropout under GQA, against the mask the forward actually drew.
 
     The forward runs one program per query head and draws a plane per
@@ -1768,3 +1919,196 @@ def test_gqa_draws_a_mask_per_query_head(rows):
     assert _rel(dk, dk_ref.double()) < 1e-2, "dK: the GQA fold is not drawing a mask per query head"
     assert _rel(dv, dv_ref.double()) < 1e-2, "dV: the GQA fold is not drawing a mask per query head"
     assert abs(keep - 0.75) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# B8: tests that can only pass if the build is genuinely the dtype it claims
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+@pytest.mark.parametrize("dt", ["bf16", "f16"])
+def test_the_build_uses_the_mfma_opcode_for_its_dtype(dt, rows):
+    """The coverage gate, and the reason it exists is that everything else can lie.
+
+    bf16 and f16 are **the same width**. Every descriptor, stride, LDS offset,
+    tile geometry and register count is identical between them, so a build that
+    silently kept bf16 while the harness fed it f16 tensors would produce
+    numbers that are finite and, against a tolerance, plausible. Feeding fp16
+    tensors is not evidence that fp16 was built -- that is the dtype-shaped
+    twin of a checker that parsed a flag and never passed it on.
+
+    So this reads the emitted ISA and requires the right MFMA opcode **and the
+    absence of the other one**. The absence half is what makes it decisive: a
+    build that emitted both would mean the dtype reached one GEMM and not
+    another, and the four GEMMs here do not all take their operands from the
+    same place.
+    """
+    _require_rocm_path()
+    isa = _dump_isa(dtype_str=dt, rows=rows)
+    shape = "32x32x16" if rows == 32 else "16x16x32"
+    want, other = f"v_mfma_f32_{shape}_{dt}", f"v_mfma_f32_{shape}_{'bf16' if dt == 'f16' else 'f16'}"
+    assert want in isa, f"a dtype_str={dt!r} build emitted no {want}; the dtype did not reach the MMA atom"
+    assert other not in isa, f"a dtype_str={dt!r} build also emitted {other}; the dtype reached only some GEMMs"
+    # And the output conversion, which is the site that was hardcoded before B8
+    # and would have bitcast bf16 patterns into an f16 tensor.
+    cvt = "v_cvt_pk_bf16_f32" if dt == "bf16" else "v_cvt_pk_f16_f32"
+    bad = "v_cvt_pk_f16_f32" if dt == "bf16" else "v_cvt_pk_bf16_f32"
+    assert cvt in isa, f"a dtype_str={dt!r} build emitted no {cvt}; the store is packing the wrong type"
+    assert bad not in isa, f"a dtype_str={dt!r} build emitted {bad}; some store path is still hardcoded"
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_f16_is_measurably_more_accurate_than_bf16(head_dim, rows):
+    """The second coverage gate, in the direction only fp16 can produce.
+
+    f16 has 10 mantissa bits to bf16's 7, so on **identical inputs** against an
+    fp64 reference its error must be about 8x smaller. A build that claimed f16
+    and ran bf16 would score the same as bf16, not 8x better -- so this catches
+    the same lie as the ISA assertion without reading a disassembly, and it
+    catches it in the numbers a user would actually see.
+
+    The bar is 3x rather than 8x: 8x is what the mantissa predicts and what is
+    measured (2.9e-4 against 2.35e-3), and 3x is clear of both that and of any
+    shape-dependence, while still being far outside the 1.0x a silently-bf16
+    build would give. This is the same "assert it is measurably not the other
+    plausible value" move as dropped-vs-undropped `dS` and the bias-free
+    reference.
+    """
+    _require_rocm_path()
+    knobs = _family_knobs(head_dim, rows)
+    b, h, s = 2, 4, 256
+    torch.manual_seed(head_dim * 7 + rows)
+    q32, k32, v32, do32 = (torch.randn(b, h, s, head_dim, device="cuda", dtype=torch.float32) for _ in range(4))
+    scale = 1.0 / head_dim**0.5
+    err = {}
+    for name, dt in (("bf16", torch.bfloat16), ("f16", torch.float16)):
+        # Cast from one f32 source, so the two runs see the same values to
+        # within their own rounding rather than two different draws.
+        q, k, v, do = (t.to(dt) for t in (q32, k32, v32, do32))
+        _o, lse, delta, _dq, dk64, dv64 = _math_backward(q, k, v, do, scale, torch.float64)
+        fn = build(num_heads=h, head_dim=head_dim, num_kv_heads=h, dtype_str=name, **knobs)
+        dk, dv = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
+        fn(
+            q,
+            k,
+            v,
+            do,
+            dk,
+            dv,
+            lse.reshape(b * h, s).float().contiguous(),
+            delta.reshape(b * h, s).float().contiguous(),
+            b,
+            s,
+            seqlen_k=s,
+            scale=scale,
+        )
+        torch.cuda.synchronize()
+        err[name] = (_rel(dk, dk64), _rel(dv, dv64))
+    for i, tensor in enumerate(("dk", "dv")):
+        lo, hi = err["f16"][i], err["bf16"][i]
+        assert lo * 3.0 < hi, (
+            f"{tensor}: f16 error {lo:.3e} is not measurably below bf16's {hi:.3e}. f16 has three more "
+            "mantissa bits, so ~8x is expected; a ratio near 1 means the f16 build is running bf16."
+        )
+
+
+def test_the_tensor_dtype_must_match_the_build():
+    """Same width, so nothing downstream would notice a mismatch.
+
+    Handing f16 tensors to a bf16 build reads them as bf16: every address is
+    identical and only the bit interpretation differs, which is wrong by a
+    factor near 2^112 and entirely silent. There is no place further down that
+    could catch it, so the host is the only place it can be caught.
+    """
+    _require_rocm_path()
+    b, h, s, d = 1, 2, 128, 64
+    torch.manual_seed(4)
+    row = torch.zeros(b * h, s, device="cuda", dtype=torch.float32)
+    for build_dt, feed_dt in (("bf16", torch.float16), ("f16", torch.bfloat16)):
+        q, k, v, do = (torch.randn(b, h, s, d, device="cuda", dtype=feed_dt) for _ in range(4))
+        dk, dv = torch.empty_like(k), torch.empty_like(v)
+        fn = build(num_heads=h, head_dim=d, num_kv_heads=h, dtype_str=build_dt)
+        with pytest.raises(ValueError, match="compiled for dtype_str"):
+            fn(q, k, v, do, dk, dv, row, row, b, s)
+
+
+@pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])
+def test_f16_range_holds_where_bf16_does_and_the_boundary_is_ds(rows):
+    """The one place the two element types are not interchangeable.
+
+    f16 overflows at 65504 where bf16 carries f32's range, so B7's and B5's
+    range arguments were re-derived rather than assumed:
+
+    - **The padding-row argument carries.** `LSE` and `delta` are f32 row
+      tensors whatever the element type, `exp2` is f32 and the accumulators are
+      f32, so "a zero row gives `P = exp2(0) = 1` and contributes zero" is a
+      statement about f32 arithmetic. Nothing in it moves.
+    - **The `-inf` bias case carries.** f16 has an infinity, the read converts
+      to f32 before anything arithmetic happens, and `exp2(-inf)` is an exact
+      zero either way. A caller who spells the mask as a large finite negative
+      instead saturates to `-inf` on the way into an f16 tensor, which still
+      masks.
+    - **`P` cannot overflow.** `lse` is the log-sum-exp of its own row, so no
+      score exceeds it and `P <= 1` by construction, in either type.
+    - **`dS` is the exposure**, and the only one: it is the one unbounded value
+      packed to the element type, for GEMM4. Measured boundary, at
+      `B1 H2 S256 D64` with `dO` scaled up: `|dS|` reaches 22390 at `|dO|`
+      scale 15000 and f16 is clean; at scale 30000 `|dS|` is 69482, past
+      65504, and f16 returns NaN where bf16 does not.
+
+    This pins the safe side. **The test computes its own precondition** rather
+    than trusting a magnitude, because `max|dS|` depends on the tail of the
+    draw and not just the scale: the first version of this test used 15000x on
+    the grounds that the probe had measured it clean, and a different seed put
+    the maximum over the line. A range test whose safety margin is itself a
+    random variable is not a range test.
+
+    The boundary is inherent to f16 and is shared with every f16 attention
+    backward; it is recorded rather than worked around, because clamping `dS`
+    would change the gradient.
+    """
+    _require_rocm_path()
+    knobs = _family_knobs(64, rows)
+    b, h, s, d = 1, 2, 256, 64
+    scale = 1.0 / d**0.5
+    torch.manual_seed(rows)
+    q32, k32, v32 = (torch.randn(b, h, s, d, device="cuda", dtype=torch.float32) for _ in range(3))
+    # Far outside any magnitude the other tests reach, so it exercises the
+    # range rather than the mantissa -- and then checked, not assumed.
+    do32 = torch.randn(b, h, s, d, device="cuda", dtype=torch.float32) * 5000.0
+    _o, lse, delta, _dq, dk64, dv64 = _math_backward(q32, k32, v32, do32, scale, torch.float64)
+
+    # The precondition: this shape must actually be inside f16's range, or the
+    # assertions below are testing the overflow rather than the absence of one.
+    qq, kk, vv = (t.double() for t in (q32, k32, v32))
+    sc64 = (qq @ kk.transpose(-1, -2)) * scale
+    p64 = torch.softmax(sc64, -1)
+    dp64 = do32.double() @ vv.transpose(-1, -2)
+    delta64 = (do32.double() * (p64 @ vv)).sum(-1, keepdim=True)
+    max_ds = (p64 * (dp64 - delta64)).abs().max().item()
+    assert max_ds < 65504.0 / 4, f"|dS| reaches {max_ds:.0f}, too close to f16's 65504 for this to be a safe case"
+    for name in ("bf16", "f16"):
+        dt = _DTYPES[name]
+        q, k, v, do = (t.to(dt) for t in (q32, k32, v32, do32))
+        fn = build(num_heads=h, head_dim=d, num_kv_heads=h, dtype_str=name, **knobs)
+        dk, dv = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
+        fn(
+            q,
+            k,
+            v,
+            do,
+            dk,
+            dv,
+            lse.reshape(b * h, s).float().contiguous(),
+            delta.reshape(b * h, s).float().contiguous(),
+            b,
+            s,
+            seqlen_k=s,
+            scale=scale,
+        )
+        torch.cuda.synchronize()
+        assert torch.isfinite(dk.float()).all(), f"{name}: dK is not finite at a magnitude inside f16's range"
+        assert torch.isfinite(dv.float()).all(), f"{name}: dV is not finite at a magnitude inside f16's range"
+        assert _rel(dk, dk64) < 1e-2 and _rel(dv, dv64) < 1e-2, f"{name}: wrong at 15000x dO"
