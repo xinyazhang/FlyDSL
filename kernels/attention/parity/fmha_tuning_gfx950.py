@@ -144,6 +144,33 @@ LADDER_PLANNED = ()
 # Granule 64 with BLOCK_N 64 is one point in that space, not the only one.
 DEFAULT_HEAD_DIM_GRANULE = 64
 
+# ---------------------------------------------------------------------------
+# The grid axis order, as a knob
+# ---------------------------------------------------------------------------
+#
+# **A consumer that computes the launch grid itself needs this, and cannot see
+# it.** AOTriton dispatches the hsaco directly and computes the grid in C++; it
+# never runs our `@flyc.jit` launcher, so every decision the launcher makes
+# about which quantity lands on which grid axis has to travel in the knob set.
+# The alternative is an `if (arch == ...)` on their side, which silently rots
+# the next time this is re-measured.
+#
+# The mapping *is* the interface, so it is written here rather than inferred:
+#
+#   0  HEAD_FASTEST  grid = (head, tile_blocks, batch_or_seq)
+#   1  TILE_FASTEST  grid = (tile_blocks, head, batch_or_seq)
+#
+# "head" is the q head for the forward and dQ, the **kv** head for dK/dV, which
+# is what the GQA fold made it. All three gfx950 launchers are HEAD_FASTEST;
+# gfx1201's dK/dV is TILE_FASTEST, chosen there for causal load balance.
+#
+# gfx950 measured the other order and rejected it: KV-fastest was 12-15% slower
+# at every rung, because MI355X's eight XCDs make this an L2-locality lever
+# rather than a duration-spreading one. That measurement is why the value is a
+# recorded knob and not a constant someone can quietly re-derive.
+GRID_AXIS_HEAD_FASTEST = 0
+GRID_AXIS_TILE_FASTEST = 1
+
 # The PV MFMA is `v_mfma_f32_32x32x16`, whose output is 32 D columns wide, so
 # `D_CHUNKS = head_dim / 32` cannot go below 1. **This is what makes a granule
 # of 16 impossible**, and it is an instruction limit rather than a staging one:
@@ -413,18 +440,40 @@ class Gfx950Knobs(FmhaKnobs):
     v_k_substep: int | None = None
     v_dc_in_pair: int | None = None
 
-    # Set by `resolve`; never by a caller. Holding the traits *on* the resolved
-    # knobs is what makes "knobs and traits are one thing" true at the use
-    # site: the builder takes one object and reads both from it.
-    traits: object | None = None
+    # Which quantity lands on which grid axis; see `GRID_AXIS_HEAD_FASTEST`.
+    # Set by `resolve`, never by a caller -- it is a property of the launcher,
+    # not a choice. **Spelled in upper case against the convention here** because
+    # the field name is the wire key: the C++ side reads it back as
+    # `perf().get_int("GRID_AXIS_ORDER")`.
+    GRID_AXIS_ORDER: int | None = None
+
+    # There is deliberately no `traits` field. **A knob class is plain build
+    # options, every value a scalar**, which is what gfx1201's `FmhaKnobs` is
+    # and what makes the object serialisable: AOTriton records the knob set
+    # beside each compiled hsaco in a flat `k=v` wire format, and a nested
+    # dataclass cannot be rendered into it.
+    #
+    # The traits are still derived here, by `build_traits` below, and `resolve`
+    # still calls it -- so a configuration that cannot produce valid traits is
+    # rejected at tuning time rather than at a kernel address. What changed is
+    # only that the result is handed to the builder on request instead of being
+    # carried on the object.
 
     def resolve(self, meta: FmhaInputMetadata) -> "Gfx950Knobs":
-        """The complete build configuration for `meta`, traits included.
+        """The complete build configuration for `meta`.
 
         Subsumes what used to be `resolve_knobs` *and* `make_parity_traits`.
         Idempotent: resolving an already-resolved object re-derives the same
         answer, since every derived field is recomputed from `meta` and the
         pinned fields rather than read back.
+
+        The last step builds the traits and **throws the result away**, keeping
+        only its verdict. That is not waste: every check in `build_traits` --
+        the LDS cap, the shard split, the rows-per-wave ceiling -- reports which
+        knob to move, and reporting it here means a bad configuration fails at
+        `resolve` rather than at a kernel address. The builder calls
+        `build_traits` again for the object itself; it is a dataclass
+        construction, not a compile.
         """
         return (
             _GFX950_FALLBACK.merge(self)
@@ -432,7 +481,7 @@ class Gfx950Knobs(FmhaKnobs):
             ._with_mode_defaults(meta)
             ._with_widths(meta)
             ._with_wave_geometry()
-            ._with_traits(meta)
+            ._checked_against_traits(meta)
         )
 
     def _checked_modes(self):
@@ -681,14 +730,27 @@ class Gfx950Knobs(FmhaKnobs):
             )
         return per_issue, lines, lines // self.num_waves
 
-    def _with_traits(self, meta):
-        """Build the dualwave traits this configuration implies.
+    def _checked_against_traits(self, meta):
+        """`resolve`'s last step: prove the traits are buildable, return `self`.
 
-        The last step. `fmha_traits_gfx950.make_traits` takes the geometry as
-        parameters where the production constructor hardcodes it, and is
-        checked field-by-field against production at family A's numbers -- so
-        family A goes through this path today and the bitwise-vs-production
-        test covers it.
+        See `resolve` for why the traits object is discarded here.
+        """
+        self.build_traits(meta)
+        return replace(self, GRID_AXIS_ORDER=GRID_AXIS_HEAD_FASTEST)
+
+    def build_traits(self, meta):
+        """The dualwave traits this configuration implies. **The one mapping.**
+
+        Knobs are the tuning module's vocabulary and traits are the kernel's;
+        this method is the only place the two are related, which is why it is
+        public rather than a step of `resolve`. The builder calls it instead of
+        reading a field off the knobs, so the knob object stays plain data --
+        see the note where the `traits` field used to be.
+
+        `fmha_traits_gfx950.make_traits` takes the geometry as parameters where
+        the production constructor hardcodes it, and is checked field-by-field
+        against production at family A's numbers -- so family A goes through
+        this path today and the bitwise-vs-production test covers it.
         """
         self.staging_shape()  # the geometry must divide a KV tile evenly
         self._check_helpers_support_geometry()
@@ -736,7 +798,7 @@ class Gfx950Knobs(FmhaKnobs):
                 "Left to the compiler this surfaces as 'local memory (N) exceeds limit (163840)' "
                 "with no indication of which knob to move."
             )
-        return replace(self, traits=traits)
+        return traits
 
 
 # Defaults the policy has no shape-dependent opinion about. These match the
@@ -772,8 +834,6 @@ def fmha_knobs(arch: str, **overrides) -> FmhaKnobs:
     base = arch.split(":")[0].lower() if arch else ""
     for prefix, cls in _BY_ARCH.items():
         if base.startswith(prefix):
-            if "traits" in overrides:
-                raise TypeError("`traits` is set by resolve(), not by the caller")
             known = {f.name for f in fields(cls)}
             unknown = set(overrides) - known
             if unknown:

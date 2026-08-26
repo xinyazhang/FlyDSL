@@ -1490,9 +1490,9 @@ class BwdDkDvTileBody(dualwave.DualwaveKernelContext):
 
 def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
     """Build the dK/dV kernel for a resolved (meta, knobs) pair."""
-    if knobs.traits is None:
+    if knobs.block_dmodel is None:
         raise ValueError("knobs must be resolved: call `bwd_dkdv_knobs(arch, ...).resolve(meta)` first")
-    traits = knobs.traits
+    traits = knobs.build_traits(meta)
     BLOCK_DMODEL = knobs.block_dmodel
     PADDED_HEAD = knobs.padded_head
     # D columns at or below this are guaranteed real, so the streamed masks can

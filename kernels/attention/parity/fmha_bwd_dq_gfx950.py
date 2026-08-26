@@ -164,7 +164,7 @@ each becomes an override here.
 
 --- f16 and bf16, and where the operand dtype actually reaches ----------------
 
-Both are supported; `BwdDqKnobs._with_traits` refuses anything else by name,
+Both are supported; `BwdDqKnobs.build_traits` refuses anything else by name,
 matching gfx1201's `assert dtype_str in ("f16", "bf16")`.
 
 **The operand dtype reaches only two places**, and knowing that is what makes
@@ -195,7 +195,7 @@ hot path to change one implausible case into a different wrong answer.
 --- Not implemented, deliberately ---------------------------------------------
 
 Causal, windows, varlen, dropout, bias *input*, split-K, paged, `D_STAGES`,
-d-axis sharding. `BwdDqKnobs._with_traits` refuses each by name rather than
+d-axis sharding. `BwdDqKnobs.build_traits` refuses each by name rather than
 ignoring it -- every one of them would otherwise build, run and return a
 correctly-shaped wrong answer, and `D_STAGES` nearly did: the forward's knob
 policy turns it on above head_dim 256 and the inherited GEMM helpers then
@@ -982,9 +982,9 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
     the caller asked for, `knobs` is what the tuning policy answered, and
     nothing here falls back to a policy.
     """
-    if knobs.traits is None:
+    if knobs.block_dmodel is None:
         raise ValueError("knobs must be resolved: call `bwd_dq_knobs(arch, ...).resolve(meta)` first")
-    traits = knobs.traits
+    traits = knobs.build_traits(meta)
 
     BLOCK_DMODEL = knobs.block_dmodel
     PADDED_HEAD = knobs.padded_head
@@ -1723,7 +1723,7 @@ def build_fmha_bwd_dq_gfx950_module(arch="gfx950", **kwargs):
     """Keyword front end: name a problem, get the policy's schedule.
 
     `causal` defaults to **False** here where `FmhaInputMetadata` defaults it
-    to True. B2 implements only the dense case and `_with_traits` refuses the
+    to True. B2 implements only the dense case and `build_traits` refuses the
     other, so inheriting the forward's default would make every unqualified
     call raise -- and a caller who wants causal should be told it is B4, not
     told to pass an argument that is then rejected.

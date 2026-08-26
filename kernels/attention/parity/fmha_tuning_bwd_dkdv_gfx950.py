@@ -58,6 +58,7 @@ behind it are recorded there.
 from dataclasses import dataclass, fields, replace
 
 from fmha_traits_gfx950 import ParityDualwaveTraits, make_traits
+from fmha_tuning_gfx950 import GRID_AXIS_HEAD_FASTEST
 
 __all__ = [
     "LADDER",
@@ -477,7 +478,7 @@ class BwdDkDvInputMetadata:
     # who does not want one. It also makes `bias=None` bitwise identical to a
     # build compiled without bias, since there is nothing to be identical to
     # otherwise. **Mutually exclusive with `causal`/`window`**, which
-    # `make_traits` enforces; see `_with_traits`.
+    # `make_traits` enforces; see `build_traits`.
     bias: bool = False
 
 
@@ -512,8 +513,15 @@ class BwdDkDvKnobs:
     daz: bool | None = None
     strides_constexpr: bool | None = None
 
-    # Set by `resolve`; never by a caller.
-    traits: object | None = None
+    # Which quantity lands on which grid axis; the enum is documented in
+    # `fmha_tuning_gfx950`. Set by `resolve`, never by a caller. Upper case
+    # because the field name is the wire key the C++ side reads back. **Note
+    # the head here is the *kv* head**, which is what the GQA fold made it.
+    GRID_AXIS_ORDER: int | None = None
+
+    # There is deliberately no `traits` field: a knob class is plain build
+    # options, every value a scalar, so the set can be recorded beside the
+    # compiled hsaco in a flat `k=v` wire format. `build_traits` derives them.
 
     def merge(self, other):
         """`other`'s set fields win; its `None`s leave this one's alone."""
@@ -535,7 +543,7 @@ class BwdDkDvKnobs:
             ._with_geometry(meta)
             ._with_buffers()
             ._with_register_pressure(meta)
-            ._with_traits(meta)
+            ._checked_against_traits(meta)
         )
 
     def _checked_scope(self, meta):
@@ -672,7 +680,7 @@ class BwdDkDvKnobs:
         Duplicates two lines of `make_traits`' derivation, and does so
         knowingly: `_with_buffers` has to decide the buffer count *before* the
         traits exist, and the alternative is building throwaway traits to ask
-        them. Guarded -- `_with_traits` asserts the two agree.
+        them. Guarded -- `build_traits` asserts the two agree.
         """
         granule = self.head_dim_granule
         smem_n_rpt = self.block_q // (512 // granule)
@@ -693,8 +701,24 @@ class BwdDkDvKnobs:
             return self
         return replace(self, tight_registers=_geometry_for(self.block_dmodel, meta)[5])
 
-    def _with_traits(self, meta):
-        """Build the traits this configuration implies.
+    def _checked_against_traits(self, meta):
+        """`resolve`'s last step: prove the traits are buildable, return `self`.
+
+        The traits object is built and discarded. Only its verdict is kept --
+        every check in `build_traits` names the knob to move, so a bad
+        configuration fails here rather than at a kernel address. This class
+        does not inherit `Gfx950Knobs`, so it carries its own copy of a method
+        the forward and dQ share.
+        """
+        self.build_traits(meta)
+        return replace(self, GRID_AXIS_ORDER=GRID_AXIS_HEAD_FASTEST)
+
+    def build_traits(self, meta):
+        """The traits this configuration implies. **The one knob->traits map.**
+
+        Public, and called by the builder in place of reading a `traits` field,
+        which is what keeps the knob object plain data -- see the note where
+        that field used to be.
 
         `make_traits` is the forward's, called with `block_m=block_kv`,
         `block_n=block_q` and `vo_shards=dkv_shards`. Those three slots change
@@ -776,7 +800,7 @@ class BwdDkDvKnobs:
                 f"block_dmodel {self.block_dmodel} at block_q {self.block_q} with "
                 f"{self.num_stream_buffers} buffers. Drop to one buffer, or lower block_q."
             )
-        return replace(self, traits=traits)
+        return traits
 
 
 # Defaults the policy has no shape-dependent opinion about. `daz` is the

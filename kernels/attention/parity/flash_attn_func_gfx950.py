@@ -160,12 +160,12 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
     Takes the two objects rather than a long parameter list, split on *who
     decides*: `meta` is what the caller asked for, `knobs` is what the tuning
     policy answered. `knobs` must come from `Gfx950Knobs.resolve(meta)` --
-    nothing here falls back to a policy, and `knobs.traits` is the arch
+    nothing here falls back to a policy, and `knobs.build_traits(meta)` is the arch
     configuration that call produced.
     """
-    if knobs.traits is None:
+    if knobs.block_dmodel is None:
         raise ValueError("knobs must be resolved: call `fmha_knobs(arch, ...).resolve(meta)` first")
-    traits = knobs.traits
+    traits = knobs.build_traits(meta)
 
     BLOCK_DMODEL = knobs.block_dmodel
     PADDED_HEAD = knobs.padded_head

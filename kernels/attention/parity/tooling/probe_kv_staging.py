@@ -62,8 +62,8 @@ def build_probe(head_dim, num_heads=8, which="k", buf=0):
     if GEOM is not None:
         nw, bm, bn, gran = GEOM
         pinned = replace(pinned, num_waves=nw, block_m=bm, block_n=bn, head_dim_granule=gran)
-    knobs = _GFX950_FALLBACK.merge(pinned)._checked_modes()._with_wave_geometry()._with_traits(meta)
-    traits = knobs.traits
+    knobs = _GFX950_FALLBACK.merge(pinned)._checked_modes()._with_wave_geometry()
+    traits = knobs.build_traits(meta)
     WHICH = which
     BUF = buf
     PER_LANE = {

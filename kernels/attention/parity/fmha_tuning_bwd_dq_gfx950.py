@@ -303,7 +303,7 @@ def make_bwd_dq_traits(*, store_db=False, hdim_vo_floor=0, mfma_shape=(32, 32, 1
 class BwdDqKnobs(Gfx950Knobs):
     """The forward's knob pipeline, with the dQ build axes added.
 
-    `resolve` is inherited whole; only the last step (`_with_traits`) is
+    `resolve` is inherited whole; only the last step (`build_traits`) is
     replaced, because the pipeline before it -- mode checks, the ladder, the
     wave geometry -- asks exactly the same questions for the backward.
     """
@@ -349,7 +349,7 @@ class BwdDqKnobs(Gfx950Knobs):
             ._with_mode_defaults(meta)
             ._with_widths(meta)
             ._with_wave_geometry()
-            ._with_traits(meta)
+            ._checked_against_traits(meta)
         )
 
     def _with_d_axis_splits(self):
@@ -367,7 +367,7 @@ class BwdDqKnobs(Gfx950Knobs):
         reduces over half the head dim, writes half the accumulator, and
         returns a finite wrong answer. Caught here by an LDS figure that was
         half what it should have been, which is the only reason it was caught
-        at all -- so `_with_traits` also refuses a pinned `d_stages > 1`
+        at all -- so `build_traits` also refuses a pinned `d_stages > 1`
         rather than relying on this default holding.
         """
         return replace(
@@ -469,7 +469,7 @@ class BwdDqKnobs(Gfx950Knobs):
         # because 4% was measured as a loss.
         rows = me.mfma_rows if me.mfma_rows is not None else (16 if me.block_dmodel >= 384 else 32)
         if rows == 16:
-            # BLOCK_N 32 for the reason `_with_traits` states, and four waves
+            # BLOCK_N 32 for the reason `build_traits` states, and four waves
             # because the wide rungs need one wave per SIMD to see all 512
             # registers -- which is the whole premise of the family.
             return replace(me, num_waves=4, block_m=4 * 16, block_n=32, head_dim_granule=64, mfma_rows=16)
@@ -487,8 +487,8 @@ class BwdDqKnobs(Gfx950Knobs):
             head_dim_granule=32 if me.block_dmodel % 64 else 64,
         )
 
-    def _with_traits(self, meta):
-        """The forward's `_with_traits`, against `make_bwd_dq_traits`.
+    def build_traits(self, meta):
+        """The forward's `build_traits`, against `make_bwd_dq_traits`.
 
         Copied in structure rather than called through, because the parent
         hardcodes `make_traits` as its last expression and there is no seam
@@ -625,7 +625,7 @@ class BwdDqKnobs(Gfx950Knobs):
                 f"KV staging needs {lds_bytes} B of LDS, over the {self.LDS_CAP_BYTES} B cap, for "
                 f"block_dmodel {self.block_dmodel} at BLOCK_N {self.block_n}"
             )
-        return replace(self, traits=traits)
+        return traits
 
 
 def bwd_dq_knobs(arch: str = "gfx950", **overrides) -> BwdDqKnobs:
@@ -637,8 +637,6 @@ def bwd_dq_knobs(arch: str = "gfx950", **overrides) -> BwdDqKnobs:
     base = arch.split(":")[0].lower() if arch else ""
     if not base.startswith("gfx950"):
         raise ValueError(f"the backward dQ kernel is gfx950-only, got arch {arch!r}")
-    if "traits" in overrides:
-        raise TypeError("`traits` is set by resolve(), not by the caller")
     known = {f.name for f in fields(BwdDqKnobs)}
     unknown = set(overrides) - known
     if unknown:

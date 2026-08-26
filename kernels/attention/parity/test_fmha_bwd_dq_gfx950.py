@@ -881,7 +881,9 @@ def test_the_wide_rungs_fit_lds_unstaged():
     ]
     for head_dim, rows, want_kb in cases:
         traits = (
-            bwd_dq_knobs(mfma_rows=rows).resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False)).traits
+            bwd_dq_knobs(mfma_rows=rows)
+            .resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
+            .build_traits(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
         )
         kb = traits.LDS_KV_TOTAL_SIZE * traits.BF16_BYTES / 1024
         assert abs(kb - want_kb) < 0.5, f"head_dim {head_dim} at {rows} rows: {kb:.1f} KB, expected {want_kb}"
@@ -936,7 +938,11 @@ def test_register_model_matches_measured(head_dim):
     from fmha_tuning_bwd_dq_gfx950 import register_demand
     from fmha_tuning_gfx950 import FmhaInputMetadata
 
-    traits = bwd_dq_knobs().resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False)).traits
+    traits = (
+        bwd_dq_knobs()
+        .resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
+        .build_traits(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
+    )
     predicted = register_demand(traits)["total"]
     measured = _B3_MEASURED_VGPR[head_dim]
     assert abs(measured - predicted) <= 32, (
@@ -968,7 +974,11 @@ def test_register_model_predicted_the_16_row_family(head_dim):
     from fmha_tuning_bwd_dq_gfx950 import register_demand
     from fmha_tuning_gfx950 import FmhaInputMetadata
 
-    traits = bwd_dq_knobs(mfma_rows=16).resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False)).traits
+    traits = (
+        bwd_dq_knobs(mfma_rows=16)
+        .resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
+        .build_traits(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
+    )
     predicted = register_demand(traits)["total"]
     measured = _M16_MEASURED_VGPR[head_dim]
     assert 0 <= measured - predicted <= 32, (
@@ -995,7 +1005,9 @@ def test_sixteen_rows_is_what_the_wide_rungs_need():
 
     def demand(head_dim, rows):
         traits = (
-            bwd_dq_knobs(mfma_rows=rows).resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False)).traits
+            bwd_dq_knobs(mfma_rows=rows)
+            .resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
+            .build_traits(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
         )
         return register_demand(traits)
 
@@ -1018,7 +1030,11 @@ def test_the_default_policy_splits_the_families_at_384():
     from fmha_tuning_gfx950 import FmhaInputMetadata
 
     for head_dim, rows in ((64, 32), (128, 32), (256, 32), (384, 16), (512, 16)):
-        traits = bwd_dq_knobs().resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False)).traits
+        traits = (
+            bwd_dq_knobs()
+            .resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
+            .build_traits(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
+        )
         assert traits.MFMA_N == rows, f"head_dim {head_dim} should default to {rows} rows"
 
 
@@ -1067,8 +1083,8 @@ def test_knobs_resolve_is_idempotent():
     once = bwd_dq_knobs("gfx950:sramecc+:xnack-").resolve(meta)
     twice = once.resolve(meta)
     assert once == twice
-    assert once.traits.STORE_DB is False
-    assert bwd_dq_knobs("gfx950", store_db=True).resolve(meta).traits.STORE_DB is True
+    assert once.build_traits(meta).STORE_DB is False
+    assert bwd_dq_knobs("gfx950", store_db=True).resolve(meta).build_traits(meta).STORE_DB is True
 
 
 # ---------------------------------------------------------------------------

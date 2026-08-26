@@ -61,8 +61,8 @@ def build_probe(head_dim, which, num_heads=8, geom=None):
     if geom is not None:
         nw, bm, bn, gran = geom
         pinned = replace(pinned, num_waves=nw, block_m=bm, block_n=bn, head_dim_granule=gran)
-    knobs = _GFX950_FALLBACK.merge(pinned)._checked_modes()._with_wave_geometry()._with_traits(meta)
-    traits = knobs.traits
+    knobs = _GFX950_FALLBACK.merge(pinned)._checked_modes()._with_wave_geometry()
+    traits = knobs.build_traits(meta)
     WHICH = which
     elem = dualwave.dtype_to_elem_type(traits.DTYPE_STR)
     scope = dualwave._dualwave_lds_scope("v", 0)
@@ -268,7 +268,8 @@ def _check_td(traits, got_i16, expect, label, n_slots):
                     bad += 1
                     if bad <= 5:
                         print(
-                            f"      lane{j:>3} slot{slot} i{i}: got (t {got[0]}, d {got[1]}), want (t {want[0]}, d {want[1]})"
+                            f"      lane{j:>3} slot{slot} i{i}: "
+                            f"got (t {got[0]}, d {got[1]}), want (t {want[0]}, d {want[1]})"
                         )
     print(f"  {label:<48} {bad:>5} / {64 * n_slots * TR_ELEMS} wrong")
     return bad

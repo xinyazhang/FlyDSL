@@ -613,7 +613,7 @@ def test_lpt_tile_order_is_bit_identical(hdim):
         )
         outs.append(o)
     assert torch.equal(outs[0], outs[1])
-    assert fmha_knobs("gfx950").resolve(meta).traits.LPT_TILE_ORDER is False
+    assert fmha_knobs("gfx950").resolve(meta).build_traits(meta).LPT_TILE_ORDER is False
 
 
 # ---------------------------------------------------------------------------
@@ -1396,7 +1396,7 @@ _META = FmhaInputMetadata(num_heads=8, head_dim=128)
 
 def test_factory_accepts_a_full_arch_string():
     """`gcnArchName` carries target features; the caller should not strip them."""
-    assert fmha_knobs("gfx950:sramecc+:xnack-").resolve(_META).traits.BLOCK_M == 256
+    assert fmha_knobs("gfx950:sramecc+:xnack-").resolve(_META).build_traits(_META).BLOCK_M == 256
 
 
 def test_factory_rejects_unknown_arch_and_fields():
@@ -1404,35 +1404,40 @@ def test_factory_rejects_unknown_arch_and_fields():
         fmha_knobs("gfx1201")
     with pytest.raises(TypeError, match="unknown Gfx950Knobs field"):
         fmha_knobs("gfx950", nonsense=1)
-    with pytest.raises(TypeError, match="set by resolve"):
+    with pytest.raises(TypeError, match="unknown Gfx950Knobs field"):
+        # `traits` is no longer a field at all, so it lands in the generic
+        # unknown-field arm rather than a special case of its own.
         fmha_knobs("gfx950", traits=object())
 
 
 def test_resolve_produces_the_traits():
-    """The whole point of R1: one object carries both halves.
+    """`resolve` still owns the derivation; the knobs just stop carrying it.
 
-    Before it, the traits came from a separate `make_parity_traits(meta,
-    knobs, ...)` call, so a caller could hold knobs that disagreed with the
-    traits actually built.
+    R1 made one call produce both halves, so a caller could not hold knobs that
+    disagreed with the traits actually built. That still holds -- the traits
+    come from `build_traits` on the resolved knobs, and there is no other way
+    to make them -- but the knob object stays plain scalars so the set can be
+    recorded beside the compiled hsaco in a flat `k=v` wire format.
     """
     unresolved = fmha_knobs("gfx950")
-    assert unresolved.traits is None
+    assert not hasattr(unresolved, "traits"), "a knob class is plain build options"
+    assert unresolved.block_dmodel is None
     resolved = unresolved.resolve(_META)
-    assert resolved.traits is not None
-    assert resolved.traits.HEAD_DIM == 128
+    assert resolved.block_dmodel == 128
+    assert resolved.build_traits(_META).HEAD_DIM == 128
 
 
 def test_resolve_is_idempotent():
     once = fmha_knobs("gfx950").resolve(_META)
     twice = once.resolve(_META)
-    assert once.traits.cache_tag == twice.traits.cache_tag
+    assert once.build_traits(_META).cache_tag == twice.build_traits(_META).cache_tag
     assert (once.num_waves, once.block_m, once.block_n) == (twice.num_waves, twice.block_m, twice.block_n)
 
 
 def test_cross_seqlen_is_an_ordinary_field():
     """R1's side effect: no keyword-only parameter, no `kwargs.pop`, no converter arg."""
-    assert fmha_knobs("gfx950").resolve(_META).traits.CROSS_SEQLEN is False
-    assert fmha_knobs("gfx950", cross_seqlen=True).resolve(_META).traits.CROSS_SEQLEN is True
+    assert fmha_knobs("gfx950").resolve(_META).build_traits(_META).CROSS_SEQLEN is False
+    assert fmha_knobs("gfx950", cross_seqlen=True).resolve(_META).build_traits(_META).CROSS_SEQLEN is True
 
 
 @pytest.mark.parametrize(
