@@ -693,23 +693,30 @@ def build_bwd_dq_module_primary(meta, knobs):
 
         # Bias is (B, H, Sq, Sk): its last axis is the KV column, so its "row"
         # stride is the seq_q one and the contiguous axis is the one the KV
-        # loop walks. Built here rather than earlier because it needs
-        # `_q_safe`: a lane whose Q row is past `seqlen_q` still executes every
-        # iteration, and an unclamped row walks off the tensor. `q_ap` clamps
-        # Q and dO the same way one line above.
+        # loop walks. Built here rather than earlier because it needs the row
+        # gate: a lane whose Q row is past `seqlen_q` still executes every
+        # iteration, and an unclamped row walks off the tensor.
+        #
+        # `_q_in` with the **absolute** `q_row`, not `_q_safe` -- `MaskedAxis.
+        # safe` returns the offset *within the tile*, because that is what the
+        # Q/dO address closures want on top of a per-tile base. B has no such
+        # base and is indexed absolutely, so `_q_safe` here silently addresses
+        # row `q - start_q`: correct only for the first Q block, wrong for
+        # every other one.
         if const_expr(BIAS_TYPE):
+            _bq = fx.Index(q_row) if _q_in else fx.Index(0)
             _b_ptr = fmha.pointer_to_llvm_ptr(B)
             _b_row = (
                 _q_batch_v * fx.Index(stride_b_batch)
                 + head_q * fx.Index(stride_b_head)
-                + (_q_row_off_v + _q_safe) * fx.Index(stride_b_seq_q)
+                + (_q_row_off_v + _bq) * fx.Index(stride_b_seq_q)
             )
             # DB is a different tensor and may be laid out differently, so it
             # gets its own row rather than reusing B's.
             _db_row = (
                 _q_batch_v * fx.Index(stride_db_batch)
                 + head_q * fx.Index(stride_db_head)
-                + (_q_row_off_v + _q_safe) * fx.Index(stride_db_seq_q)
+                + (_q_row_off_v + _bq) * fx.Index(stride_db_seq_q)
             )
             _db_ptr = fmha.pointer_to_llvm_ptr(DB)
         q_packs = []
@@ -993,14 +1000,19 @@ def build_bwd_dq_module_primary(meta, knobs):
                 # Not a gather: element `_st*8 + _r` is KV column
                 # `_st*16 + klane*8 + _r`, so within a group only `_r` varies
                 # and one v8 load covers all eight.
+                # The *value* is zeroed past `seqlen_k`, not the address. The
+                # address cannot be clamped: moving the eight-wide base to keep
+                # it in-row would shift which column each element carries, so
+                # the in-range ones would take a neighbour's bias. Zeroing after
+                # the load keeps those exact and stops an arbitrary neighbouring
+                # row's value entering the arithmetic -- which matters because
+                # the mask below is a select, and this build assumes no NaNs.
                 for _st in range_constexpr(NUM_S_ACCS):
-                    _bv = load_global_v8f16(
-                        _b_ptr,
-                        _b_row + fx.Index(kv_block_start) + fx.Index(_st * WMMA_N) + klane * fx.Index(8),
-                        fx.Index(0),
-                    )
+                    _c0 = fx.Int32(kv_block_start) + fx.Int32(_st * WMMA_N) + fx.Int32(klane) * fx.Int32(8)
+                    _bv = load_global_v8f16(_b_ptr, _b_row + fx.Index(_c0), fx.Index(0))
                     for _r in range_constexpr(8):
-                        _bs = fx.Float32(Vec(_bv)[_r].to(fx.Float32))
+                        _live = _c0 + fx.Int32(_r) < seqlen_k_i32
+                        _bs = fx.Float32(fx.Float32(Vec(_bv)[_r].to(fx.Float32)) if _live else fx.Float32(0.0))
                         s_raw[_st * 8 + _r] = fastmath.add(s_raw[_st * 8 + _r], fastmath.mul(_bs, fx.Float32(_LOG2E)))
 
             if const_expr(_MASK_STEPS):

@@ -390,9 +390,13 @@ _KNOBS_FALLBACK = BwdDqKnobs(
     denormals_are_zero=True,
     unsafe_fp_math=True,
     fast_fp_math=True,
-    padded_head=False,
     lpt_tile_order=True,
 )
+
+
+def _head_dim_v(meta) -> int:
+    """The V/O extent, defaulting to the QK one."""
+    return meta.head_dim_v if meta.head_dim_v is not None else meta.head_dim
 
 
 def resolve_knobs(meta: BwdDqInputMetadata, overrides: "BwdDqKnobs | None" = None) -> BwdDqKnobs:
@@ -404,8 +408,18 @@ def resolve_knobs(meta: BwdDqInputMetadata, overrides: "BwdDqKnobs | None" = Non
     """
     s = _KNOBS_FALLBACK.merge(overrides)
     if s.block_dmodel is None:
-        s = replace(s, block_dmodel=meta.head_dim)
+        # The wider of the two axes: one tile serves both, so it must cover
+        # whichever is larger and the other rides as a masked runtime extent.
+        s = replace(s, block_dmodel=max(meta.head_dim, _head_dim_v(meta)))
     hd = s.block_dmodel
+
+    # **Derived here rather than in `plan`.** `plan` is only one of the ways in
+    # -- `build_bwd_dq_module`'s keyword front end and the AOT builder both call
+    # `resolve_knobs` directly -- and a `padded_head` computed one level up is a
+    # `padded_head` those two never see. It defaulted to False for them, which
+    # left `vo_cols` unmasked whenever the V/O extent was the narrower one.
+    if s.padded_head is None:
+        s = replace(s, padded_head=(hd != meta.head_dim) or (hd != _head_dim_v(meta)))
 
     if s.shards is None:
         s = replace(s, shards=default_shards(hd))
@@ -466,12 +480,6 @@ def plan(request: BwdDqInputMetadata, overrides: BwdDqKnobs | None = None) -> Bw
     if wide < 1 or wide > MAX_HEAD_DIM:
         raise ValueError(f"kernel requires 1 <= head_dim <= {MAX_HEAD_DIM}, got ({head_dim}, {head_dim_v})")
     block_dmodel = _round_to_ladder(wide)
-    knobs = replace(
-        resolve_knobs(request, (overrides or BwdDqKnobs()).merge(BwdDqKnobs(block_dmodel=block_dmodel))),
-        # EITHER axis short of the tile turns the masking on, because one flag
-        # gates both `qk_cols` and `vo_cols` in the kernel. Deriving it from
-        # `head_dim` alone left `hdim_qk != hdim_vo` walking the narrower
-        # tensor to the full tile width.
-        padded_head=(block_dmodel != head_dim) or (block_dmodel != head_dim_v),
-    )
+    # `resolve_knobs` derives `padded_head` from the same two extents.
+    knobs = resolve_knobs(request, (overrides or BwdDqKnobs()).merge(BwdDqKnobs(block_dmodel=block_dmodel)))
     return BwdDqPlan(request, knobs)
