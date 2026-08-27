@@ -236,6 +236,8 @@ from fmha_dualwave_gfx950 import (
     ParitySoftmaxHelper,
     ParityStoreHelper,
     _score_column_runs,
+    wire_ptr,
+    wire_view,
 )
 
 # Private to `fmha_dualwave_gfx950`, and imported anyway: they are the
@@ -1023,15 +1025,15 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
 
     @flyc.kernel(known_block_size=[traits.BLOCK_SIZE, 1, 1])
     def fmha_bwd_dq_gfx950_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        B: fx.Tensor,
-        DO: fx.Tensor,
-        DQ: fx.Tensor,
-        DB: fx.Tensor,
-        LSE: fx.Tensor,
-        Delta: fx.Tensor,
+        Q: fx.Pointer,
+        K: fx.Pointer,
+        V: fx.Pointer,
+        B: fx.Pointer,
+        DO: fx.Pointer,
+        DQ: fx.Pointer,
+        DB: fx.Pointer,
+        LSE: fx.Pointer,
+        Delta: fx.Pointer,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
@@ -1074,6 +1076,20 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         stride_db_head: fx.Int64,
         stride_db_seq_q: fx.Int64,
     ):
+        # Nine pointers in, nine nominal views out -- `wire_view` in
+        # `fmha_dualwave_gfx950.py` has the argument. Everything below this line
+        # is unchanged by the move, because every extent the kernel bounds a
+        # descriptor with was already built from the strides and seqlens on the
+        # wire rather than read off a tensor.
+        Q = wire_view(Q)
+        K = wire_view(K)
+        V = wire_view(V)
+        B = wire_view(B)
+        DO = wire_view(DO)
+        DQ = wire_view(DQ)
+        DB = wire_view(DB)
+        LSE = wire_view(LSE)
+        Delta = wire_view(Delta)
         ctx = BwdDqKernelContext(
             traits,
             # dQ occupies the `O` slot: it is the tensor this kernel writes
@@ -1332,15 +1348,15 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
 
     @flyc.jit
     def launch_fmha_bwd_dq_gfx950(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        Bias: fx.Tensor,
-        DO: fx.Tensor,
-        DQ: fx.Tensor,
-        DB: fx.Tensor,
-        LSE: fx.Tensor,
-        Delta: fx.Tensor,
+        Q: fx.Pointer,
+        K: fx.Pointer,
+        V: fx.Pointer,
+        Bias: fx.Pointer,
+        DO: fx.Pointer,
+        DQ: fx.Pointer,
+        DB: fx.Pointer,
+        LSE: fx.Pointer,
+        Delta: fx.Pointer,
         batch_size: fx.Int32,
         seqinfo_q0: fx.Pointer,
         seqinfo_q1: fx.Pointer,
@@ -1532,7 +1548,10 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             [("Q", Q), ("K", K), ("V", V), ("DO", DO), ("DQ", DQ)],
             q_heads=("DO", "DQ"),
         )
-        del _ptrs  # gfx950 addresses through buffer descriptors, so it wants the tensors
+        # Used for the checks and the strides, not the pointers: `prep_tensors`
+        # builds those as `fx.Uint8`, which carries alignment 1. `wire_ptr`
+        # types each operand from its own tensor instead -- see its docstring.
+        del _ptrs
         num_head_q, num_head_k, hdim_qk, hdim_vo = shape_meta
 
         # **A build without `padded_head` promises the tile *is* the extent**,
@@ -1663,15 +1682,20 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         db_st = tuple(int(x) for x in db.stride()[:3]) if db is not None else (0, 0, 0)
 
         return (
-            Q,
-            K,
-            V,
-            bias_t,
-            DO,
-            DQ,
-            db_t,
-            LSE,
-            Delta,
+            # Nine pointers, not nine tensors. LSE and Delta are pinned to f32
+            # rather than read off the tensor: both are required and both are
+            # already checked f32 by `abi.row_tensor_arg`, so naming the type
+            # here keeps the slot's type a property of the ABI rather than of
+            # the call.
+            wire_ptr(Q),
+            wire_ptr(K),
+            wire_ptr(V),
+            wire_ptr(bias_t),
+            wire_ptr(DO),
+            wire_ptr(DQ),
+            wire_ptr(db_t),
+            wire_ptr(LSE, fx.Float32),
+            wire_ptr(Delta, fx.Float32),
             int(batch_size),
             _vl[1],
             _vl[2],

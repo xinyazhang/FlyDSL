@@ -68,6 +68,7 @@ guard, which is why the arms were at least known to be looking at a kernel.
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -138,43 +139,55 @@ torch.cuda.synchronize()
 
 
 def build_isa(head_dim, rows, causal, window, varlen=0, dropout=0, bias=0, kvheads=0, dt="bf16"):
-    """Compile one configuration in a child process and return its final ISA."""
+    """Compile one configuration in a child process and return its final ISA.
+
+    The dump directory is removed on the way out. A `FLYDSL_DUMP_IR` tree is
+    ~25MB per configuration and this function is called once per row of a
+    sweep, so leaving them behind is not a tidiness question: an earlier run of
+    this script left 152 of them holding 1.7GB and filled the disk underneath
+    an unrelated test run. The `finally` matters more than the `rmtree` -- the
+    calls that leaked were the ones that raised.
+    """
     out = tempfile.mkdtemp(prefix="exec_hazard_")
     env = dict(os.environ)
     env.update(FLYDSL_RUNTIME_ENABLE_CACHE="0", FLYDSL_DUMP_IR="1", FLYDSL_DUMP_DIR=out)
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(_CHILD.format(parity=_PARITY))
         script = f.name
-    subprocess.run(
-        [
-            sys.executable,
-            script,
-            str(head_dim),
-            "--rows",
-            str(rows),
-            "--causal",
-            str(int(causal)),
-            "--window",
-            str(int(window)),
-            "--varlen",
-            str(int(varlen)),
-            "--dropout",
-            str(int(dropout)),
-            "--bias",
-            str(int(bias)),
-            "--kvheads",
-            str(int(kvheads)),
-            "--dt",
-            str(dt),
-        ],
-        env=env,
-        capture_output=True,
-        timeout=900,
-        check=True,
-    )
-    path = os.path.join(out, "fmha_bwd_dkdv_gfx950_kernel_0", "21_final_isa.s")
-    with open(path) as fh:
-        return fh.read()
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                script,
+                str(head_dim),
+                "--rows",
+                str(rows),
+                "--causal",
+                str(int(causal)),
+                "--window",
+                str(int(window)),
+                "--varlen",
+                str(int(varlen)),
+                "--dropout",
+                str(int(dropout)),
+                "--bias",
+                str(int(bias)),
+                "--kvheads",
+                str(int(kvheads)),
+                "--dt",
+                str(dt),
+            ],
+            env=env,
+            capture_output=True,
+            timeout=900,
+            check=True,
+        )
+        path = os.path.join(out, "fmha_bwd_dkdv_gfx950_kernel_0", "21_final_isa.s")
+        with open(path) as fh:
+            return fh.read()
+    finally:
+        os.unlink(script)
+        shutil.rmtree(out, ignore_errors=True)
 
 
 def scan(isa):

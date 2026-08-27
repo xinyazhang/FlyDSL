@@ -71,19 +71,26 @@ def main():
         _child(a)
         return 0
 
-    d = tempfile.mkdtemp()
-    env = dict(os.environ, FLYDSL_DUMP_IR="1", FLYDSL_DUMP_DIR=d, FLYDSL_RUNTIME_ENABLE_CACHE="0")
-    r = subprocess.run([sys.executable, __file__, *sys.argv[1:], "--child"], env=env, capture_output=True, timeout=1800)
-    if r.returncode != 0:
-        print(r.stderr.decode()[-3000:], file=sys.stderr)
-        return 1
-    got = sorted(glob.glob(os.path.join(d, "*", f"*{a.stage}*")))
-    if not got:
-        print(f"no stage matching {a.stage!r} in {d}", file=sys.stderr)
-        return 1
-    shutil.copy(got[0], a.out)
-    print(a.out)
-    return 0
+    # The dump tree is ~25MB and every early `return 1` below used to leak one.
+    # See `check_exec_hazard_gfx950.build_isa` for what that cost in practice.
+    d = tempfile.mkdtemp(prefix="dump_isa_")
+    try:
+        env = dict(os.environ, FLYDSL_DUMP_IR="1", FLYDSL_DUMP_DIR=d, FLYDSL_RUNTIME_ENABLE_CACHE="0")
+        r = subprocess.run(
+            [sys.executable, __file__, *sys.argv[1:], "--child"], env=env, capture_output=True, timeout=1800
+        )
+        if r.returncode != 0:
+            print(r.stderr.decode()[-3000:], file=sys.stderr)
+            return 1
+        got = sorted(glob.glob(os.path.join(d, "*", f"*{a.stage}*")))
+        if not got:
+            print(f"no stage matching {a.stage!r} in {d}", file=sys.stderr)
+            return 1
+        shutil.copy(got[0], a.out)
+        print(a.out)
+        return 0
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

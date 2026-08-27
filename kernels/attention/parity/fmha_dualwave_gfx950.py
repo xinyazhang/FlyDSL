@@ -72,7 +72,108 @@ __all__ = [
     "ParityQLoader",
     "ParitySoftmaxHelper",
     "ParityStoreHelper",
+    "wire_ptr",
+    "wire_view",
 ]
+
+
+# --- the tensor operands are pointers on the wire --------------------------
+#
+# Every tensor operand of the three gfx950 parity kernels is declared
+# `fx.Pointer`, not `fx.Tensor`. This is an ABI requirement, not a style
+# choice: an `fx.Tensor` kernarg costs **two** slots -- the pointer, plus a
+# packed shape+stride descriptor -- and AOTriton dispatches the compiled hsaco
+# by filling the kernarg block itself, from a C++ struct that has a pointer and
+# the strides it was already passing separately. The descriptor is 40 bytes of
+# kernarg per operand that the caller has no way to fill and the kernel never
+# reads.
+#
+# **It never reads it because every extent is already on the wire.** The
+# kernels bound their buffer descriptors with products of `max_seqlen_q/k`,
+# `hdim_qk/vo`, the head counts and the fifteen strides -- `seqlen_q * stride_q_seq`
+# and so on -- and `batch_size` never appears as an extent at all, only as
+# `batch_idx * stride_batch` with `batch_idx` coming from the grid. So the
+# shapes in the descriptor duplicate scalars the ABI carries anyway, which is
+# what makes dropping them safe rather than merely cheap.
+#
+# Measured, one build each at bf16 / h=2 / d=64 / s=256, `.kernarg_segment_size`
+# from the final ISA, with VGPR counts alongside to show the wrapping is free:
+#
+#     forward   512 -> 296   (vgpr 164 both)
+#     dQ        664 -> 352   (vgpr 190 both)
+#     dK/dV     664 -> 352   (vgpr 236 both)
+#
+# **`Workspace` and `BlockTable` are deliberately still tensors.** Split-K and
+# paged are not parity gaps -- the target is `scaled_dot_product_attention`, and
+# neither is part of it -- so in every build that ships they are `Constexpr` and
+# occupy no kernarg at all. There is nothing to shrink.
+#
+# The one thing that would have to change first if paged were ever built: the
+# block table's consumer is `fx.rocdl.make_buffer_tensor(block_table)` in
+# `flash_attn_utils.init_descriptors`, and that genuinely wants a tensor rather
+# than an address -- unlike every operand converted here, whose only use of the
+# tensor was `fx.get_iter`. A `wire_view` would not serve it, because
+# `make_buffer_tensor` reads the layout it is handed. That is a real piece of
+# work, not a rename.
+
+
+def wire_ptr(t, elem_type=None):
+    """A tensor's base address as an `fx.Pointer` argument.
+
+    `elem_type` defaults to the tensor's **own** element type, and that default
+    is load-bearing rather than cosmetic. `PointerJitArg` derives the pointer's
+    assumed alignment from its element type -- `(width + 7) // 8` -- and so does
+    the `fx.Tensor` path it replaces, which is what makes the two agree: a bf16
+    operand keeps alignment 2 either way. Passing a byte pointer instead, as
+    `fmha_abi_gfx1201.ptr_arg` does, would silently drop it to 1. Nothing fails
+    when that happens; the loads just lose an alignment fact the backend was
+    using, which is the kind of regression that gets attributed to the wrong
+    change six weeks later.
+    """
+    if t is None:
+        return flyc.from_c_void_p(elem_type or fx.Uint8, 0)
+    if elem_type is None:
+        # Keyed on the dtype's name so this module needs no torch import; it is
+        # imported by the kernel builders, which run before any tensor exists.
+        elem_type = _TORCH_DTYPE_TO_FX[str(t.dtype)]
+    return flyc.from_c_void_p(elem_type, t.data_ptr())
+
+
+_TORCH_DTYPE_TO_FX = {
+    "torch.bfloat16": fx.BFloat16,
+    "torch.float16": fx.Float16,
+    "torch.float32": fx.Float32,
+    "torch.uint8": fx.Uint8,
+    "torch.int32": fx.Int32,
+    "torch.int64": fx.Int64,
+}
+
+
+def wire_view(ptr):
+    """A nominal view over `ptr`, for production code that spells `fx.get_iter`.
+
+    `flash_attn_utils.py` is imported and never edited, and two of its methods
+    reach a tensor operand through `fx.get_iter(...)`: `init_descriptors`, for
+    the four dense Q/K/V/O views, and `_store_lse_row`, for LSE's base address.
+    `fx.get_iter` rejects a pointer outright -- *"GetIterOp: expected
+    TensorLikeType"* -- so a pointer operand cannot be handed to either
+    directly. This wraps it back into something they accept.
+
+    **The layout is a placeholder and the round trip is what makes that safe.**
+    `fx.get_iter(fx.make_view(p, L))` returns `p` for any `L`, so every one of
+    those call sites gets the address it wanted and none of them is affected by
+    what `L` says -- all four of `init_descriptors`' views are rebased and
+    re-bounded by `ParityKernelContext.init_descriptors` immediately afterwards,
+    and `_store_lse_row` uses only `ptrtoint`. The value is verified to survive
+    the round trip bit-exactly, and the ISA is unchanged by the wrapping.
+
+    **What is therefore not safe is reading a size back off one of these.**
+    `.shape` on a real `fx.Tensor` operand used to return the caller's true
+    BHSD extents; here it returns the placeholder, which is a wrong answer
+    rather than an error. No kernel does -- see the note above on why none needs
+    to -- and `test_no_shape_reads_off_wire_views` is what keeps it that way.
+    """
+    return fx.make_view(ptr, fx.make_layout(fx.Int32(1), fx.Int32(1)))
 
 
 # --- granule-general addressing --------------------------------------------
