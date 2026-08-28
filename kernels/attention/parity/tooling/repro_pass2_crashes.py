@@ -36,9 +36,10 @@ needs removed. `unsafe_fp_math` and `fast_fp_math` are cleared for the same
 reason. Addresses do not depend on float flags, so an OOB access found here is
 an OOB access in the shipped build; only its *visibility* changes.
 
-`--aot` builds the way AOTriton does -- one compiled tile for both head-dim
-axes, `padded_head` set explicitly -- rather than the way `plan` does. For a
-head_dim already on the ladder the two agree.
+Every build is AOTriton-shaped: head_dim rounded to the compiled tile with
+`padded_head` set, and the real extent riding as a runtime argument. That is
+not a choice -- BLOCK_DMODEL must be a multiple of 16, and 8, 24, 72, 152, 216
+and 248 are not. `--aot` is accepted but inert.
 
 **What this cannot see.** Column overruns are caught completely: every offset
 outside `[MARGIN, MARGIN + D)` of a row is poison, in both directions. A *row*
@@ -151,6 +152,7 @@ def _run(case, aot):
     from fmha_tuning_bwd_dkdv_gfx1201 import _round_to_ladder as dkdv_tile
     from fmha_tuning_bwd_dkdv_gfx1201 import resolve_knobs as dkdv_knobs
     from fmha_tuning_bwd_dq_gfx1201 import _round_to_ladder as dq_tile
+    from fmha_tuning_gfx1201 import _round_to_ladder as fwd_tile
 
     label, b, h, sq, sk, d, causal, p, bias, dt = case
     assert d % 8 == 0, "the margin scheme assumes an 8-element-aligned head_dim"
@@ -210,9 +212,17 @@ def _run(case, aot):
     # forward bug cannot mask a backward one by poisoning its inputs.
     ob, o_k = _poisoned_out(torch, b, h, sq, d, dtype)
     lse_k = torch.full((b * h, sq), float("-inf"), dtype=torch.float32, device="cuda")
+    # Rounded to the compiled tile with `padded_head` set, which is the only
+    # shape any of these kernels accepts: BLOCK_DMODEL must be a multiple of
+    # 16, and every interesting head_dim here (8, 24, 72, 152, 216, 248) is
+    # not. The real extent rides as a runtime argument, which is exactly the
+    # ragged case under test.
+    ftile = fwd_tile(d)
     fwd = build_flash_attn_func_aiw_module(
         num_heads=h,
-        head_dim=d,
+        head_dim=ftile,
+        block_dmodel=ftile,
+        padded_head=ftile != d,
         causal=causal,
         causal_type=ctype or None,
         dtype_str=dt,
@@ -228,20 +238,25 @@ def _run(case, aot):
     # ---- dK / dV -----------------------------------------------------------
     dkb, dk = _poisoned_out(torch, b, h, sk, d, dtype)
     dvb, dv = _poisoned_out(torch, b, h, sk, d, dtype)
-    tile = dkdv_tile(d) if aot else d
+    tile = dkdv_tile(d)
     meta = BwdDkDvMetadata(
         num_heads=h,
-        head_dim=tile if aot else d,
-        head_dim_v=tile if aot else d,
+        head_dim=tile,
+        head_dim_v=tile,
         causal=causal,
         causal_type=ctype or None,
         dtype_str=dt,
         dropout=p > 0.0,
         bias=bool(bias),
     )
-    over = BwdDkDvKnobs(fp_mode="safe", unsafe_fp_math=False, fast_fp_math=False)
-    if aot:
-        over = over.merge(BwdDkDvKnobs(block_dmodel=tile, block_dmodel_v=tile, padded_head=tile != d))
+    over = BwdDkDvKnobs(
+        fp_mode="safe",
+        unsafe_fp_math=False,
+        fast_fp_math=False,
+        block_dmodel=tile,
+        block_dmodel_v=tile,
+        padded_head=tile != d,
+    )
     exe = build_bwd_dkdv_module(meta, dkdv_knobs(meta, over))
     exe(
         q, k, v, do, dk, dv, lse, delta, b, sq,
@@ -261,8 +276,8 @@ def _run(case, aot):
     qtile = dq_tile(d)
     exe_dq = build_bwd_dq_module(
         num_heads=h,
-        head_dim=qtile if aot else d,
-        head_dim_v=qtile if aot else d,
+        head_dim=qtile,
+        head_dim_v=qtile,
         causal=causal,
         causal_type=ctype or None,
         dtype_str=dt,
@@ -270,7 +285,8 @@ def _run(case, aot):
         fp_mode="safe",
         unsafe_fp_math=False,
         fast_fp_math=False,
-        **({"block_dmodel": qtile, "padded_head": qtile != d} if aot else {}),
+        block_dmodel=qtile,
+        padded_head=qtile != d,
     )
     exe_dq(q, k, v, do, dq, lse, delta, b, sq, sk, bias=bv, dbias=dbv)
     torch.cuda.synchronize()
@@ -301,7 +317,11 @@ def main():
     ap.add_argument("index", nargs="?", type=int)
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--all", action="store_true")
-    ap.add_argument("--aot", action="store_true", help="build AOTriton's way: one tile, explicit padded_head")
+    # Accepted but inert: every build is now AOTriton-shaped unconditionally,
+    # because it has to be. BLOCK_DMODEL must be a multiple of 16 and most of
+    # the interesting head dims are not, so "the way `plan` does it" was never
+    # a buildable option for them. Kept so existing command lines still work.
+    ap.add_argument("--aot", action="store_true", help="deprecated no-op; builds are always AOTriton-shaped")
     a = ap.parse_args()
     if a.list:
         for i, c in enumerate(CASES):
