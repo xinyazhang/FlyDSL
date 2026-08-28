@@ -41,12 +41,13 @@ Every build is AOTriton-shaped: head_dim rounded to the compiled tile with
 not a choice -- BLOCK_DMODEL must be a multiple of 16, and 8, 24, 72, 152, 216
 and 248 are not. `--aot` is accepted but inert.
 
-**What this cannot see.** Column overruns are caught completely: every offset
-outside `[MARGIN, MARGIN + D)` of a row is poison, in both directions. A *row*
-overrun is only caught when it clears the tensor's last row, because a row
-index one too large lands on the next row's real data -- the same
-"plausible data inside the right allocation" hole the suite's varlen tests
-exist for. A clean run therefore rules out an OOB column, not an OOB row.
+**Rows are guarded too, now.** The first version of this probe poisoned only
+the column margins, and said so; the bug that got through it -- an unclamped
+bias *row* in the forward -- went through exactly that hole. Each tensor now
+carries `ROW_GUARD` poisoned rows past its sequence extent, so an overrun of up
+to a full BLOCK_M lands in poison rather than on the next row's real data. What
+remains uncatchable is an overrun past *both* guards at once, which by
+construction has already left the allocation and faults on its own.
 
 Run one shape per process so a fault names itself::
 
@@ -79,6 +80,16 @@ MARGIN = 8
 # read wraps into the *next row's real data*, and the probe reports clean. 256
 # clears every BLOCK_N this family compiles.
 BIAS_MARGIN = 256
+
+# Guard *rows* past the sequence extent, poisoned like the column margins.
+#
+# This is the hole the first version of this probe documented and did not
+# close, and the bug that got through it went through exactly there: a
+# workgroup covers BLOCK_M query rows whatever `seqlen_q` is, and an unclamped
+# row index lands on the next row's *real data* -- plausible numbers, no
+# signal, right up until it runs off the end of the tensor. 256 covers every
+# BLOCK_M this family compiles, so a row overrun now lands in poison instead.
+ROW_GUARD = 256
 
 # (label, batch, heads, seqlen_q, seqlen_k, head_dim, causal, dropout_p, bias, dtype)
 #
@@ -129,7 +140,8 @@ def _poisoned_out(torch, b, h, s, d, dtype, margin=MARGIN):
 def _verdict(torch, name, buf, view, report, margin=MARGIN):
     """Three checks on one output: OOB write, OOB read, and never-written."""
     intact = torch.isneginf(buf).clone()
-    intact[..., margin : margin + view.shape[-1]] = True  # only the margin is under test here
+    # Everything outside the live view -- column margins and guard rows alike.
+    intact[:, :, : view.shape[2], margin : margin + view.shape[3]] = True
     n_write = int((~intact).sum())
     n_nan = int(torch.isnan(view).sum())
     n_unwritten = int(torch.isneginf(view).sum())
@@ -295,13 +307,15 @@ def _run(case, aot):
         _verdict(torch, "dB", dbb, dbv, report, BIAS_MARGIN)
 
     # ---- inputs and row tensors must come back untouched --------------------
-    _inputs = [("Q", qb, d, MARGIN), ("K", kb, d, MARGIN), ("V", vb, d, MARGIN), ("DO", dob, d, MARGIN)]
+    _inputs = [("Q", qb, q, MARGIN), ("K", kb, k, MARGIN), ("V", vb, v, MARGIN), ("DO", dob, do, MARGIN)]
     if bias:
-        _inputs.append(("B", bb, sk, BIAS_MARGIN))
-    for nm, bufr, _w, _m in _inputs:
-        n = int((~torch.isnan(bufr[..., :_m])).sum()) + int((~torch.isnan(bufr[..., _m + _w :])).sum())
+        _inputs.append(("B", bb, bv, BIAS_MARGIN))
+    for nm, bufr, viewr, _m in _inputs:
+        poisoned = torch.isnan(bufr).clone()
+        poisoned[:, :, : viewr.shape[2], _m : _m + viewr.shape[3]] = True
+        n = int((~poisoned).sum())
         if n:
-            report.append(f"OOB WRITE   {nm} (input!): {n} margin element(s) overwritten")
+            report.append(f"OOB WRITE   {nm} (input!): {n} poison element(s) overwritten")
     for nm, bufr in (("lse", lse_buf), ("delta", delta_buf)):
         n = int((~torch.isnan(bufr[0])).sum()) + int((~torch.isnan(bufr[-1])).sum())
         if n:

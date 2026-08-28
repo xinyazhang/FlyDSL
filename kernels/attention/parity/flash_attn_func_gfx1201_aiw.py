@@ -1564,7 +1564,29 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     # are eight *contiguous* columns starting at klane*8, and
                     # one v8 load covers them -- the same shape as the K and V
                     # loads.
-                    _b_row = _b_base + q_rows[qt] * fx.Index(stride_b_seq_q)
+                    # **The row is clamped, and this is the one that faulted.**
+                    # A workgroup covers BLOCK_M query rows whatever `seqlen_q`
+                    # is -- 128 of them at head_dim 24 against a seqlen_q of 11
+                    # -- and every one of those dead lanes still runs this load.
+                    # Unclamped, row 33 of an 11-row plane is 22 rows past it,
+                    # and `stride_b_seq_q` rows are far enough apart that it
+                    # leaves the tensor entirely:
+                    #
+                    #   fault 0x7ef51f810000, 70,074 B past a 519,750 B
+                    #   allocation = 3*5*11*1575*2, the bias exactly
+                    #
+                    # Not something a poisoned margin can catch either: a row
+                    # index one too large lands on the next row's *real data*,
+                    # so it reads plausible numbers until it runs off the end.
+                    #
+                    # `q_rows[qt]` and not `gate`'s `_safe`: `MaskedAxis.safe`
+                    # returns the offset *within the tile* for an addressed
+                    # access, and the bias is indexed absolutely from
+                    # `_b_base`. The dQ kernel shipped that exact confusion
+                    # once. `_b_base` already carries `_q_row_off_v`, so this
+                    # stays correct under varlen.
+                    _bq = q_rows[qt] if (q_row_i32s[qt] < seqlen_q_i32) else fx.Index(0)
+                    _b_row = _b_base + _bq * fx.Index(stride_b_seq_q)
                     if const_expr(_MASK_STEPS):
                         # **The tail tile reads one element at a time, with the
                         # address clamped.** A group's eight columns can run
