@@ -37,6 +37,7 @@ from fmha_abi_gfx1201 import varlen_compact, varlen_padded
 from fmha_bwd_dkdv_gfx1201_interface import build_bwd_dkdv_module, flydsl_flash_attn_bwd_dkdv_gfx1201
 from fmha_tuning_bwd_dkdv_gfx1201 import BwdDkDvKnobs, BwdDkDvMetadata
 from fmha_tuning_bwd_dkdv_gfx1201 import plan as bwd_plan
+from fmha_tuning_bwd_dkdv_gfx1201 import resolve_knobs as bwd_resolve_knobs
 from philox import dropout_threshold
 
 # f16 tolerance. dK and dV are accumulated in f32 and rounded once on store, so
@@ -142,9 +143,33 @@ def _reference(q, k, v, do, causal_type=0, window=None, sm_scale=None, keep=None
 
 
 def _bwd_via_kernel(
-    q, k, v, do, o, lse, delta, causal_type, window, dropout_p=None, seed=0, offset=0, knobs=None, offset1=None
+    q,
+    k,
+    v,
+    do,
+    o,
+    lse,
+    delta,
+    causal_type,
+    window,
+    dropout_p=None,
+    seed=0,
+    offset=0,
+    knobs=None,
+    offset1=None,
+    one_tile=None,
 ):
-    """Direct builder call, bypassing the interface's delta and allocation."""
+    """Direct builder call, bypassing the interface's delta and allocation.
+
+    `one_tile` compiles both head-dim axes to the *same* width and marks the
+    build padded, which is AOTriton's shape and not `plan`'s: it has a single
+    BLOCK_DMODEL operator axis, so `flyc_bwd_dkdv.py` asks for `head_dim ==
+    head_dim_v == tile` and lets the real extents ride as `hdim_qk` /
+    `hdim_vo`. `plan` rounds the two independently, which makes them unequal
+    whenever the caller's are -- and `split_head_dim` requires them equal, so
+    every build `plan` produces for a mismatched pair has the split *off*.
+    Reaching the split's role-selected operand at all needs this door.
+    """
     batch, num_heads_q, seq_q, _ = q.shape
     seq_k = k.shape[2]
     dtype_str = "bf16" if q.dtype == torch.bfloat16 else "f16"
@@ -152,19 +177,26 @@ def _bwd_via_kernel(
     pitch_v = (v.shape[3] + 7) // 8 * 8
     dk = torch.zeros(*k.shape[:3], pitch_k, dtype=k.dtype, device=k.device)[..., : k.shape[3]]
     dv = torch.zeros(*v.shape[:3], pitch_v, dtype=v.dtype, device=v.device)[..., : v.shape[3]]
-    _plan = bwd_plan(
-        BwdDkDvMetadata(
-            num_heads=num_heads_q,
-            head_dim=k.shape[3],
-            head_dim_v=v.shape[3],
-            causal=causal_type != 0,
-            causal_type=causal_type or None,
-            dtype_str=dtype_str,
-            dropout=dropout_p is not None,
-        ),
-        knobs,
+    _meta = BwdDkDvMetadata(
+        num_heads=num_heads_q,
+        head_dim=one_tile if one_tile else k.shape[3],
+        head_dim_v=one_tile if one_tile else v.shape[3],
+        causal=causal_type != 0,
+        causal_type=causal_type or None,
+        dtype_str=dtype_str,
+        dropout=dropout_p is not None,
     )
-    exe = build_bwd_dkdv_module(_plan.meta, _plan.knobs)
+    if one_tile is None:
+        _plan = bwd_plan(_meta, knobs)
+        _meta, _knobs = _plan.meta, _plan.knobs
+    else:
+        _knobs = bwd_resolve_knobs(
+            _meta,
+            (knobs or BwdDkDvKnobs()).merge(
+                BwdDkDvKnobs(block_dmodel=one_tile, block_dmodel_v=one_tile, padded_head=True)
+            ),
+        )
+    exe = build_bwd_dkdv_module(_meta, _knobs)
     exe(
         q,
         k,
@@ -201,7 +233,9 @@ def _case(batch, hq, hk, seq_q, seq_k, head_dim, dtype=torch.float16, seed=0):
     )
 
 
-def _check(q, k, v, do, causal_type=0, window=None, dtype=None, label="", seed=0, offset=0, offset1=None, **kw):
+def _check(
+    q, k, v, do, causal_type=0, window=None, dtype=None, label="", seed=0, offset=0, offset1=None, one_tile=None, **kw
+):
     """Reference and kernel on the same inputs, both gradients within tolerance.
 
     `seed` / `offset` are the kernel's Philox arguments and are deliberately
@@ -224,6 +258,7 @@ def _check(q, k, v, do, causal_type=0, window=None, dtype=None, label="", seed=0
         seed=seed,
         offset=offset,
         offset1=offset1,
+        one_tile=one_tile,
     )
     tol = _tol(dtype or q.dtype)
     # See `_rel`: the two gradients share a problem, so the larger norm is the
@@ -395,6 +430,40 @@ def test_padded_head(head_dim, causal):
     q, k, v, do = _case(1, 2, 2, 256, 256, pitch)
     q, k, v, do = (t[..., :head_dim] for t in (q, k, v, do))
     _check(q, k, v, do, causal_type=1 if causal else 0, label=f"padded hd{head_dim}")
+
+
+# `hdim_qk != hdim_vo` on ONE compiled tile -- AOTriton's shape, and the only
+# way into `split_head_dim` with the two extents unequal, since `plan` rounds
+# them separately and the split requires equal tiles.
+#
+# The tiles here are all >= `_SPLIT_HEAD_DIM_MIN`, which is the point: under
+# the split a wave holds *one* operand array and uses it as K or V according
+# to its role, so the column bound has to be the role's as well. Bounding V by
+# `hdim_qk` fails silently and in both directions -- a wider V loses the
+# columns past `hdim_qk` out of dP, a narrower one reads real data past its
+# own extent and is saved only by dO being zero there. 512 is included because
+# `contraction_shards` shards that same operand array again.
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize(
+    "hdim_qk,hdim_vo,tile",
+    [(160, 224, 224), (224, 160, 224), (192, 256, 256), (256, 512, 512), (64, 128, 128)],
+    ids=["vo-wider", "qk-wider", "vo-wider-256", "vo-wider-512", "unsplit"],
+)
+def test_hdim_qk_ne_vo_on_one_tile(hdim_qk, hdim_vo, tile, causal):
+    _require_env()
+    q = _rand(1, 2, 128, hdim_qk, torch.float16, 0)
+    k = _rand(1, 2, 128, hdim_qk, torch.float16, 1)
+    v = _rand(1, 2, 128, hdim_vo, torch.float16, 2)
+    do = _rand(1, 2, 128, hdim_vo, torch.float16, 3)
+    _check(
+        q,
+        k,
+        v,
+        do,
+        causal_type=1 if causal else 0,
+        one_tile=tile,
+        label=f"qk{hdim_qk} vo{hdim_vo} tile{tile} causal={causal}",
+    )
 
 
 # --------------------------------------------------------------------------

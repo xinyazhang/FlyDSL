@@ -669,6 +669,21 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
             my_tbase, my_toff, _ = fmha.make_addr_pair(_my_st, head_k, _k_batch_v, _k_row_off_v, **_addr_kw_k)
             my_tile_base = my_tbase(_k_start_addr)
 
+            # The column bound is the role's too. `BLOCK_DMODEL ==
+            # BLOCK_DMODEL_V` is asserted above, so the two roles share a tile
+            # width -- but the *runtime* extents need not agree, and reading V
+            # against `hdim_qk` is wrong in both directions: with a wider V it
+            # zeroes the columns in `[hdim_qk, hdim_vo)` whose dO is live, so
+            # dP silently drops them; with a narrower one it leaves columns
+            # past `hdim_vo` unzeroed, and they survive only because dO is zero
+            # there. Selected on plain values for the reason above, before any
+            # aperture exists to call a method on.
+            if const_expr(PADDED_HEAD):
+                _my_hdim = fx.Int32(hdim_qk) if _role0 else fx.Int32(hdim_vo)
+                my_ap = fmha.Aperture(fmha.MaskedAxis(fx.Index(_my_hdim), elem_dtype=elem_dtype), rows=kv_rows)
+            else:
+                my_ap = k_ap
+
             def fetch_my(row, col):
                 return load_global_v8f16(my_ptr, my_tile_base, my_toff(row, col))
 
@@ -682,7 +697,7 @@ def build_bwd_dkdv_module_primary(meta: BwdDkDvMetadata, knobs: BwdDkDvKnobs):
                     _c = fx.Index((_shard_k0 + fx.Int32(ks)) * fx.Int32(WMMA_K)) + klane * WMMA_LANE_K
                 else:
                     _c = fx.Index(ks * WMMA_K) + klane * WMMA_LANE_K
-                k_packs.append(k_ap.read_v8(fetch_my, _kv_safe, _c, _kv_in))
+                k_packs.append(my_ap.read_v8(fetch_my, _kv_safe, _c, _kv_in))
             v_packs = k_packs
         else:
             k_packs = []
