@@ -72,6 +72,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # 8 f16 elements is exactly one cooperative-load vector.
 MARGIN = 8
 
+# The bias margin has to be bigger, and the reason is the bug this probe was
+# built to catch. Bias runs along KV, and the tail tile's dead groups can start
+# a whole `BLOCK_N` past `seqlen_k` -- so an 8-element margin is overshot, the
+# read wraps into the *next row's real data*, and the probe reports clean. 256
+# clears every BLOCK_N this family compiles.
+BIAS_MARGIN = 256
+
 # (label, batch, heads, seqlen_q, seqlen_k, head_dim, causal, dropout_p, bias, dtype)
 #
 # Decoded from the pytest ids, which order parametrize marks bottom-decorator
@@ -89,27 +96,39 @@ CASES = [
     ("pass1-only irregular hd216 sk32 sq16", 3, 5, 16, 32, 216, False, 0.0, False, "f16"),
     ("control    regular hd224 sk128 sq128 causal", 3, 5, 128, 128, 224, True, 0.0, False, "f16"),
     ("control    regular hd216 sk128 sq8 causal", 3, 5, 8, 128, 216, True, 0.0, False, "bf16"),
+    # pass3: 93 of its 117 aborts involve bias. The first is the one that was
+    # reproduced by hand and named the faulting kernel --
+    #   Memory access fault ... kernel: flash_attn_func_aiw_kernel_0
+    # -- so the FORWARD is on trial here as much as the backward. Every one has
+    # a ragged seqlen_k, which is the axis the bias load runs along.
+    ("pass3 CONFIRMED irregular hd24 sk1063 sq11 bias", 3, 5, 11, 1063, 24, False, 0.0, True, "bf16"),
+    ("pass3 irregular hd128 sk71 sq257 bias", 3, 5, 257, 71, 128, False, 0.0, True, "f16"),
+    ("pass3 irregular hd248 sk13 sq11 bias", 3, 5, 11, 13, 248, False, 0.0, True, "f16"),
+    ("pass3 irregular hd8 sk1063 sq523 bias", 3, 5, 523, 1063, 8, False, 0.0, True, "bf16"),
+    ("pass3 matrix-bias hd24 sk1024 sq16", 3, 5, 16, 1024, 24, False, 0.0, True, "f16"),
+    ("pass3 matrix-bias hd256 sk128 sq8", 3, 5, 8, 128, 256, False, 0.0, True, "f16"),
+    ("control    bias hd64 sk128 sq128 (aligned)", 3, 5, 128, 128, 64, False, 0.0, True, "f16"),
 ]
 
 
-def _poisoned_in(torch, b, h, s, d, dtype, gen):
+def _poisoned_in(torch, b, h, s, d, dtype, gen, margin=MARGIN):
     """Random `(b, h, s, d)` inside a NaN margin on both sides of every row."""
-    buf = torch.full((b, h, s, d + 2 * MARGIN), float("nan"), dtype=dtype, device="cuda")
-    view = buf[..., MARGIN : MARGIN + d]
+    buf = torch.full((b, h, s, d + 2 * margin), float("nan"), dtype=dtype, device="cuda")
+    view = buf[..., margin : margin + d]
     view.copy_(torch.rand(b, h, s, d, dtype=dtype, device="cuda", generator=gen))
     return buf, view
 
 
-def _poisoned_out(torch, b, h, s, d, dtype):
+def _poisoned_out(torch, b, h, s, d, dtype, margin=MARGIN):
     """`(b, h, s, d)` of -inf inside a -inf margin. Everything starts poisoned."""
-    buf = torch.full((b, h, s, d + 2 * MARGIN), float("-inf"), dtype=dtype, device="cuda")
-    return buf, buf[..., MARGIN : MARGIN + d]
+    buf = torch.full((b, h, s, d + 2 * margin), float("-inf"), dtype=dtype, device="cuda")
+    return buf, buf[..., margin : margin + d]
 
 
-def _verdict(torch, name, buf, view, report):
+def _verdict(torch, name, buf, view, report, margin=MARGIN):
     """Three checks on one output: OOB write, OOB read, and never-written."""
     intact = torch.isneginf(buf).clone()
-    intact[..., MARGIN : MARGIN + view.shape[-1]] = True  # only the margin is under test here
+    intact[..., margin : margin + view.shape[-1]] = True  # only the margin is under test here
     n_write = int((~intact).sum())
     n_nan = int(torch.isnan(view).sum())
     n_unwritten = int(torch.isneginf(view).sum())
@@ -125,6 +144,7 @@ def _verdict(torch, name, buf, view, report):
 
 def _run(case, aot):
     import torch
+    from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module
     from fmha_bwd_dkdv_gfx1201_interface import build_bwd_dkdv_module
     from fmha_bwd_dq_gfx1201_kernel import build_bwd_dq_module
     from fmha_tuning_bwd_dkdv_gfx1201 import BwdDkDvKnobs, BwdDkDvMetadata
@@ -142,6 +162,13 @@ def _run(case, aot):
     kb, k = _poisoned_in(torch, b, h, sk, d, dtype, g)
     vb, v = _poisoned_in(torch, b, h, sk, d, dtype, g)
     dob, do = _poisoned_in(torch, b, h, sq, d, dtype, g)
+    # Bias runs along KV, so its poison sits past `seqlen_k` -- exactly where a
+    # group of eight adjacent columns overruns a ragged extent. See BIAS_MARGIN
+    # for why it is not the same 8 the head-dim axis uses.
+    bb = bv = dbb = dbv = None
+    if bias:
+        bb, bv = _poisoned_in(torch, b, h, sq, sk, dtype, g, BIAS_MARGIN)
+        dbb, dbv = _poisoned_out(torch, b, h, sq, sk, dtype, BIAS_MARGIN)
 
     print(f"[repro] {label}")
     print(f"[repro]   B={b} H={h} sq={sq} sk={sk} d={d} causal={causal} p={p} bias={bias} {dt} margin={MARGIN}")
@@ -175,6 +202,29 @@ def _run(case, aot):
 
     report = []
 
+    # ---- forward -----------------------------------------------------------
+    #
+    # First, and not optional: the one fault reproduced by hand named
+    # `flash_attn_func_aiw_kernel_0`, not a backward kernel. Its `o` and `lse`
+    # are thrown away -- the backward below keeps using the torch ones, so a
+    # forward bug cannot mask a backward one by poisoning its inputs.
+    ob, o_k = _poisoned_out(torch, b, h, sq, d, dtype)
+    lse_k = torch.full((b * h, sq), float("-inf"), dtype=torch.float32, device="cuda")
+    fwd = build_flash_attn_func_aiw_module(
+        num_heads=h,
+        head_dim=d,
+        causal=causal,
+        causal_type=ctype or None,
+        dtype_str=dt,
+        bias=bool(bias),
+        fp_mode="safe",
+        unsafe_fp_math=False,
+        fast_fp_math=False,
+    )
+    fwd(q, k, v, o_k, b, sq, seqlen_k=sk, lse=lse_k, bias=bv)
+    torch.cuda.synchronize()
+    _verdict(torch, "O (forward)", ob, o_k, report)
+
     # ---- dK / dV -----------------------------------------------------------
     dkb, dk = _poisoned_out(torch, b, h, sk, d, dtype)
     dvb, dv = _poisoned_out(torch, b, h, sk, d, dtype)
@@ -187,6 +237,7 @@ def _run(case, aot):
         causal_type=ctype or None,
         dtype_str=dt,
         dropout=p > 0.0,
+        bias=bool(bias),
     )
     over = BwdDkDvKnobs(fp_mode="safe", unsafe_fp_math=False, fast_fp_math=False)
     if aot:
@@ -199,6 +250,7 @@ def _run(case, aot):
         dropout_p=p or None,
         philox_seed=0x1234,
         philox_offset2=0,
+        bias=bv,
     )  # fmt: skip
     torch.cuda.synchronize()
     _verdict(torch, "dK", dkb, dk, report)
@@ -214,18 +266,24 @@ def _run(case, aot):
         causal=causal,
         causal_type=ctype or None,
         dtype_str=dt,
+        bias=bool(bias),
         fp_mode="safe",
         unsafe_fp_math=False,
         fast_fp_math=False,
         **({"block_dmodel": qtile, "padded_head": qtile != d} if aot else {}),
     )
-    exe_dq(q, k, v, do, dq, lse, delta, b, sq, sk)
+    exe_dq(q, k, v, do, dq, lse, delta, b, sq, sk, bias=bv, dbias=dbv)
     torch.cuda.synchronize()
     _verdict(torch, "dQ", dqb, dq, report)
+    if bias:
+        _verdict(torch, "dB", dbb, dbv, report, BIAS_MARGIN)
 
     # ---- inputs and row tensors must come back untouched --------------------
-    for nm, bufr, viewr in (("Q", qb, q), ("K", kb, k), ("V", vb, v), ("DO", dob, do)):
-        n = int((~torch.isnan(bufr[..., :MARGIN])).sum()) + int((~torch.isnan(bufr[..., MARGIN + d :])).sum())
+    _inputs = [("Q", qb, d, MARGIN), ("K", kb, d, MARGIN), ("V", vb, d, MARGIN), ("DO", dob, d, MARGIN)]
+    if bias:
+        _inputs.append(("B", bb, sk, BIAS_MARGIN))
+    for nm, bufr, _w, _m in _inputs:
+        n = int((~torch.isnan(bufr[..., :_m])).sum()) + int((~torch.isnan(bufr[..., _m + _w :])).sum())
         if n:
             report.append(f"OOB WRITE   {nm} (input!): {n} margin element(s) overwritten")
     for nm, bufr in (("lse", lse_buf), ("delta", delta_buf)):

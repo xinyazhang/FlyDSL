@@ -1565,19 +1565,61 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     # one v8 load covers them -- the same shape as the K and V
                     # loads.
                     _b_row = _b_base + q_rows[qt] * fx.Index(stride_b_seq_q)
-                    for _st in range_constexpr(NUM_S_ACCS):
-                        _c0 = (_st // 2) * 32 + (_st % 2) * 16
-                        _bv = load_global_v8f16(
-                            _b_ptr,
-                            _b_row + fx.Index(kv_block_start) + fx.Index(_c0) + klane * fx.Index(8),
-                            fx.Index(0),
-                        )
-                        for _r in range_constexpr(8):
-                            _bs = fx.Float32(Vec(_bv)[_r].to(fx.Float32))
-                            s_raw[_st * 8 + _r] = fastmath.add(
-                                s_raw[_st * 8 + _r],
-                                fastmath.mul(_bs, fx.Float32(_LOG2E)),
+                    if const_expr(_MASK_STEPS):
+                        # **The tail tile reads one element at a time, with the
+                        # address clamped.** A group's eight columns can run
+                        # past `seqlen_k` here, and the v8 below would issue the
+                        # whole 16-byte access anyway: the mask further down
+                        # replaces those *scores* with -inf, so the wrong value
+                        # was harmless and the out-of-bounds *access* was
+                        # invisible -- until it reached a page the tensor does
+                        # not own. That is a real fault, not a theoretical one
+                        # (AOTriton `test_irregulars` seqlen_k 1063, hdim 24:
+                        # "Memory access fault ... kernel:
+                        # flash_attn_func_aiw_kernel_0").
+                        #
+                        # Sliding the eight-wide base back into the row instead
+                        # would be wrong -- it shifts which column each element
+                        # carries, so the live ones would take a neighbour's
+                        # bias. Clamping *per element* is exact, because a dead
+                        # element's value is discarded either way. Same
+                        # contract dK/dV's bias load already has.
+                        #
+                        # Cost lands only here: full tiles are bounded by
+                        # `blk_last_whole`, so every column of one exists, and
+                        # `_MASK_STEPS` is `const_expr` so they keep the v8.
+                        _kv_i32 = fx.Int32(kv_block_start)
+                        _klane_off = fx.Int32(klane) * fx.Int32(8)
+                        for _i in range_constexpr(NUM_S_VALS):
+                            _bcol = _kv_i32 + fx.Int32(fmha.acc_elem_column(_i)) + _klane_off
+                            _bin = _bcol < seqlen_k_i32
+                            _bsafe = fx.Index(fx.Int32(_bcol) if _bin else fx.Int32(0))
+                            _braw = fx.Float32(
+                                fx.as_dsl_value(
+                                    _pointer_load(
+                                        elem_type,
+                                        buffer_ops.get_element_ptr(
+                                            _b_ptr, fx.Int64(_b_row + _bsafe), elem_type=elem_type
+                                        ),
+                                    )
+                                ).to(fx.Float32)
                             )
+                            _bs = fx.Float32(_braw if _bin else fx.Float32(0.0))
+                            s_raw[_i] = fastmath.add(s_raw[_i], fastmath.mul(_bs, fx.Float32(_LOG2E)))
+                    else:
+                        for _st in range_constexpr(NUM_S_ACCS):
+                            _c0 = (_st // 2) * 32 + (_st % 2) * 16
+                            _bv = load_global_v8f16(
+                                _b_ptr,
+                                _b_row + fx.Index(kv_block_start) + fx.Index(_c0) + klane * fx.Index(8),
+                                fx.Index(0),
+                            )
+                            for _r in range_constexpr(8):
+                                _bs = fx.Float32(Vec(_bv)[_r].to(fx.Float32))
+                                s_raw[_st * 8 + _r] = fastmath.add(
+                                    s_raw[_st * 8 + _r],
+                                    fastmath.mul(_bs, fx.Float32(_LOG2E)),
+                                )
 
                 if const_expr(_MASK_STEPS):
                     # ---- Masked region: KV tail and causal, fused ----

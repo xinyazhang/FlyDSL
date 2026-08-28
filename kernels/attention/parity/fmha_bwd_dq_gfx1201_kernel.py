@@ -649,6 +649,12 @@ def build_bwd_dq_module_primary(meta, knobs):
             """One dB element. Scalar because the guard is per column."""
             _pointer_store(val, buffer_ops.get_element_ptr(base_ptr, fx.Int64(off64), elem_type=elem_type))
 
+        def load_global_f16(base_ptr, off64):
+            """One bias element, for the tail tile. Scalar for the same reason
+            the dB store is: past `seqlen_k` the guard is per column, and a
+            v8 would issue the whole line regardless of it."""
+            return _pointer_load(elem_type, buffer_ops.get_element_ptr(base_ptr, fx.Int64(off64), elem_type=elem_type))
+
         def store_global_v8(base_ptr, base64, off32, val):
             _pointer_store(val, fmha.split_ptr(base_ptr, base64, off32, elem_type))
 
@@ -1000,20 +1006,42 @@ def build_bwd_dq_module_primary(meta, knobs):
                 # Not a gather: element `_st*8 + _r` is KV column
                 # `_st*16 + klane*8 + _r`, so within a group only `_r` varies
                 # and one v8 load covers all eight.
-                # The *value* is zeroed past `seqlen_k`, not the address. The
-                # address cannot be clamped: moving the eight-wide base to keep
-                # it in-row would shift which column each element carries, so
-                # the in-range ones would take a neighbour's bias. Zeroing after
-                # the load keeps those exact and stops an arbitrary neighbouring
-                # row's value entering the arithmetic -- which matters because
-                # the mask below is a select, and this build assumes no NaNs.
-                for _st in range_constexpr(NUM_S_ACCS):
-                    _c0 = fx.Int32(kv_block_start) + fx.Int32(_st * WMMA_N) + fx.Int32(klane) * fx.Int32(8)
-                    _bv = load_global_v8f16(_b_ptr, _b_row + fx.Index(_c0), fx.Index(0))
-                    for _r in range_constexpr(8):
-                        _live = _c0 + fx.Int32(_r) < seqlen_k_i32
-                        _bs = fx.Float32(fx.Float32(Vec(_bv)[_r].to(fx.Float32)) if _live else fx.Float32(0.0))
-                        s_raw[_st * 8 + _r] = fastmath.add(s_raw[_st * 8 + _r], fastmath.mul(_bs, fx.Float32(_LOG2E)))
+                # **Both the value and the address are guarded, and the tail
+                # tile pays for it one element at a time.** Zeroing the value
+                # alone was not enough: the v8 access is still issued, so a
+                # group whose columns are all past `seqlen_k` reads a whole
+                # 16-byte line the bias tensor does not own. The same omission
+                # in the forward faulted for real (AOTriton `test_irregulars`
+                # seqlen_k 1063, hdim 24).
+                #
+                # Sliding the eight-wide base back into the row is what cannot
+                # be done -- it shifts which column each element carries, so
+                # the live ones would take a neighbour's bias. Clamping *per
+                # element* has no such problem, because a dead element's value
+                # is discarded anyway. Same contract dK/dV's bias load has.
+                #
+                # Only the tail tile is affected: full tiles end at
+                # `blk_last_whole`, so every column of one exists, and
+                # `_MASK_STEPS` is `const_expr` so they keep the v8.
+                if const_expr(_MASK_STEPS):
+                    _bkv = fx.Int32(kv_block_start)
+                    _bklane = fx.Int32(klane) * fx.Int32(8)
+                    for _i in range_constexpr(NUM_S_VALS):
+                        _bcol = _bkv + fx.Int32(fmha.acc_elem_column(_i)) + _bklane
+                        _bin = _bcol < seqlen_k_i32
+                        _bsafe = fx.Index(fx.Int32(_bcol) if _bin else fx.Int32(0))
+                        _braw = fx.Float32(fx.as_dsl_value(load_global_f16(_b_ptr, _b_row + _bsafe)).to(fx.Float32))
+                        _bs = fx.Float32(_braw if _bin else fx.Float32(0.0))
+                        s_raw[_i] = fastmath.add(s_raw[_i], fastmath.mul(_bs, fx.Float32(_LOG2E)))
+                else:
+                    for _st in range_constexpr(NUM_S_ACCS):
+                        _c0 = fx.Int32(kv_block_start) + fx.Int32(_st * WMMA_N) + fx.Int32(klane) * fx.Int32(8)
+                        _bv = load_global_v8f16(_b_ptr, _b_row + fx.Index(_c0), fx.Index(0))
+                        for _r in range_constexpr(8):
+                            _bs = fx.Float32(Vec(_bv)[_r].to(fx.Float32))
+                            s_raw[_st * 8 + _r] = fastmath.add(
+                                s_raw[_st * 8 + _r], fastmath.mul(_bs, fx.Float32(_LOG2E))
+                            )
 
             if const_expr(_MASK_STEPS):
                 # Element i of the flattened accumulators is KV column

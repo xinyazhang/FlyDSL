@@ -742,10 +742,14 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                         # This half holds one kv column and eight q rows, so
                         # the eight bias entries are `stride_b_seq_q` apart and each
                         # is its own load -- the standalone dK/dV kernel pays
-                        # exactly this. Clamped, since a dead row still issues
-                        # the load and `dead` below is what removes it.
+                        # exactly this. **Both** indices clamped, since a dead
+                        # row or column still issues the load and `dead` below
+                        # is what removes it -- the column clamp is loop
+                        # invariant, and without it a wave whose kv row is past
+                        # `seqlen_k` reads off the end of the bias tensor.
                         _bq = fx.Index(q_g) if (q_g < seqlen_q_i32) else fx.Index(0)
-                        _bo = _b_head + (_q_row_off_v + _bq) * fx.Index(stride_b_seq_q) + fx.Index(kv_row_i32)
+                        _bk = fx.Index(kv_row_i32) if (kv_row_i32 < seqlen_k_i32) else fx.Index(0)
+                        _bo = _b_head + (_q_row_off_v + _bq) * fx.Index(stride_b_seq_q) + _bk
                         _bv = fx.Float32(fx.as_dsl_value(load_bias_1(_bo)).to(fx.Float32))
                         s = fastmath.add(s, fastmath.mul(_bv, fx.Float32(_LOG2E)))
                     s = fastmath.sub(s, fastmath.mul(fx.Float32(lse), fx.Float32(_LOG2E)))
@@ -922,22 +926,36 @@ def build_fmha_bwd_fuse_module(meta: BwdInputMetadata, knobs: BwdKnobs):
                     # The mirror of the other half: one q row and eight
                     # *adjacent* kv columns, so one v8 covers all eight and the
                     # load hoists out of the element loop.
+                    #
+                    # Except on a masked tile, where those eight columns can
+                    # run past `seqlen_k`. The v8 would issue the whole 16-byte
+                    # access anyway and `dead` below only fixes the *score*, so
+                    # the out-of-bounds read stayed invisible until it reached
+                    # a page the tensor does not own -- which is what the
+                    # forward's identical omission actually did. Sliding the
+                    # base back would shift each element's column, so the clamp
+                    # is per element; `MASKED` is `const_expr`, so full tiles
+                    # keep the single v8.
                     _bq = fx.Index(q_row_i32) if (q_row_i32 < seqlen_q_i32) else fx.Index(0)
-                    _bo = (
-                        _b_head
-                        + (_q_row_off_v + _bq) * fx.Index(stride_b_seq_q)
-                        + fx.Index(start_k_i)
-                        + klane * fx.Index(WMMA_LANE_K)
-                    )
-                    _bvec = load_bias_8(_bo)
+                    _brow = _b_head + (_q_row_off_v + _bq) * fx.Index(stride_b_seq_q)
+                    if const_expr(MASKED):
+                        _bvals = []
+                        for _e in range_constexpr(8):
+                            _bc = fx.Int32(start_k_i) + fx.Int32(klane * fx.Index(WMMA_LANE_K)) + fx.Int32(_e)
+                            _bin = _bc < seqlen_k_i32
+                            _bsafe = fx.Index(fx.Int32(_bc) if _bin else fx.Int32(0))
+                            _braw = fx.Float32(fx.as_dsl_value(load_bias_1(_brow + _bsafe)).to(fx.Float32))
+                            _bvals.append(fx.Float32(_braw if _bin else fx.Float32(0.0)))
+                    else:
+                        _bvec = load_bias_8(_brow + fx.Index(start_k_i) + klane * fx.Index(WMMA_LANE_K))
+                        _bvals = [fx.Float32(Vec(_bvec)[_e].to(fx.Float32)) for _e in range_constexpr(8)]
 
                 ds_vals = []
                 for e in range_constexpr(8):
                     kv_g = fx.Int32(start_k_i) + fx.Int32(klane * fx.Index(WMMA_LANE_K)) + fx.Int32(e)
                     s = fastmath.mul(fx.Float32(Vec(st_acc)[e]), sm_log2e)
                     if const_expr(BIAS_TYPE):
-                        _bv = fx.Float32(Vec(_bvec)[e].to(fx.Float32))
-                        s = fastmath.add(s, fastmath.mul(_bv, fx.Float32(_LOG2E)))
+                        s = fastmath.add(s, fastmath.mul(fx.Float32(_bvals[e]), fx.Float32(_LOG2E)))
                     s = fastmath.sub(s, lse_log2e)
                     if const_expr(MASKED):
                         dead = kv_g >= seqlen_k_i32
