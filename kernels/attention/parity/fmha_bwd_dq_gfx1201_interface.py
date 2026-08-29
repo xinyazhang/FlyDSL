@@ -177,21 +177,13 @@ def flydsl_bwd_dq_gfx1201(
         ),
         knobs,
     )
-    if _plan.knobs.padded_head:
-        # The D-axis pitch must be a multiple of 16 bytes -- 8 elements at
-        # f16/bf16 -- because loads and stores are 8 columns wide, so the chunk
-        # containing `head_dim` runs to ceil8(head_dim). This is the forward's
-        # alignment contract and it is load-bearing on the *store* side too:
-        # dQ's last chunk would otherwise write into the next head.
-        for name, t in (("q", q), ("k", k), ("v", v), ("do", do)):
-            if t.stride(2) % 8:
-                raise ValueError(
-                    f"{name} has a D-axis pitch of {t.stride(2)} elements, which is not a "
-                    f"multiple of 8 (16 bytes). head_dim {head_dim} is not a compiled tile "
-                    f"width, so the kernel operates on ceil8({head_dim})="
-                    f"{(head_dim + 7) // 8 * 8} columns and needs the allocation padded to "
-                    f"match. Pad the last dimension before calling."
-                )
+    # The D-axis pitch contract -- accesses are 8 columns wide, so the chunk
+    # holding the last live column runs to ceil8(head_dim) -- is enforced in
+    # `fmha_abi_gfx1201.strides_of`, which every path reaches. It used to be
+    # checked here too, and in the two sibling interfaces, and each of the three
+    # copies had a different hole: none covered the outputs, and none ran on the
+    # builder path. The `% 8` form was also stricter than the rule it stood for,
+    # rejecting a legal pitch of 108 at head_dim 100.
 
     lse_p = _flat_rows(lse, "lse", batch, num_heads, seq_len_q)
     if delta is None:

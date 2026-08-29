@@ -155,30 +155,13 @@ def flydsl_flash_attn_func_gfx1201(
         ),
         knobs,
     )
-    padded_head = _plan.knobs.padded_head
-    if padded_head:
-        # The D-axis pitch must be a multiple of 16 bytes -- 8 elements at
-        # f16/bf16. This is the alignment contract (see sdpa-close-gap-plan1.md
-        # section 3), upheld upstream by the shim layer shared by the CUDA and
-        # ROCm backends, which pads the last dimension before dispatch exactly
-        # as `pad_last_dim` does.
-        #
-        # It is load-bearing here, not decorative. Loads and stores are 8
-        # columns wide, so the chunk containing `head_dim` runs to
-        # ceil8(head_dim); an 8-aligned pitch guarantees that lands inside the
-        # tensor's own padding. A tightly-packed tensor -- e.g. contiguous
-        # (B, H, S, 100), pitch 100 -- has no such padding, and the store at
-        # column 96 would write columns 100..103 of the *next head*.
-        for name, t in (("q", q), ("k", k), ("v", v)):
-            if t.stride(2) % 8:
-                raise ValueError(
-                    f"{name} has a D-axis pitch of {t.stride(2)} elements, which is "
-                    f"not a multiple of 8 (16 bytes). head_dim {head_dim} is not a "
-                    f"compiled tile width, so the kernel operates on "
-                    f"ceil8({head_dim})={(head_dim + 7) // 8 * 8} columns and needs "
-                    f"the allocation padded to match. Pad the last dimension before "
-                    f"calling, as PyTorch's SDPA shim does."
-                )
+    # The D-axis pitch contract -- accesses are 8 columns wide, so the chunk
+    # holding the last live column runs to ceil8(head_dim) -- is enforced in
+    # `fmha_abi_gfx1201.strides_of`, which every path reaches. It used to be
+    # checked here too, and in the two sibling interfaces, and each of the three
+    # copies had a different hole: none covered the outputs, and none ran on the
+    # builder path. The `% 8` form was also stricter than the rule it stood for,
+    # rejecting a legal pitch of 108 at head_dim 100.
     # The KV tail is masked in-kernel, so seq_len is passed through as-is.
     #
     # It used to be rounded up to BLOCK_M with F.pad -- three tensor copies per

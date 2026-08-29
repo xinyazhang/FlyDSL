@@ -261,6 +261,35 @@ def strides_of(t, name):
         raise ValueError(f"{name} must be rank 4, got shape {tuple(t.shape)}")
     if t.stride(3) != 1:
         raise ValueError(f"{name} must have a contiguous last dimension, got " f"stride(3)={t.stride(3)}")
+    # **The D-axis pitch must cover a whole 8-element chunk.**
+    #
+    # Every 16-bit access on this axis is 8 columns wide and the guard is
+    # `col < head_dim`, so the chunk containing the last live column runs to
+    # `ceil8(head_dim)`. That is a real address bound and not a "discard the
+    # surplus", but only while the allocation reaches that far: at a tighter
+    # pitch the chunk lands in the next row, and on the final row it leaves the
+    # tensor. The store side is the sharp one -- dQ, dK, dV and O *write* those
+    # columns, so a tight pitch corrupts the next row rather than merely
+    # reading it. Measured at head_dim 20 with a packed dQ: 4 elements past the
+    # allocation and 41% error in the last row.
+    #
+    # Checked here rather than in each interface because there were three
+    # private copies of this rule and each had a different hole -- dQ's omitted
+    # `dq` itself, and none of them ran on the builder path that every test and
+    # both `tooling/` probes use. `strides_of` is on every path by construction.
+    #
+    # Stated against `shape[3]` rather than the compiled tile: the tile is not
+    # visible here, and it is not the bound anyway. Vacuous whenever head_dim
+    # is itself a multiple of 8, which every ladder rung is.
+    _pitch_needed = (t.shape[3] + 7) // 8 * 8
+    if t.stride(2) < _pitch_needed:
+        raise ValueError(
+            f"{name} has a D-axis pitch of {t.stride(2)} elements, under the "
+            f"{_pitch_needed} that head_dim {t.shape[3]} needs. Accesses on this axis are 8 "
+            f"columns wide, so the chunk holding the last column runs to ceil8({t.shape[3]})"
+            f"={_pitch_needed} and would otherwise read -- and for an output, write -- past "
+            f"the row. Allocate the last dimension padded to {_pitch_needed} and slice."
+        )
     return t.stride(0), t.stride(1), t.stride(2)
 
 
