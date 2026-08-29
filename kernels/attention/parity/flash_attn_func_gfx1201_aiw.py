@@ -963,9 +963,23 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         _k_row_off_v = fx.Index(k_row_off)
         # Bias is (B, H, Sq, Sk): the last axis is the KV column, so unlike
         # Q/K/V/O its "row" stride is stride_b_seq_q and the contiguous axis is the
-        # one the KV tile walks. Indexed with the *same* (batch_index,
-        # q_row_off) the varlen decode produced, so it inherits every layout
-        # for free rather than needing its own -- sdpa-bias-plan.md 3.
+        # one the KV tile walks. Indexed with the *same* offsets the varlen
+        # decode produced, so it inherits every layout for free rather than
+        # needing its own -- sdpa-bias-plan.md 3.
+        #
+        # **Both** offsets: `q_row_off` on the row and `k_row_off` on the
+        # column. The column half was missing, so under a packed layout every
+        # sequence read sequence 0's bias columns -- a wrong answer rather than
+        # an out-of-bounds one, since a KV column is always below `seqlen_k`
+        # and so inside the tensor, which is why nothing caught it. It also
+        # contradicted the sentence above: the bias inherited the Q decode and
+        # ignored the K one.
+        #
+        # Inert everywhere with coverage today. `k_row_off` is 0 for dense and
+        # for the padded varlen layouts; only the packed layouts move, and
+        # bias-with-varlen has no test in any of the three suites. That gap is
+        # worth naming rather than papering over: this makes the kernel
+        # self-consistent, it does not settle what a packed bias should mean.
         if const_expr(BIAS_TYPE):
             _b_ptr = fmha.pointer_to_llvm_ptr(B)
             _b_base = (
@@ -1613,6 +1627,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     # stays correct under varlen.
                     _bq = q_rows[qt] if (q_row_i32s[qt] < seqlen_q_i32) else fx.Index(0)
                     _b_row = _b_base + _bq * fx.Index(stride_b_seq_q)
+                    # The KV column offset, the mirror of `_bq` on the row.
+                    _b_col0 = _k_row_off_v
                     if const_expr(_MASK_STEPS):
                         # **The tail tile reads one element at a time, with the
                         # address clamped.** A group's eight columns can run
@@ -1641,7 +1657,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         for _i in range_constexpr(NUM_S_VALS):
                             _bcol = _kv_i32 + fx.Int32(fmha.acc_elem_column(_i)) + _klane_off
                             _bin = _bcol < seqlen_k_i32
-                            _bsafe = fx.Index(fx.Int32(_bcol) if _bin else fx.Int32(0))
+                            _bsafe = _b_col0 + fx.Index(fx.Int32(_bcol) if _bin else fx.Int32(0))
                             _braw = fx.Float32(
                                 fx.as_dsl_value(
                                     _pointer_load(
@@ -1659,7 +1675,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                             _c0 = (_st // 2) * 32 + (_st % 2) * 16
                             _bv = load_global_v8f16(
                                 _b_ptr,
-                                _b_row + fx.Index(kv_block_start) + fx.Index(_c0) + klane * fx.Index(8),
+                                _b_row + _b_col0 + fx.Index(kv_block_start) + fx.Index(_c0) + klane * fx.Index(8),
                                 fx.Index(0),
                             )
                             for _r in range_constexpr(8):
