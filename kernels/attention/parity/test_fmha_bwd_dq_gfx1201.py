@@ -458,7 +458,16 @@ def _cu(lens):
 _VARLEN_LENGTHS = [
     ([3, 128, 40, 200], "mixed"),
     ([64, 64, 64], "all_equal"),
+    ([0, 96, 40], "zero_leading"),
     ([96, 0, 40], "zero_middle"),
+    # `zero_trailing` is not "zero_middle with the hole moved". An interior
+    # empty sequence has `row_off` pointing at the *next* sequence's first row,
+    # which is inside the tensor -- the read is wrong but legal, and nothing
+    # complains. A trailing one has `row_off == total_tokens`, so it addresses
+    # one row past the end, and that is a real out-of-bounds read of Q and dO.
+    # The forward and dK/dV suites carried this case; this one did not, which
+    # is why the bug lived here longest.
+    ([96, 40, 0], "zero_trailing"),
     ([77], "single"),
 ]
 
