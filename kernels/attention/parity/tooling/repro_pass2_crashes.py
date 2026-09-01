@@ -3,6 +3,24 @@
 
 """Poisoned-margin OOB probe for the `flyc_pass2.out` shapes whose worker aborted.
 
+**Resolved, and not in this kernel.** The bias-free aborts this file was built
+to chase turned out to be the *reference* computation, not the kernels: rerun
+with `AOTRITON_TORCH_ONLY_USE_CPU=1`, which moves torch's fp32 reference off
+the GPU, all twelve pass (flyc_pass6, 29 targeted tests, 100%, zero
+node-downs). Every clean result this probe reported was therefore correct.
+
+That is worth keeping rather than deleting the file over, for two reasons. The
+poison found real bugs when there were real bugs to find -- the forward's
+unclamped bias row and column, both confirmed by HIP faults naming our kernels
+-- so a clean run here is now calibrated evidence rather than an absence of
+evidence. And the shapes below are the ones a future regression would land on
+first.
+
+Note what a clean probe cannot tell you on its own: "the symptom moved when the
+reference moved" is consistent with a masked kernel bug as well as with a
+reference bug. What rules the first out is that the two aborts we *did* get
+fault logs for both named our kernels by name, and the twelve never did.
+
 Those failures are not tolerance failures: xdist reports the in-flight test as
 FAILED when the node goes down, and each sits immediately after a `node down:
 Not properly terminated`. Seven of them reproduce byte-identically across two
