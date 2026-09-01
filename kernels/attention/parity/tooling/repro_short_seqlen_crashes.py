@@ -79,14 +79,37 @@ ROW_GUARD = 512
 # Head dims to build. The four that crash bias-free (224, 216, 96, 32) plus 88
 # and 64 as neighbours -- 224/216/96/64 carry BLOCK_M 256, the largest, and so
 # the most dead lanes at a short seqlen_q.
-HEAD_DIMS = (224, 216, 96, 88, 64, 32)
+HEAD_DIMS = (408, 224, 216, 96, 88, 64, 48, 32)
 DTYPES = ("bf16", "f16")
 
 # Short on both axes. seqlen_q dominates the suspicion, but seqlen_k is swept
 # too: it decides the KV tile count and the ragged tail, and 1/2/4 are below a
 # single WMMA tile in a way no AOTriton shape reaches.
-SEQ_Q = (1, 2, 4, 7, 8, 15, 16)
+SEQ_Q = (1, 2, 4, 7, 8, 15, 16, 37)
 SEQ_K = (1, 4, 8, 15, 16, 64, 128, 512)
+
+# The pairs AOTriton actually aborts on, verbatim, because the cross product
+# above does not contain them and a sweep that misses the known failures is not
+# evidence of anything. Two lessons are encoded here:
+#
+#   * a *short seqlen_k against a long seqlen_q* is its own case. The sweep was
+#     built on "short seqlen_q with a big BLOCK_M", and `4-2048` / `16-2048`
+#     are the mirror image -- one KV tile against 16 Q tiles.
+#   * every one of these carries dropout 0.5 except the hdim224 family, which
+#     carries 0.0. The split is exact across the twelve, so dropout is an axis
+#     and not a detail.
+#
+# `(seqlen_q, seqlen_k, head_dim, causal, dropout)`.
+OBSERVED = (
+    (2048, 4, 32, True, 0.5),
+    (4, 579, 32, True, 0.5),
+    (2048, 16, 48, True, 0.5),
+    (17, 13, 408, False, 0.5),
+    (37, 71, 216, False, 0.5),
+    (8, 64, 224, False, 0.0),
+    (8, 128, 224, False, 0.0),
+    (8, 128, 224, True, 0.0),
+)
 
 
 def _configs():
@@ -296,11 +319,36 @@ def main():
     ap.add_argument("--batch", type=int, default=3)
     ap.add_argument("--heads", type=int, default=5)
     ap.add_argument("--pair", type=str, default=None, help="one 'sq,sk' instead of the sweep")
+    ap.add_argument("--observed", action="store_true", help="only the shapes AOTriton aborts on")
+    ap.add_argument("--only", type=str, default=None, help="'hd,causal,dtype' -- build exactly this one")
     ap.add_argument("--col-margin", type=int, default=COL_MARGIN, help="poison elements each side of a row")
     ap.add_argument("--row-guard", type=int, default=ROW_GUARD, help="poison rows past the sequence extent")
     ap.add_argument("--dropout", type=float, default=0.0, help="dK/dV dropout probability (a build axis)")
     a = ap.parse_args()
     COL_MARGIN, ROW_GUARD = a.col_margin, a.row_guard
+    if a.observed:
+        # One process per distinct build, each running only its own pairs.
+        bad, dirty = [], []
+        builds = sorted({(hd, causal, dt, drop) for _, _, hd, causal, drop in OBSERVED for dt in ("bf16", "f16")})
+        for hd, causal, dt, drop in builds:
+            pairs = [(sq, sk) for sq, sk, h, c, d in OBSERVED if (h, c, d) == (hd, causal, drop)]
+            for sq, sk in pairs:
+                argv = [sys.executable, os.path.abspath(__file__), "0",
+                        "--batch", str(a.batch), "--heads", str(a.heads),
+                        "--col-margin", str(a.col_margin), "--row-guard", str(a.row_guard),
+                        "--dropout", str(drop), "--pair", f"{sq},{sk}",
+                        "--only", f"{hd},{causal},{dt}"]  # fmt: skip
+                r = subprocess.run(argv)
+                tag = f"hd{hd} sq{sq} sk{sk} causal={causal} {dt} p={drop}"
+                print(f"[obs] {tag} exit={r.returncode}", flush=True)
+                if r.returncode == 2:
+                    dirty.append(tag)
+                elif r.returncode != 0:
+                    bad.append((tag, r.returncode))
+        print(f"[done] {len(dirty)} finding(s): {dirty}")
+        print(f"[done] {len(bad)} crash(es): {bad}")
+        return 1 if (bad or dirty) else 0
+
     cfgs = _configs()
     if a.list:
         for i, c in enumerate(cfgs):
@@ -327,7 +375,12 @@ def main():
         return 1 if (bad or dirty) else 0
 
     pair = tuple(int(x) for x in a.pair.split(",")) if a.pair else None
-    found = _run_config(cfgs[a.index or 0], a.batch, a.heads, pair, a.dropout)
+    if a.only:
+        _hd, _c, _dt = a.only.split(",")
+        cfg = (int(_hd), _c == "True", _dt)
+    else:
+        cfg = cfgs[a.index or 0]
+    found = _run_config(cfg, a.batch, a.heads, pair, a.dropout)
     return 2 if found else 0
 
 
