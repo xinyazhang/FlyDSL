@@ -1583,3 +1583,48 @@ def test_build_time_sm_scale_is_honoured():
     o2 = torch.empty_like(q)
     fn(q, k, v, o2, b, s, scale=0.2)
     assert _err(o2, _ref(q, k, v, scale=0.2)) < TOL
+
+
+@pytest.mark.parametrize("sq,sk", [(256, 128), (512, 128), (256, 64), (384, 256)], ids=lambda p: str(p))
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_window_masks_the_kv_tail_when_q_overhangs_k(sq, sk, head_dim):
+    """`seqlen_q > seqlen_k` under a top-left window, which was wrong before.
+
+    `DualwaveSoftmaxHelper.causal_mask_pair_if_needed` replaces
+    `seq_pad_mask_if_needed` on the argument that with `delta = seqlen_kv -
+    seqlen_q` no row can reach a padding column. True of *that* delta -- but a
+    window build re-points `delta_i32` at the resolved `window_right`, and
+    top-left causal is `window_right == 0`, so the bound is `col <= row` and a
+    row at or past `seqlen_kv` reaches columns the K buffer does not hold.
+    They read back as **0, which is a logit and not `-inf`**, so each takes a
+    real share of the softmax weight while contributing nothing to the
+    numerator, and every such row comes out too small.
+
+    Measured before `_KvTailCausalMaskMixin`, relative error on `O` against
+    fp64 at `B1 H2 D64`: 1.1e-01 at Sq 256/Sk 128, 2.2e-01 at 512/128, 3.2e-01
+    at 256/64 -- growing with the overhang, while plain bottom-right causal
+    stayed at 2.3e-03 throughout. Nothing in the suite covered
+    `seqlen_q > seqlen_k` under a window, which is why it shipped.
+
+    The band here is top-left (`right = 0`), the one the kernel gets wrong; the
+    left bound is unbounded so this is exactly "causal, aligned top-left".
+    """
+    torch.manual_seed(sq * 31 + sk + head_dim)
+    b, h = 1, 2
+    q = _rand(b, h, sq, head_dim)
+    k, v = _rand(b, h, sk, head_dim), _rand(b, h, sk, head_dim)
+    got = _run_window(q, k, v, (fmha.WINDOW_BOTRIGHT, 0))
+
+    qq, kk, vv = (t.double() for t in (q, k, v))
+    scores = (qq @ kk.transpose(-1, -2)) * (1.0 / head_dim**0.5)
+    i = torch.arange(sq, device="cuda").view(-1, 1)
+    c = torch.arange(sk, device="cuda").view(1, -1)
+    scores = scores.masked_fill(c > i, float("-inf"))
+    live = torch.isfinite(scores).any(-1, keepdim=True)
+    ref = torch.where(live, torch.softmax(scores, -1), torch.zeros_like(scores)) @ vv
+
+    err = ((got.double() - ref).norm() / ref.norm()).item()
+    assert err < 1e-2, (
+        f"Sq {sq} Sk {sk} D {head_dim}: {err:.3e}. Rows at or past seqlen_k are attending to "
+        "columns the K buffer does not hold, which read as 0 and take softmax weight."
+    )

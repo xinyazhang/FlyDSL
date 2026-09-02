@@ -191,6 +191,71 @@ _v_pair_to_vec32 = dualwave._v_pair_to_vec32
 _v_vec32_to_pair = dualwave._v_vec32_to_pair
 _waitcnt_vm_n = dualwave._waitcnt_vm_n
 
+
+class _KvTailCausalMaskMixin:
+    """Make a causal tile also mask the columns past `seqlen_kv`.
+
+    `DualwaveSoftmaxHelper.causal_mask_pair_if_needed` replaces
+    `seq_pad_mask_if_needed` outright, with the reason on the method:
+
+        This replaces seq_pad_mask_if_needed: with delta = seqlen_kv -
+        seqlen_q the largest key any row may attend to is seqlen_kv - 1, so
+        every padding column is already strictly above the diagonal.
+
+    True of the `delta` that sentence names. **Not true of the `delta_i32` the
+    kernel uses**: `init_tile_bounds` re-points it at the resolved
+    `window_right`, and top-left causal is `window_right == 0`, so the bound is
+    `col <= row`. For `row >= seqlen_kv` that admits columns the K buffer does
+    not hold; they come back as zero from the out-of-range buffer load -- a
+    logit of 0, not `-inf` -- so each takes a real share of the softmax weight
+    and contributes nothing to the numerator.
+
+    Measured in this tree before the fix, `B1 H2 D64`, top-left causal spelled
+    as `window=(BOTRIGHT, 0)`, relative error on `O` against fp64:
+
+        Sq 256, Sk 256    2.4e-03   (no overhang; correct)
+        Sq 256, Sk 128    1.1e-01
+        Sq 512, Sk 128    2.2e-01
+        Sq 256, Sk  64    3.2e-01
+
+    -- growing with the overhang, and bottom-right causal (`delta = Sk - Sq`)
+    clean at 2.3e-03 throughout, which is the half the original argument got
+    right.
+
+    **Both bounds have to move, not just the mask.** The inherited test asks
+    whether some row's right bound lands inside this tile, and a tile wholly
+    past the diagonal's end answers no while still holding padding columns --
+    so the tail mask runs *before* that test rather than inside it.
+    `seq_pad_mask_if_needed` is already a runtime-guarded no-op for a tile
+    ending at or before `seqlen_kv`, so the tiles that do not need it pay one
+    scalar compare.
+
+    A mixin rather than an in-place fix because the choke point,
+    `causal_mask_prologue_if_needed`, lives in `flash_attn_utils.py`, which is
+    imported and never edited here -- and because the two bodies reach the
+    causal mask by different routes (the dual-wave body through
+    `causal_mask_split_prologue_if_needed` and three epilogue calls, the wide
+    body through one call per tile) while both pass through this one method.
+
+    Delete this and go back to the plain helpers once upstream masks the tail
+    in window builds (issue 8).
+    """
+
+    def causal_mask_prologue_if_needed(self, v_s, tile_idx=None, kv_end_pos=None, **kwargs):
+        if tile_idx is None:
+            tile_idx = fx.Index(0)
+        v_s = self.seq_pad_mask_if_needed(v_s, tile_idx)
+        return super().causal_mask_prologue_if_needed(v_s, tile_idx=tile_idx, kv_end_pos=kv_end_pos, **kwargs)
+
+
+class _ParitySoftmaxHelper(_KvTailCausalMaskMixin, ParitySoftmaxHelper):
+    pass
+
+
+class _WideSoftmaxHelper(_KvTailCausalMaskMixin, WideSoftmaxHelper):
+    pass
+
+
 _COMPILED = {}
 
 _COMPILE_HINTS = {
@@ -456,7 +521,7 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         page_ids = dualwave.DualwavePageIdLoader(ctx)
         q_loader = ParityQLoader(ctx)
         gemm_helper = (WideGemmHelper if WIDE else ParityGemmHelper)(ctx)
-        softmax_helper = (WideSoftmaxHelper if WIDE else ParitySoftmaxHelper)(ctx)
+        softmax_helper = (_WideSoftmaxHelper if WIDE else _ParitySoftmaxHelper)(ctx)
 
         def _main_body():
             # Paged: stage the block-table row into LDS before any page-id ds_read.
