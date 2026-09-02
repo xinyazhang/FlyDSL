@@ -207,6 +207,227 @@ def _anchor_v_o(traits, v_o):
     return [dualwave.llvm.inline_asm(acc.type, [acc], "", "=v,0", has_side_effects=True)]
 
 
+def _slab_span_elems(rows, stride_seq, hdim=None):
+    """Elements in a `(batch, head)` slab, ending on its last **real** element.
+
+    `stride_seq` is the distance between rows and `hdim` is the width of one;
+    the two coincide only when the tensor is contiguous in `(.., seqlen, hdim)`
+    order. A BSHD caller hands us `(batch, seqlen, head, hdim)`, where the row
+    stride is `num_heads * hdim` and the rest belongs to the *other heads* of
+    that row -- so the obvious `rows * stride_seq` overshoots the slab by
+    `stride_seq - hdim`.
+
+    For an interior head that overshoot reads a neighbouring head's rows, which
+    a padded head's `discard` throws away anyway. For the **last** (batch,
+    head) slab it runs off the end of the tensor. AOTriton's concrete case: a
+    `(3, 5, 64, 8)` Q at strides `(2560, 8, 40, 1)` puts the slab at
+    `(batch 2, head 4)` at element 5152 bounded to 5152 + 64*40 = 7712, while
+    the tensor ends at 7680 -- and `BLOCK_DMODEL` is 32 for `hdim_qk` 8, so the
+    last row's load reaches column 31, 24 elements past the allocation, with
+    the hardware range check permitting every one because they sit inside a
+    `num_records` that should never have covered them. Whether that faults is
+    up to the page mapping, which is why it surfaced as intermittent
+    `pytest-xdist` worker deaths rather than a reproducible failure.
+
+    **Under BHSD this changes nothing, by construction**: there
+    `stride_seq == hdim`, so `(rows - 1) * stride_seq + hdim` *is*
+    `rows * stride_seq` -- the same descriptor, down to the
+    `oob_off == num_records` equality the D-tail store suppression relies on.
+    Elsewhere the bound only shrinks, so an `oob_off` computed from the loose
+    span stays at or past it and keeps being dropped.
+
+    **`hdim` is rounded up to the load's 8-element chunk, and that is a
+    departure from AOTriton's version.** Theirs ends on the last *real*
+    element and warns against rounding, because for them the chunk containing
+    `hdim` is off the end of the tensor for a last (batch, head) slab. This
+    tree has a stricter input contract that makes the round-up not merely safe
+    but required: `_check_8x_d_contract` enforces an 8-aligned D pitch
+    precisely because "loads and stores are 8 columns wide, so the kernel
+    touches `ceil8(hdim)` columns of every row" -- the chunk is inside the
+    row's own slack by construction, and the caller was asked for it.
+
+    Ending on the last real element instead **clips columns the kernel
+    legitimately reads**: gfx950 range-checks a multi-dword buffer op per dword
+    and drops any dword not wholly inside `num_records`, so at `hdim = 225`
+    (bf16, two elements per dword) the dword holding columns 224 and 225 falls
+    outside a bound ending at 225 and takes the *real* column 224 with it.
+    Imported unrounded first, and that is exactly what happened: 36 failures in
+    `test_padded_head_ignores_pad_contents`, all at `hdim % 8 == 1`.
+
+    The round-up does not weaken the fix. On AOTriton's own example -- a
+    `(3, 5, 64, 8)` Q at strides `(2560, 8, 40, 1)` -- `ceil8(8)` is 8, so the
+    bound is `63*40 + 8 = 2528`, which is exactly the 2528 elements the tensor
+    has left after that slab's base. The loose `64*40 = 2560` overruns it by
+    32.
+
+    The subtraction wraps at `rows == 0` -- a varlen empty sequence -- and an
+    index that wraps becomes a `num_records` covering all of memory, which is a
+    bigger version of this bug rather than a smaller one. The `rows > 0` select
+    pins that case back to the untightened 0.
+
+    `hdim=None` keeps the untightened bound, for callers not yet passing one.
+    """
+    rows_v = fx.Index(rows)
+    if hdim is None:
+        return rows_v * fx.Index(stride_seq)
+    # `ceil8`, computed at runtime because `hdim` is a kernarg.
+    width = ((fx.Index(hdim) + fx.Index(7)) // fx.Index(8)) * fx.Index(8)
+    # A stride narrower than the chunk would make this negative; clamp so the
+    # bound can only shrink, never grow past the loose span.
+    over = fx.Index(stride_seq) - width
+    trim = fx.Index((rows_v > fx.Index(0)).select((over > fx.Index(0)).select(over, fx.Index(0)), fx.Index(0)))
+    return rows_v * fx.Index(stride_seq) - trim
+
+
+def _bias_slab_num_records_bytes(seqlen_q, seqlen_kv, stride_b_seq_q, elem_bytes):
+    """Byte bound for a `(q_row, kv_col)` bias slab, in `num_records` terms.
+
+    `_slab_span_elems`'s problem on the bias, with the same answer.
+    `stride_b_seq_q` is the distance between bias rows, not the width of one; a
+    BSHD caller hands us `(batch, seqlen_q, head, seqlen_k)`, where the row
+    stride is `num_heads * seqlen_k`. So `seqlen_q * stride_b_seq_q` overshoots
+    by `stride_b_seq_q - seqlen_k`, and for the last (batch, head) slab it runs
+    off the end -- AOTriton saw `flyc_attn_fwd` fault 128 bytes past a
+    `(3, 5, 32, 16)` bias at strides `(2560, 16, 80, 1)`.
+
+    `minui` against the untightened span pins the `seqlen_q == 0` wrap back to
+    0 and is a no-op everywhere else, since `seqlen_k <= stride_b_seq_q`.
+
+    **Do not widen this back.** Ending on the last valid element costs the
+    readers something -- gfx950 range-checks a multi-dword buffer op per dword
+    and drops any dword not wholly inside `num_records`, so at odd `seqlen_k` a
+    wide read of the last row loses column `seqlen_k-1` to the out-of-range
+    column sharing its dword. That is a load-side problem with a load-side fix;
+    buying those columns back here means reading memory the caller never handed
+    us.
+    """
+    loose = fx.Index(seqlen_q) * fx.Index(stride_b_seq_q) * fx.Index(elem_bytes)
+    tight = (fx.Index(seqlen_q) * fx.Index(stride_b_seq_q) - fx.Index(stride_b_seq_q) + fx.Index(seqlen_kv)) * fx.Index(
+        elem_bytes
+    )
+    return arith.minui(as_mlir_value(tight), as_mlir_value(loose))
+
+
+def exp2_wait_state(values):
+    """Hold a consumer one slot away from the `v_exp_f32` that produced its input.
+
+    `v_exp_f32` is a quarter-rate transcendental -- it retires 16 lanes a cycle
+    -- so a VALU consumer issued in the very next slot reads a partially
+    written destination. CDNA requires a wait state there and
+    `GCNHazardRecognizer` does not insert one for gfx950.
+
+    **A bare `_s_nop` is not this.** `s_nop` is emitted as inline asm with no
+    operands, so it orders itself against memory and nothing else; a pure VALU
+    has no dependence on it and LLVM moves one across freely. AOTriton's first
+    patch for this was exactly that and it fixed the one build it was written
+    against by perturbing register allocation -- the `_s_nop` stayed within
+    three instructions of an `exp2` in one of eight builds scanned, and
+    `BLOCK_DMODEL=192, PADDED_HEAD=False` still carried two zero-gap sites with
+    it in. The two `dualwave._s_nop(1)` calls already in `ParityGemmHelper.qk`
+    for the head_dim 96 defect are documented as working the same accidental
+    way, and this is very likely that defect seen from the other end.
+
+    The barrier has to be one the values flow *through*. Tying every `exp2`
+    result to a matching asm output (`"=v,=v,...,0,1,..."`) makes the allocator
+    give each pair one register and emits one `s_nop 0`; a consumer then cannot
+    precede it, because it reads the asm's result rather than the `exp2`'s.
+
+    **`has_side_effects` must stay off.** With it on the asm becomes a
+    scheduling-region boundary, and at rung 224 -- already on the 512-VGPR
+    cliff -- AOTriton measured `vgpr_spill_count` going 100 -> 440 and 38-48%
+    of the backward at head_dim 216. Without it the allocation is byte-for-byte
+    the pre-patch one, because what holds the consumer down is the SSA def-use
+    edge and not the flag.
+
+    **Unreproduced in this tree**, and imported on the argument rather than on
+    a failure: a gap scan over six dK/dV configurations (both families, both
+    dtypes, with and without bias/dropout/causal), counting vector-pipe
+    instructions between each `v_exp_f32` and its first consumer, found the
+    minimum gap at exactly 1 everywhere and never 0 -- which is the "luck, not
+    enforcement" AOTriton's own scan reports. The scan located 32-64 `exp2`
+    sites per kernel, so the zero is a measurement and not a vacuous pass.
+
+    **The forward does not get this, and that is a measurement too.** AOTriton
+    reports a zero-gap site in seven of 108 bf16 forward kernels at
+    `BLOCK_DMODEL` 96, 224 and 256 -- "exactly the set of rungs whose head dims
+    were failing" -- which is the strongest correspondence in their write-up.
+    Re-checked here at precisely those rungs *and* at the padded head dims
+    inside them that their note names (72/80/88/96 and 216, plus 240/248/256),
+    across dropout on and off and causal on and off: **30 configurations,
+    82-128 dependent `exp2` pairs each, minimum gap exactly 1, zero sites below
+    it.** So the forward sits where dK/dV sat before this barrier -- at the
+    minimum, not under it -- and the copy of `_exp2_score_slice` it would take
+    (its results are consumed inside, so no wrapper can interpose on a return
+    value) would be a verbatim body rotting against `flash_attn_utils.py` for a
+    hazard with no local evidence.
+
+    That negative is weaker than it looks and should not be read as immunity:
+    30 samples against an effect AOTriton saw in 7 of 108 leaves a real chance
+    of having missed it, and exposure is per-schedule -- phase 2 measured a
+    minimum gap of 8 in dQ against the exactly-1 here, from the same source.
+    If a forward failure ever points this way, the mixin is the fix and the
+    scan above is the thing to re-run first.
+
+    Delete this once the hazard is modelled in `GCNHazardRecognizer` or the
+    wait state is supplied where `exp2` is emitted (issue 10).
+    """
+    irs = [as_mlir_value(v) for v in values]
+    n = len(irs)
+    if const_expr(n == 1):
+        # A single-output asm returns the value's own type; LLVM rejects a
+        # struct return from one, which is the same edge `_anchor_v_o` hits.
+        return [dualwave.llvm.inline_asm(irs[0].type, irs, "s_nop 0", "=v,0", has_side_effects=False)]
+    ret_ty = dualwave.ir.Type.parse(f"!llvm.struct<({', '.join(['f32'] * n)})>")
+    constraints = ",".join(["=v"] * n + [str(i) for i in range(n)])
+    ret = dualwave.llvm.inline_asm(ret_ty, irs, "s_nop 0", constraints, has_side_effects=False)
+    return [dualwave.llvm.extractvalue(irs[i].type, ret, [i]) for i in range(n)]
+
+
+def mfma_operand_wait_state(pack):
+    """Two wait states between a packed MFMA operand and the MFMA reading it.
+
+    One step further down the chain than `exp2_wait_state`: that one keeps
+    `v_exp_f32` away from the `v_cvt_pk_bf16_f32` reading it, this one keeps
+    that convert away from the `v_mfma` reading *its* result as SrcA or SrcB.
+    Same barrier shape, same reason a bare `_s_nop` will not do.
+
+    **AOTriton's evidence**, at `BLOCK_DMODEL=128`, bf16, dropout, matrix bias,
+    `mfma_rows=16`:
+
+        v_cvt_pk_bf16_f32 v70, v0, v1
+        s_waitcnt lgkmcnt(1)
+        v_mfma_f32_16x16x32_bf16 v[54:57], v[78:81], v[70:73], v[54:57]
+
+    `v[54:57]` came back NaN and ~1e23 against a correct 2e-3, in dK head-dim
+    columns 16..31 and nowhere else, while dV out of the same kernel was always
+    correct. **Non-deterministic**: two runs from one seed with bit-identical
+    inputs disagreed on which rows were wrong, so it is a race and not a
+    miscompiled value. Forcing all 131 `s_waitcnt` in the shipped hsaco to
+    `vmcnt(0) lgkmcnt(0)` changed nothing, which rules out memory visibility --
+    `s_waitcnt` retires on the scalar pipe, so an already-satisfied one between
+    the two supplies no wait state at all. Swapping the convert with the
+    `ds_read_b64_tr_b16` above it, a semantic no-op, makes the kernel correct.
+
+    **Reproduced here.** The same gap scan finds `v_cvt_pk_*_f32` writes
+    reaching an MFMA SrcA/SrcB with a gap of 1 in four of six configurations --
+    2 sites at `d128 r16 bf16` with bias and dropout, 7 at `d192 r32`, 9 at
+    `d224 r32 causal`, 1 at `d128 r16 f16` -- and the producer writes the
+    *last* register of the SrcB tuple in each, which is the shape AOTriton
+    names.
+
+    **Scope is not established and the obvious generalisation is wrong.** A
+    blanket "VALU write then MFMA read needs two wait states" cannot be the
+    rule: ~7500 such sites across 426 mostly-passing kernels. Narrowing to this
+    exact instruction pair at zero effective wait states still leaves 196.
+    What separates the site that corrupts from the rest is not known.
+
+    Delete this once the hazard is modelled or the wait state is supplied where
+    `_bf16_trunc_pack_v8` builds the operand (issue 11).
+    """
+    ir_val = as_mlir_value(pack)
+    return dualwave.llvm.inline_asm(ir_val.type, [ir_val], "s_nop 1", "=v,0", has_side_effects=False)
+
+
 def _k_read_base(traits, lane_mod_32, lane_div_32):
     """`_k_lds_read_base_per_lane` with `SMEM_N_RPT` in place of a literal 8."""
     return (
@@ -447,15 +668,28 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         num_seqlens=0,
         Bias=None,
         bias_strides=(0, 0, 0),
+        o_strides=(0, 0, 0),
         philox=(None, None, 0, None, None),
         idropout_p=0,
         dropout_scale=1.0,
         **kwargs,
     ):
         super().__init__(traits, **kwargs)
-        # 12 strides in launch order: Q, K, V, O, each (batch, head, seq).
+        # 9 strides in launch order: Q, K, V, each (batch, head, seq).
         # Numerically named per `sdpa-feature-gap.md`'s porting instruction --
         # the `z/h/m/k` suffixes it warns about have caused real bugs.
+        #
+        # **O's three are separate**, because two of the three kernels built on
+        # this class have no O at all: dQ writes dQ and dK/dV writes dK and dV,
+        # each under its own name with its own strides. Folding an output's
+        # strides into the O slot is what made `stride_o_*` a name for
+        # whichever tensor happened to be in it -- which computes the right
+        # answer right up until someone reads `stride_o_seq` expecting O.
+        #
+        # A 12-tuple is still accepted and puts its last three in the O slot,
+        # which is what the caller meant by passing them. That compatibility is
+        # for the dQ kernel, which is another agent's file and still passes 12;
+        # retire it once dQ moves to `o_strides`.
         (
             self.stride_q_batch,
             self.stride_q_head,
@@ -466,10 +700,13 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
             self.stride_v_batch,
             self.stride_v_head,
             self.stride_v_seq,
-            self.stride_o_batch,
-            self.stride_o_head,
-            self.stride_o_seq,
-        ) = strides
+        ) = strides[:9]
+        if len(strides) == 12:
+            self.stride_o_batch, self.stride_o_head, self.stride_o_seq = strides[9:12]
+        elif len(strides) == 9:
+            self.stride_o_batch, self.stride_o_head, self.stride_o_seq = o_strides
+        else:
+            raise ValueError(f"strides must be 9 (Q, K, V) or 12 (with O); got {len(strides)}")
         self.sm_scale_arg = sm_scale
         self.num_head_q = num_head_q
         self.num_head_k = num_head_k
@@ -562,6 +799,11 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         # so a build with matching counts schedules identically.
         num_head_k = fx.Index(self.num_head_k)
         gqa_group = fx.Index(self.num_head_q) // num_head_k
+        # Published, because the dK/dV group loop's trip count is this same
+        # quantity and `gqa_q_head_base` -- the head that loop walks from -- is
+        # derived from it here. Recomputing it at the loop is what let a trait
+        # and a kernarg drift apart in the first place (issue 9).
+        self.gqa_group = gqa_group
         self.h_kv_idx = self.h_idx % num_head_k
         self.group_id = self.h_idx // num_head_k
         self.q_head_idx = self.h_kv_idx * gqa_group + self.group_id
@@ -628,6 +870,14 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
           `z` for a batched layout and 0 for a packed one. Overwriting
           `batch_idx` here is what keeps `_slab_byte_base` correct without a
           varlen branch inside it.
+        - **`z` outlives that overwrite, as `seq_idx_i32`.** Anything indexed
+          by *sequence* rather than by batch slice needs it, and after this
+          method runs there is nowhere else to get it. `init_philox` is the
+          caller that found this out the hard way: it was using `batch_idx`,
+          which is 0 for every sequence of a packed layout, so all N sequences
+          drew one dropout mask. Published before the branch so the dense path
+          has it too -- there `z` and `batch_idx` are the same number, which is
+          why the dense and padded layouts were never wrong.
         - **The reads are scalar.** `z` is workgroup-uniform, so these land in
           SGPRs and cost nothing against the VGPR budget.
         - **Row offsets stay separate from the batch index.** A packed tensor
@@ -637,12 +887,17 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
           need no varlen case at all.
         """
         traits = self.traits
+        # Captured before anything can overwrite `batch_idx`, and before the
+        # dense/varlen branch so both paths publish it. At entry `batch_idx` is
+        # `init_block_mapping`'s `batch_q_tile_id // num_q_tiles` -- the grid's
+        # sequence index, with the head and q-tile axes already divided out.
+        z = fx.Int32(self.batch_idx)
+        self.seq_idx_i32 = z
         if const_expr(not traits.VARLEN):
             super().init_sequence_lengths(**kwargs)
             self.lse_tokens_i32 = fx.Int32(self.seq_len_v)
             self.kv_batch_idx = self.batch_idx
             return
-        z = fx.Int32(self.batch_idx)
         q_len, q_row, q_batch = fmha.decode_addressing(
             self.varlen_bits_arg, 0, self.seq_len_v, self.seqinfo_q0, self.seqinfo_q1, z
         )
@@ -695,7 +950,19 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         if const_expr(not self.traits.ENABLE_DROPOUT):
             return
         self.philox_rng = Philox.for_arch("gfx950")
-        plane = fx.Int32(self.batch_idx) * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
+        # **`seq_idx_i32`, not `batch_idx`.** The plane is per *sequence*, and
+        # the two are the same number only when the layout has a real batch
+        # axis. `decode_addressing` resolves `batch_idx` to 0 for every
+        # sequence of a packed layout -- correct for addressing, since a packed
+        # tensor carries its origin in `row_off` instead -- so a packed call
+        # drew plane `0*H + h` for all N and every sequence in the pack shared
+        # one dropout mask.
+        #
+        # Invisible to every gate we had: `allclose` cannot see it, and the
+        # bitwise varlen oracle could not either, because its reference was N
+        # separate `batch_size=1` calls and those also collapse to plane 0. The
+        # two sides agreed by being degenerate in the same way.
+        plane = self.seq_idx_i32 * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
         seed = fmha.philox_seed_value(self.philox_seed_ptr)
         offset = fmha.philox_offset_base(self.philox_offset1, self.philox_offset2)
         fmha.philox_report(self.philox_seed_output, self.philox_offset_output, seed, offset)
@@ -807,15 +1074,20 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         elems = batch_idx * fx.Index(s0) + head_idx * fx.Index(s1) + row_off * fx.Index(s2)
         return elems * fx.Index(self.traits.BF16_BYTES)
 
-    def _slab_view(self, tensor, s0, s1, s2, row_off, head_idx, rows, batch_idx=None):
-        """A buffer view over one (batch, head) slab, bounded at `rows` rows.
+    def _slab_view(self, tensor, s0, s1, s2, row_off, head_idx, rows, batch_idx=None, hdim=None):
+        """A buffer view over one (batch, head) slab, bounded at its last element.
 
-        The bound is `rows * stride_seq`, so a row past the sequence is out of
-        the descriptor and reads as zero rather than faulting -- the same
-        mechanism the production kernel uses for its ragged tail, restated over
-        a stride the caller chose.
+        A row past the sequence is out of the descriptor and reads as zero
+        rather than faulting -- the same mechanism the production kernel uses
+        for its ragged tail, restated over a stride the caller chose.
+
+        `hdim` is the row's real extent and `s2` the distance between rows; see
+        `_slab_span_elems` for why the second is not a bound for the first.
+        **Optional, and defaulting to the untightened bound**, so that call
+        sites in kernels this change does not cover keep their present
+        behaviour rather than silently acquiring a different descriptor.
         """
-        span_elems = rows * fx.Index(s2)
+        span_elems = _slab_span_elems(rows, s2, hdim)
         return dualwave._make_rebased_view(
             fx.get_iter(tensor),
             self._slab_byte_base(s0, s1, s2, row_off, head_idx, batch_idx=batch_idx),
@@ -874,11 +1146,14 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
             # The bound is the slab, so a row past `seqlen_q` reads zero
             # instead of faulting -- which is also the right bias for a padded
             # row -- and so does a column that runs off the last row's end.
-            _bias_span = self.seqlen_q_v * fx.Index(self.stride_b_seq_q)
             self.bias_rsrc = buffer_ops.create_buffer_resource(
                 self.Bias,
                 max_size=False,
-                num_records_bytes=as_mlir_value(_bias_span * fx.Index(traits.BF16_BYTES)),
+                num_records_bytes=as_mlir_value(
+                    _bias_slab_num_records_bytes(
+                        self.seqlen_q_v, self.seqlen_kv_v, self.stride_b_seq_q, traits.BF16_BYTES
+                    )
+                ),
                 base_byte_offset=as_mlir_value(
                     self._slab_byte_base(
                         self.stride_b_batch,
@@ -897,6 +1172,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
             self.q_row_off,
             self.q_head_idx,
             self.seqlen_q_v,
+            hdim=self.hdim_qk,
         )
         self.o_div = self._slab_view(
             self.O,
@@ -906,6 +1182,20 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
             self.q_row_off,
             self.q_head_idx,
             self.seqlen_q_v,
+            # **Deliberately untightened.** This slot does not have a width the
+            # base class knows: the forward puts O in it, which is `hdim_vo`
+            # wide, and the dQ kernel puts dQ in it, which is Q-shaped and
+            # `hdim_qk` wide -- `BwdDqStoreHelper` rebinds `self.hdim_vo` to
+            # `ctx.hdim_qk` on the helper for exactly that reason. Bounding it
+            # by `hdim_vo` here clipped dQ's real columns in
+            # `[hdim_vo, hdim_qk)` and failed six `test_asymmetric_hdim` cases
+            # the moment the tightening went in.
+            #
+            # This is the same slot-reuse the dK/dV stride split removes, and
+            # the fix is the same: the kernel that owns the output builds its
+            # own view. dK/dV now does (`dk_div` / `dv_div`, both tightened);
+            # the forward and dQ still share this one, so it stays loose until
+            # they do too.
         )
         if const_expr(not traits.PAGED):
             self.k_div = self._slab_view(
@@ -917,6 +1207,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
                 self.kv_head_idx,
                 self.seqlen_kv_v,
                 batch_idx=self.kv_batch_idx,
+                hdim=self.hdim_qk,
             )
             self.v_div = self._slab_view(
                 self.V,
@@ -927,6 +1218,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
                 self.kv_head_idx,
                 self.seqlen_kv_v,
                 batch_idx=self.kv_batch_idx,
+                hdim=self.hdim_vo,
             )
 
 
@@ -1217,7 +1509,7 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
 
     # -- P5: bias ------------------------------------------------------------
 
-    def _add_bias_inplace(self, v_s, tile_idx):
+    def _add_bias_inplace(self, v_s, tile_idx, narrow_tail=False):
         """`S += bias * log2(e)`, in place, for one KV tile.
 
         **After the scale and before the mask**, and both halves of that matter:
@@ -1232,6 +1524,37 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
 
         No runtime "does this tile need it" guard. There is nothing to skip: a
         bias build reads a bias for every live tile by definition.
+
+        **`narrow_tail` reads the run one column at a time** instead of as one
+        `dwordx2`/`dwordx4`. gfx950 range-checks a multi-dword buffer op *per
+        dword* and drops any dword not wholly inside `num_records`, so a live
+        column sharing a dword with an out-of-range one is dropped with it.
+        `_bias_slab_num_records_bytes` ends the slab exactly on its last valid
+        element, so at odd `seqlen_k` the final dword covers columns
+        `(seqlen_k-1, seqlen_k)` and straddles the bound: **the last row's last
+        bias entry reads back 0**, for every `(batch, head)`, with no fault and
+        no NaN. Widening the bound instead would make the kernel read memory
+        the caller never handed it, so the load narrows.
+
+        Reproduced in the forward before the fix, with an all-zero bias holding
+        one entry at `[.., sq-1, sk-1]` and asking whether `O`'s last row moves
+        at all:
+
+            seqlen_k    64    65    63   127   128
+            last row  2e-2   0.0   0.0   0.0  1.4e-2
+
+        -- read at even `seqlen_k`, silently dropped at odd. An aggregate error
+        bound cannot see this: it is one element in `sq*sk`, which is why it
+        survived both the forward's bias ladder and dQ's
+        `test_db_matches_bias_gradient`.
+
+        **Only the tiles that can contain column `seqlen_k-1` narrow.** A
+        straddle needs `seqlen_k` odd, hence `seqlen_k % BLOCK_N != 0`, hence
+        that tile is partial and takes the KV tail mask -- so
+        `seq_pad_mask_if_needed` passes `narrow_tail` and `bias_to_lists` does
+        not. An interior tile is wholly in bounds: its final dword covers
+        `(c, c+1)` with `c+1 <= seqlen_k-1`, ends at or before the bound, and
+        keeps the wide load.
         """
         traits = self.traits
         ctx = self.ctx_ref
@@ -1258,9 +1581,26 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
         fm_bias = arith.FastMathFlags.contract | arith.FastMathFlags.reassoc
         for half, values in ((0, s_lo), (1, s_hi)):
             for elem0, col_off, width in _score_column_runs(traits.KV_VECTORIZED):
+                run_base = row_base + col_base + fx.Index(col_off + half * 32)
+                if const_expr(narrow_tail):
+                    for j in range_constexpr(width):
+                        one = buffer_ops.buffer_load(
+                            ctx.bias_rsrc,
+                            as_mlir_value(fx.Int32(run_base + fx.Index(j))),
+                            vec_width=1,
+                            dtype=ctx.elem_dtype,
+                        )
+                        # `vec_width=1` returns a **scalar** of the element
+                        # type, not a one-lane vector, so it is wrapped
+                        # directly rather than through `Vec(...)[0]`.
+                        b = fx.Float32(ctx.elem_dtype(one).to(fx.Float32))
+                        values[elem0 + j] = dualwave._fadd(
+                            values[elem0 + j], dualwave._fmul(b, log2e, fm_bias), fm_bias
+                        )
+                    continue
                 span = buffer_ops.buffer_load(
                     ctx.bias_rsrc,
-                    as_mlir_value(fx.Int32(row_base + col_base + fx.Index(col_off + half * 32))),
+                    as_mlir_value(fx.Int32(run_base)),
                     vec_width=width,
                     dtype=ctx.elem_dtype,
                 )
@@ -1296,7 +1636,11 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
         """
         if const_expr(self.traits.BIAS_TYPE):
             lists = self.v_s_vec_to_lists(v_s)
-            self._add_bias_inplace(lists, tile_idx)
+            # `narrow_tail`: these are the tiles that can hold column
+            # `seqlen_k - 1`, which is the one a wide load loses at odd
+            # `seqlen_k`. Interior tiles come through `bias_to_lists` and keep
+            # the wide load.
+            self._add_bias_inplace(lists, tile_idx, narrow_tail=True)
             v_s = dualwave._score_lists_to_vecs(lists)
         return super().seq_pad_mask_if_needed(v_s, tile_idx)
 
@@ -1382,7 +1726,24 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
                     for j in range_constexpr(width):
                         values[elem0 + j] = keep[j].select(fx.Float32(values[elem0 + j]), zero)
             v_p = (lo, hi)
-        return super().cast_p(v_p)
+        # Every pack leaves through `mfma_operand_wait_state`. **Unreproduced
+        # in this forward** -- a gap scan over six configurations (head dims
+        # 64/96/128/224/256, both dtypes, dropout on and off, causal and not)
+        # found zero exposed `v_cvt_pk_*_f32`-into-MFMA sites, having located
+        # 88-344 candidate converts per kernel -- but AOTriton's scan of their
+        # 216-kernel forward matrix found 44 exposed, the exposure is a
+        # property of the schedule rather than of the source, and the barrier
+        # measured free. One choke point covers both forward bodies, since
+        # `WideSoftmaxHelper` subclasses this.
+        #
+        # `BwdDqSoftmaxHelper.cast_p` calls `DualwaveSoftmaxHelper.cast_p`
+        # directly rather than through here, so dQ is **not** covered by this
+        # and needs its own.
+        p_lo_packs, p_hi_packs = super().cast_p(v_p)
+        return (
+            [mfma_operand_wait_state(p) for p in p_lo_packs],
+            [mfma_operand_wait_state(p) for p in p_hi_packs],
+        )
 
     # -- P3: generalized sliding window --------------------------------------
     #
@@ -1510,6 +1871,44 @@ class ParityStoreHelper(dualwave.DualwaveStoreHelper):
         return q_row * self.stride_o_seq_v + self.lane_div_32 * 8
 
     def _store_lse_row(self, m_row, l_row, q_row):
+        """`_store_lse_row_unguarded`, skipped entirely when `LSE` is null.
+
+        **LSE is an optional output, at runtime.** AOTriton's
+        `attn_fwd_params::L` is documented "Can be `T2::get_null_tensor()`" and
+        an inference caller that will never run a backward passes exactly that;
+        their Triton kernel spells the contract as `L_not_null`. gfx1201's
+        FlyDSL forward already has the equivalent (`_l_valid` in
+        `flash_attn_func_gfx1201_aiw.py`); the gfx950 path simply never grew it,
+        and a null `L` reached `_make_ws_rsrc` as a descriptor based at address
+        0, where the store faults.
+
+        **`RETURN_LSE` does not cover this**, and that is the point worth
+        keeping. It is compile-time: `const_expr(traits.RETURN_LSE)` deletes the
+        store from the binary, so `return_lse=False` is not "LSE optional", it
+        is "LSE never written" -- and one binary has to serve both the caller
+        that wants an LSE and the caller that passes null.
+
+        The condition is wave-uniform, so this lowers to a scalar branch.
+        Everything the store needs -- the log, the scale, the addressing --
+        stays *inside* the guard, for the reason gfx1201 records at its own:
+        hoisting that arithmetic out cost 8% at head_dim 256 even with the
+        store still predicated, because the values then stay live across the
+        epilogue for every wave, including the ones with nothing to store.
+
+        One choke point covers both forward bodies and both layouts, since
+        `WideStoreHelper` subclasses this and both LSE paths funnel here.
+        """
+        store = self._store_lse_row_unguarded
+        lse_not_null = fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))) != fx.Int64(0)
+
+        @flyc.jit
+        def _store_lse_if_l_not_null():
+            if lse_not_null:
+                store(m_row, l_row, q_row)
+
+        _store_lse_if_l_not_null()
+
+    def _store_lse_row_unguarded(self, m_row, l_row, q_row):
         """LSE addressed through `VarlenBits`, which decides three things here.
 
         LSE is always **compact** -- it is the one tensor whose strides are not
@@ -1540,12 +1939,28 @@ class ParityStoreHelper(dualwave.DualwaveStoreHelper):
         a select per store to rediscover a constant is not worth it on the path
         every dense build takes.
         """
-        traits = self.traits
-        if const_expr(not traits.VARLEN):
-            super()._store_lse_row(m_row, l_row, q_row)
-            return
+        # **The runtime head count, not `traits.NUM_HEADS_Q`.** The trait is
+        # compile-time, which is right only where a kernel is compiled per
+        # shape. AOTriton compiles one binary for every head count and pins
+        # `num_heads=1`, and this descriptor was the counterexample to that
+        # pin's assumption: with the trait the per-batch slice covers `1 *
+        # tokens` rows, `batch_idx` advances by one head instead of `H`, and
+        # the hardware bound drops the row for every head but the first --
+        # `L` comes back written for `h == 0` and untouched everywhere else,
+        # with no error reported. gfx1201 already passes the runtime count to
+        # `lse_row_addressing`, which is why its identical pin is sound.
+        #
+        # **The non-varlen shortcut is gone with it.** It delegated to
+        # `super()._store_lse_row`, whose copy in `flash_attn_utils.py` bakes
+        # the same trait -- so a dense build carried the same defect and there
+        # was nothing left to inherit. At `varlen_bits == 0` the addressing
+        # below *is* the production formula (`base = q_head_idx * tokens`,
+        # `pitch = 1`), as this docstring already said; it is now reached at
+        # runtime rather than as a constant, which costs two scalar ops once
+        # per row in the epilogue.
+        num_heads_q = fx.Index(self.num_head_q)
         tokens = fx.Index(self.lse_tokens_i32)
-        per_batch = fx.Index(traits.NUM_HEADS_Q) * tokens
+        per_batch = num_heads_q * tokens
         per_batch_bytes = per_batch * fx.Index(4)
         rsrc = dualwave._make_ws_rsrc(
             fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))),
@@ -1561,7 +1976,7 @@ class ParityStoreHelper(dualwave.DualwaveStoreHelper):
             self.varlen_bits_arg,
             fx.Index(0),
             self.q_head_idx,
-            traits.NUM_HEADS_Q,
+            num_heads_q,
             tokens,
             self.q_row_off,
         )
