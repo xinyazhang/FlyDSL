@@ -1131,6 +1131,108 @@ def test_varlen_causal_defaults_to_cross_seqlen():
     assert pinned.resolve(FmhaInputMetadata(num_heads=8, head_dim=64, causal=True)).cross_seqlen is False
 
 
+def test_packed_varlen_draws_a_dropout_plane_per_sequence():
+    """**Each sequence of a packed batch must get its own dropout mask.**
+
+    The philox plane is `sequence * num_head_q + q_head_idx`, and the sequence
+    index has to come from `seq_idx_i32` -- the workgroup's raw grid `z` --
+    rather than from `batch_idx`. `decode_addressing` resolves `batch_idx` to
+    **0** for every sequence of a packed layout, which is right for addressing
+    (a packed tensor carries its origin in `row_off` instead) and wrong for
+    this: it made all N sequences draw plane `0*H + h`, one shared mask.
+
+    **The oracle is a dense call of batch N, sliced -- not N calls of batch
+    1.** That distinction is the whole test. A `batch_size=1` call cannot
+    express "sequence 3's plane" by construction: it has `batch_idx == 0` and
+    so also draws plane 0. Comparing a packed call against N such calls is
+    comparing two things that collapse the same way, and it reports agreement
+    while both are wrong. A dense call of batch N has `batch_idx == z`, so its
+    row-group `i` carries plane `i*H + h`, which is the thing worth matching.
+
+    Measured before the fix, with equal lengths so a packed and a dense call
+    hold the same rows -- per-sequence bitwise equality against each reference:
+
+        vs N dense batch-1 calls : [True, True, True]     <- the degenerate one
+        vs one dense batch-N call: [True, False, False]
+
+    Sequence 0 agrees either way, because its correct plane *is* 0. That
+    `[True, False, False]` is the fingerprint of the bug, and it inverts
+    exactly when the plane moves to `seq_idx_i32`.
+
+    This case had no numeric coverage at all before: no test in any of the
+    three kernels combined varlen with dropout, which is why a defect visible
+    in the first non-zero sequence of every packed call survived every gate.
+    Bitwise rather than `allclose` for the usual varlen reason -- only the base
+    address differs between a varlen workgroup and its dense counterpart.
+    """
+    import fmha_abi_gfx1201 as _abi
+
+    h, d, n, length = 4, 64, 3, 128
+    torch.manual_seed(7)
+    cu = _cumsum([length] * n)
+    # One pool laid out two ways. Equal lengths, so the packed (1, H, N*S, D)
+    # and dense (N, H, S, D) views hold the same rows in the same order.
+    qp, kp, vp = (_rand(1, h, cu[-1], d) for _ in range(3))
+    to_b = (
+        lambda t: t.view(1, h, n, length, d).permute(2, 0, 1, 3, 4).reshape(n, h, length, d).contiguous()
+    )  # noqa: E731
+    qb, kb, vb = to_b(qp), to_b(kp), to_b(vp)
+
+    p, seed = 0.5, 1234
+    dense_fn = build(num_heads=h, head_dim=d, causal=False, dtype_str="bf16", num_kv_heads=h, dropout=True)
+    packed_fn = build(
+        num_heads=h, head_dim=d, causal=False, dtype_str="bf16", num_kv_heads=h, dropout=True, varlen=True
+    )
+    # `philox_offset2`, matching `_run_dropout`, so the batch-1 arm below is
+    # drawn from the same counter and the comparison is about the plane alone.
+    drop = dict(dropout_p=p, philox_seed=seed, philox_offset2=0)
+
+    o_dense = torch.zeros_like(qb)
+    dense_fn(qb, kb, vb, o_dense, n, length, seqlen_k=length, **drop)
+
+    o_packed = torch.zeros_like(qp)
+    side = _abi.VARLEN_COMPACT_SIDE
+    packed_fn(
+        qp,
+        kp,
+        vp,
+        o_packed,
+        1,
+        length,
+        seqlen_k=length,
+        # Both sides get the cumulative array: `0x0B0B` is packed on Q *and*
+        # K, and the K side dereferences its own pointer -- omitting it is a
+        # null read, not a fallback.
+        varlen=dict(
+            bits=_abi.varlen_bits(side, side),
+            max_seqlen_q=length,
+            max_seqlen_k=length,
+            seqinfo_q0=_i32(cu),
+            seqinfo_k0=_i32(cu),
+        ),
+        num_seqlens=n,
+        **drop,
+    )
+    torch.cuda.synchronize()
+
+    for i in range(n):
+        assert torch.equal(o_packed[0, :, cu[i] : cu[i + 1], :], o_dense[i]), (
+            f"sequence {i} of a packed batch does not match dense row-group {i}. If sequence 0 passes and the "
+            f"rest fail, the plane has collapsed to `batch_idx` and every sequence is sharing one mask."
+        )
+
+    # The degenerate reference, asserted to *disagree*. Without this the test
+    # would still pass if the plane collapsed and the dense reference collapsed
+    # with it -- which is precisely how the original oracle came to assert the
+    # bug.
+    o_b1 = torch.stack([_run_dropout(qb[i : i + 1], kb[i : i + 1], vb[i : i + 1], p, seed=seed)[0] for i in range(n)])
+    assert torch.equal(o_b1[0], o_dense[0]), "sequence 0 shares plane 0 with the batch-1 reference by construction"
+    assert not torch.equal(o_b1[1], o_dense[1]), (
+        "a batch-1 call and dense row-group 1 drew the same mask, so `batch_idx` is not distinguishing "
+        "sequences even in the dense path -- this test's oracle would be vacuous"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Split-K: correct only in the production output layout
 # ---------------------------------------------------------------------------

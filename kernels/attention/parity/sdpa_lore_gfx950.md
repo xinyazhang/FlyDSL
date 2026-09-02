@@ -684,6 +684,25 @@ head_dim 96 is a normal rung again.
   path is the pre-feature kernel plus a handful of instructions. The runtime
   values are still checked against the build, so nothing is assumed -- the
   check is what licenses using the constant.
+
+  **REVERSED in the AOTriton import, and the reversal is the lesson.** The
+  check that licensed the constant is `_args`, a *host-side* wrapper. AOTriton
+  vendors these kernels and launches them from C++, which never calls it --
+  and their descriptions pin `num_heads=1`, so every AOT build carried
+  `GQA_GROUP_SIZE == 1`, the loop folded away, and each workgroup summed only
+  the first query head of its group. Reproduced here by bypassing the same
+  check: a group-1 build launched at a runtime group of 4 returns dK and dV at
+  **8.7e-01 relative error**, with the launch reporting success. The trip
+  count is now `ctx.gqa_group`, the kernarg quotient, and the trait survives
+  only as the `_args` check.
+
+  What generalises is not "prefer runtime bounds" -- the performance argument
+  above is still true and was still measured. It is that **a validation you
+  cannot see from inside the kernel is not a validation the kernel may rely
+  on.** The constant was safe exactly as long as every caller came through one
+  Python wrapper, and nothing in the kernel said so. When the same question
+  comes up again, the test is not "is the check correct" but "is the check on
+  every path that can reach this code".
 - **Do not edit a kernel source file while a test run is in flight, not even a
   comment.** A 622-test combined run reported 351 failures, every test from
   #272 to the end; the identical command on the unedited tree passed 622/622.
@@ -753,3 +772,25 @@ head_dim 96 is a normal rung again.
   every helper reads, driven by a fixture, means the ladder, both MFMA
   families, causal, windows, varlen, dropout, bias and GQA all gain the new
   type at once -- and so do tests that do not exist yet.
+- **A per-element defect hides inside an aggregate bound indefinitely.** The
+  bias slab's descriptor ends on its last valid element, and gfx950
+  range-checks a multi-dword buffer op *per dword* -- so at odd `seqlen_k` the
+  final dword straddles the bound and the live column `seqlen_k-1` is dropped
+  with the out-of-range one. One element out of `sq*sk`. It passed the
+  forward's bias ladder, dQ's `test_db_matches_bias_gradient` and every
+  error-ratio gate in the suite, because a relative Frobenius error cannot see
+  a single element go to zero. It was found by importing the *fix* from
+  another tree and asking what it was for.
+  The test that catches it is not a tighter tolerance but a different shape:
+  an all-zero bias with **one** large entry at `[.., sq-1, sk-1]`, asserting
+  the output's last row moves at all. That converts a 1e-5 signal buried in an
+  aggregate into an O(1) yes/no. Any feature whose data is read per element
+  wants at least one probe built this way; a ladder of random inputs will not
+  find the corner.
+- **Two kernels sharing a helper share its bugs, and the split is arbitrary.**
+  The dropped bias column was found in dQ and reported as a dQ bug. The 32-row
+  half lives in `ParitySoftmaxHelper._add_bias_inplace`, which the *forward*
+  also calls -- so the forward was returning a wrong `O` for every odd
+  `seqlen_k` bias call, and nothing in the forward's own suite was looking.
+  When a fix lands in one caller of a shared helper, run the reproducer against
+  every other caller before believing the scope.

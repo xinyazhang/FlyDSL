@@ -1840,13 +1840,30 @@ def test_gqa_matches_n_grouped_dense_calls(hk, rows, dtype):
 
 
 def test_gqa_composes_with_varlen_and_dropout(dtype):
-    """A GQA group under varlen must still equal N dense calls, bitwise.
+    """Two oracles, because varlen x dropout cannot use the varlen one.
 
-    Dropout is the interesting half: the philox plane is `(batch, query head)`,
-    so every head of a group draws a *different* mask -- which is the forward's
-    behaviour, since the forward has one program per query head. A fold that
-    hoisted the plane out of the group loop would give the whole group one
-    mask, and the error would be a plausible fraction of the right answer.
+    **Arm 1, ragged and dry:** a GQA group under varlen equals N separate dense
+    calls, bitwise. That is B5's oracle unchanged.
+
+    **Arm 2, dropout.** This test used to claim dropout in its name and its
+    docstring and pass no dropout argument at all -- found by AST inspection,
+    and the reason it mattered is that varlen x dropout then had *no* numeric
+    coverage in any of the three kernels. A defect visible in the first
+    non-zero sequence of every packed call survived every gate we had.
+
+    Enabling it needs a different reference, and that is the interesting part.
+    The philox plane is `seq_idx_i32 * num_head_q + q_head_idx`, and
+    `decode_addressing` resolves `batch_idx` to 0 for every sequence of a
+    packed layout -- so **N separate `batch_size=1` calls all draw plane 0**
+    and cannot serve. They are degenerate in exactly the way the packed call
+    used to be, which is how the bug hid. A dense call with `batch = N` gives
+    slice `i` the plane `i * H + h`, which is what packed sequence `i` gets, so
+    that is the reference here; equal-length sequences, since a dense batch has
+    one length for all of them.
+
+    The `planes differ across sequences` assertion is the negative control: if
+    the plane collapsed again, both sides would still agree and only that
+    check would notice.
     """
     _require_rocm_path()
     import fmha_abi_gfx1201 as abi
@@ -1901,6 +1918,57 @@ def test_gqa_composes_with_varlen_and_dropout(dtype):
         assert torch.equal(dk[:, :, off : off + n, :], dense[i][0]), f"dK sequence {i} under GQA+varlen"
         assert torch.equal(dv[:, :, off : off + n, :], dense[i][1]), f"dV sequence {i} under GQA+varlen"
         off += n
+
+    # -- Arm 2: the same fold with dropout on, against a dense batch of N.
+    nseq, n = 2, 128
+    torch.manual_seed(22)
+    qd = _rand(nseq, hq, n, d)
+    kd, vd = _rand(nseq, hk, n, d), _rand(nseq, hk, n, d)
+    dod = _rand(nseq, hq, n, d)
+    lse_d = torch.randn(nseq * hq, n, device="cuda", dtype=torch.float32)
+    del_d = torch.randn_like(lse_d)
+    drop = dict(dropout_p=0.25, philox_seed=_u64(4242), philox_offset1=_u64(0), philox_offset2=0)
+
+    fd = build(num_heads=hq, head_dim=d, num_kv_heads=hk, dropout=True, dtype_str=_dt_str(), **knobs)
+    dk_d, dv_d = torch.full_like(kd, float("nan")), torch.full_like(vd, float("nan"))
+    fd(qd, kd, vd, dod, dk_d, dv_d, lse_d, del_d, nseq, n, seqlen_k=n, scale=scale, **drop)
+
+    cat = lambda t: torch.cat([t[i : i + 1] for i in range(nseq)], dim=2)  # noqa: E731
+    qv, kv_, vv_, dov = cat(qd), cat(kd), cat(vd), cat(dod)
+    lse_v = torch.cat([lse_d.reshape(nseq, hq, n)[i] for i in range(nseq)], dim=1).contiguous()
+    del_v = torch.cat([del_d.reshape(nseq, hq, n)[i] for i in range(nseq)], dim=1).contiguous()
+    cu_d = _cu([n] * nseq)
+    fv = build(num_heads=hq, head_dim=d, num_kv_heads=hk, dropout=True, varlen=True, dtype_str=_dt_str(), **knobs)
+    dk_v, dv_v = torch.full_like(kv_, float("nan")), torch.full_like(vv_, float("nan"))
+    fv(
+        qv,
+        kv_,
+        vv_,
+        dov,
+        dk_v,
+        dv_v,
+        lse_v,
+        del_v,
+        1,
+        n,
+        seqlen_k=n,
+        scale=scale,
+        varlen=abi.varlen_compact(cu_d, cu_d, n, n, lse_tokens=nseq * n),
+        num_seqlens=nseq,
+        **drop,
+    )
+    torch.cuda.synchronize()
+    for i in range(nseq):
+        lo, hi = i * n, (i + 1) * n
+        assert torch.equal(dk_v[:, :, lo:hi, :], dk_d[i : i + 1]), (
+            f"dK sequence {i}: a packed sequence and the matching dense batch slice must draw the same "
+            "dropout plane, since both have seq_idx == i"
+        )
+        assert torch.equal(dv_v[:, :, lo:hi, :], dv_d[i : i + 1]), f"dV sequence {i} under GQA+varlen+dropout"
+    assert not torch.equal(dk_v[:, :, :n, :], dk_v[:, :, n:, :]), (
+        "the two packed sequences produced identical dK, so every sequence in the pack is drawing one "
+        "mask -- which is the defect this arm exists to catch, and both oracles above would still pass"
+    )
 
 
 @pytest.mark.parametrize("rows", [32, 16], ids=["m32", "m16"])

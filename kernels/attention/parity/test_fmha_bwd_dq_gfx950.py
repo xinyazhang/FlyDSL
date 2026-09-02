@@ -484,6 +484,66 @@ def test_db_covers_a_ragged_kv_axis():
     assert _max_err(db, bias.grad) <= 5.0e-2
 
 
+@pytest.mark.parametrize("rows", [32, 16], ids=["rows32", "rows16"])
+@pytest.mark.parametrize("sk", [64, 65, 63], ids=["even", "odd-up", "odd-down"])
+def test_bias_last_column_is_read_at_odd_seqlen_k(rows, sk):
+    """The last bias entry must reach the kernel, whatever the parity of `seqlen_k`.
+
+    gfx950 range-checks a multi-dword buffer op **per dword** and drops any
+    dword not wholly inside `num_records`. The bias slab's descriptor ends
+    exactly on its last valid element, so at odd `seqlen_k` the final dword
+    covers columns `(seqlen_k-1, seqlen_k)`, straddles the bound, and takes the
+    *live* column with the out-of-range one -- silently, for every (batch,
+    head), with no fault and no NaN.
+
+    Isolated rather than measured as an aggregate error: an all-zero bias with
+    one large entry at `[..., sq-1, sk-1]` changes dQ's last row if and only if
+    the kernel read it. Against a full random bias this is one element in
+    `sq*sk` and disappears into the tolerance, which is why it survived the
+    ladder's `test_db_matches_bias_gradient`.
+
+    Found by importing AOTriton's narrow-read change and asking what it was
+    for. It is **not** a regression from the slab-bound tightening -- a
+    contiguous bias has `stride_b_seq_q == seqlen_k`, so the tightened bound
+    equals the loose one and the probe fails identically at `7cd69444`.
+
+    The 16-row family reads bias in `M16DqReader.add_bias`. The 32-row family
+    reads it through `ParitySoftmaxHelper._add_bias_inplace` in
+    `fmha_dualwave_gfx950.py`, shared with the forward; `rows32` at odd
+    `seqlen_k` was `xfail` here until that landed its `narrow_tail` arm, and
+    both families now pass.
+
+    **The same defect was live in the forward**, which shares that method: an
+    all-zero bias with one entry at `[.., sq-1, sk-1]` left `O`'s last row
+    bit-identical at `seqlen_k` 63, 65 and 127, and moved it at 64 and 128.
+    """
+    b, h, sq, d = 1, 1, 64, 64
+    torch.manual_seed(0)
+    q, do = (_rand(b, h, sq, d) for _ in range(2))
+    k, v = (_rand(b, h, sk, d) for _ in range(2))
+    scale = _sm_scale(d)
+    lse, delta, _ = _fwd_stats(q, k, v, do, scale=scale, dtype=torch.float32)
+    fn = build_dq(num_heads=h, head_dim=d, causal=False, bias=True, store_db=True, mfma_rows=rows)
+
+    def once(with_bias):
+        bias = torch.zeros(b, h, sq, sk, device="cuda", dtype=DT)
+        if with_bias:
+            bias[:, :, sq - 1, sk - 1] = -30.0
+        dq = torch.full_like(q, float("nan"))
+        db = torch.zeros(b, h, sq, sk, device="cuda", dtype=DT)
+        fn(q, k, v, do, dq, lse, delta, b, sq, seqlen_k=sk, scale=scale, bias=bias, db=db)
+        torch.cuda.synchronize()
+        return dq.float()
+
+    on, off = once(True), once(False)
+    assert (on[:, :, :-1, :] - off[:, :, :-1, :]).abs().max().item() == 0.0, "only the last q row should move"
+    moved = (on[:, :, -1, :] - off[:, :, -1, :]).abs().max().item()
+    assert moved > 1e-6, (
+        f"seqlen_k={sk}: bias[..., {sq - 1}, {sk - 1}] did not reach the kernel. The final dword of the "
+        "slab straddles `num_records` and the live column was dropped with the out-of-range one."
+    )
+
+
 # ---------------------------------------------------------------------------
 # The 8xD input contract, and padded heads
 # ---------------------------------------------------------------------------
@@ -934,12 +994,17 @@ def test_register_model_matches_measured(head_dim):
     leaves out: addressing, DMA descriptors and loop scalars, measured at 4-12
     at two waves and 12-14 at four. Fitting a constant for them would make the
     model agree with today's numbers by construction.
+
+    **`mfma_rows=32` is pinned rather than defaulted**, because the table above
+    is the 32-row family's measurements and the default policy no longer picks
+    that family at 256. Reading the geometry from the policy would have made
+    this a test of the policy; the 16-row column has its own test below.
     """
     from fmha_tuning_bwd_dq_gfx950 import register_demand
     from fmha_tuning_gfx950 import FmhaInputMetadata
 
     traits = (
-        bwd_dq_knobs()
+        bwd_dq_knobs(mfma_rows=32)
         .resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
         .build_traits(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
     )
@@ -1019,17 +1084,28 @@ def test_sixteen_rows_is_what_the_wide_rungs_need():
         assert b["over_512"] == 0, "the 16-row family is supposed to be the answer"
 
 
-def test_the_default_policy_splits_the_families_at_384():
-    """32 rows below 384, 16 at and above. Measured, and additive.
+def test_the_default_policy_splits_the_families_at_256():
+    """32 rows below 256, 16 at and above. Measured, and additive.
 
-    16 against 32 rows at `B=2 H=8 S=4096`: 4.23x at 512, 1.69x at 384, 1.04x
-    at 256, level at 192, and **worse** at 128 (0.94x) and 64 (0.86x). The
-    32-row family keeps everything below 384 -- "the 32-row path must not
-    regress" is a gate, and the way it is met is that nothing below 384 moves.
+    16 against 32 rows at `B=2 H=8 S=4096`: 4.23x at 512, 1.69x at 384, level
+    at 192, and **worse** at 128 (0.94x) and 64 (0.86x). The 32-row family
+    keeps everything below 256 -- "the 32-row path must not regress" is a gate,
+    and the way it is met is that nothing below 256 moves.
+
+    **256 was moved down from the 32-row family**, where it had sat by
+    incumbency after the original sweep put it at 1.04x, inside the band the
+    lore says a sweep cannot settle. Two measurements settled it: the 32-row
+    build at 256 *with dropout* is 507 VGPR + 251 AGPR, five registers from the
+    file, against 232 VGPR / 0 AGPR / 0 spills and half the LDS for 16 rows;
+    and an interleaved A/B on one idle GPU has 16 rows ahead in all eight reps,
+    by 3.0% without dropout and 1.5% with. `fmha_tuning_bwd_dq_gfx950`'s
+    `_with_wave_geometry` carries the full note, including the fact that the
+    non-determinism AOTriton attributes to that register pressure does **not**
+    reproduce here.
     """
     from fmha_tuning_gfx950 import FmhaInputMetadata
 
-    for head_dim, rows in ((64, 32), (128, 32), (256, 32), (384, 16), (512, 16)):
+    for head_dim, rows in ((64, 32), (128, 32), (192, 32), (256, 16), (384, 16), (512, 16)):
         traits = (
             bwd_dq_knobs()
             .resolve(FmhaInputMetadata(num_heads=8, head_dim=head_dim, causal=False))
@@ -1641,6 +1717,92 @@ def test_db_under_varlen(rows):
 # ---------------------------------------------------------------------------
 # B5 gap: 0x0202, the one mode with a runtime per-batch length
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("rows", _FAMILIES)
+def test_packed_varlen_draws_a_dropout_plane_per_sequence(rows):
+    """dQ's half of the plane fix: each packed sequence gets its own mask.
+
+    The forward's test of the same name carries the full argument. The short
+    version is that the philox plane must be
+    `seq_idx_i32 * num_head_q + q_head_idx`, and `batch_idx` -- which all three
+    kernels used -- collapses to 0 for every sequence of a packed layout, so
+    the whole pack shared one mask.
+
+    **Both halves have to move together or B6 breaks.** dQ regenerates the
+    forward's mask bit for bit; that is the property the dropout phase exists
+    to guarantee. Had only one kernel's plane moved, the two would disagree
+    under exactly this layout and the gradient would be silently wrong -- so
+    this test and the forward's are two halves of one change.
+
+    The oracle is a dense call of batch N sliced, **not** N calls of batch 1: a
+    batch-1 call has `batch_idx == 0` and so also draws plane 0, which is
+    precisely why comparing against it hid the bug for so long. Equal lengths,
+    so the packed and dense layouts hold the same rows.
+    """
+    import fmha_abi_gfx1201 as _abi
+
+    h, d, n, length = 4, 64, 3, 128
+    torch.manual_seed(19)
+    cu = _cumsum([length] * n)
+    qp, kp, vp, dop = (_rand(1, h, cu[-1], d) for _ in range(4))
+
+    def to_b(t):
+        return t.view(1, h, n, length, d).permute(2, 0, 1, 3, 4).reshape(n, h, length, d).contiguous()
+
+    qb, kb, vb, dob = to_b(qp), to_b(kp), to_b(vp), to_b(dop)
+    scale = _sm_scale(d)
+
+    # Row inputs per sequence, each in its own layout's pitch: the packed side
+    # runs to the batch total (`lse_token_pitch` for a stacked Q side), the
+    # dense side to `max_seqlen_q` per batch element.
+    lse_p = torch.zeros(h, cu[-1], device="cuda", dtype=torch.float32)
+    del_p = torch.zeros_like(lse_p)
+    lse_b = torch.zeros(n * h, length, device="cuda", dtype=torch.float32)
+    del_b = torch.zeros_like(lse_b)
+    for i in range(n):
+        a, b = cu[i], cu[i + 1]
+        li, di = _vl_stats(qp[:, :, a:b], kp[:, :, a:b], vp[:, :, a:b], dop[:, :, a:b], scale=scale, causal=False)
+        lse_p[:, a:b], del_p[:, a:b] = li[0].float(), di[0].float()
+        lse_b.view(n, h, length)[i], del_b.view(n, h, length)[i] = li[0].float(), di[0].float()
+
+    drop = dict(dropout_p=0.5, philox_seed=1234, philox_offset2=0)
+    kw = dict(num_heads=h, head_dim=d, causal=False, num_kv_heads=h, dropout=True, mfma_rows=rows)
+
+    dq_b = torch.full_like(qb, float("nan"))
+    build_dq(**kw)(qb, kb, vb, dob, dq_b, lse_b, del_b, n, length, seqlen_k=length, scale=scale, **drop)
+
+    dq_p = torch.full_like(qp, float("nan"))
+    side = _abi.VARLEN_COMPACT_SIDE
+    build_dq(varlen=True, **kw)(
+        qp,
+        kp,
+        vp,
+        dop,
+        dq_p,
+        lse_p.contiguous(),
+        del_p.contiguous(),
+        1,
+        length,
+        seqlen_k=length,
+        scale=scale,
+        varlen=dict(
+            bits=_abi.varlen_bits(side, side),
+            max_seqlen_q=length,
+            max_seqlen_k=length,
+            seqinfo_q0=_i32(cu),
+            seqinfo_k0=_i32(cu),
+        ),
+        num_seqlens=n,
+        **drop,
+    )
+    torch.cuda.synchronize()
+
+    for i in range(n):
+        assert torch.equal(dq_p[0, :, cu[i] : cu[i + 1], :], dq_b[i]), (
+            f"dQ sequence {i} of a packed batch does not match dense row-group {i}. If sequence 0 passes and "
+            f"the rest fail, the dropout plane has collapsed to `batch_idx` and the pack is sharing one mask."
+        )
 
 
 @pytest.mark.parametrize("rows", _FAMILIES)
