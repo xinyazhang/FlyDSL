@@ -464,10 +464,40 @@ class BwdDqKnobs(Gfx950Knobs):
         # and the 32-row one keeps everything below 384 -- this is additive,
         # not a replacement.
         #
-        # 256 at 1.04x is inside the band the lore says a sweep cannot settle;
-        # it stays on the 32-row family because that is the incumbent, not
-        # because 4% was measured as a loss.
-        rows = me.mfma_rows if me.mfma_rows is not None else (16 if me.block_dmodel >= 384 else 32)
+        # **256 moved down to 16 rows.** It sat at 32 for a long time purely by
+        # incumbency: the original 1.04x was inside the band the lore says a
+        # sweep cannot settle, so it was never a measured loss, just not a
+        # measured win. Two things settled it, one of them AOTriton's.
+        #
+        # *Register headroom.* The 32-row build at 256 **with dropout** lands
+        # on 507 VGPR + 251 AGPR -- five registers short of the file. AOTriton
+        # reports the allocator answering that by spilling the LDS-DMA address
+        # operands into AGPRs and rematerialising several through a single VGPR
+        # overwritten between consecutive `buffer_load ... offen lds` issues,
+        # and a resulting non-deterministic poisoning of one wave's 32x32
+        # accumulator tile. Every register figure they quote reproduces here
+        # exactly -- 507/251 with dropout, 460/204 without, 456/200 at the 224
+        # rung that stays under the cliff, and 232 VGPR / 0 AGPR / 0 spills and
+        # half the LDS for 16 rows at 256.
+        #
+        # **The failure itself does not reproduce here.** At their shape
+        # (`B=3 H=5 sq=2048 sk=8192`, dropout 0.25) the 32-row build was
+        # bit-identical across four runs and agreed with the 16-row family to
+        # 2.4e-7 relative. So this is not "fixing an observed bug"; it is
+        # declining to ship a build that sits five registers from the file when
+        # the alternative has 280 to spare.
+        #
+        # *And it is not a cost.* Interleaved A/B on one idle GPU at
+        # `B=2 H=8 S=4096`, four reps alternating, min of each arm: 16 rows is
+        # 3.0% faster without dropout (0.4632 vs 0.4773 ms) and 1.5% with
+        # (0.5919 vs 0.6005 ms), winning every one of the eight reps -- the
+        # 32-row arm's best is worse than the 16-row arm's worst in both. Small
+        # margins, but the direction is not in doubt, and it matches the
+        # re-measurement AOTriton did independently.
+        #
+        # 192 stays at 32 rows: it was measured exactly level, and its 32-row
+        # build is 360/104, nowhere near the cliff.
+        rows = me.mfma_rows if me.mfma_rows is not None else (16 if me.block_dmodel >= 256 else 32)
         if rows == 16:
             # BLOCK_N 32 for the reason `build_traits` states, and four waves
             # because the wide rungs need one wave per SIMD to see all 512

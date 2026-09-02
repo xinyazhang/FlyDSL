@@ -64,7 +64,12 @@ anything else was written.
 """
 
 import fmha_common_gfx1201 as fmha  # noqa: F401  (kept for the shared row addressing)
-from fmha_dualwave_gfx950 import ParityKernelContext  # noqa: F401  (documents the base this rides on)
+from fmha_dualwave_gfx950 import (  # ParityKernelContext documents the base this rides on
+    ParityKernelContext,  # noqa: F401
+    _slab_span_elems,
+    exp2_wait_state,
+    mfma_operand_wait_state,
+)
 from fmha_mfma16_gfx950 import MFMA16_M
 from gfx950_standalone import buffer_ops, dualwave
 
@@ -451,6 +456,31 @@ class M16DqSoftmax:
         bias for a padded row -- and a column past `seqlen_kv` picks up the
         next row's entry, which the KV tail mask below then overwrites with
         `-inf`. That is the forward's argument, unchanged.
+
+        **One column at a time, not one wide load per run.** gfx950
+        range-checks a multi-dword buffer op **per dword** and drops any dword
+        that is not wholly inside `num_records`, and the bias slab ends exactly
+        on its last valid element. At odd `seqlen_k` the final dword covers
+        columns `(seqlen_k-1, seqlen_k)` and straddles the bound, so the last
+        row's last bias entry is dropped along with the out-of-range column
+        sharing its dword -- silently, for every (batch, head).
+
+        Measured rather than argued. With a bias that is zero everywhere except
+        `[..., sq-1, sk-1]`, dQ's last row was bit-identical to the no-bias run
+        at `seqlen_k` 63 and 65 and differed by 0.75 at 64. The same probe fails
+        the 32-row family, whose bias read is `_add_bias_inplace` in
+        `fmha_dualwave_gfx950.py` and shared with the forward -- reported rather
+        than fixed here, since that file has another owner.
+
+        It is **not** a regression from the slab tightening: the probe gives
+        bit-identical results at `7cd69444`, because a contiguous bias has
+        `stride_b_seq_q == seqlen_k` and the tightened bound equals the loose
+        one. The straddle is in the exact bound both compute.
+
+        Widening the bound is the wrong repair -- it would read memory the
+        caller never handed us, which is the bug the bound exists to prevent.
+        Every tile here takes the mask, so unlike the forward there is no wide
+        interior case worth keeping separate.
         """
         ctx = self.ctx
         fm = arith.FastMathFlags.contract | arith.FastMathFlags.reassoc
@@ -459,15 +489,17 @@ class M16DqSoftmax:
         lists = self.to_lists(v_s)
         for step in range_constexpr(2):
             col0 = self.kv_col(tile_idx, lane, step, 0)
-            span = buffer_ops.buffer_load(
-                ctx.bias_rsrc,
-                as_mlir_value(fx.Int32(row_base + fx.Index(col0))),
-                vec_width=self.n,
-                dtype=ctx.elem_dtype,
-            )
-            vec = Vec(span, (self.n,), ctx.elem_dtype)
             for i in range_constexpr(self.n):
-                b = fx.Float32(vec[i].to(fx.Float32))
+                one = buffer_ops.buffer_load(
+                    ctx.bias_rsrc,
+                    as_mlir_value(fx.Int32(row_base + fx.Index(col0 + i))),
+                    vec_width=1,
+                    dtype=ctx.elem_dtype,
+                )
+                # `vec_width=1` returns a **scalar** of the element type, not a
+                # one-lane vector, so it is wrapped directly rather than
+                # indexed through `Vec`.
+                b = fx.Float32(ctx.elem_dtype(one).to(fx.Float32))
                 lists[step][i] = dualwave._fadd(lists[step][i], dualwave._fmul(b, log2e, fm), fm)
         return self.to_vecs(lists)
 
@@ -560,8 +592,19 @@ class M16DqSoftmax:
         return _mask_if_needed(v_s, tile_idx)
 
     def exp2(self, v_s):
+        """The `exp2` batch, held one slot away from its consumers.
+
+        `exp2_wait_state` carries the argument; the 32-row family's `exp2`
+        carries the measurement for dQ, which is that no dQ build scanned comes
+        within 8 instructions of the hazard. Imported as a property of the
+        instruction pair rather than of today's schedule.
+
+        Unlike the 32-row path this one returns the lists directly, so it wraps
+        rather than needing the body copied.
+        """
         return tuple(
-            [dualwave.rocdl.exp2(T.f32, as_mlir_value(Vec(h)[r])) for r in range_constexpr(self.n)] for h in v_s
+            exp2_wait_state([dualwave.rocdl.exp2(T.f32, as_mlir_value(Vec(h)[r])) for r in range_constexpr(self.n)])
+            for h in v_s
         )
 
     def dropout_dp(self, dp_lists, tile_idx, lane, q_row):
@@ -611,9 +654,15 @@ class M16DqSoftmax:
         operand must hold the token the transpose read put at `4g + 16r + i` --
         which is accumulator half `r`, element `i`. The whole permutation
         argument reduces to this concatenation being in the obvious order.
+
+        The pack leaves through `mfma_operand_wait_state`, for the reason that
+        function's docstring gives. Not reproduced in *this* family -- the gap
+        scan finds the 16-row dQ builds clean -- but it is the same instruction
+        building the same operand for the same MFMA shape that the 32-row
+        family was measured exposed on at head_dim 96, and the barrier is free.
         """
         vals = list(ds_lists[0]) + list(ds_lists[1])
-        return dualwave._bf16_trunc_pack_v8(self.traits, vals, elem_dtype=self.ctx.elem_dtype)
+        return mfma_operand_wait_state(dualwave._bf16_trunc_pack_v8(self.traits, vals, elem_dtype=self.ctx.elem_dtype))
 
 
 class M16DqStore:
@@ -630,20 +679,34 @@ class M16DqStore:
     A run may write up to three columns into the caller's pad, which the 8xD
     contract guarantees exists -- and is stricter than the 32-row path, whose
     128-bit store can overrun by eight.
+
+    **dQ by name, not through the base class's `O` slot.** The descriptor is
+    built from `ctx.DQ` and `stride_dq_*`, and bounded at the last row's last
+    real element rather than at `rows * stride`. That is what makes the pad
+    claim above true for the *last* (batch, head) slab of a BSHD dQ, where the
+    row stride is `num_heads * hdim` and the pad the store would otherwise
+    reach into belongs to the next head -- or, for the final slab, to nothing
+    at all. See `_slab_span_elems`.
+
+    `hdim_qk`, not `hdim_vo`: dQ is Q-shaped, as `store` says again below.
+
+    `oob` stays the *untightened* span. A sentinel only has to sit at or past
+    `num_records`, and shrinking the bound moves it further out of range rather
+    than back into it.
     """
 
     def __init__(self, ctx):
         self.ctx = ctx
         self.traits = ctx.traits
-        span = ctx.seqlen_q_v * ctx.stride_o_seq_v
-        self.oob = span
+        self.oob = ctx.dq_oob_off
+        span = _slab_span_elems(ctx.seqlen_q_v, ctx.stride_dq_seq, ctx.hdim_qk)
         self.rsrc = buffer_ops.create_buffer_resource(
-            ctx.O,
+            ctx.DQ,
             max_size=False,
             num_records_bytes=as_mlir_value(span * fx.Index(self.traits.BF16_BYTES)),
             base_byte_offset=as_mlir_value(
                 ctx._slab_byte_base(
-                    ctx.stride_o_batch, ctx.stride_o_head, ctx.stride_o_seq, ctx.q_row_off, ctx.q_head_idx
+                    ctx.stride_dq_batch, ctx.stride_dq_head, ctx.stride_dq_seq, ctx.q_row_off, ctx.q_head_idx
                 )
             ),
         )
@@ -651,7 +714,7 @@ class M16DqStore:
     def store(self, v_dq, q_row, lane):
         ctx, traits = self.ctx, self.traits
         n = acc_elems(traits)
-        row_base = q_row * ctx.stride_o_seq_v
+        row_base = q_row * ctx.stride_dq_seq_v
         in_row = q_row < ctx.seqlen_q_v
         col_lane = fx.Index(4) * (lane // fx.Index(MFMA16_M))
         for c in range_constexpr(d_chunks16(traits)):

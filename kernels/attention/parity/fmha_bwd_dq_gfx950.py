@@ -235,7 +235,10 @@ from fmha_dualwave_gfx950 import (
     ParityQLoader,
     ParitySoftmaxHelper,
     ParityStoreHelper,
+    _bias_slab_num_records_bytes,
     _score_column_runs,
+    exp2_wait_state,
+    mfma_operand_wait_state,
     wire_ptr,
     wire_view,
 )
@@ -318,41 +321,96 @@ _COMPILE_HINTS = {
 
 
 class BwdDqKernelContext(ParityKernelContext):
-    """The forward's parity context plus dO, dB and the two row inputs.
+    """The forward's parity context plus dQ, dO, dB and the two row inputs.
 
     Subclassed rather than ported, per the contract: the strides, the padded
-    head, the varlen decode and the descriptor machinery are all inherited, and
-    `O` is bound to `dQ` so `ParityStoreHelper` writes the gradient with no
-    change at all. What is added is one more Q-shaped tensor (`dO`), one
-    score-shaped output (`dB`), and the LSE/delta pair.
+    head, the varlen decode and the descriptor machinery are all inherited.
+    What is added is this kernel's output (`dQ`), one more Q-shaped input
+    (`dO`), one score-shaped output (`dB`), and the LSE/delta pair.
+
+    **There is no `O` here, and that is the change.** dQ used to be handed to
+    the base class's `O` slot, which made `stride_o_*` dQ's strides, `o_div`
+    dQ's descriptor and `hdim_vo` -- the head dim of V or O -- the bound on a
+    tensor that is Q-shaped and therefore `hdim_qk` wide. It computed the right
+    answer only because `BwdDqStoreHelper` rebound `hdim_vo` on the helper to
+    paper over the last of those. The moment the base class tried to *tighten*
+    the O slab it had no width to tighten it by, and the shared descriptor had
+    to be left loose with a comment saying why -- six `test_asymmetric_hdim`
+    cases fail on `hdim_vo` if it is not.
+
+    dQ is spelled `DQ` here, with `stride_dq_*`, `dq_div` and `dq_oob_off`; the
+    base's `O` stays `None` and its O view is not built. `BwdDqStoreHelper` is
+    the one place upstream's `o_*` store vocabulary is bound to them. This is
+    the same slot reuse the dK/dV stride split removed there.
     """
 
-    def __init__(self, traits, *, do_strides, db_strides=(0, 0, 0), DO=None, DB=None, Delta=None, **kwargs):
+    def __init__(
+        self,
+        traits,
+        *,
+        dq_strides,
+        do_strides,
+        db_strides=(0, 0, 0),
+        DQ=None,
+        DO=None,
+        DB=None,
+        Delta=None,
+        **kwargs,
+    ):
         super().__init__(traits, **kwargs)
+        self.stride_dq_batch, self.stride_dq_head, self.stride_dq_seq = dq_strides
         self.stride_do_batch, self.stride_do_head, self.stride_do_seq = do_strides
         # `_seq_q` for the reason `ParityKernelContext` gives for the bias
         # input's: dB is `(batch, head, seqlen_q, seqlen_k)` and a bare `_seq`
         # does not say which of the two it is.
         self.stride_db_batch, self.stride_db_head, self.stride_db_seq_q = db_strides
+        self.DQ = DQ
         self.DO = DO
         self.DB = DB
         self.Delta = Delta
 
     def init_runtime_indices(self, **kwargs):
         super().init_runtime_indices(**kwargs)
+        self.stride_dq_seq_v = fx.Index(self.stride_dq_seq)
         self.stride_do_seq_v = fx.Index(self.stride_do_seq)
 
     def init_descriptors(self, **kwargs):
-        """The forward's four views, plus dO's and dB's.
+        """The forward's four views, plus dQ's, dO's and dB's.
 
         `dO` gets exactly Q's treatment -- same slab shape, same row origin,
         same `seqlen_q` bound -- because it *is* Q-shaped: (batch, head, q row,
         d), with the vo head dim rather than the qk one. The bound is what
         makes a row past `seqlen_q` read zero instead of faulting, which is the
         whole reason the ragged tail needs no branch.
+
+        Each of the three carries the width of *its own* rows, which is the
+        point of `_slab_span_elems`: `stride_seq` is the distance between rows
+        and is only the width of one when the tensor is contiguous in
+        `(.., seqlen, hdim)` order. dQ and dO differ in that width -- dQ is
+        Q-shaped and `hdim_qk` wide, dO is O-shaped and `hdim_vo` wide -- and
+        an asymmetric build is where the difference shows.
         """
         traits = self.traits
         super().init_descriptors(**kwargs)
+        # dQ's own view, rather than the base class's `O` slot. `hdim_qk`, not
+        # `hdim_vo`: dQ is Q-shaped, and at an asymmetric head dim those are
+        # different numbers with only one of them dQ's row width.
+        self.dq_div = self._slab_view(
+            self.DQ,
+            self.stride_dq_batch,
+            self.stride_dq_head,
+            self.stride_dq_seq,
+            self.q_row_off,
+            self.q_head_idx,
+            self.seqlen_q_v,
+            hdim=self.hdim_qk,
+        )
+        # First element past the *untightened* span, which is what a sentinel
+        # wants: it only has to sit at or past `num_records`, and the tightened
+        # bound only ever shrinks -- moving the sentinel further out of range
+        # rather than back into it. The store suppression past `hdim_qk`
+        # redirects here; see `BwdDqStoreHelper`.
+        self.dq_oob_off = self.seqlen_q_v * self.stride_dq_seq_v
         self.do_div = self._slab_view(
             self.DO,
             self.stride_do_batch,
@@ -361,6 +419,7 @@ class BwdDqKernelContext(ParityKernelContext):
             self.q_row_off,
             self.q_head_idx,
             self.seqlen_q_v,
+            hdim=self.hdim_vo,
         )
         self.do_gmem_elem_offset = self.q_start * self.stride_do_seq_v
         if const_expr(traits.STORE_DB):
@@ -369,14 +428,29 @@ class BwdDqKernelContext(ParityKernelContext):
             # contiguous -- and a raw resource for the same reason: the stores
             # are per-lane at an address the lane computes, which is
             # `buffer_ops.buffer_store`'s shape and not the copy atom's.
-            db_span = self.seqlen_q_v * fx.Index(self.stride_db_seq_q)
-            # First element past the descriptor. A store redirected here is
-            # dropped by the hardware bound; see `BwdDbStoreHelper`.
-            self.db_oob_off = db_span
+            # First element past the *untightened* span. A store redirected
+            # here is dropped by the hardware bound; see `BwdDbStoreHelper`.
+            # Untightened deliberately, for the reason `dq_oob_off` gives.
+            self.db_oob_off = self.seqlen_q_v * fx.Index(self.stride_db_seq_q)
+            # Bounded through the forward's own bias helper, and for its
+            # reason: a BSHD caller's `stride_db_seq_q` is `num_heads *
+            # seqlen_k`, so `seqlen_q * stride_db_seq_q` overshoots this head's
+            # slab by the other heads of the last row -- and for the last
+            # (batch, head) that is off the end of dB. Storing there corrupts a
+            # neighbouring head's gradient, or faults.
+            #
+            # The load-side caveat in that helper's docstring -- a wide read
+            # losing its last column to the per-dword range check at odd
+            # `seqlen_k` -- has no counterpart on this side: these are 2-byte
+            # stores, one per element, already predicated on `col < seqlen_k`,
+            # so every live one lands inside the tight bound whatever the
+            # parity of `seqlen_k`.
             self.db_rsrc = buffer_ops.create_buffer_resource(
                 self.DB,
                 max_size=False,
-                num_records_bytes=as_mlir_value(db_span * fx.Index(traits.BF16_BYTES)),
+                num_records_bytes=_bias_slab_num_records_bytes(
+                    self.seqlen_q_v, self.seqlen_kv_v, self.stride_db_seq_q, traits.BF16_BYTES
+                ),
                 base_byte_offset=as_mlir_value(
                     self._slab_byte_base(
                         self.stride_db_batch,
@@ -413,7 +487,19 @@ class BwdDqKernelContext(ParityKernelContext):
         if const_expr(not self.traits.ENABLE_DROPOUT):
             return
         self.philox_rng = Philox.for_arch("gfx950")
-        plane = fx.Int32(self.batch_idx) * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
+        # **`seq_idx_i32`, not `batch_idx`.** The plane is per *sequence*, and
+        # the two are the same number only when the layout has a real batch
+        # axis. `decode_addressing` resolves `batch_idx` to 0 for every
+        # sequence of a packed layout -- correct for addressing, since a packed
+        # tensor carries its origin in `row_off` instead -- so a packed call
+        # drew plane `0*H + h` for all N and every sequence in the pack shared
+        # one dropout mask.
+        #
+        # Invisible to every gate we had: `allclose` cannot see it, and the
+        # bitwise varlen oracle could not either, because its reference was N
+        # separate `batch_size=1` calls and those also collapse to plane 0. The
+        # two sides agreed by being degenerate in the same way.
+        plane = self.seq_idx_i32 * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
         seed = fmha.philox_seed_value(self.philox_seed_ptr)
         offset = fmha.philox_offset_base(self.philox_offset1, self.philox_offset2)
         self.philox_seed = seed
@@ -666,8 +752,73 @@ class BwdDqSoftmaxHelper(ParitySoftmaxHelper):
         It fails loudly today only by accident -- the forward's block reads
         `tile_idx`, which this call site does not pass. That is a bad reason to
         be safe, so the override is explicit.
+
+        **Every pack leaves through `mfma_operand_wait_state`.** Calling
+        `DualwaveSoftmaxHelper.cast_p` directly is what puts this outside
+        `ParitySoftmaxHelper.cast_p`'s barrier, so the coverage has to be
+        restated here rather than inherited -- the two paths are deliberately
+        different in what they *apply*, and identical in needing this.
+
+        **Reproduced in this tree at head_dim 96.** A scan of ten dQ builds for
+        a `v_cvt_pk_*_f32` write reaching an MFMA SrcA/SrcB under two wait
+        states -- crediting `s_nop N` as `N+1`, stopping at any redefinition of
+        the destination, expanding `v[a:b]` operand ranges -- found
+        `BLOCK_DMODEL=96, mfma_rows=32, bf16` carrying two sites at gap 1:
+
+            v_cvt_pk_bf16_f32 v51, v51, v73
+            v_mfma_f32_32x32x16_bf16 v[0:15], v[194:197], v[48:51], v[0:15]
+
+        `v51` is the **last** register of the SrcB tuple, which is the shape
+        AOTriton names and the same one the dK/dV scan found. Every other rung
+        measured clean (16 candidate converts per kernel located, so the zeros
+        are measurements) -- including `BLOCK_DMODEL=64`, which is the
+        configuration AOTriton's own deterministic reproducer uses, at 39%
+        relative L2 on dQ columns `[0, 32)`. Our schedule differs from theirs;
+        the exposure is a property of the schedule and not of the source, which
+        is the reason to barrier the site rather than the rung.
         """
-        return dualwave.DualwaveSoftmaxHelper.cast_p(self, v_p)
+        p_lo_packs, p_hi_packs = dualwave.DualwaveSoftmaxHelper.cast_p(self, v_p)
+        return (
+            [mfma_operand_wait_state(p) for p in p_lo_packs],
+            [mfma_operand_wait_state(p) for p in p_hi_packs],
+        )
+
+    def exp2(self, v_s, start, length):
+        """`_exp2_score_slice` with the gfx950 `v_exp_f32` wait state.
+
+        The body is `dualwave._exp2_score_slice` verbatim apart from the one
+        call, and copied rather than wrapped for the reason the forward's
+        equivalent gives: on the `start == 0` path the results are consumed
+        *inside* it, by `Vec.from_elements`, so there is no return value a
+        wrapper could interpose on.
+
+        See `exp2_wait_state` for why a bare `_s_nop` is not this.
+
+        **Not reproduced in dQ, and imported on the argument.** The same scan
+        measured the gap from each `v_exp_f32` to its first VALU consumer over
+        ten dQ builds: the minimum anywhere was 8, with per-build minima of 8,
+        9, 26, 50 and 54, against the *exactly 1* that AOTriton's dK/dV scan
+        reports and that phase 1 confirmed here. dQ is not near this cliff, and
+        saying otherwise would overstate it.
+
+        Imported anyway, because "not near the cliff" is a fact about one
+        schedule and not about the kernel. AOTriton's live case became live
+        exactly that way -- issue 9's fix raised register pressure, the
+        schedule moved, and a latent gap became a zero-gap wrong answer. The
+        cost here is measured rather than assumed; see the plan's outcome
+        section for the register and ISA comparison.
+        """
+        if const_expr(start == 0):
+            s_lo = [Vec(v_s[0])[r] for r in range_constexpr(16)]
+            lo_partial = exp2_wait_state(
+                [dualwave.rocdl.exp2(T.f32, as_mlir_value(s_lo[r])) for r in range_constexpr(16)]
+            )
+            return Vec.from_elements(lo_partial, fx.Float32).ir_value(), v_s[1]
+        lo_partial = [Vec(v_s[0])[r] for r in range_constexpr(16)]
+        hi_full = exp2_wait_state(
+            [dualwave.rocdl.exp2(T.f32, as_mlir_value(Vec(v_s[1])[r])) for r in range_constexpr(16)]
+        )
+        return lo_partial, hi_full
 
     def dropout_dp(self, dp_lists, tile_idx, q_row):
         """`dP <- keep ? dP * (1/(1-p)) : 0`, on the **dP** rather than on P.
@@ -863,21 +1014,42 @@ class BwdDqKvLdsToVgprLoader(ParityKvLdsToVgprLoader):
 
 
 class BwdDqStoreHelper(ParityStoreHelper):
-    """The O store, told that its output is `hdim_qk` wide.
+    """The inherited store, pointed at dQ.
 
-    `_final_o_global` suppresses chunks starting at or past `self.hdim_vo`,
-    because in the forward the tensor it writes *is* O. Here it writes dQ,
-    which is Q-shaped and `hdim_qk` wide. The two coincide in every symmetric
-    build and cross the moment they do not -- the second of the two sites the
-    plan's B2 outcome names.
+    Upstream's `DualwaveStoreHelper` has exactly one output vocabulary and it
+    is spelled `o_*`: `o_div` is the descriptor it writes through,
+    `stride_o_seq_v` the row pitch it addresses with, `o_oob_off` the sentinel
+    it redirects suppressed chunks to, and `hdim_vo` the width past which
+    `_final_o_global` suppresses them. This kernel's output is dQ, so all four
+    are bound to dQ's here -- in one block, at the boundary with the code that
+    owns those names. Nothing outside this class has to know that the inherited
+    store calls dQ "O".
 
-    Rebinding the attribute rather than overriding the method: the suppression
-    is one comparison inside a method that also computes the address, and a
-    copy of it would be a copy of both.
+    `hdim_qk`, not `hdim_vo`, for the width: dQ is Q-shaped. The two coincide
+    in every symmetric build and cross the moment they do not -- the second of
+    the two sites the plan's B2 outcome names, and the reason
+    `test_asymmetric_hdim` is the only test that can tell this from its
+    absence.
+
+    **Rebinding four names rather than one is what lets the descriptor be
+    bounded.** Before this, only `hdim_vo` was rebound and the other three came
+    from the base's `O` slot, which dQ had been passed into. That worked, but
+    it left the base class holding a descriptor whose width it could not know
+    -- `hdim_vo` for the forward, `hdim_qk` here -- so the O slab could not be
+    tightened without clipping dQ's real columns in `[hdim_vo, hdim_qk)`. Now
+    the base's O slot is empty and `dq_div` carries dQ's own width.
+
+    Rebinding attributes rather than overriding methods: the store helper is a
+    dict copy of the context, and the suppression is one comparison inside a
+    method that also computes the address, so a copy of it would be a copy of
+    both.
     """
 
     def __init__(self, ctx):
         super().__init__(ctx)
+        self.o_div = ctx.dq_div
+        self.o_oob_off = ctx.dq_oob_off
+        self.stride_o_seq_v = ctx.stride_dq_seq_v
         self.hdim_vo = ctx.hdim_qk
 
 
@@ -1090,10 +1262,24 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         DB = wire_view(DB)
         LSE = wire_view(LSE)
         Delta = wire_view(Delta)
+        # dQ's three strides, named once. They reach the context twice, and
+        # the second of the two is a residue with a retirement condition:
+        #
+        # - `dq_strides` is the real one. It builds `dq_div`, bounded by
+        #   `hdim_qk`, which is what `BwdDqStoreHelper` writes through.
+        # - `o_strides` fills the base class's `O` slot, which this kernel has
+        #   no tensor for. It is still needed because
+        #   `ParityKernelContext.init_descriptors` builds an O view
+        #   unconditionally; the view it builds here is dead -- the store reads
+        #   `dq_div` -- and folds away, being pure descriptor arithmetic.
+        #
+        # Retire the second, along with `O=DQ` below, once the shared context
+        # grows the `if self.O is not None` guard that dK/dV's split wants
+        # anyway. That file has another owner, so this stays a duplicated
+        # argument rather than a cross-file change.
+        _dq_strides = (stride_dq_batch, stride_dq_head, stride_dq_seq)
         ctx = BwdDqKernelContext(
             traits,
-            # dQ occupies the `O` slot: it is the tensor this kernel writes
-            # with `ParityStoreHelper`, and that helper reads `stride_o_*`.
             strides=(
                 stride_q_batch,
                 stride_q_head,
@@ -1104,10 +1290,9 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
                 stride_v_batch,
                 stride_v_head,
                 stride_v_seq,
-                stride_dq_batch,
-                stride_dq_head,
-                stride_dq_seq,
             ),
+            o_strides=_dq_strides,
+            dq_strides=_dq_strides,
             do_strides=(stride_do_batch, stride_do_head, stride_do_seq),
             db_strides=(stride_db_batch, stride_db_head, stride_db_seq_q),
             sm_scale=sm_scale,
@@ -1125,7 +1310,8 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             Q=Q,
             K=K,
             V=V,
-            O=DQ,
+            O=DQ,  # the base's slot; `DQ` below is what the store actually uses
+            DQ=DQ,
             DO=DO,
             DB=DB,
             Delta=Delta,
