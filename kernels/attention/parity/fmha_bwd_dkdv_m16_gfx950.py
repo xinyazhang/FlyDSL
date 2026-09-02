@@ -82,6 +82,7 @@ It also leaves a lane's four accumulator rows **contiguous** (`8*(lane//16) +
 """
 
 from fmha_common_gfx1201 import MaskedAxis
+from fmha_dualwave_gfx950 import exp2_wait_state, mfma_operand_wait_state
 from fmha_mfma16_gfx950 import MFMA16_M, a16_chunk_offset, a16_read_base, lds_elem, tok_off, tok_off_dyn
 from gfx950_standalone import buffer_ops, dualwave
 
@@ -351,10 +352,13 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
         scaled = [dualwave._fmul(values[r], scale, fm) for r in range_constexpr(ACC16)]
         if const_expr(bias2 is not None):
             scaled = [dualwave._fadd(scaled[r], bias2[r], fm) for r in range_constexpr(ACC16)]
-        return [
-            dualwave.rocdl.exp2(T.f32, as_mlir_value(dualwave._fadd(scaled[r], neg_lse2[r], fm)))
-            for r in range_constexpr(ACC16)
-        ]
+        # The `v_exp_f32` wait state; see `exp2_wait_state`.
+        return exp2_wait_state(
+            [
+                dualwave.rocdl.exp2(T.f32, as_mlir_value(dualwave._fadd(scaled[r], neg_lse2[r], fm)))
+                for r in range_constexpr(ACC16)
+            ]
+        )
 
     def dscores(self, p_list, v_dp, delta, keep=None):
         """`dS = P * (dP - delta)`. `dP` is unscaled; `sm_scale` belongs to dK.
@@ -447,7 +451,11 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
         family's, unchanged -- which is the other reason `16x16x32` is the
         cheaper port.
         """
-        return dualwave._bf16_trunc_pack_v8(self.traits, list(lo) + list(hi), elem_dtype=self.elem_dtype)
+        # This is the family the `v_cvt_pk_bf16_f32`-into-MFMA hazard was
+        # demonstrated in; `mfma_operand_wait_state` has the evidence.
+        return mfma_operand_wait_state(
+            dualwave._bf16_trunc_pack_v8(self.traits, list(lo) + list(hi), elem_dtype=self.elem_dtype)
+        )
 
 
 class M16StoreHelper(dualwave.DualwaveKernelContext):
