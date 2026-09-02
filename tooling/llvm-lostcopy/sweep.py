@@ -6,6 +6,7 @@ usage:
     sweep.py --shard <Bare.compile> --out <dir> [--stride N] [--limit N] [-j N]
     sweep.py --module k.py --kernel name --sigs sigs.txt --out <dir>
 """
+
 import argparse
 import os
 import subprocess
@@ -28,8 +29,15 @@ def parse_shard(path):
         if len(f) < 10:
             continue
         out.append(
-            dict(src=f[3], kernel=f[4], warps=int(f[5]), stages=int(f[6]),
-                 wpeu=int(f[7]), arch=f[8], sig=";".join(f[9:]).strip())
+            dict(
+                src=f[3],
+                kernel=f[4],
+                warps=int(f[5]),
+                stages=int(f[6]),
+                wpeu=int(f[7]),
+                arch=f[8],
+                sig=";".join(f[9:]).strip(),
+            )
         )
     return out
 
@@ -40,8 +48,9 @@ def one(job):
 
     stem = f"{cfg['kernel']}_{idx:05d}"
     try:
-        p = compile_one(cfg["src"], cfg["kernel"], cfg["sig"], cfg["arch"],
-                        cfg["warps"], cfg["stages"], cfg["wpeu"], outdir, stem)
+        p = compile_one(
+            cfg["src"], cfg["kernel"], cfg["sig"], cfg["arch"], cfg["warps"], cfg["stages"], cfg["wpeu"], outdir, stem
+        )
         return idx, str(p), None
     except Exception:
         return idx, None, traceback.format_exc(limit=3)
@@ -75,8 +84,9 @@ def main():
     if not ok:
         return
     env = dict(os.environ)
-    r = subprocess.run([sys.executable, str(HERE / "harmscan.py")] + ok,
-                       capture_output=True, text=True, env=env, cwd=str(HERE))
+    r = subprocess.run(
+        [sys.executable, str(HERE / "harmscan.py")] + ok, capture_output=True, text=True, env=env, cwd=str(HERE)
+    )
     print(r.stdout)
     print(r.stderr[-2000:] if r.returncode else "", file=sys.stderr)
 

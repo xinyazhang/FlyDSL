@@ -14,29 +14,35 @@ instruction that actually reads the undefined value.
 
 usage: LLVM_BIN=... consumescan.py <objects...>
 """
-import re
+
 import sys
 from pathlib import Path
 
-import lostdef as L
 import spillscan as S
 import undefscan as U
 
 # instructions that only move a value around without observing it
-MOVERS = ('v_writelane_b32', 'v_readlane_b32', 's_mov_b32', 's_mov_b64')
+MOVERS = ("v_writelane_b32", "v_readlane_b32", "s_mov_b32", "s_mov_b64")
 
 # VOP3B-style instructions whose *second* operand is a second destination
 # (carry-out / scale-out), not a source.  undefscan.uses_of() treats every
 # operand after the first as a source, which flags these spuriously.
-TWO_DST = ('v_mad_u64_u32', 'v_mad_i64_i32', 'v_add_co_u32', 'v_sub_co_u32',
-           'v_subrev_co_u32', 'v_div_scale_f32', 'v_div_scale_f64')
+TWO_DST = (
+    "v_mad_u64_u32",
+    "v_mad_i64_i32",
+    "v_add_co_u32",
+    "v_sub_co_u32",
+    "v_subrev_co_u32",
+    "v_div_scale_f32",
+    "v_div_scale_f64",
+)
 
 
 def uses_of(ins):
     """undefscan.uses_of, minus the second destination of VOP3B forms."""
-    if not ins['op'].startswith(TWO_DST):
+    if not ins["op"].startswith(TWO_DST):
         return U.uses_of(ins)
-    parts = [p.strip() for p in ins['ops'].split(',')]
+    parts = [p.strip() for p in ins["ops"].split(",")]
     out = set()
     for s in parts[2:]:
         out |= U.regs(s)
@@ -78,11 +84,11 @@ def scan(path):
         live = set(inn[b])
         for i in range(s, e):
             ins = insns[i]
-            op = ins['op']
+            op = ins["op"]
             if not op.startswith(MOVERS):
                 bad = uses_of(ins) & tainted
                 if bad:
-                    findings.append((ins['pc'], op, ins['ops'], sorted(bad)))
+                    findings.append((ins["pc"], op, ins["ops"], sorted(bad)))
             tainted, lanes = S.run_block(insns, (i, i + 1), live, (tainted, lanes))
             live |= U.defs_of(ins)
     return findings
@@ -94,15 +100,15 @@ def main(paths):
         try:
             f = scan(p)
         except Exception as exc:  # noqa: BLE001
-            print(f'### {Path(p).name}  SCAN ERROR {exc}')
+            print(f"### {Path(p).name}  SCAN ERROR {exc}")
             continue
         if f:
             flagged += 1
-            print(f'### {Path(p).name}  ({len(f)} consumers)')
+            print(f"### {Path(p).name}  ({len(f)} consumers)")
             for pc, op, ops, bad in f[:6]:
-                print(f'    0x{pc:08X}  {op} {ops}   reads lost: {bad}')
-    print(f'\n{flagged} of {len(paths)} objects compute with a lost definition')
+                print(f"    0x{pc:08X}  {op} {ops}   reads lost: {bad}")
+    print(f"\n{flagged} of {len(paths)} objects compute with a lost definition")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main(sys.argv[1:])

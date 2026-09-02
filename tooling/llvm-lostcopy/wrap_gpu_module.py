@@ -5,6 +5,7 @@
 
 usage: wrap_gpu_module.py <imported.mlir> <original.ll> <out.mlir> [chip]
 """
+
 import re
 import sys
 from pathlib import Path
@@ -20,7 +21,7 @@ for line in Path(ll).read_text().splitlines():
         break
 
 lines = Path(imp).read_text().splitlines()
-i = next(k for k, l in enumerate(lines) if l.startswith("module"))
+i = next(k for k, ln in enumerate(lines) if ln.startswith("module"))
 head = lines[:i]
 body = lines[i + 1 :]
 # drop the module's closing brace (last line that is exactly "}")
@@ -31,9 +32,10 @@ body = body[:j] + body[j + 1 :]
 
 wrapped = (
     head
-    + ["module {",
-       f'  gpu.module @kernels [#rocdl.target<chip = "{chip}">] '
-       f'attributes {{llvm.data_layout = "{dl}"}} {{']
+    + [
+        "module {",
+        f'  gpu.module @kernels [#rocdl.target<chip = "{chip}">] ' f'attributes {{llvm.data_layout = "{dl}"}} {{',
+    ]
     + body
     + ["  }", "}"]
 )

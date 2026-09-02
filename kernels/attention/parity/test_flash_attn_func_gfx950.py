@@ -1173,9 +1173,10 @@ def test_packed_varlen_draws_a_dropout_plane_per_sequence():
     # One pool laid out two ways. Equal lengths, so the packed (1, H, N*S, D)
     # and dense (N, H, S, D) views hold the same rows in the same order.
     qp, kp, vp = (_rand(1, h, cu[-1], d) for _ in range(3))
-    to_b = (
-        lambda t: t.view(1, h, n, length, d).permute(2, 0, 1, 3, 4).reshape(n, h, length, d).contiguous()
-    )  # noqa: E731
+
+    def to_b(t):
+        return t.view(1, h, n, length, d).permute(2, 0, 1, 3, 4).reshape(n, h, length, d).contiguous()
+
     qb, kb, vb = to_b(qp), to_b(kp), to_b(vp)
 
     p, seed = 0.5, 1234

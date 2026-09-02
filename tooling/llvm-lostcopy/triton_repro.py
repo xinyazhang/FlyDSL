@@ -10,6 +10,7 @@ usage:
 
 Writes <outdir>/<name>.hsaco, .ll (llir), .amdgcn (asm) and .json.
 """
+
 import argparse
 import importlib.util
 import json

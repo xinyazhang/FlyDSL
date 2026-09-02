@@ -22,6 +22,7 @@ so the SGPR pair, when present, is the last operand.
 
 usage: LLVM_BIN=... globalscan.py <objects...>
 """
+
 import re
 import sys
 from pathlib import Path
@@ -29,12 +30,12 @@ from pathlib import Path
 import spillscan as S
 import undefscan as U
 
-PAIR = re.compile(r's\[(\d+):(\d+)\]\s*$')
+PAIR = re.compile(r"s\[(\d+):(\d+)\]\s*$")
 
 
 def saddr_of(ins):
     """The 64-bit SGPR base of a global_* instruction, or empty."""
-    parts = [p.strip() for p in ins['ops'].split(',')]
+    parts = [p.strip() for p in ins["ops"].split(",")]
     if not parts:
         return set()
     m = PAIR.match(parts[-1])
@@ -79,10 +80,10 @@ def scan(path):
         live = set(inn[b])
         for i in range(s, e):
             ins = insns[i]
-            if ins['op'].startswith('global_'):
+            if ins["op"].startswith("global_"):
                 base = saddr_of(ins)
                 if base & tainted:
-                    findings.append((ins['pc'], ins['op'], ins['ops'], sorted(base & tainted)))
+                    findings.append((ins["pc"], ins["op"], ins["ops"], sorted(base & tainted)))
             tainted, lanes = S.run_block(insns, (i, i + 1), live, (tainted, lanes))
             live |= U.defs_of(ins)
     return findings
@@ -94,16 +95,15 @@ def main(paths):
         try:
             f = scan(p)
         except Exception as exc:  # noqa: BLE001
-            print(f'### {Path(p).name}  SCAN ERROR {exc}')
+            print(f"### {Path(p).name}  SCAN ERROR {exc}")
             continue
         if f:
             flagged += 1
-            print(f'### {Path(p).name}  ({len(f)} accesses)')
+            print(f"### {Path(p).name}  ({len(f)} accesses)")
             for pc, op, ops, bad in f[:4]:
-                print(f'    0x{pc:08X}  {op} {ops}   saddr from lost def: {bad}')
-    print(f'\n{flagged} of {len(paths)} objects address a global_* access '
-          f'with a base built from a lost definition')
+                print(f"    0x{pc:08X}  {op} {ops}   saddr from lost def: {bad}")
+    print(f"\n{flagged} of {len(paths)} objects address a global_* access " f"with a base built from a lost definition")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main(sys.argv[1:])

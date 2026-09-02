@@ -9,6 +9,7 @@ uses.  MachineIR goes to stderr; redirect it.
 usage: drive2.py <in.mlir> <out.s> [name=value ...]
 e.g.   drive2.py mod.mlir out.s print-after=greedy filter-print-funcs=flyc_bwd_dkdv
 """
+
 import ctypes
 import os
 import sys
@@ -69,9 +70,9 @@ for kv in sys.argv[3:]:
     setopt(k, v)
 with ir.Context():
     m = ir.Module.parse(Path(inp).read_text())
-    PassManager.parse(
-        'builtin.module(gpu-module-to-binary{format=isa opts="--amdgpu-waves-per-eu=1"})'
-    ).run(m.operation)
+    PassManager.parse('builtin.module(gpu-module-to-binary{format=isa opts="--amdgpu-waves-per-eu=1"})').run(
+        m.operation
+    )
     txt = str(m.operation)
 key = 'assembly = "'
 i = txt.index(key) + len(key)

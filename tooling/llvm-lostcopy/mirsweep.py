@@ -10,6 +10,7 @@ Categories (see REPORT-triton-gfx950-lost-sgpr-copy.md):
 
 usage: mirsweep.py <dir-with-.ll> [-j N] [--func NAME]
 """
+
 import argparse
 import os
 import subprocess
@@ -28,9 +29,20 @@ CLANG = os.path.join(BIN, "amdclang") if BIN else "amdclang"
 
 def one(path):
     p = Path(path)
-    cmd = [CLANG, "-x", "ir", "-S", "--target=amdgcn-amd-amdhsa", "-mcpu=gfx950",
-           "-O3", str(p), "-o", "/dev/null",
-           "-mllvm", "-print-after=greedy"]
+    cmd = [
+        CLANG,
+        "-x",
+        "ir",
+        "-S",
+        "--target=amdgcn-amd-amdhsa",
+        "-mcpu=gfx950",
+        "-O3",
+        str(p),
+        "-o",
+        "/dev/null",
+        "-mllvm",
+        "-print-after=greedy",
+    ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     txt = r.stderr + r.stdout
     if "IR Dump After" not in txt:

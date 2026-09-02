@@ -8,8 +8,8 @@ lane N is never written" can be checked by reading the dump.
 
 usage: witness.py <dump> <slot> [--section N]
 """
+
 import argparse
-import re
 from collections import deque
 from pathlib import Path
 
@@ -19,7 +19,7 @@ import mirscan as M
 
 def run(path, slot):
     for sec in M.sections(Path(path).read_text()):
-        if 'SI_SPILL' not in sec:
+        if "SI_SPILL" not in sec:
             continue
         blocks, succ, defs, uses = C.parse(sec)
         if not blocks:
@@ -41,12 +41,12 @@ def run(path, slot):
                     d = set()
                     for name in defs.get(int(m.group(2)), set()):
                         d |= M.lanes(name, ww)
-                    lst.append((i, 'save', int(m.group(2)), d, ln.strip()))
+                    lst.append((i, "save", int(m.group(2)), d, ln.strip()))
                     continue
                 if C.SAVE_PHYS.search(ln):
                     ww = M.CLASS_W.get(C.SAVE_PHYS.search(ln).group(1), 0)
                     w = max(w, ww)
-                    lst.append((i, 'save', None, set(range(ww)), ln.strip()))
+                    lst.append((i, "save", None, set(range(ww)), ln.strip()))
                     continue
                 m = C.RESTORE.search(ln)
                 if m:
@@ -56,14 +56,12 @@ def run(path, slot):
                     for name in uses.get(int(m.group(1)), set()):
                         if name:
                             rd |= M.lanes(name, ww)
-                    lst.append((i, 'restore', int(m.group(1)), rd, ln.strip()))
+                    lst.append((i, "restore", int(m.group(1)), rd, ln.strip()))
             ev[b] = lst
 
         # candidate partial stores and reading restores
-        partial = [(b, e) for b in order for e in ev[b]
-                   if e[1] == 'save' and e[3] != set(range(w))]
-        readers = [(b, e) for b in order for e in ev[b]
-                   if e[1] == 'restore' and e[3]]
+        partial = [(b, e) for b in order for e in ev[b] if e[1] == "save" and e[3] != set(range(w))]
+        readers = [(b, e) for b in order for e in ev[b] if e[1] == "restore" and e[3]]
         if not partial or not readers:
             continue
 
@@ -75,12 +73,12 @@ def run(path, slot):
                     continue
                 p = bfs(pb, pe[0], rb, re_[0], order, succ, ev, slot, w)
                 if p:
-                    print(f'slot %stack.{slot}  lanes {sorted(need)} never written on this path')
-                    print(f'  store  bb.{pb}: {pe[4][:130]}')
-                    print(f'          defines lanes {sorted(pe[3])}')
+                    print(f"slot %stack.{slot}  lanes {sorted(need)} never written on this path")
+                    print(f"  store  bb.{pb}: {pe[4][:130]}")
+                    print(f"          defines lanes {sorted(pe[3])}")
                     print(f'  path   {" -> ".join("bb.%d" % x for x in p)}')
-                    print(f'  restore bb.{rb}: {re_[4][:130]}')
-                    print(f'          reads lanes {sorted(re_[3])}')
+                    print(f"  restore bb.{rb}: {re_[4][:130]}")
+                    print(f"          reads lanes {sorted(re_[3])}")
                     return True
     return False
 
@@ -91,13 +89,13 @@ def bfs(sb, si, rb, ri, order, succ, ev, slot, w):
 
     def full_after(b, lo, hi):
         for i, kind, reg, lanes, _ln in ev.get(b, []):
-            if kind == 'save' and lanes == FULL and lo < i < hi:
+            if kind == "save" and lanes == FULL and lo < i < hi:
                 return True
         return False
 
     if sb == rb and si < ri and not full_after(sb, si, ri):
         return [sb]
-    if full_after(sb, si, 10 ** 9):
+    if full_after(sb, si, 10**9):
         start_ok = False
     else:
         start_ok = True
@@ -120,17 +118,17 @@ def bfs(sb, si, rb, ri, order, succ, ev, slot, w):
                         x = prev[x]
                     return out[::-1]
                 continue
-            if full_after(s, -1, 10 ** 9):
+            if full_after(s, -1, 10**9):
                 continue
             prev[s] = b
             q.append(s)
     return None
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument('dump')
-    ap.add_argument('slot', type=int)
+    ap.add_argument("dump")
+    ap.add_argument("slot", type=int)
     a = ap.parse_args()
     if not run(a.dump, a.slot):
-        print('no witness path found')
+        print("no witness path found")

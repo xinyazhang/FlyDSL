@@ -12,6 +12,7 @@ destination register, and classifies every lost definition as LIVE or DEAD.
 
 usage: LLVM_BIN=... harmscan.py <objects...>
 """
+
 import re
 import sys
 from pathlib import Path
@@ -19,7 +20,7 @@ from pathlib import Path
 import lostdef as L
 import undefscan as U
 
-READLANE = re.compile(r's(\d+),\s*v(\d+),\s*(\d+)\s*$')
+READLANE = re.compile(r"s(\d+),\s*v(\d+),\s*(\d+)\s*$")
 
 
 def liveness(insns, blocks, succs):
@@ -78,13 +79,13 @@ def scan(path):
         v, s, lane = int(m.group(1)), int(m.group(2)), int(m.group(3))
         reloads = []
         for i, ins in enumerate(insns):
-            if not ins['op'].startswith('v_readlane_b32'):
+            if not ins["op"].startswith("v_readlane_b32"):
                 continue
-            mm = READLANE.search(ins['ops'].strip())
+            mm = READLANE.search(ins["ops"].strip())
             if not mm or int(mm.group(2)) != v or int(mm.group(3)) != lane:
                 continue
             dst = int(mm.group(1))
-            reloads.append((ins['pc'], dst, live_at(insns, blocks, succs, live_out, i, dst)))
+            reloads.append((ins["pc"], dst, live_at(insns, blocks, succs, live_out, i, dst)))
         out.append((pc, v, s, lane, reloads))
     return out
 
@@ -97,19 +98,19 @@ def main():
             continue
         n_obj += 1
         live_here = False
-        print(f'### {Path(p).name}')
+        print(f"### {Path(p).name}")
         for pc, v, s, lane, reloads in res:
-            print(f'  0x{pc:08X}  v_writelane_b32 v{v}, s{s}, {lane}   (s{s} undefined)')
+            print(f"  0x{pc:08X}  v_writelane_b32 v{v}, s{s}, {lane}   (s{s} undefined)")
             if not reloads:
-                print('      no reload of that lane')
+                print("      no reload of that lane")
             for rpc, dst, live in reloads:
-                tag = 'LIVE  <<< consumed' if live else 'dead'
+                tag = "LIVE  <<< consumed" if live else "dead"
                 live_here |= live
-                print(f'      reload 0x{rpc:08X} -> s{dst}: {tag}')
+                print(f"      reload 0x{rpc:08X} -> s{dst}: {tag}")
         if live_here:
             n_live += 1
-    print(f'\n{n_live} of {n_obj} flagged objects have a LIVE lost definition')
+    print(f"\n{n_live} of {n_obj} flagged objects have a LIVE lost definition")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
