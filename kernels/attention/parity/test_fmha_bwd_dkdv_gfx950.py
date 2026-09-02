@@ -42,6 +42,7 @@ than guessed, and it scales with sequence length and head dim on its own.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -680,21 +681,27 @@ def _dump_isa(*, dtype_str, rows):
     """
     here = os.path.dirname(os.path.abspath(__file__))
     out = tempfile.mkdtemp(prefix="isa_dtype_")
-    env = dict(os.environ, FLYDSL_RUNTIME_ENABLE_CACHE="0", FLYDSL_DUMP_IR="1", FLYDSL_DUMP_DIR=out)
-    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
-        f.write(_ISA_CHILD.format(parity=here))
-        script = f.name
-    r = subprocess.run(
-        [sys.executable, script, "--rows", str(rows), "--dt", dtype_str],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    assert r.returncode == 0, f"build failed for {dtype_str} rows{rows}:\n{r.stderr[-2000:]}"
-    path = os.path.join(out, "fmha_bwd_dkdv_gfx950_kernel_0", "21_final_isa.s")
-    with open(path) as fh:
-        isa = fh.read()
+    try:
+        env = dict(os.environ, FLYDSL_RUNTIME_ENABLE_CACHE="0", FLYDSL_DUMP_IR="1", FLYDSL_DUMP_DIR=out)
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write(_ISA_CHILD.format(parity=here))
+            script = f.name
+        r = subprocess.run(
+            [sys.executable, script, "--rows", str(rows), "--dt", dtype_str],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        assert r.returncode == 0, f"build failed for {dtype_str} rows{rows}:\n{r.stderr[-2000:]}"
+        path = os.path.join(out, "fmha_bwd_dkdv_gfx950_kernel_0", "21_final_isa.s")
+        with open(path) as fh:
+            isa = fh.read()
+    finally:
+        # An IR dump is ~6 MB and this helper runs four times per suite pass.
+        # Left behind, they filled /tmp and killed a 33-minute run mid-flight.
+        shutil.rmtree(out, ignore_errors=True)
+        os.unlink(script)
     # The negative control: if the scan is not looking at a real kernel, every
     # "absence" assertion below passes vacuously.
     assert "v_mfma" in isa, f"no MFMA in the dumped ISA for {dtype_str} rows{rows}; this is not the kernel"
