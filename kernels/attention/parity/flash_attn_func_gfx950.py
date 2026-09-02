@@ -118,6 +118,8 @@ from gfx950_standalone import dualwave
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr
 
@@ -139,7 +141,52 @@ _sched_barrier = dualwave._sched_barrier
 _sched_barrier_exp_pairs = dualwave._sched_barrier_exp_pairs
 _sched_barrier_pairs = dualwave._sched_barrier_pairs
 _stagger_extra_barrier_if_one = dualwave._stagger_extra_barrier_if_one
-_stagger_extra_barrier_if_zero = dualwave._stagger_extra_barrier_if_zero
+
+
+def _stagger_extra_barrier_if_zero(stagger_i32):
+    """`s_barrier` only when `stagger == 0`, **declaring the SCC clobber**.
+
+    `dualwave._stagger_extra_barrier_if_zero` is this function with the
+    constraint string `"s"` instead of `"s,~{scc}"`, and that omission is a
+    live bug rather than a tidiness point. The asm body runs
+
+        s_cmp_eq_u32 $0, 0
+        s_cbranch_scc0 1f
+        s_barrier
+        1:
+
+    -- both of the first two instructions touch SCC -- so without the clobber
+    LLVM is entitled to keep an SCC-producing compare live *across* the asm,
+    and it does. AOTriton found the victim: the null-`LSE` test added below
+    (`_store_lse_row`) compiles to `s_cmp_eq_u64 s[2:3], 0`, which got hoisted
+    above this asm, and the `s_cbranch_scc1` reading it -- about 200
+    instructions later -- branched on the asm's leftover `stagger == 0`
+    instead. The LSE store was skipped for every row, so fp16 with
+    `PADDED_HEAD` returned an untouched `L` at `BLOCK_DMODEL` 96/128/160/192,
+    while bf16 happened to schedule the two compares the other way and was
+    correct.
+
+    Nothing about it is dtype- or head-dim-specific; those were the schedules
+    that exposed it.
+
+    **Only this one needs it.** AOTriton's note says
+    `_stagger_extra_barrier_if_one` "has the same body and the same omission";
+    in this tree it does not -- it is a `@flyc.jit` with real control flow and
+    no inline asm at all, so there is nothing to declare. Verified, not
+    assumed.
+
+    Local because `flash_attn_utils.py` is imported and never edited here.
+    Delete this and restore the alias once upstream adds the clobber (issue 7).
+    """
+    llvm.inline_asm(
+        ir.Type.parse("!llvm.void"),
+        [stagger_i32],
+        ("s_cmp_eq_u32 $0, 0\n\ts_cbranch_scc0 1f\n\ts_barrier\n\t1:"),
+        "s,~{scc}",
+        has_side_effects=True,
+    )
+
+
 _v_pair_to_vec32 = dualwave._v_pair_to_vec32
 _v_vec32_to_pair = dualwave._v_vec32_to_pair
 _waitcnt_vm_n = dualwave._waitcnt_vm_n
