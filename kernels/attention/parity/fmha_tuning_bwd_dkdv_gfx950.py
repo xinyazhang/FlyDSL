@@ -269,6 +269,25 @@ _FEATURE_OVERRIDES = {
     (160, False, True, True): (4, 2, 1, 16, 64, False),
     (224, False, False, True): (4, 1, 1, 32, 64, True),
     (224, False, True, True): (4, 1, 1, 32, 64, True),
+    # **Varlen re-tuned after the logsumexp layout became a runtime branch.**
+    # A varlen build now emits both row-read arms and picks between them once,
+    # outside the tile loop (`BwdDkDvSoftmaxHelper.load_row_values`). Dense
+    # builds are untouched -- they cannot be handed the other layout, so they
+    # keep the single specialised arm -- but two rungs of the 32-row family no
+    # longer suit the geometry they had. Measured, `B=2 H=8 S=4096` packed
+    # varlen, against the same shapes before the change:
+    #
+    #   head_dim 64,  non-causal   policy 622   16-row 659    (was 712)
+    #   head_dim 64,  causal       policy 917   16-row 1017   (was 876)
+    #   head_dim 224, non-causal   policy 271   32 tight 723  (was 627)
+    #
+    # The 16-row family is *unaffected* by the extra arm at both rungs -- it
+    # holds four accumulator elements per lane to the 32-row family's
+    # thirty-two -- which is why it wins where the 32-row one gives way. At
+    # head_dim 64 causal it is now faster than anything the old code reached.
+    (64, False, True, False): (4, 1, 1, 16, 64, False),
+    (64, True, True, False): (4, 1, 1, 16, 64, False),
+    (224, False, True, False): (4, 1, 1, 32, 64, True),
 }
 
 

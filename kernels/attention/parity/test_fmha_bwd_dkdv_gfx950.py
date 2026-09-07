@@ -2187,3 +2187,103 @@ def test_f16_range_holds_where_bf16_does_and_the_boundary_is_ds(rows):
         assert torch.isfinite(dk.float()).all(), f"{name}: dK is not finite at a magnitude inside f16's range"
         assert torch.isfinite(dv.float()).all(), f"{name}: dV is not finite at a magnitude inside f16's range"
         assert _rel(dk, dk64) < 1e-2 and _rel(dv, dv64) < 1e-2, f"{name}: wrong at 15000x dO"
+
+
+@pytest.mark.parametrize("build_th", [False, True], ids=["build-HT", "build-TH"])
+@pytest.mark.parametrize("bits_th", [False, True], ids=["bits-HT", "bits-TH"])
+@pytest.mark.parametrize("hq", [1, 4], ids=["h1", "h4"])
+def test_logsumexp_layout_is_decoded_at_runtime_not_at_build(build_th, bits_th, hq, dtype):
+    """The kernel must be right for either `VarlenBits` layout, whatever it was built for.
+
+    `fmha.lse_row_addressing` decodes the logsumexp layout from bits 17:16 at
+    **runtime**, so `base` and `pitch` were always right for either -- but the
+    row read specialised on the `lse_layout_th` build axis and, on the `_HT`
+    arm, ignored `pitch` and loaded contiguously. A build compiled
+    `lse_layout_th=False` and handed `_TH` bits read the wrong elements.
+
+    The only thing that caught it was `_args`, and `_args` is a host-side
+    wrapper: AOTriton launches from C++ and never calls it, which is why their
+    Level 3 run failed **1193 tests, every one of them `test_op_bwd[TH-...]`**
+    -- the whole TH varlen backward, every head dim, both dtypes, dropout and
+    causal on and off. Same shape as the GQA trip count: a build trait that has
+    to match a runtime bit, enforced only where the consumer does not look.
+
+    Measured before the fix, packed varlen, two sequences, head_dim 64, against
+    an fp64 reference:
+
+        num_head_q   build=HT/bits=HT   build=TH/bits=TH   build=HT/bits=TH
+             4          2.36e-03           2.36e-03           3.34e-01
+             8          2.36e-03           2.36e-03           3.33e-01
+             1          2.35e-03           2.35e-03           2.35e-03
+
+    **`hq=1` is parametrised because it is the case that hides the bug.** At
+    `num_head_q == 1` the two layouts coincide exactly -- `base_ht == base_th`
+    and both pitches are 1 -- so an `hq=1` test passes against a broken kernel.
+    AOTriton pins `num_heads=1` at build and passes the real count as a
+    kernarg, which is precisely what made this reachable for them and
+    unreachable for anyone testing at one head.
+    """
+    _require_rocm_path()
+    import fmha_abi_gfx1201 as abi
+
+    d = 64
+    lens = [128, 192]
+    smax, total = max(lens), sum(lens)
+    scale = 1.0 / d**0.5
+    knobs = _family_knobs(d, 32)
+    torch.manual_seed(31)
+    qs = [_rand(1, hq, n, d) for n in lens]
+    ks = [_rand(1, hq, n, d) for n in lens]
+    vs = [_rand(1, hq, n, d) for n in lens]
+    dos = [_rand(1, hq, n, d) for n in lens]
+    qp, kp, vp, dop = (torch.cat(t, dim=2) for t in (qs, ks, vs, dos))
+
+    lse_ht = torch.zeros(hq, total, device="cuda", dtype=torch.float32)
+    del_ht = torch.zeros_like(lse_ht)
+    ref_dk, ref_dv, off = [], [], 0
+    for i, n in enumerate(lens):
+        lse, delta, dk_, dv_ = _gqa_ref(qs[i], ks[i], vs[i], dos[i], scale)
+        ref_dk.append(dk_)
+        ref_dv.append(dv_)
+        lse_ht[:, off : off + n] = lse.float().reshape(hq, n)
+        del_ht[:, off : off + n] = delta.float().reshape(hq, n)
+        off += n
+    ref_dk, ref_dv = torch.cat(ref_dk, dim=2), torch.cat(ref_dv, dim=2)
+
+    # The same numbers, laid out the way the bits say.
+    lse = lse_ht.t().contiguous() if bits_th else lse_ht
+    dlt = del_ht.t().contiguous() if bits_th else del_ht
+    layout = abi.VARLEN_LSE_LAYOUT_TH if bits_th else abi.VARLEN_LSE_LAYOUT_HT
+    fn = build(
+        num_heads=hq,
+        head_dim=d,
+        num_kv_heads=hq,
+        varlen=True,
+        lse_layout_th=build_th,
+        dtype_str=_dt_str(),
+        **knobs,
+    )
+    dk, dv = torch.full_like(kp, float("nan")), torch.full_like(vp, float("nan"))
+    fn(
+        qp,
+        kp,
+        vp,
+        dop,
+        dk,
+        dv,
+        lse,
+        dlt,
+        1,
+        smax,
+        seqlen_k=smax,
+        scale=scale,
+        varlen=abi.varlen_compact(cu := _cu(lens), cu, smax, smax, lse_tokens=total, lse_layout=layout),
+        num_seqlens=len(lens),
+    )
+    torch.cuda.synchronize()
+    for name, got, ref in (("dk", dk, ref_dk), ("dv", dv, ref_dv)):
+        e = _rel(got, ref)
+        assert e < 1e-2, (
+            f"{name}: {e:.3e} at build_th={build_th} bits_th={bits_th} num_head_q={hq}. The row read is "
+            "ignoring the runtime pitch, so the logsumexp rows are being taken from the wrong elements."
+        )

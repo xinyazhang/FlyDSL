@@ -1119,13 +1119,53 @@ class BwdDkDvSoftmaxHelper(ParitySoftmaxHelper):
 
         **Under the `_TH` logsumexp layout the four rows are `num_heads`
         apart**, so the wide load does not apply and it is sixteen scalars
-        instead. That is why the layout is a build axis rather than a runtime
-        bit: making every build take the scalar path measured 0.68x at head_dim
-        64, where the row-tensor reads are the largest share of a tile.
+        instead.
+
+        **The choice is made at runtime, and it has to be.** `lse_layout_th`
+        used to select this at build time, with `_args` rejecting a call whose
+        `VarlenBits` disagreed. `lse_row_addressing` decodes the layout from
+        those bits at *runtime*, so `base` and `pitch` were already right for
+        either -- and this method then ignored `pitch` and loaded contiguously.
+        A build compiled `lse_layout_th=False` and handed TH bits read the
+        wrong elements, silently, and the only thing stopping it was a
+        host-side wrapper that AOTriton's C++ launcher never calls. Measured by
+        bypassing that wrapper, packed varlen, two sequences, head_dim 64:
+
+            num_head_q    build=HT/bits=HT   build=TH/bits=TH   build=HT/bits=TH
+                 4            2.36e-03           2.36e-03          3.34e-01
+                 8            2.36e-03           2.36e-03          3.33e-01
+                 1            2.35e-03           2.35e-03          2.35e-03
+
+        -- the same defect shape as the GQA trip count, and unreachable at
+        `num_head_q == 1`, where the two layouts coincide exactly
+        (`base_ht == base_th`, both pitches 1). AOTriton pins `num_heads=1` at
+        build but passes the real count as a kernarg, which is what made this
+        reachable.
+
+        **The predicate is `pitch != 1`, not the bits.** It comes from the one
+        decode rather than a second reading of `VarlenBits`, so the two cannot
+        drift -- and it is the sharper test: the wide load is valid exactly
+        when the pitch is 1, which includes TH at `num_head_q == 1`.
+
+        **The branch is outside the tile loop, and it has to be.** `LSE_STRIDED`
+        is a *Python* bool here: the kernel body is traced twice, once per arm,
+        and one runtime `scf.if` on `ctx.lse_strided` picks a whole body. Put
+        the branch here instead -- an `scf.if` per call, four per tile -- and
+        the loop pays for it whichever arm it takes, because the region is a
+        scheduling barrier the row loads can no longer be hoisted across.
+        Measured, `B=2 H=8 S=4096`, branch-inside against this:
+
+            head_dim        32     64     96    128    224    512
+            branch inside  450    497    603    700    355    433
+            branch outside 494    741    765    812    627    430
+
+        -- the inside form performs as though it always took the scalar arm,
+        which is the 0.68x that made this a build axis in the first place. The
+        cost of the outside form is that the body is emitted twice.
         """
         values = [None] * 16
         row_base = fx.Int32(tile_base + fx.Index(half * 32)) + fx.Int32(self.lane_div_32) * fx.Int32(4)
-        if const_expr(not self.LSE_TH):
+        if const_expr(not self.LSE_STRIDED):
             for elem0, col_off, width in _ROW_RUNS:
                 span = buffer_ops.buffer_load(
                     rsrc,
@@ -1548,6 +1588,11 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
     # Which MFMA family this build is. See `fmha_bwd_dkdv_m16_gfx950`.
     M16 = traits.MFMA_ROWS == 16
     # `(T, H)` logsumexp/delta. See `BwdDkDvInputMetadata.lse_layout_th`.
+    # `lse_layout_th` no longer reaches the emitted code: the row read decodes
+    # the layout at runtime and a varlen build carries both arms. It stays in
+    # the cache key so a caller who does pass it still gets a distinct entry
+    # rather than a silently shared one, and stays in the metadata so the
+    # signature does not move; nothing else reads it.
     LSE_TH = bool(meta.lse_layout_th)
     # One knob for the whole register-against-ILP trade; see
     # `BwdDkDvTileBody._row_reader` and `_with_register_pressure`.
@@ -1708,7 +1753,6 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         ctx.init_atoms_and_lds_ptrs()
         ctx.init_dma_thread_offsets()
         ctx.init_tile_bounds()
-        ctx.LSE_TH = LSE_TH
         ctx.init_active_guard()
         ctx.init_lds_read_bases()
         ctx.init_dma_m0_tables()
@@ -1731,19 +1775,24 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             resident = m16.M16ResidentLoader(ctx)
             gemm = m16.M16GemmHelper(ctx)
             gemm.init16()
-            softmax = m16.M16SoftmaxHelper(ctx)
             store = m16.M16StoreHelper(ctx)
-            tile = m16.M16TileBody(
-                ctx,
-                stream=stream,
-                reader=reader,
-                gemm=gemm,
-                softmax=softmax,
-                hdim_qk=hdim_qk,
-                hdim_vo=hdim_vo,
-                keep_fn=philox_keep,
-                bias_fn=bias_log2e,
-            )
+
+            def _m16_tile(lse_strided):
+                sm = m16.M16SoftmaxHelper(ctx)
+                sm.LSE_STRIDED = lse_strided
+                return m16.M16TileBody(
+                    ctx,
+                    stream=stream,
+                    reader=reader,
+                    gemm=gemm,
+                    softmax=sm,
+                    hdim_qk=hdim_qk,
+                    hdim_vo=hdim_vo,
+                    keep_fn=philox_keep,
+                    bias_fn=bias_log2e,
+                )
+
+            tile_wide, tile_strided = _m16_tile(False), _m16_tile(True)
             n_acc = m16.d_chunks16(traits)
             zero_acc = Vec.filled(m16.ACC16, 0.0, fx.Float32).ir_value()
             acc_width = m16.ACC16
@@ -1752,18 +1801,23 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             reader.masked_steps = MASKED_STEPS
             resident = BwdDkDvResidentLoader(ctx)
             gemm = BwdDkDvGemmHelper(ctx)
-            softmax = BwdDkDvSoftmaxHelper(ctx)
             store = BwdDkDvStoreHelper(ctx)
-            tile = BwdDkDvTileBody(
-                ctx,
-                stream=stream,
-                reader=reader,
-                gemm=gemm,
-                softmax=softmax,
-                hdim_qk=hdim_qk,
-                hdim_vo=hdim_vo,
-                tight_registers=TIGHT_REGISTERS,
-            )
+
+            def _m32_tile(lse_strided):
+                sm = BwdDkDvSoftmaxHelper(ctx)
+                sm.LSE_STRIDED = lse_strided
+                return BwdDkDvTileBody(
+                    ctx,
+                    stream=stream,
+                    reader=reader,
+                    gemm=gemm,
+                    softmax=sm,
+                    hdim_qk=hdim_qk,
+                    hdim_vo=hdim_vo,
+                    tight_registers=TIGHT_REGISTERS,
+                )
+
+            tile_wide, tile_strided = _m32_tile(False), _m32_tile(True)
             n_acc = traits.D_CHUNKS_PER_SHARD
             zero_acc = ctx.c_zero_v16f32
             acc_width = 16
@@ -1774,7 +1828,7 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         drop_vec = Vec.from_elements([ctx.c_dropout_scale], fx.Float32).broadcast_to(acc_width)
 
         @flyc.jit
-        def _dkdv_body():
+        def _dkdv_body(tile):
             """K/V resident, Q/dO streaming, two tiles per iteration.
 
             **The GQA group is the outer loop and the accumulators live across
@@ -1928,15 +1982,49 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         # branch (the predicate is workgroup-uniform), so EXEC is untouched
         # across the transpose reads inside -- which is not optional; see
         # `tooling/check_exec_hazard_gfx950.py`.
-        if const_expr(ctx.active is None):
-            _dkdv_body()
+        # **One runtime branch, outside the tile loop, picking a whole body.**
+        # `lse_row_addressing` decodes the logsumexp layout from `VarlenBits`
+        # at runtime, so the kernel must serve either -- and putting the choice
+        # inside `load_row_values` costs the wide arm its throughput, because
+        # an `scf.if` there is a scheduling barrier the row loads cannot be
+        # hoisted across (0.67x at head_dim 64, measured; the docstring on
+        # `BwdDkDvSoftmaxHelper.load_row_values` has the table). Here each arm
+        # is exactly the specialised code it was before, at the price of
+        # emitting the body twice.
+        #
+        # `pitch != 1` rather than the bits: one decode, no second reading, and
+        # it is the sharper test -- at `num_head_q == 1` the two layouts
+        # coincide and the wide arm is correct for both.
+        # **A build without varlen has no bits and cannot be TH.** `_args`
+        # refuses a varlen descriptor on such a build, so `varlen_bits` is 0,
+        # the layout is `_HT` and the pitch is 1 -- there is nothing to choose.
+        # Gating on the trait here keeps every dense build byte-identical to
+        # what it was, and confines the cost of this fix to the builds that can
+        # actually be handed the other layout.
+        lse_strided = ctx.lse_pitch != fx.Index(1)
+        active = ctx.active
+
+        @flyc.jit
+        def _run_body_varlen():
+            if lse_strided:
+                _dkdv_body(tile_strided)
+            else:
+                _dkdv_body(tile_wide)
+
+        def _run_body():
+            if const_expr(not traits.VARLEN):
+                _dkdv_body(tile_wide)
+            else:
+                _run_body_varlen()
+
+        if const_expr(active is None):
+            _run_body()
         else:
-            active = ctx.active
 
             @flyc.jit
             def _run_body_if_active():
                 if active:
-                    _dkdv_body()
+                    _run_body()
 
             _run_body_if_active()
 
@@ -2262,13 +2350,16 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             raise ValueError(f"logsumexp must be ({int(batch_size) * num_head_q}, {seqlen_q}); got {tuple(LSE.shape)}")
         if varlen is not None and not traits.VARLEN:
             raise ValueError("this build was not compiled for varlen; pass varlen=True in BwdDkDvInputMetadata")
-        if varlen is not None and bool((int(varlen["bits"]) >> 16) & 3) != LSE_TH:
-            want = "lse_layout_th=True" if not LSE_TH else "lse_layout_th=False"
-            raise ValueError(
-                f"this build is compiled for lse_layout_th={LSE_TH} but the descriptor's bits say "
-                f"otherwise. The logsumexp layout decides whether a lane's four accumulator rows are "
-                f"adjacent, so it is a build axis here rather than a runtime bit; pass {want}."
-            )
+        # **No layout check any more, and its removal is the fix.** This used
+        # to reject a call whose `VarlenBits` disagreed with `lse_layout_th`,
+        # because the kernel's row read was specialised at build time and would
+        # otherwise read the wrong elements. That made a host-side wrapper the
+        # only thing standing between a wrong number and a caller who does not
+        # go through it -- AOTriton launches from C++ and never calls `_args`,
+        # and its whole TH varlen backward was wrong. The kernel now decodes
+        # the layout at runtime and serves either, so there is nothing left to
+        # reject; `lse_layout_th` survives as a build hint with no effect on
+        # correctness.
         if varlen is None and traits.VARLEN:
             # A varlen build with `bits == 0` decodes to the dense answer, so
             # this would work -- and it would also be a caller who thinks a

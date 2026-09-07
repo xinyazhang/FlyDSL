@@ -299,17 +299,29 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
     """
 
     def load_row_values(self, rsrc, tile_base, sub, scale):
-        """Four f32 from a compact row tensor, times `scale`."""
+        """Four f32 from a compact row tensor, times `scale`.
+
+        **Chosen at runtime on `pitch != 1`**, not at build time on
+        `lse_layout_th`; `BwdDkDvSoftmaxHelper.load_row_values` carries the
+        measurement and the reason. The short version is that
+        `lse_row_addressing` decodes the layout from `VarlenBits` at runtime,
+        so a build compiled for one layout and handed the other read the wrong
+        elements with only a host-side wrapper standing in the way -- and that
+        wrapper is not on AOTriton's path.
+
+        Under `_TH` the four rows are `num_heads` apart, so the `dwordx4` does
+        not apply and it is four scalars. `LSE_STRIDED` is a Python bool: the
+        body is traced once per arm and one runtime branch outside the tile
+        loop picks a whole body, which is what keeps the wide arm at its
+        pre-fix throughput.
+        """
         row0 = fx.Int32(tile_base + fx.Index((sub // 2) * MFMA16_K + (sub % 2) * 4)) + fx.Int32(
             self.lane // fx.Index(MFMA16_M)
         ) * fx.Int32(8)
-        if const_expr(not self.LSE_TH):
+        if const_expr(not self.LSE_STRIDED):
             span = buffer_ops.buffer_load(rsrc, as_mlir_value(row0), vec_width=ACC16, dtype=fx.Float32)
             vec = Vec(span, (ACC16,), fx.Float32)
             return [dualwave._fmul(vec[i], scale, self.fm_fast) for i in range_constexpr(ACC16)]
-        # `_TH`: the four rows are `num_heads` apart, so the vector load does
-        # not apply. A build axis rather than a runtime bit; see
-        # `BwdDkDvInputMetadata.lse_layout_th`.
         pitch = self.lse_pitch
         out = []
         for i in range_constexpr(ACC16):
