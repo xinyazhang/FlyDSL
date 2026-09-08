@@ -288,6 +288,20 @@ _FEATURE_OVERRIDES = {
     (64, False, True, False): (4, 1, 1, 16, 64, False),
     (64, True, True, False): (4, 1, 1, 16, 64, False),
     (224, False, True, False): (4, 1, 1, 32, 64, True),
+    # **head_dim 256, re-tuned when `varlen` became the default.** The rungs
+    # above were measured when varlen was opt-in; with it on by default every
+    # ordinary build carries both row-reader arms, and 256 -- which the policy
+    # gives `block_q=32` -- lost most to it. Measured at `B=2 H=8 S=4096`:
+    #
+    #   256 non-causal   policy 405   32 bq64 tight 505   (was 773 pre-flip)
+    #   256 causal       policy 781   16 bq64       859   (was 1378)
+    #
+    # Neither recovers the pre-flip number; both are the best of five
+    # geometries tried, and they are the price of the decode being present.
+    # head_dim 192 causal is left alone deliberately: its best arm is 1198
+    # against the policy's 1162, and 3% does not earn a table entry.
+    (256, False, True, False): (4, 1, 1, 32, 64, True),
+    (256, True, True, False): (4, 1, 1, 16, 64, False),
 }
 
 
