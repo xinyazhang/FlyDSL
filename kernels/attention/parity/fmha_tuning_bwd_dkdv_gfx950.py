@@ -285,23 +285,48 @@ _FEATURE_OVERRIDES = {
     # holds four accumulator elements per lane to the 32-row family's
     # thirty-two -- which is why it wins where the 32-row one gives way. At
     # head_dim 64 causal it is now faster than anything the old code reached.
-    (64, False, True, False): (4, 1, 1, 16, 64, False),
+    #
+    # **Two of these three survived the row-address rewrite; head_dim 64
+    # non-causal did not** and is a few lines down under what replaced it. The
+    # 271 above is also gone: the 224 rung's policy geometry now measures 473,
+    # so the entry is worth 1.5x rather than 2.6x and still earns its place.
     (64, True, True, False): (4, 1, 1, 16, 64, False),
     (224, False, True, False): (4, 1, 1, 32, 64, True),
-    # **head_dim 256, re-tuned when `varlen` became the default.** The rungs
-    # above were measured when varlen was opt-in; with it on by default every
-    # ordinary build carries both row-reader arms, and 256 -- which the policy
-    # gives `block_q=32` -- lost most to it. Measured at `B=2 H=8 S=4096`:
+    # **head_dim 64 non-causal asks for the occupancy, not a geometry.** The
+    # 16-row entry this replaces was measured against the row-address form
+    # `BwdDkDvSoftmaxHelper.load_row_values` no longer uses; with the uniform
+    # split the policy's own 32-row geometry is the best arm again, and the
+    # only thing left to say is *two waves per SIMD*. The dense build reaches
+    # that on its own at 234 VGPRs; the varlen build wants 276 and, told
+    # `waves_per_eu=1`, LLVM has a 512-register budget and no reason to stop.
+    # Measured at `B=2 H=8 S=4096`, varlen against the dense 740:
     #
-    #   256 non-causal   policy 405   32 bq64 tight 505   (was 773 pre-flip)
-    #   256 causal       policy 781   16 bq64       859   (was 1378)
+    #   policy geometry, waves_per_eu 1    635      16-row entry (old)  625
+    #   policy geometry, waves_per_eu 2    734
     #
-    # Neither recovers the pre-flip number; both are the best of five
-    # geometries tried, and they are the price of the decode being present.
-    # head_dim 192 causal is left alone deliberately: its best arm is 1198
-    # against the policy's 1162, and 3% does not earn a table entry.
-    (256, False, True, False): (4, 1, 1, 32, 64, True),
-    (256, True, True, False): (4, 1, 1, 16, 64, False),
+    # The hint is not a geometry change -- the five other fields are the
+    # policy's. It buys the second wave for 24 scratch slots, which is the
+    # only rung where that trade has to be made rather than won outright, and
+    # it is worth making: the spills cost 2% and the wave is worth 15%. Causal
+    # is left on the 16-row entry above; it measures 1002 there against 960
+    # for this one.
+    (64, False, True, False): (4, 2, 1, 32, 64, False),
+    # **head_dim 256 has no varlen entry, and removing it is the fix.** Two
+    # were added when `varlen` became the default, on the reading that the
+    # rung had to be re-tuned around the second row-reader arm. It did not:
+    # the cost was the arm's *addressing*, and with that split into one
+    # divergent multiply and sixteen uniform ones the policy's own geometry
+    # comes back to parity. Measured at `B=2 H=8 S=4096` against the dense
+    # 756 / 1396:
+    #
+    #                    entry (32 bq64 tight / 16 bq64)   policy geometry
+    #   256 non-causal              490                          757
+    #   256 causal                  856                         1392
+    #
+    # -- the entries were tuned against codegen that no longer exists and are
+    # now worth 0.65x and 0.61x. head_dim 192 causal, left alone for being
+    # only 3% off, is back at parity for the same reason and still needs
+    # nothing.
 }
 
 
