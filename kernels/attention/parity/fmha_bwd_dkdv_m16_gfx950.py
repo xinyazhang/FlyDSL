@@ -314,6 +314,13 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
         body is traced once per arm and one runtime branch outside the tile
         loop picks a whole body, which is what keeps the wide arm at its
         pre-fix throughput.
+
+        The scalar arm splits the offset the way the 32-row family's does --
+        one divergent multiply and `ACC16` uniform ones, rather than `ACC16`
+        divergent ones. Four addresses is not where that family's registers go,
+        so it buys little here; it is written the same way because the two
+        arms are read together and a second spelling of one address is how the
+        layout bug got in.
         """
         row0 = fx.Int32(tile_base + fx.Index((sub // 2) * MFMA16_K + (sub % 2) * 4)) + fx.Int32(
             self.lane // fx.Index(MFMA16_M)
@@ -323,9 +330,10 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
             vec = Vec(span, (ACC16,), fx.Float32)
             return [dualwave._fmul(vec[i], scale, self.fm_fast) for i in range_constexpr(ACC16)]
         pitch = self.lse_pitch
+        row_v = fx.Index(row0) * pitch
         out = []
         for i in range_constexpr(ACC16):
-            off = fx.Index(row0 + fx.Int32(i)) * pitch
+            off = row_v + fx.Index(i) * pitch
             one = buffer_ops.buffer_load(rsrc, as_mlir_value(fx.Int32(off)), vec_width=1, dtype=fx.Float32)
             out.append(dualwave._fmul(fx.Float32(one), scale, self.fm_fast))
         return out

@@ -1162,6 +1162,45 @@ class BwdDkDvSoftmaxHelper(ParitySoftmaxHelper):
         -- the inside form performs as though it always took the scalar arm,
         which is the 0.68x that made this a build axis in the first place. The
         cost of the outside form is that the body is emitted twice.
+
+        **The strided arm's address is one divergent value plus sixteen
+        uniform ones, and writing it the other way cost a third of the
+        kernel.** `(row_base + T[r]) * pitch` and `row_base * pitch +
+        T[r] * pitch` compute the same offset, but the first makes all sixteen
+        *divergent*: sixteen `v_mul_lo_u32` and sixteen VGPRs that must be live
+        together, because the loads are issued back to back to overlap their
+        latency. The second multiplies once per call in a VGPR and once per
+        `r` in an **SGPR** -- `pitch` is decoded from `VarlenBits` and the head
+        count, both workgroup-uniform, and `_ROW_THRESHOLDS` is a Python
+        constant -- so what reaches the loads is one base plus a scalar.
+
+        Fifteen VGPRs is not a rounding error here: it is the 256 boundary. A
+        wave that fits in 256 gets two per SIMD on this geometry -- the LDS
+        admits two workgroups per CU, so two is what the geometry is for -- and
+        a wave that needs 260 gets one. Nothing says so out loud, because
+        `waves_per_eu` is 1 at this rung and LLVM therefore budgets 512 and has
+        no reason to stop at 256. Measured, `B=2 H=8 S=4096`, head_dim 256
+        causal, `mfma_rows=16 block_q=32`:
+
+            arms              VGPRs   waves/SIMD   TFLOP/s
+            wide only           239        2         1403
+            strided only        259        1          786
+            both                268        1          783
+            both, this form     253        2         1392
+
+        -- 0.56x from fifteen registers, with nothing else about the loop
+        changed, and the dense build's 239 sitting seventeen short of the cliff
+        the whole time. That is the entire varlen dK/dV regression, at four
+        rungs; `_FEATURE_OVERRIDES` records the three whose table entries had
+        to be put back afterwards.
+
+        **`soffset` is not available for the uniform term**, tempting as it
+        looks: CDNA4 9.1.5.1 range-checks a raw buffer on
+        `InstOffset + vgpr_offset` alone, so an offset carried in `soffset`
+        addresses memory without being bounded. The bound is what makes a q row
+        past `seqlen_q` read zero rather than a neighbour's very negative LSE,
+        and `init_descriptors` explains what that zero is worth. The uniform
+        term therefore rides a `v_add` into the voffset, which is checked.
         """
         values = [None] * 16
         row_base = fx.Int32(tile_base + fx.Index(half * 32)) + fx.Int32(self.lane_div_32) * fx.Int32(4)
@@ -1178,8 +1217,11 @@ class BwdDkDvSoftmaxHelper(ParitySoftmaxHelper):
                     values[elem0 + j] = dualwave._fmul(vec[j], scale, self.fm_fast)
             return values
         pitch = self.lse_pitch
+        # One divergent multiply, sixteen uniform ones. Not `(row_base +
+        # T[r]) * pitch`; see the docstring for the twenty VGPRs that costs.
+        row_v = fx.Index(row_base) * pitch
         for r in range_constexpr(16):
-            off = fx.Index(row_base + fx.Int32(_ROW_THRESHOLDS[r])) * pitch
+            off = row_v + fx.Index(_ROW_THRESHOLDS[r]) * pitch
             one = buffer_ops.buffer_load(rsrc, as_mlir_value(fx.Int32(off)), vec_width=1, dtype=fx.Float32)
             values[r] = dualwave._fmul(fx.Float32(one), scale, self.fm_fast)
         return values
