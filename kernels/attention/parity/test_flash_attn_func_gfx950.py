@@ -1125,7 +1125,14 @@ def test_varlen_causal_defaults_to_cross_seqlen():
     assert causal_vl.cross_seqlen is True
     full_vl = fmha_knobs("gfx950", varlen=True).resolve(FmhaInputMetadata(num_heads=8, head_dim=64, causal=False))
     assert full_vl.cross_seqlen is False
-    dense = fmha_knobs("gfx950").resolve(FmhaInputMetadata(num_heads=8, head_dim=64, causal=True))
+    # **`varlen` now defaults on, so a *default* causal build carries
+    # `cross_seqlen` too.** That is the intended consequence of the flip, not a
+    # side effect: the derivation is `varlen and causal`, and a caller who did
+    # not say their batch is rectangular is exactly the caller whose leading Q
+    # blocks might have no live key. Getting the old behaviour is one word.
+    default_causal = fmha_knobs("gfx950").resolve(FmhaInputMetadata(num_heads=8, head_dim=64, causal=True))
+    assert default_causal.cross_seqlen is True
+    dense = fmha_knobs("gfx950", varlen=False).resolve(FmhaInputMetadata(num_heads=8, head_dim=64, causal=True))
     assert dense.cross_seqlen is False
     pinned = fmha_knobs("gfx950", varlen=True, cross_seqlen=False)
     assert pinned.resolve(FmhaInputMetadata(num_heads=8, head_dim=64, causal=True)).cross_seqlen is False
@@ -1259,7 +1266,9 @@ def test_splitk_matches_sdpa_in_production_layout(splits):
     q, k, v = (_rand(b, s, h, d).transpose(1, 2) for _ in range(3))
     o = torch.empty(b, s, h, d, device="cuda", dtype=DT).transpose(1, 2)
     assert o.stride(1) == d, "the point of this layout is heads adjacent"
-    fn = build(num_heads=h, head_dim=d, causal=True, dtype_str="bf16", num_kv_heads=h, num_kv_splits=splits)
+    fn = build(
+        num_heads=h, head_dim=d, causal=True, dtype_str="bf16", num_kv_heads=h, num_kv_splits=splits, varlen=False
+    )
     fn(q, k, v, o, b, s, seqlen_k=s, scale=None, lse=None, workspace=_splitk_workspace(b, h, s, splits, d))
     assert _err(o, _ref(q, k, v, causal=True)) < TOL
 
@@ -1278,7 +1287,7 @@ def test_splitk_refuses_a_gapped_batch_stride():
     o = _rand(b, s + 37, h, d)[:, :s, :, :].transpose(1, 2)
     assert o.stride(1) == d, "heads are adjacent, so only the batch stride is wrong"
     assert o.stride(0) != s * o.stride(2)
-    fn = build(num_heads=h, head_dim=d, causal=True, dtype_str="bf16", num_kv_heads=h, num_kv_splits=2)
+    fn = build(num_heads=h, head_dim=d, causal=True, dtype_str="bf16", num_kv_heads=h, num_kv_splits=2, varlen=False)
     with pytest.raises(ValueError, match="batch stride"):
         fn(q, k, v, o, b, s, seqlen_k=s, scale=None, lse=None, workspace=_splitk_workspace(b, h, s, 2, d))
 
@@ -1295,7 +1304,7 @@ def test_splitk_refuses_a_bhsd_output():
     b, h, s, d = 1, 4, 2048, 64
     q, k, v = (_rand(b, h, s, d) for _ in range(3))
     o = torch.empty(b, h, s, d, device="cuda", dtype=DT)
-    fn = build(num_heads=h, head_dim=d, causal=True, dtype_str="bf16", num_kv_heads=h, num_kv_splits=2)
+    fn = build(num_heads=h, head_dim=d, causal=True, dtype_str="bf16", num_kv_heads=h, num_kv_splits=2, varlen=False)
     with pytest.raises(ValueError, match="head stride"):
         fn(q, k, v, o, b, s, seqlen_k=s, scale=None, lse=None, workspace=_splitk_workspace(b, h, s, 2, d))
 
@@ -1538,9 +1547,20 @@ def test_resolve_is_idempotent():
 
 
 def test_cross_seqlen_is_an_ordinary_field():
-    """R1's side effect: no keyword-only parameter, no `kwargs.pop`, no converter arg."""
-    assert fmha_knobs("gfx950").resolve(_META).build_traits(_META).CROSS_SEQLEN is False
+    """R1's side effect: no keyword-only parameter, no `kwargs.pop`, no converter arg.
+
+    `_META` is causal (the metadata default), and `varlen` now defaults on, so
+    the *derived* value here is True -- see
+    `test_varlen_causal_defaults_to_cross_seqlen`. What this test is about is
+    that the field is settable both ways from the ordinary constructor, so it
+    pins each direction explicitly rather than leaning on a default that has
+    since moved.
+    """
+    assert fmha_knobs("gfx950", varlen=False).resolve(_META).build_traits(_META).CROSS_SEQLEN is False
+    assert fmha_knobs("gfx950", cross_seqlen=False).resolve(_META).build_traits(_META).CROSS_SEQLEN is False
     assert fmha_knobs("gfx950", cross_seqlen=True).resolve(_META).build_traits(_META).CROSS_SEQLEN is True
+    # And the default, which is now the derived one.
+    assert fmha_knobs("gfx950").resolve(_META).build_traits(_META).CROSS_SEQLEN is True
 
 
 @pytest.mark.parametrize(

@@ -915,25 +915,50 @@ def test_varlen_edges(dtype):
 
 
 def test_varlen_build_and_descriptor_must_agree():
-    """Neither direction of the mismatch may pass silently.
+    """A descriptor on a build that cannot decode it must fail; the reverse is legal.
 
-    A varlen descriptor on a dense build would be ignored, and a dense call on
-    a varlen build decodes `bits == 0` to the right answer -- so both would
-    *work*, and both are a caller who believes something about the layout that
-    is not being honoured.
+    **Only one direction is a mismatch now, and that is the point of the
+    default flip.** A varlen descriptor handed to a `varlen=False` build would
+    be silently ignored -- the decode is not compiled in, `q_row_off` and
+    `kv_row_off` are hardwired to 0, and every call is treated as dense. That
+    is a caller who believes a ragged batch is being honoured when it is not,
+    so it still raises.
+
+    The other direction used to raise too, on the same "believes something
+    that is not being honoured" reasoning. It no longer does, because
+    `varlen` now defaults to **True**: the caller who passes no descriptor is
+    the ordinary dense caller, not someone making a claim about layout. They
+    are served exactly -- `varlen_args` gives `bits == 0`, and at zero bits
+    `decode_addressing` returns dense addressing with every array read behind
+    a real branch, so the null `seqinfo` pointers are never dereferenced. This
+    asserts that it works and is *right*, which is stronger than asserting it
+    raises.
     """
     _require_rocm_path()
     b, h, s, d = 1, 2, 128, 64
+    torch.manual_seed(5)
     q, k, v, do = (_rand(b, h, s, d) for _ in range(4))
     dk, dv = torch.empty_like(k), torch.empty_like(v)
     lse = torch.zeros(b * h, s, device="cuda", dtype=torch.float32)
     desc = abi.varlen_compact(_cu([s]), _cu([s]), s, s, lse_tokens=s)
+    # `varlen=False` explicitly: the default no longer gives a dense build.
     with pytest.raises(ValueError, match="not compiled for varlen"):
-        build(num_heads=h, head_dim=d, dtype_str=_dt_str())(
+        build(num_heads=h, head_dim=d, varlen=False, dtype_str=_dt_str())(
             q, k, v, do, dk, dv, lse, lse, b, s, varlen=desc, num_seqlens=1
         )
-    with pytest.raises(ValueError, match="requires a varlen= descriptor"):
-        build(num_heads=h, head_dim=d, varlen=True, dtype_str=_dt_str())(q, k, v, do, dk, dv, lse, lse, b, s)
+
+    # A plain dense call on a default (varlen) build: legal, and correct.
+    scale = 1.0 / d**0.5
+    lse64, delta64, dk64, dv64 = _gqa_ref(q, k, v, do, scale)
+    rows = (lse64.float().reshape(b * h, s).contiguous(), delta64.float().reshape(b * h, s).contiguous())
+    got_dk, got_dv = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
+    fn = build(num_heads=h, head_dim=d, dtype_str=_dt_str())
+    assert fn.traits.VARLEN, "the default build should carry the varlen decode"
+    fn(q, k, v, do, got_dk, got_dv, rows[0], rows[1], b, s, seqlen_k=s, scale=scale)
+    torch.cuda.synchronize()
+    for name, got, ref in (("dk", got_dk, dk64), ("dv", got_dv, dv64)):
+        e = _rel(got, ref)
+        assert e < 1e-2, f"{name}: {e:.3e} -- a dense call on a varlen build must decode bits 0 to dense"
 
 
 # ---------------------------------------------------------------------------

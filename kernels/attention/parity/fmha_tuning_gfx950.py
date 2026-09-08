@@ -493,7 +493,18 @@ class Gfx950Knobs(FmhaKnobs):
         input rather than about something computed from it.
         """
         if self.varlen and self.num_kv_splits > 1:
-            raise ValueError("varlen is not supported together with num_kv_splits > 1")
+            # **`varlen` now defaults on, so a split-K caller must opt out**,
+            # and that is the intended shape rather than an awkwardness to
+            # engineer around: split-K's active guard is `split_nonempty`,
+            # derived over a rectangular batch, and it says nothing about a
+            # sequence shorter than `max_seqlen`. Making the caller write
+            # `varlen=False` puts the incompatibility at the call site instead
+            # of choosing silently for them.
+            raise ValueError(
+                "num_kv_splits > 1 needs varlen=False: the split guard was derived over a rectangular "
+                "batch and has not been re-derived for a ragged one. `varlen` defaults to True, so pass "
+                "varlen=False explicitly to build a split-K kernel."
+            )
         if self.kv_cache_layout not in ("linear", "vectorized"):
             raise ValueError(f"kv_cache_layout must be 'linear' or 'vectorized', got {self.kv_cache_layout!r}")
         return self
@@ -811,7 +822,16 @@ _GFX950_FALLBACK = Gfx950Knobs(
     setprio=True,
     stagger=True,
     lpt_tile_order=False,
-    varlen=False,
+    # **On by default**, because the decode is what makes a binary serve a
+    # ragged batch and a caller who does not set the field is exactly the
+    # caller who cannot be asked. AOTriton's descriptions pass no `varlen`, so
+    # with the old `False` their binaries had `init_sequence_lengths`
+    # early-returning before `decode_addressing` and `q_row_off`/`kv_row_off`
+    # hardwired to 0 -- every call treated as dense, which is right for the
+    # padded layout by coincidence and wrong for packed, compact and strided.
+    # A caller who knows their input is rectangular passes `varlen=False` and
+    # gets exactly the old code.
+    varlen=True,
     cross_seqlen=None,  # derived from varlen+causal; see `_with_mode_defaults`
     paged=False,
     kv_cache_layout="linear",

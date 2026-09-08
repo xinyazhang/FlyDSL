@@ -2360,11 +2360,16 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
         # the layout at runtime and serves either, so there is nothing left to
         # reject; `lse_layout_th` survives as a build hint with no effect on
         # correctness.
-        if varlen is None and traits.VARLEN:
-            # A varlen build with `bits == 0` decodes to the dense answer, so
-            # this would work -- and it would also be a caller who thinks a
-            # ragged batch is being honoured getting a rectangular one.
-            raise ValueError("this build has varlen=True and requires a varlen= descriptor")
+        # **No "requires a descriptor" check.** It used to raise here, on the
+        # grounds that a caller who asked for a varlen build and passed no
+        # descriptor probably thought a ragged batch was being honoured. That
+        # reasoning inverts once `varlen` defaults on: the caller who passes
+        # nothing is now the ordinary *dense* caller, and they must be served.
+        # They are, exactly: `varlen_args` gives `bits == 0`, and at zero bits
+        # `decode_addressing` returns `(max_seqlen, 0, z)` -- dense addressing
+        # -- with every array read behind a real branch, so the null `seqinfo`
+        # pointers are never dereferenced. The cost of a dense call on a varlen
+        # build is one not-taken scalar branch.
         # `abi.varlen_args` is gfx1201's, reused unedited: it encodes the same
         # wire format and it is where the two host-side checks live that no
         # kernel can make -- `batch_size` must be the tensor's batch extent

@@ -1764,8 +1764,16 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         _vl = abi.varlen_args(bool(knobs.strides_constexpr), varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens)
         if varlen is not None and not traits.VARLEN:
             raise ValueError("this build was not compiled for varlen; pass varlen=True to the builder")
-        if traits.VARLEN and varlen is None:
-            raise ValueError("this build has varlen=True and requires a varlen= descriptor")
+        # **No "requires a descriptor" check.** It used to raise here, on the
+        # grounds that a caller who asked for a varlen build and passed no
+        # descriptor probably thought a ragged batch was being honoured. That
+        # reasoning inverts once `varlen` defaults on: the caller who passes
+        # nothing is now the ordinary *dense* caller, and they must be served.
+        # They are, exactly: `varlen_args` gives `bits == 0`, and at zero bits
+        # `decode_addressing` returns `(max_seqlen, 0, z)` -- dense addressing
+        # -- with every array read behind a real branch, so the null `seqinfo`
+        # pointers are never dereferenced. The cost of a dense call on a varlen
+        # build is one not-taken scalar branch.
 
         # **`(batch * heads, tokens)`, and the shape is shared with dK/dV.**
         # Both backward kernels take the same two row tensors and read them

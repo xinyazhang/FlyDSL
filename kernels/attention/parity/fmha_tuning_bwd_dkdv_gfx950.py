@@ -471,7 +471,15 @@ class BwdDkDvInputMetadata:
     # B5. Whether this build decodes `VarlenBits`. The bits themselves are a
     # runtime argument -- one build serves all six configurations -- so only
     # the decision to compile the decode at all is here.
-    varlen: bool = False
+    #
+    # **Defaults on.** With it off, `init_sequence_lengths` early-returns
+    # before `decode_addressing` and the row origins are hardwired to 0, so the
+    # binary treats every call as dense -- right for the padded layout by
+    # coincidence, wrong for packed, compact and strided. A caller who does not
+    # set this field is the one who cannot be asked, so they get the decode; a
+    # caller who knows their batch is rectangular passes `varlen=False` and
+    # gets the old code unchanged.
+    varlen: bool = True
     # B5. Whether the logsumexp and delta tensors use Transformer Engine's
     # `(T, H)` layout rather than AOTriton's `(H, T)`. **A build axis rather
     # than a runtime bit**, unlike everything else in `VarlenBits`, and the

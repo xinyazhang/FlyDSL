@@ -687,7 +687,15 @@ _BWD_DQ_FALLBACK = BwdDqKnobs(
     setprio=True,
     stagger=True,
     lpt_tile_order=False,
-    varlen=False,
+    # On by default, for the reason `Gfx950Knobs`' fallback gives: a caller who
+    # does not set it is the one who cannot be asked whether their batch is
+    # ragged, and a binary without the decode treats every call as dense.
+    varlen=True,
+    # Still pinned off here, unlike the forward's `None`. This kernel does not
+    # need it: `BwdDqKernelContext.compute_active_guard` drops the
+    # `causal_end_raw_i32 > 0` term because a Q block with an empty causal
+    # region walks zero tiles and stores its zero seed, so there is no zeroing
+    # path to switch on. Flipping `varlen` therefore does not turn it on here.
     cross_seqlen=False,
     paged=False,
     kv_cache_layout="linear",
