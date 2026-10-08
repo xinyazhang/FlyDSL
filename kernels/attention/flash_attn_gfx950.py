@@ -1458,7 +1458,9 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
     `Constexpr` kernel arguments: AOTriton's driver synthesises `0` for every `Constexpr` launcher parameter and
     parses the kernel `def` for its argument list, so a knob taken as an argument would build a 0-wide tile. A
     `Constexpr` argument is used only for the Leading_upper_snake_case values (`Window_left`/`Window_right` under
-    STATIC_WINDOW, `Max_seqlen_q`/`Max_seqlen_k` under STATIC_SEQLEN), which are Int32 kernargs otherwise.
+    STATIC_WINDOW, `Max_seqlen_q`/`Max_seqlen_k` under STATIC_SEQLEN, `Num_head_q`/`Num_head_k` under STATIC_HEADS,
+    `Hdim_qk`/`Hdim_vo` under STATIC_HDIM, the fifteen `Stride_*` under STATIC_STRIDES, `Varlen_bits` under STATIC_LAYOUT
+    and `Sm_scale` under STATIC_SCALE), which are real kernargs otherwise.
 
     The contract of the kernel's ABI, head dims and layouts:
 

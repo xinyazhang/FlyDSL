@@ -209,6 +209,40 @@ def test_static_seqlen_leaves_the_default_abi_alone(backend, arch, tmp_path, mon
     assert d.metadata[".kernarg_segment_size"] == 296
 
 
+_FOLDED_BY_KNOB = {  # JIT-only baking knobs: the Leading_upper_snake_case kernargs each one removes
+    "STATIC_HEADS": 2,  # Num_head_q, Num_head_k
+    "STATIC_HDIM": 2,  # Hdim_qk, Hdim_vo
+    "STATIC_STRIDES": 15,  # Stride_{q,k,v,o,b}_{batch,head,seq}
+    "STATIC_LAYOUT": 1,  # Varlen_bits
+    "STATIC_SCALE": 1,  # Sm_scale
+}
+
+
+@pytest.mark.parametrize("knob", list(_FOLDED_BY_KNOB))
+def test_static_arg_knobs_fold_exactly_their_kernargs(backend, arch, tmp_path, monkeypatch, knob):
+    """FWD-40..44: each STATIC_* baking knob turns its Leading_upper_snake_case parameters into `Constexpr`, so exactly
+    those kernargs leave the block (and nothing else does); the defaults keep all 43 (296 bytes)."""
+    meta = meta_of(head_dim=64)
+    base = _dump(backend, arch, meta, tmp_path, monkeypatch)
+    baked = _dump(backend, arch, meta, tmp_path, monkeypatch, **{knob: True})
+    assert len(base.kernel_args) == 43 and base.metadata[".kernarg_segment_size"] == 296
+    assert len(baked.kernel_args) == 43 - _FOLDED_BY_KNOB[knob], knob
+    assert baked.hidden_args == []
+
+
+def test_raw_scores_keeps_the_abi_and_drops_the_score_multiplies(backend, arch, tmp_path, monkeypatch):
+    """RAW_SCORES keeps the scores unscaled through the masks and the row max, so the per-score multiply of the max pass
+    leaves the loop. The kernarg block is the default's (it is not a baking knob), the VGPR count does not grow, and the
+    final ISA has far fewer f32 multiplies."""
+    meta = meta_of(head_dim=64)
+    base = _control(backend, arch, meta, tmp_path, monkeypatch)
+    raw = _dump(backend, arch, meta, tmp_path, monkeypatch, RAW_SCORES=True)
+    assert raw.kernel_args == base.kernel_args and raw.metadata[".kernarg_segment_size"] == 296
+    muls = lambda d: d.isa.count("v_mul_f32") + d.isa.count("v_pk_mul_f32")  # noqa: E731
+    assert muls(raw) < 0.8 * muls(base), (muls(raw), muls(base))
+    assert raw.metadata[".vgpr_count"] <= base.metadata[".vgpr_count"]
+
+
 def test_return_lse_modes(backend, arch, tmp_path, monkeypatch):
     """A12/K24: `"never"` drops the LSE store; `"always"` drops the null-pointer branch; `"runtime"` stays within 1% of
     `"always"`. The LSE kernarg exists in every mode, so the mode never changes the ABI."""
