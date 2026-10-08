@@ -1442,7 +1442,7 @@ class _FwdGemmHelper(helpers.ParityGemmHelper):
 
     def qk(self, v_k, q_all_bf16, stage=0):
         raw = super().qk(v_k, q_all_bf16, stage)
-        # RAW_SCORES (STATIC_SCALE, positive scale): the scale moves to the row max and the exp subtract.
+        # RAW_SCORES: the scale moves to the row max and the exp subtract (see `ParitySoftmaxHelper.reduce_max`).
         return raw if const_expr(self.RAW_SCORES) else self.scale_scores(raw)
 
 
@@ -1489,6 +1489,7 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
     STATIC_STRIDES = knobs.STATIC_STRIDES
     STATIC_LAYOUT = knobs.STATIC_LAYOUT
     STATIC_SCALE = knobs.STATIC_SCALE
+    RAW_SCORES = knobs.RAW_SCORES
     BASE_TRAITS = traits  # the kernel rebinds `traits` (see its first statements)
 
     # Which algorithm this build is. `D_STAGES > 1` is the discriminator rather than a width threshold: staging is
@@ -1623,12 +1624,6 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
             and (Window_right in (common.WINDOW_TOPLEFT, common.WINDOW_BOTRIGHT) or Window_right >= 0)
         )
         KV_TAIL_FREE = const_expr(STATIC_SEQLEN and Max_seqlen_k % BASE_TRAITS.BLOCK_N == 0)
-        # STATIC_SCALE with a positive scale: `max(c * s) == c * max(s)`, so the masks and the row max run on the raw scores
-        # and the scale is one multiply per row plus the exp subtract's FMA. Needs the scaled domain nowhere else: a bias
-        # (or ALiBi) adds in it, and the wide body scales its own staged scores.
-        RAW_SCORES = const_expr(
-            STATIC_SCALE and Sm_scale > 0 and not BASE_TRAITS.BIAS_TYPE and not BASE_TRAITS.ALIBI and not WIDE
-        )
         traits = dc_replace(BASE_TRAITS, CROSS_SEQLEN=False) if const_expr(NO_CROSS) else BASE_TRAITS
         # Whether *every* tile needs the mask applied, or only the ones near the causal diagonal. `CROSS_SEQLEN` (which
         # follows `CAUSAL`) already gates the `v_s_1` site, and a window's left bound clips tiles anywhere in the range.

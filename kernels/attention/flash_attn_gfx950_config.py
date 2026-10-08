@@ -936,6 +936,12 @@ class Gfx950FwdKnobs(_Knobs):
     STATIC_STRIDES: bool | None = None  # Stride_{q,k,v,o,b}_{batch,head,seq}
     STATIC_LAYOUT: bool | None = None  # Varlen_bits: dense-only, the varlen decode compiles away
     STATIC_SCALE: bool | None = None  # Sm_scale
+    # Keep the QK scores raw (unscaled) through the masks and the row max, and scale once, fused into the exp subtract:
+    # `max(rn(c * s)) == rn(c * max(s))`, so the per-score multiply of the row-max pass disappears. The same softmax for
+    # every scale (a negative one flips Q's sign, exact, and a zero one runs at a vanishing positive one); a different binary,
+    # so the fp32 sums round differently: at most 1 bf16 ulp in O and 1 f32 ulp in LSE from the default. Works at runtime or
+    # with STATIC_SCALE; needs the scaled domain nowhere else, so it refuses bias and ALiBi and the wide body.
+    RAW_SCORES: bool | None = None
     # feature knobs, off by default; AOTriton never sets them
     XCD_SWIZZLE: bool | None = None
     NUM_KV_SPLITS: int | None = None
@@ -1044,6 +1050,11 @@ class Gfx950FwdKnobs(_Knobs):
         """`resolve`'s last step: prove the traits are buildable. The traits object is built and thrown
         away; only its verdict is kept, because every check names the knob to move."""
         fwd_traits(meta, self)
+        if self.RAW_SCORES and (meta.bias or meta.alibi or self.D_STAGES > 1 or self.VO_SHARDS > 1):
+            raise NotImplementedError(
+                "RAW_SCORES keeps the scores unscaled until the exp subtract, so it cannot serve a bias or ALiBi (both add in the "
+                "scaled domain) or the wide body (D_STAGES/VO_SHARDS > 1, which scales its own staged scores)"
+            )
         return self._check_grid_axis_order(GRID_AXIS_HEAD_FASTEST)
 
 
@@ -1064,6 +1075,7 @@ _FWD_FALLBACK = Gfx950FwdKnobs(
     STATIC_STRIDES=False,
     STATIC_LAYOUT=False,
     STATIC_SCALE=False,
+    RAW_SCORES=False,
     XCD_SWIZZLE=False,
     NUM_KV_SPLITS=1,
 )

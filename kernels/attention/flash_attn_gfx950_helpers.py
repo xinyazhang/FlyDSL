@@ -275,6 +275,32 @@ def mfma_operand_wait_state(pack):
     return dualwave.llvm.inline_asm(ir_val.type, [ir_val], "s_nop 1", "=v,0", has_side_effects=False)
 
 
+# What a zero `Sm_scale` becomes under RAW_SCORES. The raw path multiplies a masked `-inf` score by the scale, and `-inf * 0` is
+# NaN; a vanishing positive scale gives the same softmax (every `exp2` argument is a tiny finite number, so every unmasked
+# weight is exactly 1.0f) and keeps `-inf` as `-inf`.
+_RAW_SCALE_FLOOR = 2.0**-100
+_Q_SIGN_BITS = -0x7FFF8000  # 0x80008000 as an i32: the sign bit of both bf16/f16 halves of a dword
+
+
+def _raw_scale_and_q_sign(scale):
+    """`(|scale|, Q sign mask)` for RAW_SCORES, which needs a positive scale.
+
+    `rn(c * s) == rn(|c| * (-s))` for `c < 0` -- rounding is symmetric -- and `-s` is the QK dot of `-Q` with K, exactly, so
+    a negative scale is served by flipping Q's sign bits and using `|c|`: bit-identical to the scaled path. A python float
+    (STATIC_SCALE) decides at trace time and a flip of 0 emits nothing; a runtime `Sm_scale` pays one xor per Q dword in the
+    prologue, with a wave-uniform mask. A zero scale becomes `_RAW_SCALE_FLOOR`.
+    """
+    if const_expr(isinstance(scale, (int, float))):
+        mag = abs(float(scale)) or _RAW_SCALE_FLOOR
+        return fx.Float32(mag), (_Q_SIGN_BITS if scale < 0 else None)
+    s = fx.Float32(scale)
+    zero = fx.Float32(0.0)
+    neg = s < zero
+    mag = neg.select(zero - s, s)
+    mag = (mag == zero).select(fx.Float32(_RAW_SCALE_FLOOR), mag)
+    return mag, neg.select(fx.Int32(_Q_SIGN_BITS), fx.Int32(0))
+
+
 def exp2_wait_state(values):
     """One wait state between a batch of `exp2` results and their consumers.
 
@@ -892,6 +918,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         # STATIC_SCALE with a positive baked scale: the forward keeps the QK scores *raw* (unscaled) through the masks and
         # the row max, and scales once, fused into the exp subtract. See `ParitySoftmaxHelper.reduce_max`.
         self.RAW_SCORES = bool(raw_scores)
+        self.q_sign_mask = None  # set by `init_types_and_constants` under RAW_SCORES with a negative scale
         # P4. `VarlenBits` plus the four sequence-info arrays, named by role:
         # `?0` supplies lengths, `?1` supplies positions. Unread slots are
         # **null pointers**, which is safe only because the decoder branches
@@ -947,7 +974,11 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         self.NUM_DMA_K = self.traits.SMEM_D_RPT * self.ISSUES_PER_WAVE
         self.NUM_DMA_V = self.NUM_DMA_K
         self.c_sm_scale = fx.Float32(self.sm_scale_arg)
-        self.c_sm_scale_log2e = fx.Float32(self.sm_scale_arg) * fx.Float32(dualwave._LOG2E)
+        if const_expr(self.RAW_SCORES):
+            scale_eff, self.q_sign_mask = _raw_scale_and_q_sign(self.sm_scale_arg)
+        else:
+            scale_eff, self.q_sign_mask = self.sm_scale_arg, None
+        self.c_sm_scale_log2e = fx.Float32(scale_eff) * fx.Float32(dualwave._LOG2E)
 
     # -- runtime head counts ---------------------------------------------
 
@@ -1488,7 +1519,13 @@ class ParityQLoader(dualwave.DualwaveQLoader):
         acc = self.load_pack(ctx.q_row_in_block, 0)
         for ks in range_constexpr(traits.K_STEPS_QK - 1):
             acc = dualwave._concat_vectors(acc, self.load_pack(ctx.q_row_in_block, ks + 1))
-        return Vec(acc, (traits.K_STEPS_QK * traits.MFMA_LANE_K,), self.elem_dtype)
+        q_all = Vec(acc, (traits.K_STEPS_QK * traits.MFMA_LANE_K,), self.elem_dtype)
+        if const_expr(self.q_sign_mask is not None):
+            # RAW_SCORES with a negative scale: Q's sign bits flip (exact), see `_raw_scale_and_q_sign`.
+            n_dwords = traits.K_STEPS_QK * traits.MFMA_LANE_K // 2
+            mask = Vec.from_elements([fx.Int32(self.q_sign_mask)], fx.Int32).broadcast_to(n_dwords)
+            q_all = (q_all.bitcast(fx.Int32) ^ mask).bitcast(self.elem_dtype)
+        return q_all
 
 
 class ParityKvLdsToVgprLoader(dualwave.DualwaveKvLdsToVgprLoader):

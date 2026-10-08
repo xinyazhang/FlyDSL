@@ -33,7 +33,9 @@ pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 BR = (WINDOW_BOTRIGHT, WINDOW_BOTRIGHT)
 KNOBS = ("STATIC_HEADS", "STATIC_HDIM", "STATIC_STRIDES", "STATIC_LAYOUT", "STATIC_SCALE")
 PINS = {k: {k: True} for k in KNOBS}
+PINS["RAW_SCORES"] = {"RAW_SCORES": True}
 PINS["all"] = {k: True for k in KNOBS}
+PINS["all+raw"] = {**{k: True for k in KNOBS}, "RAW_SCORES": True}
 
 
 def _agree(got, want, ctx):
@@ -73,14 +75,16 @@ def test_static_knob_is_correct_and_matches_the_runtime_build(fwd_build, pins, w
 
 
 @pytest.mark.parametrize("window", [None, BR], ids=["dense", "causal"])
+@pytest.mark.parametrize("pins", ["STATIC_SCALE", "RAW_SCORES", "STATIC_SCALE+RAW_SCORES"])
 @pytest.mark.parametrize("scale", [0.3, 1.0, 0.0, -0.2], ids=["pos", "one", "zero", "neg"])
-def test_static_scale_values(fwd_build, scale, window):
-    """FWD-41: a baked positive scale takes the raw-score path (the masks and the row max run unscaled, the scale is one
-    multiply per row and the exp subtract's FMA); zero and negative scales keep the scaled path. All four are correct,
-    and a masked `-inf` score never meets the multiply as a NaN at scale 0."""
+def test_scale_values(fwd_build, scale, window, pins):
+    """FWD-41: the scale as a baked value (`STATIC_SCALE`), as the raw-score path (`RAW_SCORES`: the masks and the row max
+    run unscaled, the scale is one multiply per row and the exp subtract's FMA; a negative scale flips Q's sign, a zero one
+    runs at a vanishing positive one), and both. Every scale is correct, a masked `-inf` score never meets the multiply as
+    a NaN at scale 0, and the answer is the default build's to the usual tolerance."""
     dtype = DTYPES["bf16"]
     meta = meta_of(head_dim=64, window=window is not None)
-    fn = fwd_build(meta, STATIC_SCALE=True)
+    fn = fwd_build(meta, **{k: True for k in pins.split("+")})
     fwd_check(fn, b=2, hq=4, sq=257, sk=300, d=64, dtype=dtype, window=window, scale=scale, ctx=f"scale {scale}")
     gen = seeded(41)
     q, k, v = (randn(2, 4, 257, 64, dtype, gen=gen) for _ in range(3))
@@ -90,14 +94,12 @@ def test_static_scale_values(fwd_build, scale, window):
     _agree(got, want, f"scale {scale}")
 
 
-def test_static_scale_is_not_taken_with_bias(fwd_build):
-    """FWD-42: a bias adds in the scaled domain, so a bias build keeps the scaled path (and is correct)."""
-    dtype = DTYPES["bf16"]
-    gen = seeded(42)
-    b, h, s, d = 2, 4, 192, 64
-    bias = alloc(b, h, s, s, dtype, fill=torch.randn(b, h, s, s, device="cuda", generator=gen).to(dtype))
-    fn = fwd_build(meta_of(head_dim=64, bias=True), STATIC_SCALE=True)
-    fwd_check(fn, b=b, hq=h, sq=s, d=d, dtype=dtype, bias=bias, scale=0.2, ctx="static scale + bias")
+def test_raw_scores_refuses_what_adds_in_the_scaled_domain(backend, arch):
+    """FWD-42: a bias (or ALiBi) adds in the scaled domain and the wide body scales its own staged scores, so RAW_SCORES
+    refuses them at `resolve` instead of returning a plausible wrong answer."""
+    for meta in (meta_of(head_dim=64, bias=True), meta_of(head_dim=512)):
+        with pytest.raises(NotImplementedError, match="RAW_SCORES"):
+            backend.fwd_knobs(arch, RAW_SCORES=True).resolve(meta)
 
 
 @pytest.mark.parametrize("hdim", [72, 128], ids=lambda x: f"d{x}")
