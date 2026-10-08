@@ -140,11 +140,11 @@ def test_no_size_read_off_a_wire_view(filename):
 
 # What AOTriton's description must declare: every parameter of the kernel `def`, folded `Constexpr` ones included.
 FWD_DEF_PARAMS = (
-    "Q K V B O LSE workspace block_table seqinfo_q0 seqinfo_q1 seqinfo_k0 seqinfo_k1 varlen_bits num_seqlens Max_seqlen_q "
+    "Q K V B O LSE workspace block_table seqinfo_q0 seqinfo_q1 seqinfo_k0 seqinfo_k1 Varlen_bits num_seqlens Max_seqlen_q "
     "Max_seqlen_k Window_left Window_right philox_seed_ptr philox_offset1 philox_offset2 philox_seed_output "
-    "philox_offset_output idropout_p dropout_scale num_head_q num_head_k hdim_qk hdim_vo sm_scale stride_q_batch "
-    "stride_q_head stride_q_seq stride_k_batch stride_k_head stride_k_seq stride_v_batch stride_v_head stride_v_seq "
-    "stride_o_batch stride_o_head stride_o_seq stride_b_batch stride_b_head stride_b_seq_q block_table_stride"
+    "philox_offset_output idropout_p dropout_scale Num_head_q Num_head_k Hdim_qk Hdim_vo Sm_scale Stride_q_batch "
+    "Stride_q_head Stride_q_seq Stride_k_batch Stride_k_head Stride_k_seq Stride_v_batch Stride_v_head Stride_v_seq "
+    "Stride_o_batch Stride_o_head Stride_o_seq Stride_b_batch Stride_b_head Stride_b_seq_q block_table_stride"
 ).split()
 
 # The kernarg block at default metadata and knobs, `(kind, size)` per non-`Constexpr` parameter, offsets left to the
@@ -190,8 +190,20 @@ def test_kernarg_golden_matches_elf_args(backend, arch, tmp_path, monkeypatch):
 
 # the explicit list expected from the def: Pointer -> 8-byte buffer, Int32/Float32 -> 4, Int64 -> 8; folded params vanish
 def _expected_kernargs():
-    # Per-build annotations: WL_ANN / SEQ_ANN are Int32 at the defaults (Leading_upper_snake_case); WS_ANN / BT_ANN / BTS_ANN fold away.
-    kinds = {"fx.Pointer": _P, "fx.Int32": _I, "fx.Float32": _F, "fx.Int64": _L, "WL_ANN": _I, "SEQ_ANN": _I}
+    # Per-build annotations: the Leading_upper_snake_case ones (WL, SEQ, HEADS, HDIM, LAYOUT, SCALE, STRIDE) are real kernargs at the defaults; WS_ANN / BT_ANN / BTS_ANN fold away.
+    kinds = {
+        "fx.Pointer": _P,
+        "fx.Int32": _I,
+        "fx.Float32": _F,
+        "fx.Int64": _L,
+        "WL_ANN": _I,
+        "SEQ_ANN": _I,
+        "HEADS_ANN": _I,
+        "HDIM_ANN": _I,
+        "LAYOUT_ANN": _I,
+        "SCALE_ANN": _F,
+        "STRIDE_ANN": _L,
+    }
     return [kinds[a] for _, a in _kernel_def_params() if a in kinds]
 
 

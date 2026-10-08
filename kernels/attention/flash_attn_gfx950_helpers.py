@@ -830,6 +830,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         window_right=None,
         left_unbounded=False,
         kv_tail_free=False,
+        raw_scores=False,
         seqinfo=(None, None, None, None),
         varlen_bits=0,
         num_seqlens=0,
@@ -888,6 +889,9 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         # STATIC_SEQLEN with `seqlen_k % BLOCK_N == 0`: no tile holds a column past the end of K, so the KV-tail
         # mask compiles away.
         self.KV_TAIL_FREE = bool(kv_tail_free)
+        # STATIC_SCALE with a positive baked scale: the forward keeps the QK scores *raw* (unscaled) through the masks and
+        # the row max, and scales once, fused into the exp subtract. See `ParitySoftmaxHelper.reduce_max`.
+        self.RAW_SCORES = bool(raw_scores)
         # P4. `VarlenBits` plus the four sequence-info arrays, named by role:
         # `?0` supplies lengths, `?1` supplies positions. Unread slots are
         # **null pointers**, which is safe only because the decoder branches
@@ -1718,7 +1722,40 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
     """
 
     def reduce_max(self, v_s):
+        if const_expr(self.RAW_SCORES):
+            # Raw scores, positive baked scale: `max(rn(c * s)) == rn(c * max(s))` because rounding is monotone, so the
+            # row max of the scaled scores is one multiply of the raw max, per row instead of per score. The seed stays
+            # the floor (a raw score is -inf only when masked), so no -inf ever becomes a max; the scaled floor is
+            # `c * floor`, which only a fully masked row sees and which underflows every `exp2` all the same.
+            m_raw = dualwave._score_pair_max(v_s, self.c_neg_floor, self.fm_fast)
+            return fx.maxnumf(
+                fx.Float32(m_raw * self.c_sm_scale_log2e),
+                self.c_neg_floor,
+                fastmath=MASK_SAFE_FASTMATH,
+            )
         return dualwave._score_pair_max(v_s, self.c_neg_floor, self.fm_fast)
+
+    def sub_m(self, v_s, row_max):
+        if const_expr(self.RAW_SCORES):
+            # `fma(s, c, -m)` on the raw scores: the same single-rounding form LLVM contracts the scaled-then-subtracted
+            # path into, spelled out because the scale multiply no longer exists elsewhere to be fused with. A masked
+            # `-inf` stays `-inf` (c > 0), so the flags must not carry `ninf`.
+            scale_v = Vec.from_elements([self.c_sm_scale_log2e], fx.Float32).broadcast_to(16)
+            neg_m = Vec.from_elements([fx.Float32(self.c_zero_f - row_max)], fx.Float32).broadcast_to(16)
+            # The scores arrive as vectors, or as lists of 16 scalars once `bias_to_lists` has run.
+            lo, hi = (
+                (
+                    Vec.from_elements([as_mlir_value(x) for x in half], fx.Float32)
+                    if isinstance(half, (list, tuple))
+                    else Vec(half)
+                )
+                for half in v_s
+            )
+            return (
+                as_mlir_value(fx.fma(lo, scale_v, neg_m, fastmath=MASK_SAFE_FASTMATH)),
+                as_mlir_value(fx.fma(hi, scale_v, neg_m, fastmath=MASK_SAFE_FASTMATH)),
+            )
+        return super().sub_m(v_s, row_max)
 
     # -- P5: bias ------------------------------------------------------------
 

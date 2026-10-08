@@ -929,6 +929,13 @@ class Gfx950FwdKnobs(_Knobs):
     STATIC_WINDOW: bool | None = None
     # JIT-only, dense-only, opt-in: bakes `Max_seqlen_q`/`Max_seqlen_k` (call data, a compile per length pair). Never for AOT.
     STATIC_SEQLEN: bool | None = None
+    # JIT-only, opt-in: each bakes a group of per-call kernel arguments into the binary (a compile per value set), through
+    # the Leading_upper_snake_case parameters they govern. Never for AOT: at the defaults every one is a real kernarg.
+    STATIC_HEADS: bool | None = None  # Num_head_q, Num_head_k
+    STATIC_HDIM: bool | None = None  # Hdim_qk, Hdim_vo
+    STATIC_STRIDES: bool | None = None  # Stride_{q,k,v,o,b}_{batch,head,seq}
+    STATIC_LAYOUT: bool | None = None  # Varlen_bits: dense-only, the varlen decode compiles away
+    STATIC_SCALE: bool | None = None  # Sm_scale
     # feature knobs, off by default; AOTriton never sets them
     XCD_SWIZZLE: bool | None = None
     NUM_KV_SPLITS: int | None = None
@@ -1052,6 +1059,11 @@ _FWD_FALLBACK = Gfx950FwdKnobs(
     RETURN_LSE="runtime",
     STATIC_WINDOW=False,
     STATIC_SEQLEN=False,
+    STATIC_HEADS=False,
+    STATIC_HDIM=False,
+    STATIC_STRIDES=False,
+    STATIC_LAYOUT=False,
+    STATIC_SCALE=False,
     XCD_SWIZZLE=False,
     NUM_KV_SPLITS=1,
 )

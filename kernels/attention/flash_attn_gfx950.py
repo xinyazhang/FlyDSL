@@ -1441,7 +1441,9 @@ class _FwdGemmHelper(helpers.ParityGemmHelper):
     """
 
     def qk(self, v_k, q_all_bf16, stage=0):
-        return self.scale_scores(super().qk(v_k, q_all_bf16, stage))
+        raw = super().qk(v_k, q_all_bf16, stage)
+        # RAW_SCORES (STATIC_SCALE, positive scale): the scale moves to the row max and the exp subtract.
+        return raw if const_expr(self.RAW_SCORES) else self.scale_scores(raw)
 
 
 def build_flash_attn_gfx950_fwd(meta, knobs):
@@ -1482,6 +1484,11 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
     HDIM_QK_FLOOR = traits.HDIM_QK_FLOOR
     STATIC_WINDOW = knobs.STATIC_WINDOW
     STATIC_SEQLEN = knobs.STATIC_SEQLEN
+    STATIC_HEADS = knobs.STATIC_HEADS
+    STATIC_HDIM = knobs.STATIC_HDIM
+    STATIC_STRIDES = knobs.STATIC_STRIDES
+    STATIC_LAYOUT = knobs.STATIC_LAYOUT
+    STATIC_SCALE = knobs.STATIC_SCALE
     BASE_TRAITS = traits  # the kernel rebinds `traits` (see its first statements)
 
     # Which algorithm this build is. `D_STAGES > 1` is the discriminator rather than a width threshold: staging is
@@ -1536,6 +1543,12 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
     # build, which has the knobs at their defaults, still has a real kernarg.
     WL_ANN = fx.Constexpr if STATIC_WINDOW else fx.Int32
     SEQ_ANN = fx.Constexpr if STATIC_SEQLEN else fx.Int32
+    # The same shape for the other per-call values a JIT build may bake (all JIT-only, opt-in, off at the defaults).
+    HEADS_ANN = fx.Constexpr if STATIC_HEADS else fx.Int32
+    HDIM_ANN = fx.Constexpr if STATIC_HDIM else fx.Int32
+    STRIDE_ANN = fx.Constexpr if STATIC_STRIDES else fx.Int64
+    LAYOUT_ANN = fx.Constexpr if STATIC_LAYOUT else fx.Int32
+    SCALE_ANN = fx.Constexpr if STATIC_SCALE else fx.Float32
 
     @flyc.kernel(known_block_size=[traits.BLOCK_SIZE, 1, 1])
     def flash_attn_func_gfx950_kernel(
@@ -1551,7 +1564,7 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
-        varlen_bits: fx.Int32,
+        Varlen_bits: LAYOUT_ANN,
         num_seqlens: fx.Int32,
         Max_seqlen_q: SEQ_ANN,
         Max_seqlen_k: SEQ_ANN,
@@ -1564,26 +1577,26 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
         philox_offset_output: fx.Pointer,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
-        num_head_q: fx.Int32,
-        num_head_k: fx.Int32,
-        hdim_qk: fx.Int32,
-        hdim_vo: fx.Int32,
-        sm_scale: fx.Float32,
-        stride_q_batch: fx.Int64,
-        stride_q_head: fx.Int64,
-        stride_q_seq: fx.Int64,
-        stride_k_batch: fx.Int64,
-        stride_k_head: fx.Int64,
-        stride_k_seq: fx.Int64,
-        stride_v_batch: fx.Int64,
-        stride_v_head: fx.Int64,
-        stride_v_seq: fx.Int64,
-        stride_o_batch: fx.Int64,
-        stride_o_head: fx.Int64,
-        stride_o_seq: fx.Int64,
-        stride_b_batch: fx.Int64,
-        stride_b_head: fx.Int64,
-        stride_b_seq_q: fx.Int64,
+        Num_head_q: HEADS_ANN,
+        Num_head_k: HEADS_ANN,
+        Hdim_qk: HDIM_ANN,
+        Hdim_vo: HDIM_ANN,
+        Sm_scale: SCALE_ANN,
+        Stride_q_batch: STRIDE_ANN,
+        Stride_q_head: STRIDE_ANN,
+        Stride_q_seq: STRIDE_ANN,
+        Stride_k_batch: STRIDE_ANN,
+        Stride_k_head: STRIDE_ANN,
+        Stride_k_seq: STRIDE_ANN,
+        Stride_v_batch: STRIDE_ANN,
+        Stride_v_head: STRIDE_ANN,
+        Stride_v_seq: STRIDE_ANN,
+        Stride_o_batch: STRIDE_ANN,
+        Stride_o_head: STRIDE_ANN,
+        Stride_o_seq: STRIDE_ANN,
+        Stride_b_batch: STRIDE_ANN,
+        Stride_b_head: STRIDE_ANN,
+        Stride_b_seq_q: STRIDE_ANN,
         block_table_stride: BTS_ANN,
     ):
         # The six tensor operands arrive as bare pointers -- see `wire_ptr` in
@@ -1610,6 +1623,12 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
             and (Window_right in (common.WINDOW_TOPLEFT, common.WINDOW_BOTRIGHT) or Window_right >= 0)
         )
         KV_TAIL_FREE = const_expr(STATIC_SEQLEN and Max_seqlen_k % BASE_TRAITS.BLOCK_N == 0)
+        # STATIC_SCALE with a positive scale: `max(c * s) == c * max(s)`, so the masks and the row max run on the raw scores
+        # and the scale is one multiply per row plus the exp subtract's FMA. Needs the scaled domain nowhere else: a bias
+        # (or ALiBi) adds in it, and the wide body scales its own staged scores.
+        RAW_SCORES = const_expr(
+            STATIC_SCALE and Sm_scale > 0 and not BASE_TRAITS.BIAS_TYPE and not BASE_TRAITS.ALIBI and not WIDE
+        )
         traits = dc_replace(BASE_TRAITS, CROSS_SEQLEN=False) if const_expr(NO_CROSS) else BASE_TRAITS
         # Whether *every* tile needs the mask applied, or only the ones near the causal diagonal. `CROSS_SEQLEN` (which
         # follows `CAUSAL`) already gates the `v_s_1` site, and a window's left bound clips tiles anywhere in the range.
@@ -1623,30 +1642,31 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
         ctx = (helpers.WideKernelContext if WIDE else helpers.ParityKernelContext)(
             traits,
             strides=(
-                stride_q_batch,
-                stride_q_head,
-                stride_q_seq,
-                stride_k_batch,
-                stride_k_head,
-                stride_k_seq,
-                stride_v_batch,
-                stride_v_head,
-                stride_v_seq,
+                Stride_q_batch,
+                Stride_q_head,
+                Stride_q_seq,
+                Stride_k_batch,
+                Stride_k_head,
+                Stride_k_seq,
+                Stride_v_batch,
+                Stride_v_head,
+                Stride_v_seq,
             ),
-            o_strides=(stride_o_batch, stride_o_head, stride_o_seq),
-            sm_scale=sm_scale,
-            num_head_q=num_head_q,
-            num_head_k=num_head_k,
-            hdim_qk=hdim_qk,
-            hdim_vo=hdim_vo,
+            o_strides=(Stride_o_batch, Stride_o_head, Stride_o_seq),
+            sm_scale=Sm_scale,
+            num_head_q=Num_head_q,
+            num_head_k=Num_head_k,
+            hdim_qk=Hdim_qk,
+            hdim_vo=Hdim_vo,
             padded_head=PADDED_HEAD,
             hdim_qk_floor=HDIM_QK_FLOOR,
             window_left=wl,
             window_right=wr,
             left_unbounded=LEFT_UNBOUNDED,
             kv_tail_free=KV_TAIL_FREE,
+            raw_scores=RAW_SCORES,
             seqinfo=(seqinfo_q0, seqinfo_q1, seqinfo_k0, seqinfo_k1),
-            varlen_bits=varlen_bits,
+            varlen_bits=Varlen_bits,
             num_seqlens=num_seqlens,
             Q=Q,
             K=K,
@@ -1655,15 +1675,15 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
             DebugCounts=workspace,
             BlockTable=block_table,
             Bias=B,
-            bias_strides=(stride_b_batch, stride_b_head, stride_b_seq_q),
+            bias_strides=(Stride_b_batch, Stride_b_head, Stride_b_seq_q),
             philox=(philox_seed_ptr, philox_offset1, philox_offset2, philox_seed_output, philox_offset_output),
             idropout_p=idropout_p,
             dropout_scale=dropout_scale,
             seq_len=Max_seqlen_q,
             seq_len_kv=Max_seqlen_k,
-            stride_q_n=stride_q_seq,
-            stride_kv_n=stride_k_seq,
-            head_dim_runtime=hdim_qk,
+            stride_q_n=Stride_q_seq,
+            stride_kv_n=Stride_k_seq,
+            head_dim_runtime=Hdim_qk,
             block_table_stride=block_table_stride,
             LSE=LSE,
         )
@@ -2216,7 +2236,7 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
         seqinfo_q1: fx.Pointer,
         seqinfo_k0: fx.Pointer,
         seqinfo_k1: fx.Pointer,
-        varlen_bits: fx.Int32,
+        Varlen_bits: LAYOUT_ANN,
         num_seqlens: fx.Int32,
         Max_seqlen_q: SEQ_ANN,
         Max_seqlen_k: SEQ_ANN,
@@ -2229,26 +2249,26 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
         philox_offset_output: fx.Pointer,
         idropout_p: fx.Int32,
         dropout_scale: fx.Float32,
-        num_head_q: fx.Int32,
-        num_head_k: fx.Int32,
-        hdim_qk: fx.Int32,
-        hdim_vo: fx.Int32,
-        sm_scale: fx.Float32,
-        stride_q_batch: fx.Int64,
-        stride_q_head: fx.Int64,
-        stride_q_seq: fx.Int64,
-        stride_k_batch: fx.Int64,
-        stride_k_head: fx.Int64,
-        stride_k_seq: fx.Int64,
-        stride_v_batch: fx.Int64,
-        stride_v_head: fx.Int64,
-        stride_v_seq: fx.Int64,
-        stride_o_batch: fx.Int64,
-        stride_o_head: fx.Int64,
-        stride_o_seq: fx.Int64,
-        stride_b_batch: fx.Int64,
-        stride_b_head: fx.Int64,
-        stride_b_seq_q: fx.Int64,
+        Num_head_q: HEADS_ANN,
+        Num_head_k: HEADS_ANN,
+        Hdim_qk: HDIM_ANN,
+        Hdim_vo: HDIM_ANN,
+        Sm_scale: SCALE_ANN,
+        Stride_q_batch: STRIDE_ANN,
+        Stride_q_head: STRIDE_ANN,
+        Stride_q_seq: STRIDE_ANN,
+        Stride_k_batch: STRIDE_ANN,
+        Stride_k_head: STRIDE_ANN,
+        Stride_k_seq: STRIDE_ANN,
+        Stride_v_batch: STRIDE_ANN,
+        Stride_v_head: STRIDE_ANN,
+        Stride_v_seq: STRIDE_ANN,
+        Stride_o_batch: STRIDE_ANN,
+        Stride_o_head: STRIDE_ANN,
+        Stride_o_seq: STRIDE_ANN,
+        Stride_b_batch: STRIDE_ANN,
+        Stride_b_head: STRIDE_ANN,
+        Stride_b_seq_q: STRIDE_ANN,
         block_table_stride: BTS_ANN,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -2290,7 +2310,7 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
             seqinfo_q1,
             seqinfo_k0,
             seqinfo_k1,
-            varlen_bits,
+            Varlen_bits,
             num_seqlens,
             Max_seqlen_q,
             Max_seqlen_k,
@@ -2303,26 +2323,26 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
             philox_offset_output,
             idropout_p,
             dropout_scale,
-            num_head_q,
-            num_head_k,
-            hdim_qk,
-            hdim_vo,
-            sm_scale,
-            stride_q_batch,
-            stride_q_head,
-            stride_q_seq,
-            stride_k_batch,
-            stride_k_head,
-            stride_k_seq,
-            stride_v_batch,
-            stride_v_head,
-            stride_v_seq,
-            stride_o_batch,
-            stride_o_head,
-            stride_o_seq,
-            stride_b_batch,
-            stride_b_head,
-            stride_b_seq_q,
+            Num_head_q,
+            Num_head_k,
+            Hdim_qk,
+            Hdim_vo,
+            Sm_scale,
+            Stride_q_batch,
+            Stride_q_head,
+            Stride_q_seq,
+            Stride_k_batch,
+            Stride_k_head,
+            Stride_k_seq,
+            Stride_v_batch,
+            Stride_v_head,
+            Stride_v_seq,
+            Stride_o_batch,
+            Stride_o_head,
+            Stride_o_seq,
+            Stride_b_batch,
+            Stride_b_head,
+            Stride_b_seq_q,
             block_table_stride,
             value_attrs={
                 "rocdl.waves_per_eu": traits.WAVES_PER_EU,
@@ -2331,7 +2351,7 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
                 "llvm.denormal_fpenv": (dualwave.daz_denormal_attr() if const_expr(traits.DAZ) else None),
             },
         ).launch(
-            grid=(num_head_q, num_q_blocks, grid_z),
+            grid=(Num_head_q, num_q_blocks, grid_z),
             block=(traits.BLOCK_SIZE, 1, 1),
             stream=stream,
         )
@@ -2469,6 +2489,12 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
                 "this build has STATIC_SEQLEN=True and bakes (seqlen_q, seqlen_k); a varlen call has per-sequence "
                 "lengths. Build without STATIC_SEQLEN for varlen"
             )
+        if STATIC_LAYOUT and varlen is not None:
+            # `Varlen_bits` is baked as 0 (dense), which compiles the whole varlen decode away.
+            raise ValueError(
+                "this build has STATIC_LAYOUT=True and bakes the dense layout (varlen_bits == 0); a varlen call needs "
+                "the decode. Build without STATIC_LAYOUT for varlen"
+            )
 
         if not traits.WINDOW:
             if window is not None:
@@ -2532,6 +2558,11 @@ def build_flash_attn_gfx950_fwd(meta, knobs):
         # cache per pair, or the second pair would reuse the first one's binary.
         baked = (packed[15], packed[16]) if STATIC_SEQLEN else ()
         baked += (packed[17], packed[18]) if STATIC_WINDOW else ()
+        baked += packed[26:28] if STATIC_HEADS else ()  # Num_head_q, Num_head_k
+        baked += packed[28:30] if STATIC_HDIM else ()  # Hdim_qk, Hdim_vo
+        baked += packed[30:31] if STATIC_SCALE else ()  # Sm_scale
+        baked += packed[31:46] if STATIC_STRIDES else ()  # the fifteen strides
+        baked += packed[13:14] if STATIC_LAYOUT else ()  # Varlen_bits (0: dense)
         cache = COMPILED.setdefault(baked, abi.new_compiled_cache())
         result = abi.run_compiled(
             cache,
